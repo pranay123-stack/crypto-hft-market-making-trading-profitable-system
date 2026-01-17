@@ -1,0 +1,574 @@
+================================================================================
+MONITORING STACK INSTALLATION FOR HFT SYSTEMS
+================================================================================
+
+OVERVIEW
+--------
+Complete monitoring infrastructure for HFT systems:
+- Prometheus: Metrics collection and storage
+- Grafana: Visualization and dashboards
+- Node Exporter: System metrics
+- Process Exporter: Application metrics
+- AlertManager: Alert management
+- ELK Stack: Log aggregation and analysis (optional)
+
+PROMETHEUS INSTALLATION
+=======================
+
+Download and Install:
+--------------------
+cd /tmp
+wget https://github.com/prometheus/prometheus/releases/download/v2.48.0/prometheus-2.48.0.linux-amd64.tar.gz
+tar -xzf prometheus-2.48.0.linux-amd64.tar.gz
+sudo mv prometheus-2.48.0.linux-amd64 /opt/prometheus
+
+# Create prometheus user
+sudo useradd --no-create-home --shell /bin/false prometheus
+
+# Create directories
+sudo mkdir -p /var/lib/prometheus
+sudo mkdir -p /etc/prometheus
+
+# Set ownership
+sudo chown -R prometheus:prometheus /opt/prometheus
+sudo chown -R prometheus:prometheus /var/lib/prometheus
+sudo chown -R prometheus:prometheus /etc/prometheus
+
+Configuration:
+-------------
+cat > /tmp/prometheus.yml << 'EOF'
+global:
+  scrape_interval: 1s          # HFT requires frequent scraping
+  evaluation_interval: 1s
+  scrape_timeout: 1s
+
+  external_labels:
+    environment: 'production'
+    cluster: 'hft-primary'
+
+# Alertmanager configuration
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['localhost:9093']
+
+# Rules for alerting
+rule_files:
+  - '/etc/prometheus/rules/*.yml'
+
+scrape_configs:
+  # Prometheus itself
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # Node Exporter (system metrics)
+  - job_name: 'node'
+    static_configs:
+      - targets: ['localhost:9100']
+        labels:
+          instance: 'hft-server-1'
+
+  # HFT application metrics
+  - job_name: 'hft_app'
+    static_configs:
+      - targets: ['localhost:8080']
+        labels:
+          app: 'trading_engine'
+
+  # Process Exporter
+  - job_name: 'process'
+    static_configs:
+      - targets: ['localhost:9256']
+
+  # Redis metrics
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['localhost:9121']
+
+  # PostgreSQL metrics
+  - job_name: 'postgres'
+    static_configs:
+      - targets: ['localhost:9187']
+EOF
+
+sudo mv /tmp/prometheus.yml /etc/prometheus/
+
+Create Systemd Service:
+-----------------------
+cat > /tmp/prometheus.service << 'EOF'
+[Unit]
+Description=Prometheus Time Series Database
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=prometheus
+Group=prometheus
+Type=simple
+ExecStart=/opt/prometheus/prometheus \
+  --config.file=/etc/prometheus/prometheus.yml \
+  --storage.tsdb.path=/var/lib/prometheus/ \
+  --storage.tsdb.retention.time=30d \
+  --storage.tsdb.retention.size=50GB \
+  --web.console.templates=/opt/prometheus/consoles \
+  --web.console.libraries=/opt/prometheus/console_libraries \
+  --web.enable-lifecycle
+
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo mv /tmp/prometheus.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable prometheus
+sudo systemctl start prometheus
+
+Alert Rules for HFT:
+-------------------
+sudo mkdir -p /etc/prometheus/rules
+
+cat > /tmp/hft_alerts.yml << 'EOF'
+groups:
+  - name: hft_critical
+    interval: 1s
+    rules:
+      # Trading system down
+      - alert: TradingSystemDown
+        expr: up{job="hft_app"} == 0
+        for: 5s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Trading system is down"
+          description: "HFT application has been down for >5 seconds"
+
+      # High order latency
+      - alert: HighOrderLatency
+        expr: order_latency_microseconds > 1000
+        for: 10s
+        labels:
+          severity: warning
+        annotations:
+          summary: "Order latency exceeds 1ms"
+
+      # Exchange connection lost
+      - alert: ExchangeDisconnected
+        expr: exchange_connected{} == 0
+        for: 2s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Exchange connection lost"
+
+      # High CPU usage
+      - alert: HighCPUUsage
+        expr: 100 - (avg by(instance) (irate(node_cpu_seconds_total{mode="idle"}[30s])) * 100) > 80
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CPU usage above 80%"
+
+      # Memory pressure
+      - alert: HighMemoryUsage
+        expr: (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100 < 10
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: "Available memory below 10%"
+
+      # Disk space low
+      - alert: DiskSpaceLow
+        expr: (node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}) * 100 < 10
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Disk space below 10%"
+EOF
+
+sudo mv /tmp/hft_alerts.yml /etc/prometheus/rules/
+
+
+GRAFANA INSTALLATION
+====================
+
+Install via Package Manager (Ubuntu):
+-------------------------------------
+sudo apt install -y software-properties-common
+sudo add-apt-repository "deb https://packages.grafana.com/oss/deb stable main"
+wget -q -O - https://packages.grafana.com/gpg.key | sudo apt-key add -
+sudo apt update
+sudo apt install -y grafana
+
+# Enable and start
+sudo systemctl enable grafana-server
+sudo systemctl start grafana-server
+
+RHEL/CentOS:
+-----------
+cat > /tmp/grafana.repo << 'EOF'
+[grafana]
+name=grafana
+baseurl=https://packages.grafana.com/oss/rpm
+repo_gpgcheck=1
+enabled=1
+gpgcheck=1
+gpgkey=https://packages.grafana.com/gpg.key
+sslverify=1
+sslcacert=/etc/pki/tls/certs/ca-bundle.crt
+EOF
+
+sudo mv /tmp/grafana.repo /etc/yum.repos.d/
+sudo dnf install -y grafana
+sudo systemctl enable grafana-server
+sudo systemctl start grafana-server
+
+Configure Grafana:
+-----------------
+# Edit /etc/grafana/grafana.ini
+sudo vim /etc/grafana/grafana.ini
+
+# Key settings:
+[server]
+http_port = 3000
+domain = localhost
+
+[security]
+admin_user = admin
+admin_password = CHANGE_ME
+
+[auth.anonymous]
+enabled = false
+
+# Restart Grafana
+sudo systemctl restart grafana-server
+
+# Access: http://localhost:3000
+# Default: admin/admin
+
+Add Prometheus Data Source:
+---------------------------
+# Via UI: Configuration > Data Sources > Add Prometheus
+# URL: http://localhost:9090
+
+# Or via API:
+curl -X POST http://admin:admin@localhost:3000/api/datasources \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name":"Prometheus",
+    "type":"prometheus",
+    "url":"http://localhost:9090",
+    "access":"proxy",
+    "isDefault":true
+  }'
+
+HFT Dashboard Template:
+----------------------
+cat > /tmp/hft_dashboard.json << 'EOF'
+{
+  "dashboard": {
+    "title": "HFT System Dashboard",
+    "panels": [
+      {
+        "title": "Order Latency (µs)",
+        "targets": [
+          {"expr": "order_latency_microseconds"}
+        ],
+        "type": "graph"
+      },
+      {
+        "title": "Orders Per Second",
+        "targets": [
+          {"expr": "rate(orders_total[1s])"}
+        ],
+        "type": "graph"
+      },
+      {
+        "title": "CPU Usage",
+        "targets": [
+          {"expr": "100 - (avg(irate(node_cpu_seconds_total{mode=\"idle\"}[30s])) * 100)"}
+        ],
+        "type": "gauge"
+      },
+      {
+        "title": "Exchange Connections",
+        "targets": [
+          {"expr": "exchange_connected"}
+        ],
+        "type": "stat"
+      }
+    ]
+  }
+}
+EOF
+
+# Import dashboard
+curl -X POST http://admin:admin@localhost:3000/api/dashboards/db \
+  -H "Content-Type: application/json" \
+  -d @/tmp/hft_dashboard.json
+
+
+NODE EXPORTER
+=============
+
+Installation:
+------------
+cd /tmp
+wget https://github.com/prometheus/node_exporter/releases/download/v1.7.0/node_exporter-1.7.0.linux-amd64.tar.gz
+tar -xzf node_exporter-1.7.0.linux-amd64.tar.gz
+sudo mv node_exporter-1.7.0.linux-amd64/node_exporter /usr/local/bin/
+
+# Create user
+sudo useradd --no-create-home --shell /bin/false node_exporter
+
+Systemd Service:
+---------------
+cat > /tmp/node_exporter.service << 'EOF'
+[Unit]
+Description=Node Exporter
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=node_exporter
+Group=node_exporter
+Type=simple
+ExecStart=/usr/local/bin/node_exporter \
+  --collector.cpu \
+  --collector.meminfo \
+  --collector.diskstats \
+  --collector.netdev \
+  --collector.netstat \
+  --collector.stat
+
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo mv /tmp/node_exporter.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable node_exporter
+sudo systemctl start node_exporter
+
+
+PROCESS EXPORTER
+================
+
+Installation:
+------------
+cd /tmp
+wget https://github.com/ncabatoff/process-exporter/releases/download/v0.7.10/process-exporter-0.7.10.linux-amd64.tar.gz
+tar -xzf process-exporter-0.7.10.linux-amd64.tar.gz
+sudo mv process-exporter-0.7.10.linux-amd64/process-exporter /usr/local/bin/
+
+Configuration:
+-------------
+sudo mkdir -p /etc/process-exporter
+
+cat > /tmp/process-exporter.yml << 'EOF'
+process_names:
+  - name: "{{.Comm}}"
+    cmdline:
+      - 'hft_trading_engine'
+      - 'market_data_feed'
+      - 'risk_manager'
+
+  - name: "postgres"
+    cmdline:
+      - 'postgres'
+
+  - name: "redis"
+    cmdline:
+      - 'redis-server'
+EOF
+
+sudo mv /tmp/process-exporter.yml /etc/process-exporter/
+
+Systemd Service:
+---------------
+cat > /tmp/process-exporter.service << 'EOF'
+[Unit]
+Description=Process Exporter
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/process-exporter \
+  -config.path=/etc/process-exporter/process-exporter.yml
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo mv /tmp/process-exporter.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable process-exporter
+sudo systemctl start process-exporter
+
+
+DATABASE EXPORTERS
+==================
+
+PostgreSQL Exporter:
+-------------------
+cd /tmp
+wget https://github.com/prometheus-community/postgres_exporter/releases/download/v0.15.0/postgres_exporter-0.15.0.linux-amd64.tar.gz
+tar -xzf postgres_exporter-0.15.0.linux-amd64.tar.gz
+sudo mv postgres_exporter-0.15.0.linux-amd64/postgres_exporter /usr/local/bin/
+
+# Create environment file
+cat > /tmp/postgres_exporter.env << 'EOF'
+DATA_SOURCE_NAME="postgresql://hfttrader:PASSWORD@localhost:5432/hft_db?sslmode=disable"
+EOF
+
+sudo mv /tmp/postgres_exporter.env /etc/postgres_exporter.env
+
+# Systemd service
+cat > /tmp/postgres_exporter.service << 'EOF'
+[Unit]
+Description=PostgreSQL Exporter
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/postgres_exporter.env
+ExecStart=/usr/local/bin/postgres_exporter
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo mv /tmp/postgres_exporter.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable postgres_exporter
+sudo systemctl start postgres_exporter
+
+Redis Exporter:
+--------------
+cd /tmp
+wget https://github.com/oliver006/redis_exporter/releases/download/v1.55.0/redis_exporter-v1.55.0.linux-amd64.tar.gz
+tar -xzf redis_exporter-v1.55.0.linux-amd64.tar.gz
+sudo mv redis_exporter-v1.55.0.linux-amd64/redis_exporter /usr/local/bin/
+
+cat > /tmp/redis_exporter.service << 'EOF'
+[Unit]
+Description=Redis Exporter
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/redis_exporter \
+  -redis.addr=localhost:6379
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo mv /tmp/redis_exporter.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable redis_exporter
+sudo systemctl start redis_exporter
+
+
+C++ PROMETHEUS CLIENT
+=====================
+
+Installation:
+------------
+cd /tmp
+git clone https://github.com/jupp0r/prometheus-cpp.git
+cd prometheus-cpp
+git submodule init
+git submodule update
+
+mkdir build && cd build
+cmake .. \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_SHARED_LIBS=OFF \
+  -DENABLE_PUSH=ON \
+  -DENABLE_COMPRESSION=OFF \
+  -GNinja
+
+ninja
+sudo ninja install
+
+Example HFT Metrics:
+-------------------
+#include <prometheus/counter.h>
+#include <prometheus/exposer.h>
+#include <prometheus/registry.h>
+#include <prometheus/histogram.h>
+#include <memory>
+
+class HFTMetrics {
+private:
+    std::shared_ptr<prometheus::Registry> registry;
+    prometheus::Exposer exposer;
+
+    // Counters
+    prometheus::Family<prometheus::Counter>& order_counter;
+    prometheus::Counter& buy_orders;
+    prometheus::Counter& sell_orders;
+
+    // Histogram for latency
+    prometheus::Family<prometheus::Histogram>& latency_histogram;
+    prometheus::Histogram& order_latency;
+
+public:
+    HFTMetrics()
+        : exposer("0.0.0.0:8080"),
+          registry(std::make_shared<prometheus::Registry>()),
+          order_counter(prometheus::BuildCounter()
+                        .Name("orders_total")
+                        .Help("Total number of orders")
+                        .Register(*registry)),
+          buy_orders(order_counter.Add({{"side", "buy"}})),
+          sell_orders(order_counter.Add({{"side", "sell"}})),
+          latency_histogram(prometheus::BuildHistogram()
+                           .Name("order_latency_microseconds")
+                           .Help("Order latency in microseconds")
+                           .Register(*registry)),
+          order_latency(latency_histogram.Add({},
+                       prometheus::Histogram::BucketBoundaries{10, 50, 100, 500, 1000, 5000}))
+    {
+        exposer.RegisterCollectable(registry);
+    }
+
+    void increment_buy_orders() { buy_orders.Increment(); }
+    void increment_sell_orders() { sell_orders.Increment(); }
+    void observe_latency(double microseconds) { order_latency.Observe(microseconds); }
+};
+
+
+VERIFICATION
+============
+
+Check All Services:
+------------------
+sudo systemctl status prometheus
+sudo systemctl status grafana-server
+sudo systemctl status node_exporter
+sudo systemctl status process-exporter
+sudo systemctl status postgres_exporter
+sudo systemctl status redis_exporter
+
+# Test endpoints
+curl http://localhost:9090/metrics  # Prometheus
+curl http://localhost:9100/metrics  # Node Exporter
+curl http://localhost:9256/metrics  # Process Exporter
+curl http://localhost:3000          # Grafana
+
+================================================================================
+Next: 06_exchange_sdks.txt, 07_troubleshooting.txt
+================================================================================

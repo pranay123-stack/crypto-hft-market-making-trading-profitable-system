@@ -1,0 +1,992 @@
+================================================================================
+                    REDIS FOR HFT SYSTEMS
+                    State Management, Pub/Sub, and Caching
+================================================================================
+
+TABLE OF CONTENTS
+================================================================================
+1. Introduction to Redis in HFT
+2. Redis Architecture and Data Structures
+3. State Management Implementation
+4. Redis Pub/Sub for Events
+5. Caching Strategies
+6. Redis Cluster for High Availability
+7. Performance Optimization
+8. C++ Client Integration
+9. Use Cases and Patterns
+10. Best Practices
+
+================================================================================
+1. INTRODUCTION TO REDIS IN HFT
+================================================================================
+
+Redis (Remote Dictionary Server) is an in-memory data structure store used
+for state management, caching, and pub/sub messaging in HFT systems.
+
+KEY CHARACTERISTICS:
+- In-memory storage (50-200 μs latency)
+- Rich data structures (strings, hashes, lists, sets, sorted sets)
+- Pub/Sub messaging
+- Persistence options (RDB, AOF)
+- Atomic operations
+- Lua scripting
+- Replication and clustering
+
+PERFORMANCE PROFILE:
+┌───────────────────┬──────────┬──────────────┬────────────┐
+│ Operation         │ Latency  │ Throughput   │ Use Case   │
+├───────────────────┼──────────┼──────────────┼────────────┤
+│ GET (local)       │ 50-100μs │ 100K ops/s   │ Cache read │
+│ SET (local)       │ 60-150μs │ 80K ops/s    │ State write│
+│ HGETALL          │ 80-200μs │ 50K ops/s    │ Hash read  │
+│ PUBLISH          │ 100-300μs│ 30K msgs/s   │ Events     │
+│ Pipeline (10 ops) │ 70-150μs │ 500K ops/s   │ Batch ops  │
+└───────────────────┴──────────┴──────────────┴────────────┘
+
+WHEN TO USE REDIS IN HFT:
+✓ Position tracking (read-heavy)
+✓ Order state management
+✓ Session data caching
+✓ Reference data (symbols, contracts)
+✓ Non-critical event distribution
+✓ Distributed locks
+✓ Rate limiting
+
+WHEN NOT TO USE REDIS:
+✗ Critical path trading (too slow)
+✗ Market data distribution (use shared memory)
+✗ Sub-100μs requirements
+✗ Large data sets (> available RAM)
+
+================================================================================
+2. REDIS ARCHITECTURE AND DATA STRUCTURES
+================================================================================
+
+REDIS ARCHITECTURE:
+
+┌─────────────────────────────────────────────────────────────┐
+│                    Redis Server                             │
+│  ┌────────────────────────────────────────────────────────┐ │
+│  │  In-Memory Data Structures                             │ │
+│  │  ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐        │ │
+│  │  │String│ │ Hash │ │ List │ │ Set  │ │ZSet  │        │ │
+│  │  └──────┘ └──────┘ └──────┘ └──────┘ └──────┘        │ │
+│  └────────────────────────────────────────────────────────┘ │
+│                                                              │
+│  ┌────────────────────────────────────────────────────────┐ │
+│  │  Persistence Layer (Optional)                          │ │
+│  │  ┌─────────────┐          ┌──────────────┐            │ │
+│  │  │ RDB Snapshot│          │ AOF Log      │            │ │
+│  │  └─────────────┘          └──────────────┘            │ │
+│  └────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────┘
+                        │
+        ┌───────────────┼───────────────┐
+        │               │               │
+   ┌────▼────┐     ┌────▼────┐     ┌───▼─────┐
+   │ Client 1│     │ Client 2│     │ Client 3│
+   │(Trading)│     │ (Risk)  │     │ (OMS)   │
+   └─────────┘     └─────────┘     └─────────┘
+
+DATA STRUCTURES:
+
+1. STRING (Key-Value)
+   - Simple values
+   - Atomic counters
+   - Cache entries
+
+2. HASH (Field-Value pairs)
+   - Object storage
+   - Position data
+   - Order attributes
+
+3. LIST (Ordered collection)
+   - Message queues
+   - Recent items
+   - Time series
+
+4. SET (Unordered unique items)
+   - Tags
+   - Filters
+   - Relationships
+
+5. SORTED SET (Scored items)
+   - Leaderboards
+   - Time-ordered data
+   - Priority queues
+
+================================================================================
+3. STATE MANAGEMENT IMPLEMENTATION
+================================================================================
+
+POSITION TRACKING WITH REDIS:
+
+```cpp
+#include <sw/redis++/redis++.h>
+#include <string>
+#include <optional>
+
+using namespace sw::redis;
+
+class RedisPositionManager {
+    std::shared_ptr<Redis> redis_;
+
+public:
+    RedisPositionManager(const std::string& uri = "tcp://127.0.0.1:6379")
+        : redis_(std::make_shared<Redis>(uri)) {
+
+        // Test connection
+        redis_->ping();
+    }
+
+    // Get current position
+    int64_t getPosition(const std::string& symbol) {
+        auto key = "position:" + symbol;
+        auto val = redis_->get(key);
+
+        if (!val) {
+            return 0;  // No position
+        }
+
+        return std::stoll(*val);
+    }
+
+    // Update position (atomic increment)
+    int64_t updatePosition(const std::string& symbol, int64_t delta) {
+        auto key = "position:" + symbol;
+        return redis_->incrby(key, delta);
+    }
+
+    // Set position directly
+    void setPosition(const std::string& symbol, int64_t position) {
+        auto key = "position:" + symbol;
+        redis_->set(key, std::to_string(position));
+    }
+
+    // Get all positions
+    std::map<std::string, int64_t> getAllPositions() {
+        std::map<std::string, int64_t> positions;
+
+        // Get all position keys
+        std::vector<std::string> keys;
+        redis_->keys("position:*", std::back_inserter(keys));
+
+        if (keys.empty()) {
+            return positions;
+        }
+
+        // Batch get using pipeline
+        auto pipe = redis_->pipeline();
+        for (const auto& key : keys) {
+            pipe.get(key);
+        }
+
+        auto replies = pipe.exec();
+
+        // Parse results
+        for (size_t i = 0; i < keys.size(); ++i) {
+            auto val = replies.get<std::optional<std::string>>(i);
+            if (val) {
+                std::string symbol = keys[i].substr(9);  // Remove "position:"
+                positions[symbol] = std::stoll(*val);
+            }
+        }
+
+        return positions;
+    }
+
+    // Atomic position check and update
+    bool checkAndUpdatePosition(const std::string& symbol,
+                               int64_t delta,
+                               int64_t max_position) {
+        // Lua script for atomic check-and-update
+        static const std::string script = R"(
+            local current = tonumber(redis.call('GET', KEYS[1]) or 0)
+            local new_pos = current + tonumber(ARGV[1])
+            local max_pos = tonumber(ARGV[2])
+
+            if math.abs(new_pos) > max_pos then
+                return 0
+            end
+
+            redis.call('SET', KEYS[1], tostring(new_pos))
+            return 1
+        )";
+
+        auto key = "position:" + symbol;
+
+        try {
+            auto result = redis_->eval<long long>(
+                script,
+                {key},
+                {std::to_string(delta), std::to_string(max_position)}
+            );
+
+            return result == 1;
+        }
+        catch (const Error& e) {
+            std::cerr << "Redis error: " << e.what() << std::endl;
+            return false;
+        }
+    }
+};
+
+// Usage
+RedisPositionManager pm;
+
+// Update position
+int64_t new_pos = pm.updatePosition("AAPL", 100);  // Buy 100
+std::cout << "New position: " << new_pos << std::endl;
+
+// Check and update with limit
+bool success = pm.checkAndUpdatePosition("AAPL", 500, 1000);
+if (!success) {
+    std::cout << "Position limit exceeded" << std::endl;
+}
+
+// Get all positions
+auto positions = pm.getAllPositions();
+for (const auto& [symbol, pos] : positions) {
+    std::cout << symbol << ": " << pos << std::endl;
+}
+```
+
+ORDER STATE MANAGEMENT WITH HASH:
+
+```cpp
+class RedisOrderManager {
+    std::shared_ptr<Redis> redis_;
+
+public:
+    RedisOrderManager(const std::string& uri = "tcp://127.0.0.1:6379")
+        : redis_(std::make_shared<Redis>(uri)) {}
+
+    // Store order (using hash)
+    void storeOrder(const Order& order) {
+        auto key = "order:" + order.id();
+
+        std::unordered_map<std::string, std::string> fields = {
+            {"symbol", order.symbol()},
+            {"side", order.side() == Side::BUY ? "BUY" : "SELL"},
+            {"quantity", std::to_string(order.quantity())},
+            {"price", std::to_string(order.price())},
+            {"status", orderStatusToString(order.status())},
+            {"timestamp", std::to_string(order.timestamp())}
+        };
+
+        redis_->hmset(key, fields.begin(), fields.end());
+
+        // Set expiry (1 day)
+        redis_->expire(key, std::chrono::hours(24));
+    }
+
+    // Get order
+    std::optional<Order> getOrder(const std::string& order_id) {
+        auto key = "order:" + order_id;
+
+        std::unordered_map<std::string, std::string> fields;
+        redis_->hgetall(key, std::inserter(fields, fields.begin()));
+
+        if (fields.empty()) {
+            return std::nullopt;
+        }
+
+        Order order;
+        order.set_id(order_id);
+        order.set_symbol(fields["symbol"]);
+        order.set_side(fields["side"] == "BUY" ? Side::BUY : Side::SELL);
+        order.set_quantity(std::stoll(fields["quantity"]));
+        order.set_price(std::stod(fields["price"]));
+        // ... set other fields
+
+        return order;
+    }
+
+    // Update order status
+    void updateOrderStatus(const std::string& order_id,
+                          OrderStatus status) {
+        auto key = "order:" + order_id;
+        redis_->hset(key, "status", orderStatusToString(status));
+    }
+
+    // Get orders by status (using secondary index)
+    std::vector<std::string> getOrdersByStatus(OrderStatus status) {
+        auto index_key = "orders_by_status:" + orderStatusToString(status);
+
+        std::vector<std::string> order_ids;
+        redis_->smembers(index_key, std::back_inserter(order_ids));
+
+        return order_ids;
+    }
+
+    // Add order to status index
+    void addToStatusIndex(const std::string& order_id, OrderStatus status) {
+        auto index_key = "orders_by_status:" + orderStatusToString(status);
+        redis_->sadd(index_key, order_id);
+    }
+
+    // Remove from status index
+    void removeFromStatusIndex(const std::string& order_id, OrderStatus status) {
+        auto index_key = "orders_by_status:" + orderStatusToString(status);
+        redis_->srem(index_key, order_id);
+    }
+};
+```
+
+REFERENCE DATA CACHING:
+
+```cpp
+class RedisReferenceDataCache {
+    std::shared_ptr<Redis> redis_;
+    std::chrono::seconds ttl_;
+
+public:
+    RedisReferenceDataCache(const std::string& uri = "tcp://127.0.0.1:6379",
+                           std::chrono::seconds ttl = std::chrono::hours(24))
+        : redis_(std::make_shared<Redis>(uri))
+        , ttl_(ttl) {}
+
+    // Cache symbol info
+    void cacheSymbolInfo(const SymbolInfo& info) {
+        auto key = "symbol:" + info.symbol();
+
+        std::unordered_map<std::string, std::string> fields = {
+            {"name", info.name()},
+            {"exchange", info.exchange()},
+            {"lot_size", std::to_string(info.lot_size())},
+            {"tick_size", std::to_string(info.tick_size())},
+            {"currency", info.currency()}
+        };
+
+        redis_->hmset(key, fields.begin(), fields.end());
+        redis_->expire(key, ttl_);
+    }
+
+    // Get symbol info
+    std::optional<SymbolInfo> getSymbolInfo(const std::string& symbol) {
+        auto key = "symbol:" + symbol;
+
+        std::unordered_map<std::string, std::string> fields;
+        redis_->hgetall(key, std::inserter(fields, fields.begin()));
+
+        if (fields.empty()) {
+            return std::nullopt;
+        }
+
+        SymbolInfo info;
+        info.set_symbol(symbol);
+        info.set_name(fields["name"]);
+        info.set_exchange(fields["exchange"]);
+        info.set_lot_size(std::stoi(fields["lot_size"]));
+        info.set_tick_size(std::stod(fields["tick_size"]));
+        info.set_currency(fields["currency"]);
+
+        return info;
+    }
+
+    // Batch cache multiple symbols
+    void batchCacheSymbols(const std::vector<SymbolInfo>& symbols) {
+        auto pipe = redis_->pipeline();
+
+        for (const auto& info : symbols) {
+            auto key = "symbol:" + info.symbol();
+
+            std::unordered_map<std::string, std::string> fields = {
+                {"name", info.name()},
+                {"exchange", info.exchange()},
+                {"lot_size", std::to_string(info.lot_size())},
+                {"tick_size", std::to_string(info.tick_size())},
+                {"currency", info.currency()}
+            };
+
+            pipe.hmset(key, fields.begin(), fields.end());
+            pipe.expire(key, ttl_);
+        }
+
+        pipe.exec();
+    }
+};
+```
+
+================================================================================
+4. REDIS PUB/SUB FOR EVENTS
+================================================================================
+
+REDIS PUB/SUB ARCHITECTURE:
+
+Publisher                    Subscriber 1
+   │                              │
+   ├─── PUBLISH "orders" ────────>│ SUBSCRIBE "orders"
+   │                              │
+   │                         Subscriber 2
+   │                              │
+   └─────────────────────────────>│ SUBSCRIBE "orders"
+
+IMPLEMENTATION:
+
+```cpp
+class RedisEventPublisher {
+    std::shared_ptr<Redis> redis_;
+
+public:
+    RedisEventPublisher(const std::string& uri = "tcp://127.0.0.1:6379")
+        : redis_(std::make_shared<Redis>(uri)) {}
+
+    // Publish order event
+    void publishOrderEvent(const std::string& order_id,
+                          OrderStatus status) {
+        std::string channel = "order_events";
+
+        OrderEvent event;
+        event.set_order_id(order_id);
+        event.set_status(status);
+        event.set_timestamp(getCurrentTimestamp());
+
+        std::string serialized = event.SerializeAsString();
+
+        // Publish returns number of subscribers
+        long long num_subscribers = redis_->publish(channel, serialized);
+
+        if (num_subscribers == 0) {
+            std::cerr << "Warning: No subscribers for " << channel << std::endl;
+        }
+    }
+
+    // Publish to pattern-based channel
+    void publishSymbolEvent(const std::string& symbol,
+                           const std::string& event_type,
+                           const std::string& data) {
+        // Channel: events.<symbol>.<type>
+        std::string channel = "events." + symbol + "." + event_type;
+        redis_->publish(channel, data);
+    }
+};
+
+class RedisEventSubscriber {
+    std::shared_ptr<Redis> redis_;
+    std::unique_ptr<Subscriber> subscriber_;
+    std::thread subscriber_thread_;
+    std::atomic<bool> running_{false};
+
+public:
+    RedisEventSubscriber(const std::string& uri = "tcp://127.0.0.1:6379")
+        : redis_(std::make_shared<Redis>(uri))
+        , subscriber_(std::make_unique<Subscriber>(redis_->subscriber())) {}
+
+    ~RedisEventSubscriber() {
+        stop();
+    }
+
+    // Subscribe to channel
+    void subscribe(const std::string& channel,
+                  std::function<void(const std::string&)> callback) {
+
+        subscriber_->on_message([callback](std::string channel,
+                                           std::string msg) {
+            callback(msg);
+        });
+
+        subscriber_->subscribe(channel);
+    }
+
+    // Subscribe to pattern
+    void psubscribe(const std::string& pattern,
+                   std::function<void(const std::string&,
+                                     const std::string&)> callback) {
+
+        subscriber_->on_pmessage([callback](std::string pattern,
+                                            std::string channel,
+                                            std::string msg) {
+            callback(channel, msg);
+        });
+
+        subscriber_->psubscribe(pattern);
+    }
+
+    // Start consuming messages
+    void start() {
+        running_ = true;
+
+        subscriber_thread_ = std::thread([this]() {
+            while (running_) {
+                try {
+                    subscriber_->consume();
+                }
+                catch (const Error& e) {
+                    std::cerr << "Subscriber error: " << e.what() << std::endl;
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                }
+            }
+        });
+    }
+
+    void stop() {
+        if (running_) {
+            running_ = false;
+            subscriber_->unsubscribe();
+
+            if (subscriber_thread_.joinable()) {
+                subscriber_thread_.join();
+            }
+        }
+    }
+};
+
+// Usage
+// Publisher
+RedisEventPublisher publisher;
+publisher.publishOrderEvent("ORDER123", OrderStatus::FILLED);
+
+// Subscriber
+RedisEventSubscriber subscriber;
+
+subscriber.subscribe("order_events", [](const std::string& msg) {
+    OrderEvent event;
+    event.ParseFromString(msg);
+
+    std::cout << "Order " << event.order_id()
+             << " status: " << event.status() << std::endl;
+});
+
+subscriber.start();
+```
+
+PATTERN-BASED SUBSCRIPTION:
+
+```cpp
+// Subscribe to all events for a symbol
+subscriber.psubscribe("events.AAPL.*",
+                     [](const std::string& channel,
+                        const std::string& msg) {
+    std::cout << "Event on " << channel << ": " << msg << std::endl;
+});
+
+// Subscribe to specific event types across symbols
+subscriber.psubscribe("events.*.fill",
+                     [](const std::string& channel,
+                        const std::string& msg) {
+    // Handle fill events for all symbols
+});
+```
+
+================================================================================
+5. CACHING STRATEGIES
+================================================================================
+
+CACHE-ASIDE PATTERN:
+
+```cpp
+class RedisCacheAside {
+    std::shared_ptr<Redis> redis_;
+    std::chrono::seconds ttl_;
+
+public:
+    RedisCacheAside(const std::string& uri = "tcp://127.0.0.1:6379",
+                   std::chrono::seconds ttl = std::chrono::minutes(10))
+        : redis_(std::make_shared<Redis>(uri))
+        , ttl_(ttl) {}
+
+    // Get with cache
+    template<typename T>
+    T getWithCache(const std::string& key,
+                   std::function<T()> fetch_from_db) {
+
+        // Try cache first
+        auto cached = redis_->get(key);
+        if (cached) {
+            return deserialize<T>(*cached);
+        }
+
+        // Cache miss - fetch from database
+        T value = fetch_from_db();
+
+        // Update cache
+        redis_->setex(key, ttl_.count(), serialize(value));
+
+        return value;
+    }
+
+    // Invalidate cache
+    void invalidate(const std::string& key) {
+        redis_->del(key);
+    }
+
+    // Batch invalidate
+    void invalidatePattern(const std::string& pattern) {
+        std::vector<std::string> keys;
+        redis_->keys(pattern, std::back_inserter(keys));
+
+        if (!keys.empty()) {
+            redis_->del(keys.begin(), keys.end());
+        }
+    }
+};
+
+// Usage
+RedisCacheAside cache;
+
+auto symbol_info = cache.getWithCache<SymbolInfo>(
+    "symbol:AAPL",
+    []() {
+        // Fetch from database if not in cache
+        return fetchSymbolInfoFromDB("AAPL");
+    }
+);
+```
+
+WRITE-THROUGH CACHE:
+
+```cpp
+class RedisWriteThroughCache {
+    std::shared_ptr<Redis> redis_;
+
+public:
+    RedisWriteThroughCache(const std::string& uri = "tcp://127.0.0.1:6379")
+        : redis_(std::make_shared<Redis>(uri)) {}
+
+    // Write to both cache and database
+    void set(const std::string& key,
+            const std::string& value,
+            std::function<void(const std::string&,
+                             const std::string&)> write_to_db) {
+
+        // Write to database first
+        write_to_db(key, value);
+
+        // Then update cache
+        redis_->set(key, value);
+    }
+
+    std::optional<std::string> get(const std::string& key) {
+        return redis_->get(key);
+    }
+};
+```
+
+CACHE WARMING:
+
+```cpp
+class RedisCacheWarmer {
+    std::shared_ptr<Redis> redis_;
+
+public:
+    RedisCacheWarmer(const std::string& uri = "tcp://127.0.0.1:6379")
+        : redis_(std::make_shared<Redis>(uri)) {}
+
+    // Warm cache with symbol data
+    void warmSymbolCache(const std::vector<std::string>& symbols) {
+        auto pipe = redis_->pipeline();
+
+        for (const auto& symbol : symbols) {
+            auto info = fetchSymbolInfoFromDB(symbol);
+
+            std::string key = "symbol:" + symbol;
+            std::string value = serialize(info);
+
+            pipe.setex(key, 86400, value);  // 1 day TTL
+        }
+
+        pipe.exec();
+
+        std::cout << "Warmed cache with " << symbols.size()
+                 << " symbols" << std::endl;
+    }
+
+    // Warm on startup
+    void warmOnStartup() {
+        auto symbols = getActiveSymbols();
+        warmSymbolCache(symbols);
+    }
+};
+```
+
+================================================================================
+6. REDIS CLUSTER FOR HIGH AVAILABILITY
+================================================================================
+
+REDIS CLUSTER ARCHITECTURE:
+
+┌────────────┐  ┌────────────┐  ┌────────────┐
+│  Master 1  │  │  Master 2  │  │  Master 3  │
+│ (Slots     │  │ (Slots     │  │ (Slots     │
+│  0-5460)   │  │ 5461-10922)│  │10923-16383)│
+└─────┬──────┘  └─────┬──────┘  └─────┬──────┘
+      │               │               │
+┌─────▼──────┐  ┌─────▼──────┐  ┌─────▼──────┐
+│  Slave 1   │  │  Slave 2   │  │  Slave 3   │
+│ (Replica)  │  │ (Replica)  │  │ (Replica)  │
+└────────────┘  └────────────┘  └────────────┘
+
+CLUSTER CLIENT:
+
+```cpp
+#include <sw/redis++/redis_cluster.h>
+
+class RedisClusterPositionManager {
+    std::shared_ptr<RedisCluster> cluster_;
+
+public:
+    RedisClusterPositionManager(const std::string& uri)
+        : cluster_(std::make_shared<RedisCluster>(uri)) {
+
+        // Test connection
+        cluster_->ping("master1");
+    }
+
+    int64_t getPosition(const std::string& symbol) {
+        auto key = "position:" + symbol;
+        auto val = cluster_->get(key);
+
+        if (!val) {
+            return 0;
+        }
+
+        return std::stoll(*val);
+    }
+
+    int64_t updatePosition(const std::string& symbol, int64_t delta) {
+        auto key = "position:" + symbol;
+        return cluster_->incrby(key, delta);
+    }
+
+    // Transaction (not supported across cluster nodes)
+    // Use hash tags to ensure keys on same node
+    void updateMultiplePositions(
+        const std::map<std::string, int64_t>& updates) {
+
+        // Group updates by hash slot
+        for (const auto& [symbol, delta] : updates) {
+            // Use hash tags to ensure same slot: {user_id}:position:AAPL
+            auto key = "{trader1}:position:" + symbol;
+            cluster_->incrby(key, delta);
+        }
+    }
+};
+```
+
+SENTINEL FOR FAILOVER:
+
+```cpp
+#include <sw/redis++/sentinel.h>
+
+class RedisSentinelClient {
+    std::shared_ptr<Redis> redis_;
+    std::shared_ptr<Sentinel> sentinel_;
+    std::string master_name_;
+
+public:
+    RedisSentinelClient(const std::string& sentinel_uri,
+                       const std::string& master_name)
+        : sentinel_(std::make_shared<Sentinel>(sentinel_uri))
+        , master_name_(master_name) {
+
+        // Get master connection
+        connectToMaster();
+    }
+
+    void connectToMaster() {
+        ConnectionOptions opts;
+        opts = sentinel_->master(master_name_, opts);
+
+        redis_ = std::make_shared<Redis>(opts);
+    }
+
+    // Reconnect on failure
+    void reconnect() {
+        std::cout << "Reconnecting to master..." << std::endl;
+        connectToMaster();
+    }
+
+    // Wrapped operations with auto-reconnect
+    std::optional<std::string> get(const std::string& key) {
+        try {
+            return redis_->get(key);
+        }
+        catch (const Error& e) {
+            std::cerr << "Error: " << e.what() << ", reconnecting..." << std::endl;
+            reconnect();
+            return redis_->get(key);
+        }
+    }
+};
+```
+
+================================================================================
+7. PERFORMANCE OPTIMIZATION
+================================================================================
+
+PIPELINING FOR BATCH OPERATIONS:
+
+```cpp
+class RedisPipelinedOperations {
+    std::shared_ptr<Redis> redis_;
+
+public:
+    RedisPipelinedOperations(const std::string& uri = "tcp://127.0.0.1:6379")
+        : redis_(std::make_shared<Redis>(uri)) {}
+
+    // Batch get multiple positions
+    std::map<std::string, int64_t> batchGetPositions(
+        const std::vector<std::string>& symbols) {
+
+        auto pipe = redis_->pipeline();
+
+        for (const auto& symbol : symbols) {
+            auto key = "position:" + symbol;
+            pipe.get(key);
+        }
+
+        auto replies = pipe.exec();
+
+        std::map<std::string, int64_t> positions;
+        for (size_t i = 0; i < symbols.size(); ++i) {
+            auto val = replies.get<std::optional<std::string>>(i);
+            positions[symbols[i]] = val ? std::stoll(*val) : 0;
+        }
+
+        return positions;
+    }
+
+    // Batch update positions
+    void batchUpdatePositions(const std::map<std::string, int64_t>& updates) {
+        auto pipe = redis_->pipeline();
+
+        for (const auto& [symbol, delta] : updates) {
+            auto key = "position:" + symbol;
+            pipe.incrby(key, delta);
+        }
+
+        pipe.exec();
+    }
+};
+
+// Performance comparison
+// Individual operations: 100 GET requests = ~10ms (100μs each)
+// Pipelined: 100 GET requests = ~1ms (10μs each, 10x faster)
+```
+
+CONNECTION POOLING:
+
+```cpp
+#include <sw/redis++/connection_pool.h>
+
+class RedisConnectionPool {
+    std::shared_ptr<Redis> redis_;
+
+public:
+    RedisConnectionPool(const std::string& uri, size_t pool_size = 10) {
+        ConnectionOptions opts;
+        opts.socket_timeout = std::chrono::milliseconds(100);
+
+        ConnectionPoolOptions pool_opts;
+        pool_opts.size = pool_size;
+        pool_opts.wait_timeout = std::chrono::milliseconds(100);
+
+        redis_ = std::make_shared<Redis>(opts, pool_opts);
+    }
+
+    std::shared_ptr<Redis> getRedis() {
+        return redis_;
+    }
+};
+```
+
+LUA SCRIPTING FOR ATOMICITY:
+
+```cpp
+class RedisLuaOperations {
+    std::shared_ptr<Redis> redis_;
+
+public:
+    RedisLuaOperations(const std::string& uri = "tcp://127.0.0.1:6379")
+        : redis_(std::make_shared<Redis>(uri)) {}
+
+    // Atomic rate limiting
+    bool checkRateLimit(const std::string& key,
+                       int max_requests,
+                       int window_seconds) {
+
+        static const std::string script = R"(
+            local current = redis.call('INCR', KEYS[1])
+            if current == 1 then
+                redis.call('EXPIRE', KEYS[1], ARGV[2])
+            end
+            return current <= tonumber(ARGV[1])
+        )";
+
+        auto result = redis_->eval<bool>(
+            script,
+            {key},
+            {std::to_string(max_requests), std::to_string(window_seconds)}
+        );
+
+        return result;
+    }
+
+    // Atomic compare-and-swap
+    bool compareAndSwap(const std::string& key,
+                       const std::string& expected,
+                       const std::string& new_value) {
+
+        static const std::string script = R"(
+            local current = redis.call('GET', KEYS[1])
+            if current == ARGV[1] then
+                redis.call('SET', KEYS[1], ARGV[2])
+                return 1
+            end
+            return 0
+        )";
+
+        auto result = redis_->eval<long long>(
+            script,
+            {key},
+            {expected, new_value}
+        );
+
+        return result == 1;
+    }
+};
+```
+
+================================================================================
+8-10. BEST PRACTICES AND USE CASES
+================================================================================
+
+BEST PRACTICES:
+
+✓ Use pipelining for batch operations (10x performance improvement)
+✓ Set appropriate TTL on cache entries
+✓ Use connection pooling for concurrent access
+✓ Monitor memory usage (maxmemory policy)
+✓ Use Lua scripts for complex atomic operations
+✓ Implement retry logic with exponential backoff
+✓ Use Redis Cluster for horizontal scaling
+✓ Configure persistence based on durability needs
+✓ Monitor slow queries (SLOWLOG)
+✓ Use hash tags for multi-key operations in cluster
+
+DON'T:
+
+✗ Use Redis for critical path trading (too slow)
+✗ Store large values (> 1MB)
+✗ Use blocking operations (BLPOP) in hot path
+✗ Forget to set expiry on temporary keys
+✗ Use SELECT (database switching) in production
+✗ Run KEYS command in production (use SCAN)
+✗ Ignore memory fragmentation
+✗ Use Transactions across cluster nodes
+
+CONFIGURATION (redis.conf):
+
+maxmemory 8gb
+maxmemory-policy allkeys-lru
+tcp-backlog 511
+timeout 0
+tcp-keepalive 300
+save ""  # Disable RDB for HFT (or use AOF)
+appendonly yes  # Enable AOF if persistence needed
+appendfsync everysec
+
+================================================================================
+END OF REDIS FOR HFT
+================================================================================

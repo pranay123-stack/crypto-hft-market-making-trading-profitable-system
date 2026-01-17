@@ -1,0 +1,1172 @@
+REINFORCEMENT LEARNING FOR TRADING SYSTEMS
+==========================================
+
+TABLE OF CONTENTS
+-----------------
+1. RL Theory for Trading
+2. Market Environment Design
+3. Optimal Execution with RL
+4. Market Making with RL
+5. Q-Learning Implementation
+6. Deep Q-Network (DQN)
+7. Policy Gradient Methods
+8. Actor-Critic Architecture
+9. Experience Replay System
+10. Production Deployment
+
+================================================================================
+1. RL THEORY FOR TRADING
+================================================================================
+
+1.1 MARKOV DECISION PROCESS (MDP) FORMULATION
+----------------------------------------------
+
+Trading as MDP:
+- State (S): Market observations (orderbook, trades, positions)
+- Action (A): Trading decisions (buy, sell, hold, order placement)
+- Reward (R): PnL, risk-adjusted returns, inventory penalties
+- Transition (T): Market dynamics P(s_{t+1}|s_t, a_t)
+- Policy (π): Strategy mapping states to actions
+
+Mathematical Framework:
+State space: S = {orderbook, positions, time, volatility, ...}
+Action space: A = {buy_qty, sell_qty, limit_price, cancel, ...}
+
+Reward function:
+R_t = PnL_t - λ * |inventory_t| - μ * spread_cost_t
+
+Objective: Maximize expected cumulative reward
+J(π) = E[Σ_{t=0}^T γ^t R_t | π]
+
+where γ is discount factor (typically 0.99-0.999)
+
+1.2 RL ALGORITHMS FOR TRADING
+------------------------------
+
+Algorithm Selection:
+1. Q-Learning: Discrete actions, value-based
+2. Deep Q-Network (DQN): Neural network Q-function
+3. Policy Gradient: Continuous actions, direct policy optimization
+4. Actor-Critic: Combines value and policy methods
+5. Proximal Policy Optimization (PPO): Stable training
+
+Comparison:
+                Sample Efficiency  Stability  Continuous Actions  Latency
+Q-Learning      +++               +++        -                   +++
+DQN             ++                ++         -                   ++
+Policy Gradient +                 +          +++                 ++
+Actor-Critic    ++                ++         +++                 ++
+PPO             ++                +++        +++                 +
+
+1.3 CHALLENGES IN RL FOR HFT
+-----------------------------
+
+1. Non-stationarity: Market distribution changes over time
+2. Sparse rewards: Profit signals are rare and delayed
+3. High-dimensional state space: Large orderbook data
+4. Partial observability: Hidden market state
+5. Exploration-exploitation: Online learning risks
+6. Latency constraints: Inference must be <1ms
+7. Safety: Avoid catastrophic losses during exploration
+
+Solutions:
+- Use market simulators for safe exploration
+- Reward shaping to provide denser signals
+- State abstraction to reduce dimensionality
+- Conservative policy updates
+- Offline RL with historical data
+
+================================================================================
+2. MARKET ENVIRONMENT DESIGN
+================================================================================
+
+2.1 TRADING ENVIRONMENT INTERFACE
+----------------------------------
+
+#include <vector>
+#include <memory>
+#include <random>
+#include <cmath>
+
+struct MarketState {
+    // Order book levels
+    double bid_prices[5];
+    double ask_prices[5];
+    double bid_volumes[5];
+    double ask_volumes[5];
+
+    // Trading state
+    int inventory;
+    double cash;
+    double last_trade_price;
+    double unrealized_pnl;
+
+    // Time and market features
+    int64_t timestamp;
+    double volatility;
+    double spread;
+    double orderbook_imbalance;
+
+    // Convert to flat array for neural network input
+    std::vector<float> to_vector() const {
+        std::vector<float> state_vec;
+        state_vec.reserve(64);
+
+        // Order book
+        for (int i = 0; i < 5; i++) {
+            state_vec.push_back(static_cast<float>(bid_prices[i]));
+            state_vec.push_back(static_cast<float>(ask_prices[i]));
+            state_vec.push_back(static_cast<float>(bid_volumes[i]));
+            state_vec.push_back(static_cast<float>(ask_volumes[i]));
+        }
+
+        // Normalize inventory (-1 to 1)
+        state_vec.push_back(static_cast<float>(inventory) / 100.0f);
+
+        // Cash (normalized)
+        state_vec.push_back(static_cast<float>(cash / 100000.0));
+
+        // Market features
+        state_vec.push_back(static_cast<float>(volatility));
+        state_vec.push_back(static_cast<float>(spread));
+        state_vec.push_back(static_cast<float>(orderbook_imbalance));
+
+        // Unrealized PnL
+        state_vec.push_back(static_cast<float>(unrealized_pnl / 10000.0));
+
+        return state_vec;
+    }
+};
+
+struct TradingAction {
+    enum ActionType {
+        HOLD = 0,
+        BUY_MARKET = 1,
+        SELL_MARKET = 2,
+        BUY_LIMIT = 3,
+        SELL_LIMIT = 4,
+        CANCEL_ALL = 5
+    };
+
+    ActionType type;
+    int quantity;
+    double limit_price;
+
+    TradingAction() : type(HOLD), quantity(0), limit_price(0.0) {}
+    TradingAction(ActionType t, int q = 0, double p = 0.0)
+        : type(t), quantity(q), limit_price(p) {}
+};
+
+struct StepResult {
+    MarketState next_state;
+    double reward;
+    bool done;
+
+    // Additional info for debugging/analysis
+    double pnl_change;
+    double transaction_cost;
+    bool order_filled;
+};
+
+class TradingEnvironment {
+protected:
+    MarketState current_state_;
+    double initial_cash_;
+    int max_position_;
+    double transaction_cost_rate_;
+
+    std::mt19937 rng_;
+
+    // Performance tracking
+    double total_pnl_ = 0.0;
+    double max_drawdown_ = 0.0;
+    int total_trades_ = 0;
+
+public:
+    TradingEnvironment(double initial_cash = 100000.0,
+                      int max_position = 100,
+                      double transaction_cost = 0.0001)
+        : initial_cash_(initial_cash)
+        , max_position_(max_position)
+        , transaction_cost_rate_(transaction_cost)
+        , rng_(std::random_device{}()) {
+        reset();
+    }
+
+    virtual ~TradingEnvironment() = default;
+
+    virtual MarketState reset() {
+        current_state_ = MarketState();
+        current_state_.inventory = 0;
+        current_state_.cash = initial_cash_;
+        current_state_.last_trade_price = 100.0;  // Initial price
+        current_state_.timestamp = 0;
+
+        // Initialize order book
+        double mid_price = 100.0;
+        for (int i = 0; i < 5; i++) {
+            current_state_.bid_prices[i] = mid_price - (i + 1) * 0.01;
+            current_state_.ask_prices[i] = mid_price + (i + 1) * 0.01;
+            current_state_.bid_volumes[i] = 100.0 * (5 - i);
+            current_state_.ask_volumes[i] = 100.0 * (5 - i);
+        }
+
+        compute_market_features();
+        return current_state_;
+    }
+
+    virtual StepResult step(const TradingAction& action) {
+        StepResult result;
+        result.order_filled = false;
+        result.transaction_cost = 0.0;
+        result.pnl_change = 0.0;
+
+        double prev_pnl = compute_pnl();
+
+        // Execute action
+        switch (action.type) {
+            case TradingAction::BUY_MARKET:
+                if (current_state_.inventory + action.quantity <= max_position_) {
+                    execute_market_buy(action.quantity, result);
+                }
+                break;
+
+            case TradingAction::SELL_MARKET:
+                if (current_state_.inventory - action.quantity >= -max_position_) {
+                    execute_market_sell(action.quantity, result);
+                }
+                break;
+
+            case TradingAction::BUY_LIMIT:
+                // Simplified: assume limit order fills if price touches level
+                if (action.limit_price >= current_state_.ask_prices[0] &&
+                    current_state_.inventory + action.quantity <= max_position_) {
+                    execute_market_buy(action.quantity, result);
+                }
+                break;
+
+            case TradingAction::SELL_LIMIT:
+                if (action.limit_price <= current_state_.bid_prices[0] &&
+                    current_state_.inventory - action.quantity >= -max_position_) {
+                    execute_market_sell(action.quantity, result);
+                }
+                break;
+
+            case TradingAction::HOLD:
+            case TradingAction::CANCEL_ALL:
+                // No action
+                break;
+        }
+
+        // Advance market simulation
+        simulate_market_step();
+
+        double current_pnl = compute_pnl();
+        result.pnl_change = current_pnl - prev_pnl;
+
+        // Compute reward
+        result.reward = compute_reward(action, result);
+
+        result.next_state = current_state_;
+        result.done = is_episode_done();
+
+        return result;
+    }
+
+    MarketState get_state() const { return current_state_; }
+
+protected:
+    void execute_market_buy(int quantity, StepResult& result) {
+        double fill_price = current_state_.ask_prices[0];
+        double cost = fill_price * quantity;
+        double transaction_cost = cost * transaction_cost_rate_;
+
+        current_state_.inventory += quantity;
+        current_state_.cash -= (cost + transaction_cost);
+        current_state_.last_trade_price = fill_price;
+
+        result.order_filled = true;
+        result.transaction_cost = transaction_cost;
+        total_trades_++;
+    }
+
+    void execute_market_sell(int quantity, StepResult& result) {
+        double fill_price = current_state_.bid_prices[0];
+        double proceeds = fill_price * quantity;
+        double transaction_cost = proceeds * transaction_cost_rate_;
+
+        current_state_.inventory -= quantity;
+        current_state_.cash += (proceeds - transaction_cost);
+        current_state_.last_trade_price = fill_price;
+
+        result.order_filled = true;
+        result.transaction_cost = transaction_cost;
+        total_trades_++;
+    }
+
+    virtual void simulate_market_step() {
+        // Simple market simulation with random walk
+        std::normal_distribution<double> price_change(0.0, 0.001);
+        double change = price_change(rng_);
+
+        // Update all price levels
+        double mid_price = (current_state_.bid_prices[0] + current_state_.ask_prices[0]) / 2.0;
+        mid_price *= (1.0 + change);
+
+        for (int i = 0; i < 5; i++) {
+            current_state_.bid_prices[i] = mid_price - (i + 1) * 0.01;
+            current_state_.ask_prices[i] = mid_price + (i + 1) * 0.01;
+        }
+
+        current_state_.timestamp++;
+        compute_market_features();
+    }
+
+    void compute_market_features() {
+        // Spread
+        current_state_.spread = current_state_.ask_prices[0] - current_state_.bid_prices[0];
+
+        // Order book imbalance
+        double total_bid = 0.0, total_ask = 0.0;
+        for (int i = 0; i < 5; i++) {
+            total_bid += current_state_.bid_volumes[i];
+            total_ask += current_state_.ask_volumes[i];
+        }
+        current_state_.orderbook_imbalance = (total_bid - total_ask) / (total_bid + total_ask);
+
+        // Simple volatility estimate
+        current_state_.volatility = 0.01;  // Placeholder
+    }
+
+    double compute_pnl() const {
+        double position_value = current_state_.inventory *
+            (current_state_.bid_prices[0] + current_state_.ask_prices[0]) / 2.0;
+        return current_state_.cash + position_value - initial_cash_;
+    }
+
+    virtual double compute_reward(const TradingAction& action, const StepResult& result) {
+        // Reward components:
+        // 1. PnL change
+        double pnl_reward = result.pnl_change;
+
+        // 2. Inventory penalty (penalize large positions)
+        double inventory_penalty = -0.001 * std::abs(current_state_.inventory);
+
+        // 3. Transaction cost penalty
+        double cost_penalty = -result.transaction_cost;
+
+        // 4. Spread crossing penalty (penalize market orders)
+        double spread_penalty = 0.0;
+        if (action.type == TradingAction::BUY_MARKET ||
+            action.type == TradingAction::SELL_MARKET) {
+            spread_penalty = -current_state_.spread * action.quantity * 0.5;
+        }
+
+        return pnl_reward + inventory_penalty + cost_penalty + spread_penalty;
+    }
+
+    virtual bool is_episode_done() const {
+        // Episode ends if:
+        // 1. Out of time
+        if (current_state_.timestamp >= 1000) return true;
+
+        // 2. Out of cash
+        if (current_state_.cash < 0) return true;
+
+        // 3. Large loss
+        double pnl = compute_pnl();
+        if (pnl < -0.1 * initial_cash_) return true;
+
+        return false;
+    }
+};
+
+================================================================================
+3. OPTIMAL EXECUTION WITH RL
+================================================================================
+
+3.1 EXECUTION ENVIRONMENT
+--------------------------
+
+class OptimalExecutionEnvironment : public TradingEnvironment {
+private:
+    int target_quantity_;      // Total shares to execute
+    int remaining_quantity_;   // Shares left to execute
+    int max_steps_;           // Time horizon
+    double arrival_price_;    // Price at start
+
+    double vwap_penalty_weight_;
+    double urgency_penalty_weight_;
+
+public:
+    OptimalExecutionEnvironment(int target_qty, int max_steps,
+                               double initial_cash = 1000000.0)
+        : TradingEnvironment(initial_cash, target_qty, 0.0001)
+        , target_quantity_(target_qty)
+        , remaining_quantity_(target_qty)
+        , max_steps_(max_steps)
+        , vwap_penalty_weight_(0.1)
+        , urgency_penalty_weight_(0.05) {}
+
+    MarketState reset() override {
+        auto state = TradingEnvironment::reset();
+        remaining_quantity_ = target_quantity_;
+        arrival_price_ = (state.bid_prices[0] + state.ask_prices[0]) / 2.0;
+        return state;
+    }
+
+    StepResult step(const TradingAction& action) override {
+        auto result = TradingEnvironment::step(action);
+
+        // Update remaining quantity
+        if (result.order_filled) {
+            remaining_quantity_ -= action.quantity;
+        }
+
+        // Override reward for execution task
+        result.reward = compute_execution_reward(action, result);
+
+        // Episode done if all executed or time expired
+        result.done = (remaining_quantity_ <= 0) ||
+                     (current_state_.timestamp >= max_steps_);
+
+        return result;
+    }
+
+private:
+    double compute_execution_reward(const TradingAction& action,
+                                    const StepResult& result) {
+        // Implementation Shortfall: compare to arrival price
+        double current_price = (current_state_.bid_prices[0] + current_state_.ask_prices[0]) / 2.0;
+        double price_impact = current_price - arrival_price_;
+        double shortfall_cost = price_impact * (target_quantity_ - remaining_quantity_);
+
+        // VWAP deviation penalty
+        double vwap_penalty = vwap_penalty_weight_ * std::abs(price_impact);
+
+        // Urgency penalty (encourage timely execution)
+        double time_remaining = max_steps_ - current_state_.timestamp;
+        double urgency_penalty = 0.0;
+        if (time_remaining > 0) {
+            double completion_rate = static_cast<double>(target_quantity_ - remaining_quantity_)
+                                   / target_quantity_;
+            double expected_rate = static_cast<double>(current_state_.timestamp) / max_steps_;
+            urgency_penalty = urgency_penalty_weight_ * std::abs(completion_rate - expected_rate);
+        }
+
+        // Market impact penalty
+        double market_impact = 0.0;
+        if (result.order_filled) {
+            // Assume square-root market impact model
+            market_impact = 0.1 * std::sqrt(static_cast<double>(action.quantity)) * current_state_.volatility;
+        }
+
+        return -shortfall_cost - vwap_penalty - urgency_penalty - market_impact;
+    }
+};
+
+================================================================================
+4. MARKET MAKING WITH RL
+================================================================================
+
+4.1 MARKET MAKING ENVIRONMENT
+------------------------------
+
+class MarketMakingEnvironment : public TradingEnvironment {
+private:
+    struct OutstandingOrder {
+        bool is_buy;
+        int quantity;
+        double price;
+        int64_t timestamp;
+    };
+
+    std::vector<OutstandingOrder> orders_;
+    double target_spread_capture_;
+    double inventory_risk_weight_;
+
+public:
+    MarketMakingEnvironment(double initial_cash = 100000.0,
+                           int max_position = 50)
+        : TradingEnvironment(initial_cash, max_position, 0.00005)
+        , target_spread_capture_(0.0005)
+        , inventory_risk_weight_(0.01) {}
+
+    StepResult step(const TradingAction& action) override {
+        // Market maker posts quotes on both sides
+        StepResult result;
+        result.order_filled = false;
+        result.transaction_cost = 0.0;
+
+        double prev_pnl = compute_pnl();
+
+        // Cancel old orders
+        orders_.clear();
+
+        // Place new orders based on action
+        if (action.type == TradingAction::BUY_LIMIT) {
+            OutstandingOrder bid_order;
+            bid_order.is_buy = true;
+            bid_order.quantity = action.quantity;
+            bid_order.price = action.limit_price;
+            bid_order.timestamp = current_state_.timestamp;
+            orders_.push_back(bid_order);
+        }
+
+        if (action.type == TradingAction::SELL_LIMIT) {
+            OutstandingOrder ask_order;
+            ask_order.is_buy = false;
+            ask_order.quantity = action.quantity;
+            ask_order.price = action.limit_price;
+            ask_order.timestamp = current_state_.timestamp;
+            orders_.push_back(ask_order);
+        }
+
+        // Simulate market and check for fills
+        simulate_market_step();
+        check_order_fills(result);
+
+        double current_pnl = compute_pnl();
+        result.pnl_change = current_pnl - prev_pnl;
+
+        // Compute market making reward
+        result.reward = compute_mm_reward(result);
+        result.next_state = current_state_;
+        result.done = is_episode_done();
+
+        return result;
+    }
+
+private:
+    void check_order_fills(StepResult& result) {
+        for (auto& order : orders_) {
+            bool filled = false;
+
+            if (order.is_buy) {
+                // Buy order fills if market trades at or below our bid
+                if (current_state_.ask_prices[0] <= order.price) {
+                    if (current_state_.inventory + order.quantity <= max_position_) {
+                        execute_market_buy(order.quantity, result);
+                        filled = true;
+                    }
+                }
+            } else {
+                // Sell order fills if market trades at or above our ask
+                if (current_state_.bid_prices[0] >= order.price) {
+                    if (current_state_.inventory - order.quantity >= -max_position_) {
+                        execute_market_sell(order.quantity, result);
+                        filled = true;
+                    }
+                }
+            }
+        }
+    }
+
+    double compute_mm_reward(const StepResult& result) {
+        // Reward = spread capture - inventory risk - adverse selection
+
+        double spread_reward = 0.0;
+        if (result.order_filled) {
+            // Captured half the spread
+            spread_reward = current_state_.spread * 0.5 * result.pnl_change;
+        }
+
+        // Inventory risk penalty
+        double inventory_penalty = -inventory_risk_weight_ *
+                                  std::pow(current_state_.inventory, 2);
+
+        // PnL from inventory positions (mark-to-market)
+        double inventory_pnl = result.pnl_change;
+
+        return spread_reward + inventory_penalty + inventory_pnl;
+    }
+};
+
+================================================================================
+5. Q-LEARNING IMPLEMENTATION
+================================================================================
+
+5.1 TABULAR Q-LEARNING
+-----------------------
+
+#include <unordered_map>
+#include <functional>
+
+class QLearningAgent {
+private:
+    // Discrete state space
+    struct DiscreteState {
+        int inventory_bucket;     // -5 to 5 (11 buckets)
+        int spread_bucket;        // 0 to 4 (5 buckets)
+        int imbalance_bucket;     // 0 to 4 (5 buckets)
+        int volatility_bucket;    // 0 to 4 (5 buckets)
+
+        bool operator==(const DiscreteState& other) const {
+            return inventory_bucket == other.inventory_bucket &&
+                   spread_bucket == other.spread_bucket &&
+                   imbalance_bucket == other.imbalance_bucket &&
+                   volatility_bucket == other.volatility_bucket;
+        }
+    };
+
+    struct StateHasher {
+        size_t operator()(const DiscreteState& s) const {
+            return std::hash<int>()(s.inventory_bucket) ^
+                   (std::hash<int>()(s.spread_bucket) << 1) ^
+                   (std::hash<int>()(s.imbalance_bucket) << 2) ^
+                   (std::hash<int>()(s.volatility_bucket) << 3);
+        }
+    };
+
+    // Q-table: Q(s, a)
+    using QTable = std::unordered_map<DiscreteState,
+                                     std::array<double, 6>,
+                                     StateHasher>;
+    QTable q_table_;
+
+    // Hyperparameters
+    double learning_rate_;
+    double discount_factor_;
+    double epsilon_;  // Exploration rate
+    double epsilon_decay_;
+    double min_epsilon_;
+
+    std::mt19937 rng_;
+
+public:
+    QLearningAgent(double lr = 0.1, double gamma = 0.99,
+                  double epsilon = 0.2, double epsilon_decay = 0.9995)
+        : learning_rate_(lr)
+        , discount_factor_(gamma)
+        , epsilon_(epsilon)
+        , epsilon_decay_(epsilon_decay)
+        , min_epsilon_(0.01)
+        , rng_(std::random_device{}()) {}
+
+    TradingAction select_action(const MarketState& state) {
+        DiscreteState ds = discretize_state(state);
+
+        // Epsilon-greedy exploration
+        std::uniform_real_distribution<double> uniform(0.0, 1.0);
+        if (uniform(rng_) < epsilon_) {
+            // Random action
+            std::uniform_int_distribution<int> action_dist(0, 5);
+            int action_idx = action_dist(rng_);
+            return index_to_action(action_idx, state);
+        }
+
+        // Greedy action
+        auto& q_values = q_table_[ds];
+        int best_action = std::distance(q_values.begin(),
+                                       std::max_element(q_values.begin(), q_values.end()));
+        return index_to_action(best_action, state);
+    }
+
+    void update(const MarketState& state, const TradingAction& action,
+               double reward, const MarketState& next_state, bool done) {
+        DiscreteState ds = discretize_state(state);
+        DiscreteState next_ds = discretize_state(next_state);
+
+        int action_idx = action_to_index(action);
+
+        // Q-learning update: Q(s,a) <- Q(s,a) + α[r + γ max_a' Q(s',a') - Q(s,a)]
+        auto& q_values = q_table_[ds];
+        auto& next_q_values = q_table_[next_ds];
+
+        double max_next_q = done ? 0.0 : *std::max_element(next_q_values.begin(),
+                                                           next_q_values.end());
+
+        double td_target = reward + discount_factor_ * max_next_q;
+        double td_error = td_target - q_values[action_idx];
+
+        q_values[action_idx] += learning_rate_ * td_error;
+
+        // Decay exploration
+        epsilon_ = std::max(min_epsilon_, epsilon_ * epsilon_decay_);
+    }
+
+    void save_policy(const std::string& filename) {
+        std::ofstream file(filename);
+        for (const auto& [state, q_values] : q_table_) {
+            file << state.inventory_bucket << " "
+                 << state.spread_bucket << " "
+                 << state.imbalance_bucket << " "
+                 << state.volatility_bucket << " ";
+            for (double q : q_values) {
+                file << q << " ";
+            }
+            file << "\n";
+        }
+    }
+
+private:
+    DiscreteState discretize_state(const MarketState& state) {
+        DiscreteState ds;
+
+        // Discretize inventory
+        ds.inventory_bucket = std::clamp(state.inventory / 10, -5, 5);
+
+        // Discretize spread (0-0.05)
+        ds.spread_bucket = std::clamp(static_cast<int>(state.spread / 0.01), 0, 4);
+
+        // Discretize imbalance (-1 to 1)
+        ds.imbalance_bucket = std::clamp(
+            static_cast<int>((state.orderbook_imbalance + 1.0) * 2.5), 0, 4);
+
+        // Discretize volatility
+        ds.volatility_bucket = std::clamp(
+            static_cast<int>(state.volatility / 0.005), 0, 4);
+
+        return ds;
+    }
+
+    TradingAction index_to_action(int idx, const MarketState& state) {
+        switch (idx) {
+            case 0: return TradingAction(TradingAction::HOLD);
+            case 1: return TradingAction(TradingAction::BUY_MARKET, 10);
+            case 2: return TradingAction(TradingAction::SELL_MARKET, 10);
+            case 3: return TradingAction(TradingAction::BUY_LIMIT, 10,
+                                        state.bid_prices[0]);
+            case 4: return TradingAction(TradingAction::SELL_LIMIT, 10,
+                                        state.ask_prices[0]);
+            case 5: return TradingAction(TradingAction::CANCEL_ALL);
+            default: return TradingAction(TradingAction::HOLD);
+        }
+    }
+
+    int action_to_index(const TradingAction& action) {
+        return static_cast<int>(action.type);
+    }
+};
+
+5.2 TRAINING LOOP
+-----------------
+
+void train_q_learning(QLearningAgent& agent, TradingEnvironment& env,
+                     int num_episodes = 10000) {
+    std::vector<double> episode_rewards;
+
+    for (int episode = 0; episode < num_episodes; episode++) {
+        auto state = env.reset();
+        double total_reward = 0.0;
+        bool done = false;
+
+        while (!done) {
+            // Select action
+            auto action = agent.select_action(state);
+
+            // Execute action
+            auto result = env.step(action);
+
+            // Update Q-values
+            agent.update(state, action, result.reward, result.next_state, result.done);
+
+            total_reward += result.reward;
+            state = result.next_state;
+            done = result.done;
+        }
+
+        episode_rewards.push_back(total_reward);
+
+        // Log progress
+        if ((episode + 1) % 100 == 0) {
+            double avg_reward = std::accumulate(
+                episode_rewards.end() - 100, episode_rewards.end(), 0.0) / 100.0;
+            std::cout << "Episode " << (episode + 1)
+                     << " | Avg Reward: " << avg_reward << "\n";
+        }
+    }
+
+    agent.save_policy("q_learning_policy.txt");
+}
+
+================================================================================
+6. DEEP Q-NETWORK (DQN)
+================================================================================
+
+6.1 DQN ARCHITECTURE
+--------------------
+
+// Neural network for Q-function approximation
+// Input: state vector (64 dimensions)
+// Output: Q-values for each action (6 actions)
+
+class DQNModel {
+private:
+    std::unique_ptr<Ort::Env> env_;
+    std::unique_ptr<Ort::Session> session_;
+    std::vector<const char*> input_names_;
+    std::vector<const char*> output_names_;
+
+public:
+    DQNModel(const std::string& model_path) {
+        env_ = std::make_unique<Ort::Env>(ORT_LOGGING_LEVEL_WARNING, "DQN");
+
+        Ort::SessionOptions options;
+        options.SetIntraOpNumThreads(1);
+        options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+
+        session_ = std::make_unique<Ort::Session>(*env_, model_path.c_str(), options);
+
+        // Get input/output info
+        Ort::AllocatorWithDefaultOptions allocator;
+        input_names_.push_back(session_->GetInputName(0, allocator));
+        output_names_.push_back(session_->GetOutputName(0, allocator));
+    }
+
+    // Forward pass: state -> Q-values
+    std::array<float, 6> predict(const MarketState& state) {
+        auto state_vec = state.to_vector();
+
+        std::vector<int64_t> input_shape = {1, static_cast<int64_t>(state_vec.size())};
+
+        auto memory_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+        Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
+            memory_info, state_vec.data(), state_vec.size(),
+            input_shape.data(), input_shape.size());
+
+        auto output_tensors = session_->Run(
+            Ort::RunOptions{nullptr},
+            input_names_.data(), &input_tensor, 1,
+            output_names_.data(), 1);
+
+        float* output_data = output_tensors.front().GetTensorMutableData<float>();
+
+        std::array<float, 6> q_values;
+        std::copy(output_data, output_data + 6, q_values.begin());
+
+        return q_values;
+    }
+
+    // Batch prediction for experience replay
+    std::vector<std::array<float, 6>> predict_batch(
+        const std::vector<MarketState>& states) {
+
+        size_t batch_size = states.size();
+        size_t state_dim = states[0].to_vector().size();
+
+        std::vector<float> batch_input;
+        batch_input.reserve(batch_size * state_dim);
+
+        for (const auto& state : states) {
+            auto state_vec = state.to_vector();
+            batch_input.insert(batch_input.end(), state_vec.begin(), state_vec.end());
+        }
+
+        std::vector<int64_t> input_shape = {static_cast<int64_t>(batch_size),
+                                           static_cast<int64_t>(state_dim)};
+
+        auto memory_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+        Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
+            memory_info, batch_input.data(), batch_input.size(),
+            input_shape.data(), input_shape.size());
+
+        auto output_tensors = session_->Run(
+            Ort::RunOptions{nullptr},
+            input_names_.data(), &input_tensor, 1,
+            output_names_.data(), 1);
+
+        float* output_data = output_tensors.front().GetTensorMutableData<float>();
+
+        std::vector<std::array<float, 6>> results(batch_size);
+        for (size_t i = 0; i < batch_size; i++) {
+            std::copy(output_data + i * 6, output_data + (i + 1) * 6,
+                     results[i].begin());
+        }
+
+        return results;
+    }
+};
+
+6.2 EXPERIENCE REPLAY BUFFER
+-----------------------------
+
+struct Experience {
+    MarketState state;
+    TradingAction action;
+    double reward;
+    MarketState next_state;
+    bool done;
+};
+
+class ReplayBuffer {
+private:
+    std::vector<Experience> buffer_;
+    size_t capacity_;
+    size_t position_;
+    std::mt19937 rng_;
+
+public:
+    ReplayBuffer(size_t capacity = 100000)
+        : capacity_(capacity)
+        , position_(0)
+        , rng_(std::random_device{}()) {
+        buffer_.reserve(capacity);
+    }
+
+    void add(const Experience& exp) {
+        if (buffer_.size() < capacity_) {
+            buffer_.push_back(exp);
+        } else {
+            buffer_[position_] = exp;
+        }
+        position_ = (position_ + 1) % capacity_;
+    }
+
+    std::vector<Experience> sample(size_t batch_size) {
+        std::vector<Experience> batch;
+        batch.reserve(batch_size);
+
+        std::uniform_int_distribution<size_t> dist(0, buffer_.size() - 1);
+
+        for (size_t i = 0; i < batch_size; i++) {
+            batch.push_back(buffer_[dist(rng_)]);
+        }
+
+        return batch;
+    }
+
+    size_t size() const { return buffer_.size(); }
+};
+
+6.3 DQN AGENT
+-------------
+
+class DQNAgent {
+private:
+    std::unique_ptr<DQNModel> policy_net_;
+    std::unique_ptr<DQNModel> target_net_;
+    ReplayBuffer replay_buffer_;
+
+    double epsilon_;
+    double epsilon_decay_;
+    double min_epsilon_;
+    double discount_factor_;
+
+    int target_update_freq_;
+    int steps_since_target_update_;
+
+    std::mt19937 rng_;
+
+public:
+    DQNAgent(const std::string& model_path,
+            double epsilon = 0.2,
+            double gamma = 0.99)
+        : policy_net_(std::make_unique<DQNModel>(model_path))
+        , target_net_(std::make_unique<DQNModel>(model_path))
+        , epsilon_(epsilon)
+        , epsilon_decay_(0.9995)
+        , min_epsilon_(0.01)
+        , discount_factor_(gamma)
+        , target_update_freq_(1000)
+        , steps_since_target_update_(0)
+        , rng_(std::random_device{}()) {}
+
+    TradingAction select_action(const MarketState& state) {
+        std::uniform_real_distribution<double> uniform(0.0, 1.0);
+
+        if (uniform(rng_) < epsilon_) {
+            // Random exploration
+            std::uniform_int_distribution<int> action_dist(0, 5);
+            int action_idx = action_dist(rng_);
+            return index_to_action(action_idx, state);
+        }
+
+        // Greedy action based on Q-values
+        auto q_values = policy_net_->predict(state);
+        int best_action = std::distance(q_values.begin(),
+                                       std::max_element(q_values.begin(), q_values.end()));
+        return index_to_action(best_action, state);
+    }
+
+    void store_experience(const MarketState& state, const TradingAction& action,
+                         double reward, const MarketState& next_state, bool done) {
+        Experience exp{state, action, reward, next_state, done};
+        replay_buffer_.add(exp);
+    }
+
+    // Training step (done externally in Python/PyTorch)
+    void update_epsilon() {
+        epsilon_ = std::max(min_epsilon_, epsilon_ * epsilon_decay_);
+    }
+
+    void update_target_network() {
+        // Copy weights from policy network to target network
+        // (In practice, this is done in the training script)
+        steps_since_target_update_ = 0;
+    }
+
+    bool should_update_target() {
+        steps_since_target_update_++;
+        return steps_since_target_update_ >= target_update_freq_;
+    }
+
+    const ReplayBuffer& get_replay_buffer() const { return replay_buffer_; }
+
+private:
+    TradingAction index_to_action(int idx, const MarketState& state) {
+        switch (idx) {
+            case 0: return TradingAction(TradingAction::HOLD);
+            case 1: return TradingAction(TradingAction::BUY_MARKET, 10);
+            case 2: return TradingAction(TradingAction::SELL_MARKET, 10);
+            case 3: return TradingAction(TradingAction::BUY_LIMIT, 10, state.bid_prices[0]);
+            case 4: return TradingAction(TradingAction::SELL_LIMIT, 10, state.ask_prices[0]);
+            case 5: return TradingAction(TradingAction::CANCEL_ALL);
+            default: return TradingAction(TradingAction::HOLD);
+        }
+    }
+};
+
+================================================================================
+7. POLICY GRADIENT METHODS
+================================================================================
+
+7.1 POLICY NETWORK
+-------------------
+
+// Policy network outputs action probabilities
+// Input: state (64-d)
+// Output: action logits (6-d) -> softmax -> probabilities
+
+class PolicyNetwork {
+private:
+    std::unique_ptr<Ort::Session> session_;
+    // Similar to DQN model but outputs action probabilities
+
+public:
+    std::array<float, 6> get_action_probs(const MarketState& state) {
+        // Forward pass through network
+        // Apply softmax to get probabilities
+        // Return action probabilities
+
+        // Placeholder implementation
+        std::array<float, 6> probs = {0.16f, 0.17f, 0.17f, 0.17f, 0.17f, 0.16f};
+        return probs;
+    }
+
+    TradingAction sample_action(const MarketState& state, std::mt19937& rng) {
+        auto probs = get_action_probs(state);
+
+        // Sample action from probability distribution
+        std::discrete_distribution<int> dist(probs.begin(), probs.end());
+        int action_idx = dist(rng);
+
+        // Convert to trading action
+        return index_to_action(action_idx, state);
+    }
+
+private:
+    TradingAction index_to_action(int idx, const MarketState& state) {
+        // Same as before
+        return TradingAction(TradingAction::HOLD);
+    }
+};
+
+================================================================================
+8. PRODUCTION DEPLOYMENT
+================================================================================
+
+8.1 LOW-LATENCY RL INFERENCE
+-----------------------------
+
+class RLTradingSystem {
+private:
+    std::unique_ptr<DQNAgent> agent_;
+    TradingEnvironment env_;
+
+    // Performance metrics
+    struct Metrics {
+        uint64_t total_predictions = 0;
+        uint64_t total_latency_ns = 0;
+        double total_pnl = 0.0;
+        int winning_trades = 0;
+        int total_trades = 0;
+    };
+
+    Metrics metrics_;
+
+public:
+    RLTradingSystem(const std::string& model_path)
+        : agent_(std::make_unique<DQNAgent>(model_path, 0.0, 0.99))  // No exploration in production
+        , env_(100000.0, 100, 0.0001) {}
+
+    TradingAction get_trading_decision(const MarketState& state) {
+        auto start = std::chrono::high_resolution_clock::now();
+
+        // Get action from trained agent
+        auto action = agent_->select_action(state);
+
+        auto end = std::chrono::high_resolution_clock::now();
+        uint64_t latency_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            end - start).count();
+
+        metrics_.total_predictions++;
+        metrics_.total_latency_ns += latency_ns;
+
+        return action;
+    }
+
+    void update_performance(double pnl, bool is_winning_trade) {
+        metrics_.total_pnl += pnl;
+        metrics_.total_trades++;
+        if (is_winning_trade) {
+            metrics_.winning_trades++;
+        }
+    }
+
+    void print_metrics() {
+        double avg_latency_us = (metrics_.total_latency_ns / metrics_.total_predictions) / 1000.0;
+        double win_rate = static_cast<double>(metrics_.winning_trades) / metrics_.total_trades;
+
+        std::cout << "RL Trading System Metrics:\n";
+        std::cout << "Avg Latency: " << avg_latency_us << " us\n";
+        std::cout << "Total PnL: $" << metrics_.total_pnl << "\n";
+        std::cout << "Win Rate: " << (win_rate * 100) << "%\n";
+        std::cout << "Total Trades: " << metrics_.total_trades << "\n";
+    }
+};
+
+================================================================================
+9. PERFORMANCE BENCHMARKS
+================================================================================
+
+RL Algorithm Comparison:
+-----------------------
+
+Q-Learning (Tabular):
+- Inference: 5-15 microseconds
+- Training: Fast (minutes)
+- Performance: Good for small state spaces
+- State space: Limited (discretized)
+
+DQN:
+- Inference: 200-500 microseconds
+- Training: Slow (hours)
+- Performance: Excellent for complex environments
+- State space: Large (continuous)
+
+Policy Gradient:
+- Inference: 200-500 microseconds
+- Training: Very slow (hours to days)
+- Performance: Best for continuous action spaces
+- Convergence: Slower but more stable
+
+Actor-Critic:
+- Inference: 400-800 microseconds (two networks)
+- Training: Moderate (hours)
+- Performance: Excellent balance
+- Sample efficiency: Better than policy gradient
+
+Typical Results (Optimal Execution):
+- Implementation shortfall: 2-5 bps improvement over TWAP
+- Execution quality: 85-95% vs optimal benchmark
+- Adaptation time: <100 trades to learn market regime
+
+Typical Results (Market Making):
+- Spread capture: 60-80% of posted spread
+- Inventory management: Avg abs inventory < 20% of limit
+- PnL: 5-15 bps per day on notional traded
+
+================================================================================
+END OF DOCUMENT
+================================================================================

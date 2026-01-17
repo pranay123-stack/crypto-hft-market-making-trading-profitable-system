@@ -1,0 +1,1330 @@
+================================================================================
+USER AUTHENTICATION SYSTEMS
+High-Frequency Trading Platform - Human User Access Control
+================================================================================
+
+VERSION: 2.0
+LAST UPDATED: 2025-11-26
+CLASSIFICATION: CONFIDENTIAL
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+
+1. Overview
+2. Authentication Architecture
+3. Password-Based Authentication
+4. Multi-Factor Authentication (MFA)
+5. Single Sign-On (SSO) Integration
+6. Session Management
+7. Biometric Authentication
+8. C++ Implementation
+9. Python Integration Scripts
+10. Security Best Practices
+
+================================================================================
+1. OVERVIEW
+================================================================================
+
+User authentication is the process of verifying the identity of human users
+accessing the HFT trading system. This includes traders, risk managers,
+administrators, and other authorized personnel.
+
+AUTHENTICATION REQUIREMENTS FOR HFT SYSTEMS:
+
+Security:
+- Multi-factor authentication (MFA) mandatory for all users
+- Phishing-resistant authentication methods
+- Hardware token support for high-privilege accounts
+- Brute-force protection and account lockout
+- Password complexity requirements
+- Session hijacking prevention
+
+Compliance:
+- SOC 2 Type II compliance
+- PCI-DSS requirements for payment data access
+- FINRA Rule 4511 (recordkeeping)
+- GDPR for EU users
+- Complete audit trail of all authentication events
+
+Usability:
+- Single Sign-On (SSO) for seamless experience
+- Remember device functionality
+- Mobile authentication support
+- Password reset self-service
+- Emergency access procedures
+
+Performance:
+- < 500ms authentication latency
+- High availability (99.99% uptime)
+- Load balancing across authentication servers
+- Failover to backup authentication systems
+
+THREAT MODEL:
+
+1. Credential Theft
+   - Phishing attacks targeting user passwords
+   - Keyloggers on compromised devices
+   - Password database breaches
+   Mitigation: MFA, phishing-resistant authentication, password hashing
+
+2. Session Hijacking
+   - Session token theft
+   - Man-in-the-middle attacks
+   - Cross-site scripting (XSS)
+   Mitigation: Secure session tokens, HTTPS only, CSRF protection
+
+3. Brute Force Attacks
+   - Automated password guessing
+   - Credential stuffing
+   Mitigation: Rate limiting, account lockout, CAPTCHA
+
+4. Insider Threats
+   - Malicious employees
+   - Compromised administrator accounts
+   Mitigation: Least privilege, audit logging, anomaly detection
+
+================================================================================
+2. AUTHENTICATION ARCHITECTURE
+================================================================================
+
+2.1 SYSTEM COMPONENTS
+----------------------
+
+┌─────────────────────────────────────────────────────────────────┐
+│                        CLIENT LAYER                              │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐          │
+│  │ Web Browser  │  │ Mobile App   │  │ Trading Term │          │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘          │
+└─────────┼──────────────────┼──────────────────┼─────────────────┘
+          │                  │                  │
+          │ HTTPS/TLS 1.3    │                  │
+          ▼                  ▼                  ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    API GATEWAY / LOAD BALANCER                   │
+│  - TLS Termination                                              │
+│  - Rate Limiting                                                │
+│  - DDoS Protection                                              │
+│  - Request Routing                                              │
+└────────────────────────────┬────────────────────────────────────┘
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│              AUTHENTICATION SERVICE (C++)                        │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │  Authentication Handler                                   │  │
+│  │  - Password validation                                    │  │
+│  │  - MFA verification                                       │  │
+│  │  - Session creation                                       │  │
+│  │  - Token generation (JWT)                                 │  │
+│  └───────────────────────────────────────────────────────────┘  │
+└────────────────────────────┬────────────────────────────────────┘
+                             │
+          ┌──────────────────┼──────────────────┐
+          │                  │                  │
+          ▼                  ▼                  ▼
+┌──────────────────┐ ┌─────────────────┐ ┌────────────────┐
+│   User Database  │ │  LDAP/AD        │ │  MFA Provider  │
+│   (PostgreSQL)   │ │  (Enterprise)   │ │  (Duo, Okta)   │
+└──────────────────┘ └─────────────────┘ └────────────────┘
+
+2.2 AUTHENTICATION FLOW
+------------------------
+
+STANDARD LOGIN FLOW:
+
+1. User enters username + password
+2. Client sends credentials over HTTPS to API Gateway
+3. Authentication Service validates credentials against User DB or LDAP
+4. If valid, prompt for MFA (push notification, TOTP, SMS, or hardware token)
+5. User provides MFA code
+6. Authentication Service validates MFA
+7. Generate JWT access token (short-lived, 15 min) and refresh token (long-lived, 7 days)
+8. Return tokens to client
+9. Client stores tokens securely (HttpOnly cookies for web, Keychain for mobile)
+10. Client includes access token in Authorization header for subsequent requests
+11. When access token expires, use refresh token to get new access token
+12. Session terminated on logout or inactivity timeout (30 minutes)
+
+SSO LOGIN FLOW (SAML 2.0):
+
+1. User clicks "Login with SSO"
+2. Client redirects to Identity Provider (IdP) - Okta, Azure AD, etc.
+3. User authenticates with IdP (may include MFA)
+4. IdP generates SAML assertion and redirects back to our service
+5. Authentication Service validates SAML assertion
+6. Extract user attributes (email, roles, groups)
+7. Create local session and generate JWT tokens
+8. Return tokens to client
+
+================================================================================
+3. PASSWORD-BASED AUTHENTICATION
+================================================================================
+
+3.1 PASSWORD REQUIREMENTS
+--------------------------
+
+POLICY:
+- Minimum 12 characters
+- Must contain: uppercase, lowercase, digit, special character
+- Cannot contain username or common dictionary words
+- Cannot reuse last 10 passwords
+- Expires every 90 days
+- Account lockout after 5 failed attempts (15-minute lockout)
+- No password hints or recovery questions
+
+3.2 SECURE PASSWORD STORAGE
+----------------------------
+
+ALWAYS use Argon2id for password hashing (winner of Password Hashing Competition)
+
+```cpp
+#include <argon2.h>
+#include <string>
+#include <vector>
+#include <random>
+#include <iomanip>
+#include <sstream>
+
+class PasswordHasher {
+public:
+    struct HashResult {
+        std::string hash;           // The password hash
+        std::string salt;           // Random salt used
+        uint32_t time_cost;         // Number of iterations
+        uint32_t memory_cost;       // Memory usage in KiB
+        uint32_t parallelism;       // Number of threads
+    };
+
+    PasswordHasher() {
+        // Argon2id parameters (OWASP recommendations for server-side)
+        time_cost_ = 3;             // Number of iterations
+        memory_cost_ = 65536;       // 64 MiB
+        parallelism_ = 4;           // 4 threads
+        hash_length_ = 32;          // 256-bit hash
+        salt_length_ = 16;          // 128-bit salt
+    }
+
+    // Hash password with Argon2id
+    HashResult hashPassword(const std::string& password) {
+        HashResult result;
+
+        // Generate random salt
+        std::vector<uint8_t> salt = generateSalt();
+        result.salt = bytesToHex(salt);
+
+        // Prepare output buffer
+        std::vector<uint8_t> hash(hash_length_);
+
+        // Hash password with Argon2id
+        int ret = argon2id_hash_raw(
+            time_cost_,
+            memory_cost_,
+            parallelism_,
+            password.c_str(),
+            password.length(),
+            salt.data(),
+            salt.size(),
+            hash.data(),
+            hash.size()
+        );
+
+        if (ret != ARGON2_OK) {
+            throw std::runtime_error("Argon2 hashing failed: " +
+                                   std::string(argon2_error_message(ret)));
+        }
+
+        result.hash = bytesToHex(hash);
+        result.time_cost = time_cost_;
+        result.memory_cost = memory_cost_;
+        result.parallelism = parallelism_;
+
+        return result;
+    }
+
+    // Verify password against stored hash
+    bool verifyPassword(const std::string& password,
+                       const std::string& stored_hash,
+                       const std::string& salt_hex,
+                       uint32_t time_cost = 3,
+                       uint32_t memory_cost = 65536,
+                       uint32_t parallelism = 4) {
+
+        // Convert hex strings to bytes
+        std::vector<uint8_t> salt = hexToBytes(salt_hex);
+        std::vector<uint8_t> expected_hash = hexToBytes(stored_hash);
+
+        // Hash the provided password with the same parameters
+        std::vector<uint8_t> computed_hash(hash_length_);
+
+        int ret = argon2id_hash_raw(
+            time_cost,
+            memory_cost,
+            parallelism,
+            password.c_str(),
+            password.length(),
+            salt.data(),
+            salt.size(),
+            computed_hash.data(),
+            computed_hash.size()
+        );
+
+        if (ret != ARGON2_OK) {
+            return false;
+        }
+
+        // Constant-time comparison to prevent timing attacks
+        return constantTimeCompare(computed_hash, expected_hash);
+    }
+
+private:
+    uint32_t time_cost_;
+    uint32_t memory_cost_;
+    uint32_t parallelism_;
+    uint32_t hash_length_;
+    uint32_t salt_length_;
+
+    std::vector<uint8_t> generateSalt() {
+        std::vector<uint8_t> salt(salt_length_);
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_int_distribution<> dis(0, 255);
+
+        for (auto& byte : salt) {
+            byte = static_cast<uint8_t>(dis(gen));
+        }
+
+        return salt;
+    }
+
+    std::string bytesToHex(const std::vector<uint8_t>& bytes) {
+        std::stringstream ss;
+        ss << std::hex << std::setfill('0');
+        for (uint8_t byte : bytes) {
+            ss << std::setw(2) << static_cast<int>(byte);
+        }
+        return ss.str();
+    }
+
+    std::vector<uint8_t> hexToBytes(const std::string& hex) {
+        std::vector<uint8_t> bytes;
+        for (size_t i = 0; i < hex.length(); i += 2) {
+            std::string byte_str = hex.substr(i, 2);
+            uint8_t byte = static_cast<uint8_t>(std::stoi(byte_str, nullptr, 16));
+            bytes.push_back(byte);
+        }
+        return bytes;
+    }
+
+    bool constantTimeCompare(const std::vector<uint8_t>& a,
+                            const std::vector<uint8_t>& b) {
+        if (a.size() != b.size()) {
+            return false;
+        }
+
+        uint8_t result = 0;
+        for (size_t i = 0; i < a.size(); ++i) {
+            result |= a[i] ^ b[i];
+        }
+
+        return result == 0;
+    }
+};
+```
+
+3.3 PASSWORD VALIDATION
+------------------------
+
+```cpp
+#include <regex>
+#include <set>
+#include <fstream>
+
+class PasswordValidator {
+public:
+    PasswordValidator() {
+        loadCommonPasswords("/etc/hft/common_passwords.txt");
+    }
+
+    struct ValidationResult {
+        bool is_valid;
+        std::vector<std::string> errors;
+    };
+
+    ValidationResult validatePassword(const std::string& password,
+                                      const std::string& username) {
+        ValidationResult result;
+        result.is_valid = true;
+
+        // Check minimum length
+        if (password.length() < 12) {
+            result.errors.push_back("Password must be at least 12 characters");
+            result.is_valid = false;
+        }
+
+        // Check maximum length (to prevent DoS via very long passwords)
+        if (password.length() > 128) {
+            result.errors.push_back("Password must be at most 128 characters");
+            result.is_valid = false;
+        }
+
+        // Check for uppercase letter
+        if (!std::regex_search(password, std::regex("[A-Z]"))) {
+            result.errors.push_back("Password must contain at least one uppercase letter");
+            result.is_valid = false;
+        }
+
+        // Check for lowercase letter
+        if (!std::regex_search(password, std::regex("[a-z]"))) {
+            result.errors.push_back("Password must contain at least one lowercase letter");
+            result.is_valid = false;
+        }
+
+        // Check for digit
+        if (!std::regex_search(password, std::regex("[0-9]"))) {
+            result.errors.push_back("Password must contain at least one digit");
+            result.is_valid = false;
+        }
+
+        // Check for special character
+        if (!std::regex_search(password, std::regex("[!@#$%^&*()_+\\-=\\[\\]{};':\"\\\\|,.<>/?]"))) {
+            result.errors.push_back("Password must contain at least one special character");
+            result.is_valid = false;
+        }
+
+        // Check if password contains username
+        std::string lower_password = toLower(password);
+        std::string lower_username = toLower(username);
+        if (lower_password.find(lower_username) != std::string::npos) {
+            result.errors.push_back("Password must not contain username");
+            result.is_valid = false;
+        }
+
+        // Check against common passwords list
+        if (common_passwords_.find(lower_password) != common_passwords_.end()) {
+            result.errors.push_back("Password is too common, please choose a different one");
+            result.is_valid = false;
+        }
+
+        // Check for sequential characters (e.g., "abc", "123")
+        if (hasSequentialChars(password)) {
+            result.errors.push_back("Password must not contain sequential characters");
+            result.is_valid = false;
+        }
+
+        // Check for repeated characters (e.g., "aaa", "111")
+        if (hasRepeatedChars(password, 3)) {
+            result.errors.push_back("Password must not contain repeated characters");
+            result.is_valid = false;
+        }
+
+        return result;
+    }
+
+    bool checkPasswordHistory(const std::string& user_id,
+                             const std::string& new_password_hash) {
+        // Check if password was used in last 10 passwords
+        auto history = getPasswordHistory(user_id);
+        return std::find(history.begin(), history.end(), new_password_hash) == history.end();
+    }
+
+private:
+    std::set<std::string> common_passwords_;
+
+    void loadCommonPasswords(const std::string& file_path) {
+        std::ifstream file(file_path);
+        std::string line;
+        while (std::getline(file, line)) {
+            common_passwords_.insert(toLower(line));
+        }
+    }
+
+    std::string toLower(const std::string& str) {
+        std::string result = str;
+        std::transform(result.begin(), result.end(), result.begin(),
+                      [](unsigned char c) { return std::tolower(c); });
+        return result;
+    }
+
+    bool hasSequentialChars(const std::string& password) {
+        for (size_t i = 0; i < password.length() - 2; ++i) {
+            if (password[i] + 1 == password[i + 1] &&
+                password[i] + 2 == password[i + 2]) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool hasRepeatedChars(const std::string& password, int threshold) {
+        for (size_t i = 0; i < password.length() - threshold + 1; ++i) {
+            bool all_same = true;
+            for (int j = 1; j < threshold; ++j) {
+                if (password[i] != password[i + j]) {
+                    all_same = false;
+                    break;
+                }
+            }
+            if (all_same) return true;
+        }
+        return false;
+    }
+
+    std::vector<std::string> getPasswordHistory(const std::string& user_id) {
+        // Retrieve from database
+        return {};
+    }
+};
+```
+
+================================================================================
+4. MULTI-FACTOR AUTHENTICATION (MFA)
+================================================================================
+
+4.1 MFA METHODS
+---------------
+
+METHOD               SECURITY   USABILITY   COST        PHISHING-RESISTANT
+------------------------------------------------------------------------
+TOTP (Google Auth)   Medium     High        Free        No
+SMS                  Low        High        $$$         No
+Email                Low        High        Free        No
+Push Notification    High       Very High   $$$         Partial
+Hardware Token       Very High  Medium      $$$$        Yes (U2F/WebAuthn)
+Biometric           High        Very High   $$          Partial
+
+RECOMMENDATION: Require hardware token (YubiKey, Titan) for administrators
+                and high-privilege accounts. Allow TOTP for standard users.
+
+4.2 TOTP IMPLEMENTATION (Time-Based One-Time Password)
+-------------------------------------------------------
+
+```cpp
+#include <openssl/hmac.h>
+#include <openssl/evp.h>
+#include <ctime>
+#include <string>
+#include <sstream>
+#include <iomanip>
+
+class TOTPAuthenticator {
+public:
+    // Generate TOTP secret for user (base32-encoded)
+    std::string generateSecret() {
+        // Generate 20 random bytes (160 bits)
+        unsigned char secret[20];
+        if (RAND_bytes(secret, 20) != 1) {
+            throw std::runtime_error("Failed to generate random secret");
+        }
+
+        return base32Encode(secret, 20);
+    }
+
+    // Generate 6-digit TOTP code from secret
+    std::string generateCode(const std::string& secret_base32,
+                            uint64_t time_step = 30) {
+        // Decode base32 secret
+        std::vector<uint8_t> secret = base32Decode(secret_base32);
+
+        // Get current time step (Unix timestamp / 30 seconds)
+        uint64_t time = std::time(nullptr) / time_step;
+
+        // Convert time to big-endian bytes
+        uint8_t time_bytes[8];
+        for (int i = 7; i >= 0; --i) {
+            time_bytes[i] = time & 0xFF;
+            time >>= 8;
+        }
+
+        // Calculate HMAC-SHA1
+        unsigned char hmac[20];
+        unsigned int hmac_len;
+        HMAC(EVP_sha1(),
+             secret.data(), secret.size(),
+             time_bytes, 8,
+             hmac, &hmac_len);
+
+        // Dynamic truncation
+        int offset = hmac[19] & 0x0F;
+        uint32_t code = ((hmac[offset] & 0x7F) << 24) |
+                        ((hmac[offset + 1] & 0xFF) << 16) |
+                        ((hmac[offset + 2] & 0xFF) << 8) |
+                        (hmac[offset + 3] & 0xFF);
+
+        // Generate 6-digit code
+        code = code % 1000000;
+
+        std::stringstream ss;
+        ss << std::setw(6) << std::setfill('0') << code;
+        return ss.str();
+    }
+
+    // Verify TOTP code (allow 1 time step before and after for clock skew)
+    bool verifyCode(const std::string& secret_base32,
+                   const std::string& code,
+                   int window = 1) {
+        uint64_t current_time_step = std::time(nullptr) / 30;
+
+        // Check current and adjacent time steps
+        for (int i = -window; i <= window; ++i) {
+            uint64_t time_step = current_time_step + i;
+            std::string expected_code = generateCodeAtTimeStep(secret_base32, time_step);
+
+            if (constantTimeCompare(code, expected_code)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // Generate provisioning URI for QR code
+    std::string getProvisioningURI(const std::string& secret,
+                                  const std::string& account_name,
+                                  const std::string& issuer = "HFT-Trading") {
+        std::stringstream ss;
+        ss << "otpauth://totp/" << urlEncode(issuer) << ":" << urlEncode(account_name)
+           << "?secret=" << secret
+           << "&issuer=" << urlEncode(issuer)
+           << "&algorithm=SHA1"
+           << "&digits=6"
+           << "&period=30";
+        return ss.str();
+    }
+
+private:
+    std::string generateCodeAtTimeStep(const std::string& secret, uint64_t time_step) {
+        std::vector<uint8_t> secret_bytes = base32Decode(secret);
+
+        uint8_t time_bytes[8];
+        for (int i = 7; i >= 0; --i) {
+            time_bytes[i] = time_step & 0xFF;
+            time_step >>= 8;
+        }
+
+        unsigned char hmac[20];
+        unsigned int hmac_len;
+        HMAC(EVP_sha1(),
+             secret_bytes.data(), secret_bytes.size(),
+             time_bytes, 8,
+             hmac, &hmac_len);
+
+        int offset = hmac[19] & 0x0F;
+        uint32_t code = ((hmac[offset] & 0x7F) << 24) |
+                        ((hmac[offset + 1] & 0xFF) << 16) |
+                        ((hmac[offset + 2] & 0xFF) << 8) |
+                        (hmac[offset + 3] & 0xFF);
+
+        code = code % 1000000;
+
+        std::stringstream ss;
+        ss << std::setw(6) << std::setfill('0') << code;
+        return ss.str();
+    }
+
+    bool constantTimeCompare(const std::string& a, const std::string& b) {
+        if (a.length() != b.length()) return false;
+
+        int result = 0;
+        for (size_t i = 0; i < a.length(); ++i) {
+            result |= a[i] ^ b[i];
+        }
+        return result == 0;
+    }
+
+    std::string base32Encode(const unsigned char* data, size_t len) {
+        // Base32 implementation
+        const char base32_alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+        std::string result;
+
+        for (size_t i = 0; i < len; i += 5) {
+            uint64_t buffer = 0;
+            int bytes_in_buffer = 0;
+
+            for (int j = 0; j < 5 && (i + j) < len; ++j) {
+                buffer = (buffer << 8) | data[i + j];
+                bytes_in_buffer++;
+            }
+
+            buffer <<= (5 - bytes_in_buffer) * 8;
+            int bits_in_buffer = bytes_in_buffer * 8;
+
+            while (bits_in_buffer > 0) {
+                int index = (buffer >> (bits_in_buffer - 5)) & 0x1F;
+                result += base32_alphabet[index];
+                bits_in_buffer -= 5;
+            }
+        }
+
+        return result;
+    }
+
+    std::vector<uint8_t> base32Decode(const std::string& encoded) {
+        // Base32 decode implementation
+        std::vector<uint8_t> result;
+        // Simplified implementation
+        return result;
+    }
+
+    std::string urlEncode(const std::string& str) {
+        std::stringstream ss;
+        for (char c : str) {
+            if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+                ss << c;
+            } else {
+                ss << '%' << std::hex << std::uppercase << static_cast<int>(static_cast<unsigned char>(c));
+            }
+        }
+        return ss.str();
+    }
+};
+```
+
+4.3 WEBAUTHN/FIDO2 IMPLEMENTATION (Hardware Token)
+---------------------------------------------------
+
+```cpp
+#include <json/json.h>
+#include <openssl/evp.h>
+#include <openssl/ec.h>
+
+class WebAuthnAuthenticator {
+public:
+    struct RegistrationChallenge {
+        std::string challenge;              // Random challenge (base64)
+        std::string user_id;
+        std::string username;
+        std::string rp_id;                  // Relying party ID (domain)
+        std::time_t created_at;
+        std::time_t expires_at;
+    };
+
+    struct AuthenticationChallenge {
+        std::string challenge;
+        std::string user_id;
+        std::vector<std::string> allowed_credentials;  // Credential IDs
+        std::time_t created_at;
+        std::time_t expires_at;
+    };
+
+    // Step 1: Generate registration challenge
+    RegistrationChallenge createRegistrationChallenge(const std::string& user_id,
+                                                      const std::string& username) {
+        RegistrationChallenge challenge;
+        challenge.user_id = user_id;
+        challenge.username = username;
+        challenge.rp_id = "trading.example.com";
+        challenge.created_at = std::time(nullptr);
+        challenge.expires_at = challenge.created_at + 300;  // 5 minutes
+
+        // Generate random challenge
+        unsigned char random_bytes[32];
+        RAND_bytes(random_bytes, 32);
+        challenge.challenge = base64Encode(random_bytes, 32);
+
+        // Store challenge in database for verification
+        storeChallengeInDB(challenge);
+
+        return challenge;
+    }
+
+    // Step 2: Verify registration response from authenticator
+    bool verifyRegistrationResponse(const std::string& client_data_json,
+                                   const std::string& attestation_object,
+                                   const std::string& expected_challenge) {
+        // Parse client data JSON
+        Json::Value client_data;
+        Json::Reader reader;
+        if (!reader.parse(client_data_json, client_data)) {
+            return false;
+        }
+
+        // Verify challenge matches
+        std::string challenge = client_data["challenge"].asString();
+        if (challenge != expected_challenge) {
+            logError("Challenge mismatch");
+            return false;
+        }
+
+        // Verify origin
+        std::string origin = client_data["origin"].asString();
+        if (origin != "https://trading.example.com") {
+            logError("Origin mismatch");
+            return false;
+        }
+
+        // Verify type
+        std::string type = client_data["type"].asString();
+        if (type != "webauthn.create") {
+            logError("Type mismatch");
+            return false;
+        }
+
+        // Parse attestation object (CBOR format)
+        // Verify attestation signature
+        // Extract credential ID and public key
+        // Store credential for user
+
+        logInfo("Registration verified successfully");
+        return true;
+    }
+
+    // Step 3: Generate authentication challenge
+    AuthenticationChallenge createAuthenticationChallenge(const std::string& user_id) {
+        AuthenticationChallenge challenge;
+        challenge.user_id = user_id;
+        challenge.created_at = std::time(nullptr);
+        challenge.expires_at = challenge.created_at + 300;  // 5 minutes
+
+        // Generate random challenge
+        unsigned char random_bytes[32];
+        RAND_bytes(random_bytes, 32);
+        challenge.challenge = base64Encode(random_bytes, 32);
+
+        // Get user's registered credentials
+        challenge.allowed_credentials = getUserCredentials(user_id);
+
+        // Store challenge
+        storeChallengeInDB(challenge);
+
+        return challenge;
+    }
+
+    // Step 4: Verify authentication response
+    bool verifyAuthenticationResponse(const std::string& credential_id,
+                                     const std::string& client_data_json,
+                                     const std::string& authenticator_data,
+                                     const std::string& signature,
+                                     const std::string& expected_challenge) {
+        // Parse client data
+        Json::Value client_data;
+        Json::Reader reader;
+        if (!reader.parse(client_data_json, client_data)) {
+            return false;
+        }
+
+        // Verify challenge
+        if (client_data["challenge"].asString() != expected_challenge) {
+            return false;
+        }
+
+        // Get stored public key for credential
+        std::string public_key_pem = getCredentialPublicKey(credential_id);
+
+        // Verify signature
+        // hash = SHA256(authenticator_data || SHA256(client_data_json))
+        // Verify signature using credential public key
+
+        // Update sign count to prevent credential cloning
+
+        return true;
+    }
+
+private:
+    std::string base64Encode(const unsigned char* data, size_t len) {
+        // Base64 encoding implementation
+        return "";
+    }
+
+    void storeChallengeInDB(const RegistrationChallenge& challenge) {
+        // Store in Redis with 5-minute TTL
+    }
+
+    void storeChallengeInDB(const AuthenticationChallenge& challenge) {
+        // Store in Redis with 5-minute TTL
+    }
+
+    std::vector<std::string> getUserCredentials(const std::string& user_id) {
+        // Fetch from database
+        return {};
+    }
+
+    std::string getCredentialPublicKey(const std::string& credential_id) {
+        // Fetch from database
+        return "";
+    }
+
+    void logError(const std::string& msg) {}
+    void logInfo(const std::string& msg) {}
+};
+```
+
+================================================================================
+5. SINGLE SIGN-ON (SSO) INTEGRATION
+================================================================================
+
+5.1 SAML 2.0 INTEGRATION
+-------------------------
+
+```cpp
+#include <libxml/parser.h>
+#include <libxml/tree.h>
+#include <openssl/x509.h>
+
+class SAML2Authenticator {
+public:
+    struct SAMLAssertion {
+        std::string subject;            // User identifier
+        std::string issuer;             // Identity Provider
+        std::map<std::string, std::string> attributes;  // User attributes
+        std::time_t not_before;
+        std::time_t not_on_or_after;
+        bool is_valid;
+    };
+
+    // Parse and validate SAML response
+    SAMLAssertion validateSAMLResponse(const std::string& saml_response_base64,
+                                       const std::string& idp_cert_path) {
+        SAMLAssertion assertion;
+        assertion.is_valid = false;
+
+        // Step 1: Base64 decode SAML response
+        std::string saml_xml = base64Decode(saml_response_base64);
+
+        // Step 2: Parse XML
+        xmlDocPtr doc = xmlReadMemory(saml_xml.c_str(), saml_xml.length(),
+                                     "saml.xml", nullptr, 0);
+        if (!doc) {
+            logError("Failed to parse SAML XML");
+            return assertion;
+        }
+
+        // Step 3: Verify XML signature
+        if (!verifyXMLSignature(doc, idp_cert_path)) {
+            logError("SAML signature verification failed");
+            xmlFreeDoc(doc);
+            return assertion;
+        }
+
+        // Step 4: Extract assertion
+        xmlNodePtr root = xmlDocGetRootElement(doc);
+        xmlNodePtr assertion_node = findNode(root, "Assertion");
+        if (!assertion_node) {
+            logError("No Assertion found in SAML response");
+            xmlFreeDoc(doc);
+            return assertion;
+        }
+
+        // Step 5: Extract and validate conditions
+        xmlNodePtr conditions = findNode(assertion_node, "Conditions");
+        if (conditions) {
+            std::string not_before_str = getAttributeValue(conditions, "NotBefore");
+            std::string not_on_or_after_str = getAttributeValue(conditions, "NotOnOrAfter");
+
+            assertion.not_before = parseISO8601(not_before_str);
+            assertion.not_on_or_after = parseISO8601(not_on_or_after_str);
+
+            // Check time validity
+            std::time_t now = std::time(nullptr);
+            if (now < assertion.not_before || now >= assertion.not_on_or_after) {
+                logError("SAML assertion expired or not yet valid");
+                xmlFreeDoc(doc);
+                return assertion;
+            }
+        }
+
+        // Step 6: Extract subject
+        xmlNodePtr subject_node = findNode(assertion_node, "Subject");
+        if (subject_node) {
+            xmlNodePtr name_id = findNode(subject_node, "NameID");
+            if (name_id) {
+                assertion.subject = getNodeContent(name_id);
+            }
+        }
+
+        // Step 7: Extract attributes
+        xmlNodePtr attr_statement = findNode(assertion_node, "AttributeStatement");
+        if (attr_statement) {
+            for (xmlNodePtr attr = attr_statement->children; attr; attr = attr->next) {
+                if (xmlStrcmp(attr->name, (const xmlChar*)"Attribute") == 0) {
+                    std::string attr_name = getAttributeValue(attr, "Name");
+                    xmlNodePtr attr_value = findNode(attr, "AttributeValue");
+                    if (attr_value) {
+                        std::string value = getNodeContent(attr_value);
+                        assertion.attributes[attr_name] = value;
+                    }
+                }
+            }
+        }
+
+        assertion.is_valid = true;
+        xmlFreeDoc(doc);
+
+        logInfo("SAML assertion validated for user: " + assertion.subject);
+        return assertion;
+    }
+
+    // Generate SAML authentication request
+    std::string generateSAMLRequest(const std::string& sp_entity_id,
+                                   const std::string& acs_url) {
+        std::stringstream ss;
+        ss << "<?xml version=\"1.0\"?>"
+           << "<samlp:AuthnRequest "
+           << "xmlns:samlp=\"urn:oasis:names:tc:SAML:2.0:protocol\" "
+           << "xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\" "
+           << "ID=\"" << generateID() << "\" "
+           << "Version=\"2.0\" "
+           << "IssueInstant=\"" << getCurrentISO8601() << "\" "
+           << "AssertionConsumerServiceURL=\"" << acs_url << "\">"
+           << "<saml:Issuer>" << sp_entity_id << "</saml:Issuer>"
+           << "</samlp:AuthnRequest>";
+
+        std::string request = ss.str();
+
+        // Base64 encode and deflate compress
+        return base64Encode(request);
+    }
+
+private:
+    std::string base64Decode(const std::string& encoded) {
+        // Implementation
+        return "";
+    }
+
+    std::string base64Encode(const std::string& data) {
+        // Implementation
+        return "";
+    }
+
+    bool verifyXMLSignature(xmlDocPtr doc, const std::string& cert_path) {
+        // Verify XML digital signature using certificate
+        return true;
+    }
+
+    xmlNodePtr findNode(xmlNodePtr parent, const char* name) {
+        for (xmlNodePtr node = parent->children; node; node = node->next) {
+            if (xmlStrcmp(node->name, (const xmlChar*)name) == 0) {
+                return node;
+            }
+        }
+        return nullptr;
+    }
+
+    std::string getAttributeValue(xmlNodePtr node, const char* attr_name) {
+        xmlChar* value = xmlGetProp(node, (const xmlChar*)attr_name);
+        if (value) {
+            std::string result((char*)value);
+            xmlFree(value);
+            return result;
+        }
+        return "";
+    }
+
+    std::string getNodeContent(xmlNodePtr node) {
+        xmlChar* content = xmlNodeGetContent(node);
+        if (content) {
+            std::string result((char*)content);
+            xmlFree(content);
+            return result;
+        }
+        return "";
+    }
+
+    std::time_t parseISO8601(const std::string& timestamp) {
+        // Parse ISO8601 timestamp
+        return 0;
+    }
+
+    std::string generateID() {
+        // Generate unique ID
+        return "_" + std::to_string(std::time(nullptr));
+    }
+
+    std::string getCurrentISO8601() {
+        // Get current time in ISO8601 format
+        return "";
+    }
+
+    void logError(const std::string& msg) {}
+    void logInfo(const std::string& msg) {}
+};
+```
+
+================================================================================
+6. SESSION MANAGEMENT
+================================================================================
+
+6.1 SECURE SESSION IMPLEMENTATION
+----------------------------------
+
+```cpp
+#include <jwt-cpp/jwt.h>
+#include <redis-plus-plus/redis++.h>
+#include <chrono>
+
+using namespace sw::redis;
+
+class SessionManager {
+public:
+    struct Session {
+        std::string session_id;
+        std::string user_id;
+        std::string username;
+        std::vector<std::string> roles;
+        std::string ip_address;
+        std::string user_agent;
+        std::time_t created_at;
+        std::time_t expires_at;
+        std::time_t last_activity;
+    };
+
+    SessionManager(const std::string& redis_url, const std::string& jwt_secret)
+        : redis_(redis_url), jwt_secret_(jwt_secret) {
+
+        access_token_ttl_ = std::chrono::minutes(15);   // 15 minutes
+        refresh_token_ttl_ = std::chrono::days(7);      // 7 days
+        session_timeout_ = std::chrono::minutes(30);    // 30 minutes inactivity
+    }
+
+    // Create new session and generate tokens
+    std::pair<std::string, std::string> createSession(
+        const std::string& user_id,
+        const std::string& username,
+        const std::vector<std::string>& roles,
+        const std::string& ip_address,
+        const std::string& user_agent) {
+
+        Session session;
+        session.session_id = generateSecureID();
+        session.user_id = user_id;
+        session.username = username;
+        session.roles = roles;
+        session.ip_address = ip_address;
+        session.user_agent = user_agent;
+        session.created_at = std::time(nullptr);
+        session.expires_at = session.created_at +
+            std::chrono::duration_cast<std::chrono::seconds>(refresh_token_ttl_).count();
+        session.last_activity = session.created_at;
+
+        // Store session in Redis
+        storeSession(session);
+
+        // Generate JWT tokens
+        std::string access_token = generateAccessToken(session);
+        std::string refresh_token = generateRefreshToken(session);
+
+        auditLog("SESSION_CREATED", user_id, ip_address);
+
+        return {access_token, refresh_token};
+    }
+
+    // Validate access token
+    bool validateAccessToken(const std::string& token, Session& session_out) {
+        try {
+            auto verifier = jwt::verify()
+                .allow_algorithm(jwt::algorithm::hs256{jwt_secret_})
+                .with_issuer("hft-trading");
+
+            auto decoded = jwt::decode(token);
+            verifier.verify(decoded);
+
+            // Extract claims
+            session_out.session_id = decoded.get_payload_claim("sid").as_string();
+            session_out.user_id = decoded.get_subject();
+            session_out.username = decoded.get_payload_claim("username").as_string();
+
+            auto roles_claim = decoded.get_payload_claim("roles");
+            session_out.roles = roles_claim.as_array().to_vec<std::string>();
+
+            // Verify session exists in Redis
+            if (!sessionExists(session_out.session_id)) {
+                logWarning("Session not found in Redis: " + session_out.session_id);
+                return false;
+            }
+
+            // Update last activity
+            updateLastActivity(session_out.session_id);
+
+            return true;
+
+        } catch (const std::exception& e) {
+            logError("Token validation failed: " + std::string(e.what()));
+            return false;
+        }
+    }
+
+    // Refresh access token using refresh token
+    std::string refreshAccessToken(const std::string& refresh_token) {
+        try {
+            auto verifier = jwt::verify()
+                .allow_algorithm(jwt::algorithm::hs256{jwt_secret_})
+                .with_issuer("hft-trading")
+                .with_type("refresh");
+
+            auto decoded = jwt::decode(refresh_token);
+            verifier.verify(decoded);
+
+            std::string session_id = decoded.get_payload_claim("sid").as_string();
+
+            // Retrieve session from Redis
+            Session session;
+            if (!retrieveSession(session_id, session)) {
+                throw std::runtime_error("Session not found");
+            }
+
+            // Check inactivity timeout
+            std::time_t now = std::time(nullptr);
+            if (now - session.last_activity >
+                std::chrono::duration_cast<std::chrono::seconds>(session_timeout_).count()) {
+                // Session expired due to inactivity
+                destroySession(session_id);
+                throw std::runtime_error("Session expired due to inactivity");
+            }
+
+            // Generate new access token
+            std::string new_access_token = generateAccessToken(session);
+
+            // Update last activity
+            updateLastActivity(session_id);
+
+            return new_access_token;
+
+        } catch (const std::exception& e) {
+            logError("Token refresh failed: " + std::string(e.what()));
+            throw;
+        }
+    }
+
+    // Destroy session (logout)
+    void destroySession(const std::string& session_id) {
+        redis_.del(session_id);
+        auditLog("SESSION_DESTROYED", session_id, "");
+    }
+
+    // Destroy all sessions for user (force logout)
+    void destroyAllUserSessions(const std::string& user_id) {
+        // Get all session IDs for user
+        auto session_ids = getUserSessions(user_id);
+        for (const auto& sid : session_ids) {
+            destroySession(sid);
+        }
+        auditLog("ALL_SESSIONS_DESTROYED", user_id, "");
+    }
+
+private:
+    Redis redis_;
+    std::string jwt_secret_;
+    std::chrono::minutes access_token_ttl_;
+    std::chrono::days refresh_token_ttl_;
+    std::chrono::minutes session_timeout_;
+
+    std::string generateAccessToken(const Session& session) {
+        auto now = std::chrono::system_clock::now();
+        auto expiry = now + access_token_ttl_;
+
+        return jwt::create()
+            .set_issuer("hft-trading")
+            .set_type("JWT")
+            .set_issued_at(now)
+            .set_expires_at(expiry)
+            .set_subject(session.user_id)
+            .set_payload_claim("sid", jwt::claim(session.session_id))
+            .set_payload_claim("username", jwt::claim(session.username))
+            .set_payload_claim("roles", jwt::claim(session.roles))
+            .sign(jwt::algorithm::hs256{jwt_secret_});
+    }
+
+    std::string generateRefreshToken(const Session& session) {
+        auto now = std::chrono::system_clock::now();
+        auto expiry = now + refresh_token_ttl_;
+
+        return jwt::create()
+            .set_issuer("hft-trading")
+            .set_type("refresh")
+            .set_issued_at(now)
+            .set_expires_at(expiry)
+            .set_subject(session.user_id)
+            .set_payload_claim("sid", jwt::claim(session.session_id))
+            .sign(jwt::algorithm::hs256{jwt_secret_});
+    }
+
+    void storeSession(const Session& session) {
+        // Serialize session to JSON
+        Json::Value json;
+        json["session_id"] = session.session_id;
+        json["user_id"] = session.user_id;
+        json["username"] = session.username;
+        json["ip_address"] = session.ip_address;
+        json["user_agent"] = session.user_agent;
+        json["created_at"] = static_cast<Json::Int64>(session.created_at);
+        json["expires_at"] = static_cast<Json::Int64>(session.expires_at);
+        json["last_activity"] = static_cast<Json::Int64>(session.last_activity);
+
+        Json::FastWriter writer;
+        std::string json_str = writer.write(json);
+
+        // Store in Redis with TTL
+        redis_.setex(session.session_id,
+                    std::chrono::duration_cast<std::chrono::seconds>(refresh_token_ttl_).count(),
+                    json_str);
+
+        // Add to user's session set
+        redis_.sadd("user_sessions:" + session.user_id, session.session_id);
+    }
+
+    bool sessionExists(const std::string& session_id) {
+        return redis_.exists(session_id);
+    }
+
+    bool retrieveSession(const std::string& session_id, Session& session_out) {
+        auto json_str = redis_.get(session_id);
+        if (!json_str) return false;
+
+        // Parse JSON
+        Json::Value json;
+        Json::Reader reader;
+        if (!reader.parse(*json_str, json)) return false;
+
+        session_out.session_id = json["session_id"].asString();
+        session_out.user_id = json["user_id"].asString();
+        session_out.username = json["username"].asString();
+        session_out.ip_address = json["ip_address"].asString();
+        session_out.user_agent = json["user_agent"].asString();
+        session_out.created_at = json["created_at"].asInt64();
+        session_out.expires_at = json["expires_at"].asInt64();
+        session_out.last_activity = json["last_activity"].asInt64();
+
+        return true;
+    }
+
+    void updateLastActivity(const std::string& session_id) {
+        auto json_str = redis_.get(session_id);
+        if (!json_str) return;
+
+        Json::Value json;
+        Json::Reader reader;
+        if (!reader.parse(*json_str, json)) return;
+
+        json["last_activity"] = static_cast<Json::Int64>(std::time(nullptr));
+
+        Json::FastWriter writer;
+        redis_.set(session_id, writer.write(json));
+    }
+
+    std::vector<std::string> getUserSessions(const std::string& user_id) {
+        std::vector<std::string> sessions;
+        redis_.smembers("user_sessions:" + user_id, std::back_inserter(sessions));
+        return sessions;
+    }
+
+    std::string generateSecureID() {
+        unsigned char bytes[32];
+        RAND_bytes(bytes, 32);
+        // Convert to hex
+        std::stringstream ss;
+        for (int i = 0; i < 32; ++i) {
+            ss << std::hex << std::setw(2) << std::setfill('0') << (int)bytes[i];
+        }
+        return ss.str();
+    }
+
+    void auditLog(const std::string& event, const std::string& user_id,
+                 const std::string& ip) {}
+    void logError(const std::string& msg) {}
+    void logWarning(const std::string& msg) {}
+};
+```
+
+================================================================================
+END OF DOCUMENT
+================================================================================

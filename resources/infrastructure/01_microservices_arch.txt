@@ -1,0 +1,1691 @@
+================================================================================
+                    MICROSERVICES ARCHITECTURE FOR HFT
+                    Service Decomposition & Communication Patterns
+================================================================================
+
+TABLE OF CONTENTS
+================================================================================
+1. Introduction to Microservices in HFT
+2. Service Decomposition Strategy
+3. Service Mesh Architecture
+4. Inter-Service Communication Patterns
+5. Service Boundaries & Responsibilities
+6. API Gateway Design
+7. Service Discovery & Registration
+8. Circuit Breaker Pattern
+9. Saga Pattern for Distributed Transactions
+10. C++ Implementation Examples
+11. Configuration & Deployment
+12. Performance Considerations
+13. Best Practices
+
+================================================================================
+1. INTRODUCTION TO MICROSERVICES IN HFT
+================================================================================
+
+Microservices architecture for HFT requires careful consideration of:
+- Ultra-low latency requirements
+- Strong consistency for orders
+- High throughput for market data
+- Fault isolation
+- Independent scalability
+
+Traditional Monolith vs. HFT Microservices:
+
+MONOLITHIC HFT SYSTEM:
+┌────────────────────────────────────────────┐
+│           Single Process                   │
+│  ┌──────────────────────────────────────┐  │
+│  │  Market Data Module                  │  │
+│  │  Strategy Module                     │  │
+│  │  Risk Module                         │  │
+│  │  Order Management Module             │  │
+│  │  Execution Module                    │  │
+│  └──────────────────────────────────────┘  │
+│  Shared Memory / Direct Function Calls    │
+└────────────────────────────────────────────┘
+Latency: 5-10 μs (intra-process)
+Drawbacks: Single point of failure, difficult to scale, tight coupling
+
+MICROSERVICES HFT SYSTEM:
+┌─────────────┐   ┌─────────────┐   ┌─────────────┐
+│   Market    │   │  Strategy   │   │    Risk     │
+│    Data     │◄──┤   Engine    │◄──┤  Management │
+│   Service   │   │   Service   │   │   Service   │
+└─────────────┘   └─────────────┘   └─────────────┘
+       │                 │                 │
+       └─────────────────┼─────────────────┘
+                         │
+              ┌──────────▼──────────┐
+              │  Order Management   │
+              │      Service        │
+              └──────────┬──────────┘
+                         │
+              ┌──────────▼──────────┐
+              │    Execution        │
+              │      Service        │
+              └─────────────────────┘
+
+Latency: 10-50 μs (inter-process with shared memory)
+Benefits: Fault isolation, independent scaling, easier maintenance
+
+Key Principle for HFT Microservices:
+"Decompose by business capability, but keep latency-critical paths tight"
+
+Hybrid Approach (Recommended):
+- Critical path services: Co-located, shared memory IPC
+- Supporting services: Loosely coupled, network communication
+- State management: Centralized Redis or distributed consensus
+
+================================================================================
+2. SERVICE DECOMPOSITION STRATEGY
+================================================================================
+
+DOMAIN-DRIVEN DESIGN (DDD) FOR HFT:
+
+Bounded Context 1: MARKET DATA
+├── Market Data Gateway Service
+│   ├── Exchange connectivity
+│   ├── Protocol handling (FIX, binary)
+│   └── Initial data normalization
+│
+├── Market Data Processing Service
+│   ├── Order book construction
+│   ├── Trade aggregation
+│   ├── Indicator calculation
+│   └── Data distribution
+
+Bounded Context 2: TRADING STRATEGY
+├── Strategy Engine Service
+│   ├── Alpha signal generation
+│   ├── Position sizing
+│   └── Order decision logic
+│
+├── Backtesting Service
+│   ├── Historical data replay
+│   ├── Performance analytics
+│   └── Strategy validation
+
+Bounded Context 3: RISK MANAGEMENT
+├── Pre-Trade Risk Service
+│   ├── Order validation
+│   ├── Position limits
+│   ├── Capital allocation
+│   └── Concentration checks
+│
+├── Post-Trade Risk Service
+│   ├── Real-time position monitoring
+│   ├── VaR calculation
+│   ├── P&L tracking
+│   └── Margin monitoring
+
+Bounded Context 4: ORDER MANAGEMENT
+├── Order Management Service
+│   ├── Order lifecycle management
+│   ├── Order routing
+│   ├── Smart order routing
+│   └── Order book management
+│
+├── Execution Management Service
+│   ├── Execution algorithms
+│   ├── Fill processing
+│   ├── Order status updates
+│   └── Execution reporting
+
+Bounded Context 5: INFRASTRUCTURE
+├── Configuration Service
+├── Monitoring & Alerting Service
+├── Audit & Compliance Service
+└── Reference Data Service
+
+SERVICE SIZING GUIDELINES:
+─────────────────────────
+
+Micro Service (100-500 LOC):
+- Single, well-defined responsibility
+- Example: Price formatter, position calculator
+
+Small Service (500-2000 LOC):
+- Related functionality cluster
+- Example: Risk checker, order validator
+
+Medium Service (2000-5000 LOC):
+- Complex business logic
+- Example: Strategy engine, OMS
+
+Large Service (5000-10000 LOC):
+- Multiple sub-modules with shared state
+- Example: Market data gateway, execution manager
+
+Mega Service (10000+ LOC):
+- Consider splitting if possible
+- May be acceptable for gateway services with protocol complexity
+
+================================================================================
+3. SERVICE MESH ARCHITECTURE
+================================================================================
+
+SERVICE MESH OVERVIEW:
+
+Traditional Point-to-Point:
+Service A ──────────> Service B
+           (direct call)
+
+Service Mesh with Sidecar Proxies:
+Service A ──> Sidecar A ─────> Sidecar B ──> Service B
+                      (mesh control plane)
+
+For HFT, we use a LIGHTWEIGHT service mesh focused on:
+- Service discovery
+- Health checking
+- Metrics collection
+- NOT for traffic routing (too much latency overhead)
+
+LIGHTWEIGHT HFT SERVICE MESH ARCHITECTURE:
+
+                    ┌─────────────────────┐
+                    │  Control Plane      │
+                    │  (Consul/etcd)      │
+                    │  - Service Registry │
+                    │  - Health Checks    │
+                    │  - Config Store     │
+                    └──────────┬──────────┘
+                               │
+        ┌──────────────────────┼──────────────────────┐
+        │                      │                      │
+   ┌────▼────┐           ┌────▼────┐           ┌────▼────┐
+   │ Market  │           │Strategy │           │  Risk   │
+   │  Data   │           │ Engine  │           │ Manager │
+   │ Service │           │ Service │           │ Service │
+   └────┬────┘           └────┬────┘           └────┬────┘
+        │                     │                      │
+   ┌────▼────┐           ┌────▼────┐           ┌────▼────┐
+   │ Local   │           │ Local   │           │ Local   │
+   │ Agent   │           │ Agent   │           │ Agent   │
+   │(Consul) │           │(Consul) │           │(Consul) │
+   └─────────┘           └─────────┘           └─────────┘
+
+Data Plane: Direct service-to-service communication (ZeroMQ/SHM)
+Control Plane: Service discovery, health checks, configuration
+
+IMPORTANT: For HFT, the data plane BYPASSES the mesh proxies to avoid
+           latency overhead. The control plane provides infrastructure
+           services only.
+
+SERVICE MESH COMPONENTS:
+
+1. Service Registry (Consul):
+   - Services register on startup
+   - Periodic health checks
+   - Automatic deregistration on failure
+
+2. Client-Side Load Balancing:
+   - No proxy overhead
+   - Direct connection after discovery
+   - Local decision making
+
+3. Circuit Breaker:
+   - Embedded in service code
+   - Fast-fail for unavailable services
+   - Automatic recovery
+
+4. Observability:
+   - Service-level metrics
+   - Distributed tracing (optional)
+   - Centralized logging
+
+ANTI-PATTERNS FOR HFT:
+─────────────────────
+✗ Envoy/Istio sidecar proxies (adds 1-5ms latency)
+✗ gRPC for critical paths (use only for admin APIs)
+✗ HTTP/REST for trading operations
+✗ Service mesh policy enforcement on data path
+✗ Automatic retries (can duplicate orders)
+
+================================================================================
+4. INTER-SERVICE COMMUNICATION PATTERNS
+================================================================================
+
+PATTERN 1: REQUEST-REPLY (Synchronous RPC)
+──────────────────────────────────────────
+
+When to use:
+- Risk checks before order submission
+- Configuration queries
+- Reference data lookups
+
+Implementation:
+
+┌──────────┐         REQUEST          ┌──────────┐
+│ Strategy │ ─────────────────────> │   Risk   │
+│  Engine  │ OrderValidationRequest │  Service │
+└──────────┘                         └──────────┘
+     │                                      │
+     │                                      │ Process
+     │                                      │ Validate
+     │                                      │
+     │           REPLY                      │
+     │ <─────────────────────────────────── │
+     │    ValidationResult (PASS/FAIL)      │
+
+C++ Code Example:
+// Client (Strategy Service)
+class RiskServiceClient {
+    zmq::socket_t socket_;
+public:
+    RiskServiceClient(zmq::context_t& ctx)
+        : socket_(ctx, zmq::socket_type::req) {
+        socket_.connect("ipc:///tmp/risk_service.ipc");
+    }
+
+    ValidationResult validateOrder(const Order& order) {
+        // Serialize order
+        OrderValidationRequest req;
+        req.set_order_id(order.id);
+        req.set_symbol(order.symbol);
+        req.set_quantity(order.quantity);
+        req.set_price(order.price);
+
+        std::string serialized = req.SerializeAsString();
+
+        // Send request
+        zmq::message_t request(serialized.size());
+        memcpy(request.data(), serialized.data(), serialized.size());
+        socket_.send(request, zmq::send_flags::none);
+
+        // Receive reply (with timeout)
+        zmq::message_t reply;
+        auto result = socket_.recv(reply, zmq::recv_flags::none);
+
+        // Deserialize
+        ValidationResult validation;
+        validation.ParseFromArray(reply.data(), reply.size());
+        return validation;
+    }
+};
+
+// Server (Risk Service)
+class RiskService {
+    zmq::socket_t socket_;
+public:
+    RiskService(zmq::context_t& ctx)
+        : socket_(ctx, zmq::socket_type::rep) {
+        socket_.bind("ipc:///tmp/risk_service.ipc");
+    }
+
+    void run() {
+        while (true) {
+            zmq::message_t request;
+            socket_.recv(request, zmq::recv_flags::none);
+
+            // Deserialize
+            OrderValidationRequest req;
+            req.ParseFromArray(request.data(), request.size());
+
+            // Validate
+            ValidationResult result = validateOrder(req);
+
+            // Serialize reply
+            std::string serialized = result.SerializeAsString();
+            zmq::message_t reply(serialized.size());
+            memcpy(reply.data(), serialized.data(), serialized.size());
+
+            // Send reply
+            socket_.send(reply, zmq::send_flags::none);
+        }
+    }
+};
+
+Latency: 10-20 μs (IPC), 50-100 μs (TCP localhost)
+
+PATTERN 2: PUBLISH-SUBSCRIBE (Event-Driven)
+───────────────────────────────────────────
+
+When to use:
+- Market data distribution
+- Order status updates
+- System events/alerts
+
+Implementation:
+
+                    ┌──────────────┐
+                    │   Market     │
+                    │   Data       │
+                    │  Publisher   │
+                    └──────┬───────┘
+                           │ Publish: "MARKET.AAPL"
+          ┌────────────────┼────────────────┐
+          │                │                │
+    ┌─────▼─────┐    ┌─────▼─────┐    ┌───▼──────┐
+    │Strategy A │    │Strategy B │    │ Risk Mgr │
+    │Subscribe  │    │Subscribe  │    │Subscribe │
+    │"MARKET.*" │    │"MARKET.AAPL"│  │"MARKET.*"│
+    └───────────┘    └───────────┘    └──────────┘
+
+C++ Code Example:
+// Publisher (Market Data Service)
+class MarketDataPublisher {
+    zmq::socket_t socket_;
+public:
+    MarketDataPublisher(zmq::context_t& ctx)
+        : socket_(ctx, zmq::socket_type::pub) {
+        socket_.bind("ipc:///tmp/market_data.ipc");
+
+        // High water mark to prevent buffer overflow
+        int hwm = 10000;
+        socket_.set(zmq::sockopt::sndhwm, hwm);
+    }
+
+    void publishMarketData(const std::string& symbol,
+                          const MarketData& data) {
+        // Topic: MARKET.<SYMBOL>
+        std::string topic = "MARKET." + symbol;
+
+        // Serialize
+        std::string serialized = data.SerializeAsString();
+
+        // Send multi-part message: [topic][data]
+        zmq::message_t topic_msg(topic.size());
+        memcpy(topic_msg.data(), topic.data(), topic.size());
+        socket_.send(topic_msg, zmq::send_flags::sndmore);
+
+        zmq::message_t data_msg(serialized.size());
+        memcpy(data_msg.data(), serialized.data(), serialized.size());
+        socket_.send(data_msg, zmq::send_flags::none);
+    }
+};
+
+// Subscriber (Strategy Service)
+class MarketDataSubscriber {
+    zmq::socket_t socket_;
+public:
+    MarketDataSubscriber(zmq::context_t& ctx,
+                        const std::vector<std::string>& symbols)
+        : socket_(ctx, zmq::socket_type::sub) {
+        socket_.connect("ipc:///tmp/market_data.ipc");
+
+        // Subscribe to specific symbols
+        for (const auto& symbol : symbols) {
+            std::string topic = "MARKET." + symbol;
+            socket_.set(zmq::sockopt::subscribe, topic);
+        }
+    }
+
+    MarketData receive() {
+        // Receive topic
+        zmq::message_t topic;
+        socket_.recv(topic, zmq::recv_flags::none);
+
+        // Receive data
+        zmq::message_t data;
+        socket_.recv(data, zmq::recv_flags::none);
+
+        // Deserialize
+        MarketData md;
+        md.ParseFromArray(data.data(), data.size());
+        return md;
+    }
+};
+
+Latency: 5-15 μs (IPC, single subscriber)
+
+PATTERN 3: ASYNCHRONOUS MESSAGING (Fire-and-Forget)
+───────────────────────────────────────────────────
+
+When to use:
+- Logging
+- Metrics collection
+- Non-critical notifications
+
+Implementation:
+
+┌──────────┐         PUSH          ┌──────────┐
+│  Service │ ───────────────────> │  Logger  │
+│    A     │    LogMessage        │  Service │
+└──────────┘                       └──────────┘
+                (No reply expected)
+
+C++ Code Example:
+// Sender (Any Service)
+class AsyncLogger {
+    zmq::socket_t socket_;
+public:
+    AsyncLogger(zmq::context_t& ctx)
+        : socket_(ctx, zmq::socket_type::push) {
+        socket_.connect("ipc:///tmp/logger.ipc");
+
+        // Set send timeout to avoid blocking
+        int timeout = 10; // 10ms
+        socket_.set(zmq::sockopt::sndtimeo, timeout);
+    }
+
+    void log(const std::string& message, LogLevel level) {
+        LogEntry entry;
+        entry.set_timestamp(getCurrentTimestamp());
+        entry.set_message(message);
+        entry.set_level(level);
+        entry.set_service_name(getServiceName());
+
+        std::string serialized = entry.SerializeAsString();
+        zmq::message_t msg(serialized.size());
+        memcpy(msg.data(), serialized.data(), serialized.size());
+
+        // Non-blocking send
+        socket_.send(msg, zmq::send_flags::dontwait);
+    }
+};
+
+// Receiver (Logger Service)
+class LoggerService {
+    zmq::socket_t socket_;
+public:
+    LoggerService(zmq::context_t& ctx)
+        : socket_(ctx, zmq::socket_type::pull) {
+        socket_.bind("ipc:///tmp/logger.ipc");
+    }
+
+    void run() {
+        while (true) {
+            zmq::message_t msg;
+            socket_.recv(msg, zmq::recv_flags::none);
+
+            LogEntry entry;
+            entry.ParseFromArray(msg.data(), msg.size());
+
+            // Process log entry (write to file, forward to aggregator, etc.)
+            processLogEntry(entry);
+        }
+    }
+};
+
+Latency: 3-8 μs (sender overhead), non-blocking
+
+PATTERN 4: SHARED STATE (Read-Heavy)
+────────────────────────────────────
+
+When to use:
+- Position tracking
+- Configuration data
+- Reference data (symbols, contracts)
+
+Implementation using Redis:
+
+┌──────────┐         GET          ┌──────────┐
+│ Service  │ ──────────────────> │  Redis   │
+│    A     │   position:AAPL     │ (State)  │
+└──────────┘                      └──────────┘
+
+┌──────────┐         SET          ┌──────────┐
+│ Position │ ──────────────────> │  Redis   │
+│  Service │   position:AAPL     │ (State)  │
+└──────────┘                      └──────────┘
+
+C++ Code Example:
+// Position tracking with Redis
+class PositionManager {
+    std::shared_ptr<redis::Redis> redis_;
+public:
+    PositionManager(const std::string& redis_uri) {
+        redis_ = std::make_shared<redis::Redis>(redis_uri);
+    }
+
+    // Get current position (fast read)
+    int64_t getPosition(const std::string& symbol) {
+        auto val = redis_->get("position:" + symbol);
+        if (!val) return 0;
+        return std::stoll(*val);
+    }
+
+    // Update position (write with strong consistency)
+    void updatePosition(const std::string& symbol, int64_t quantity) {
+        redis_->incrby("position:" + symbol, quantity);
+    }
+
+    // Batch read (pipeline for efficiency)
+    std::map<std::string, int64_t> getPositions(
+        const std::vector<std::string>& symbols) {
+
+        auto pipe = redis_->pipeline();
+        for (const auto& symbol : symbols) {
+            pipe.get("position:" + symbol);
+        }
+        auto replies = pipe.exec();
+
+        std::map<std::string, int64_t> positions;
+        for (size_t i = 0; i < symbols.size(); ++i) {
+            auto val = replies.get<std::optional<std::string>>(i);
+            positions[symbols[i]] = val ? std::stoll(*val) : 0;
+        }
+        return positions;
+    }
+};
+
+Latency: 50-200 μs (Redis GET), 100-500 μs (Redis SET)
+
+================================================================================
+5. SERVICE BOUNDARIES & RESPONSIBILITIES
+================================================================================
+
+SERVICE 1: MARKET DATA GATEWAY
+──────────────────────────────
+Responsibilities:
+├── Exchange connectivity management
+├── Protocol handling (FIX, binary protocols)
+├── Connection monitoring and reconnection
+├── Initial timestamp capture
+└── Basic data validation
+
+Interface:
+- Input: Raw exchange data (TCP/UDP)
+- Output: Normalized market data events (Pub-Sub)
+
+Resource Requirements:
+- CPU: 2-4 cores (dedicated)
+- Memory: 4-8 GB
+- Network: Dedicated NIC
+- Priority: SCHED_FIFO 99
+
+SERVICE 2: MARKET DATA PROCESSOR
+────────────────────────────────
+Responsibilities:
+├── Order book construction and maintenance
+├── Trade aggregation (VWAP, TWAP)
+├── Technical indicator calculation
+├── Data quality checks
+└── Derived data generation
+
+Interface:
+- Input: Normalized market data (Sub)
+- Output: Processed market data, order books (Pub-Sub)
+
+Resource Requirements:
+- CPU: 4-8 cores
+- Memory: 8-16 GB
+- Storage: RAM disk for order books
+- Priority: SCHED_FIFO 98
+
+SERVICE 3: TRADING STRATEGY ENGINE
+──────────────────────────────────
+Responsibilities:
+├── Alpha signal generation
+├── Position sizing
+├── Order decision logic
+├── Strategy-specific risk checks
+└── Performance tracking
+
+Interface:
+- Input: Market data (Sub), Positions (Redis)
+- Output: Trading signals (Pub), Orders (Req-Rep with OMS)
+
+Resource Requirements:
+- CPU: 2-4 cores per strategy
+- Memory: 4-8 GB per strategy
+- Priority: SCHED_FIFO 97
+
+SERVICE 4: RISK MANAGEMENT SERVICE
+──────────────────────────────────
+Responsibilities:
+├── Pre-trade order validation
+├── Position limit enforcement
+├── Capital allocation
+├── Real-time P&L calculation
+└── Risk metric computation (VaR, Greeks)
+
+Interface:
+- Input: Order validation requests (Rep), Market data (Sub)
+- Output: Validation results (Rep), Risk alerts (Pub)
+
+Resource Requirements:
+- CPU: 2-4 cores
+- Memory: 8-16 GB
+- Priority: SCHED_FIFO 96
+
+SERVICE 5: ORDER MANAGEMENT SERVICE
+───────────────────────────────────
+Responsibilities:
+├── Order lifecycle management
+├── Order routing and smart order routing
+├── Order book management
+├── Fill aggregation
+└── Order status tracking
+
+Interface:
+- Input: Orders from strategies (Req), Fills from execution (Sub)
+- Output: Routed orders to execution (Req), Order updates (Pub)
+
+Resource Requirements:
+- CPU: 4-8 cores
+- Memory: 8-16 GB
+- Storage: Redis for order state
+- Priority: SCHED_FIFO 95
+
+SERVICE 6: EXECUTION MANAGEMENT SERVICE
+───────────────────────────────────────
+Responsibilities:
+├── Exchange-specific order submission
+├── Fill processing
+├── Order confirmation handling
+├── Execution reporting
+└── Slippage tracking
+
+Interface:
+- Input: Routed orders from OMS (Req)
+- Output: Order confirmations (Rep), Fills (Pub)
+
+Resource Requirements:
+- CPU: 2-4 cores per exchange
+- Memory: 4-8 GB
+- Network: Dedicated NIC for exchange
+- Priority: SCHED_FIFO 94
+
+SUPPORTING SERVICES:
+───────────────────
+
+SERVICE 7: REFERENCE DATA SERVICE
+- Symbol master data
+- Contract specifications
+- Trading calendars
+- Holiday schedules
+
+SERVICE 8: CONFIGURATION SERVICE
+- Centralized configuration
+- Feature flags
+- Strategy parameters
+- System settings
+
+SERVICE 9: MONITORING SERVICE
+- Metrics collection
+- Health checks
+- Alerting
+- Dashboard data aggregation
+
+SERVICE 10: AUDIT & COMPLIANCE SERVICE
+- Order audit trail
+- Regulatory reporting
+- Compliance checks
+- Historical data archival
+
+================================================================================
+6. API GATEWAY DESIGN
+================================================================================
+
+API Gateway for HFT serves different purposes than typical microservices:
+
+ADMIN API GATEWAY (Non-Critical Path):
+─────────────────────────────────────
+
+                    ┌─────────────────┐
+                    │   Admin Users   │
+                    │   (Web UI, CLI) │
+                    └────────┬────────┘
+                             │ HTTPS
+                    ┌────────▼────────┐
+                    │   API Gateway   │
+                    │   (Nginx/Go)    │
+                    │ ┌─────────────┐ │
+                    │ │Auth/AuthZ   │ │
+                    │ │Rate Limiting│ │
+                    │ │Logging      │ │
+                    │ └─────────────┘ │
+                    └────────┬────────┘
+                             │
+         ┌───────────────────┼───────────────────┐
+         │                   │                   │
+    ┌────▼────┐        ┌────▼────┐        ┌────▼────┐
+    │Strategy │        │  Risk   │        │  OMS    │
+    │ Config  │        │ Config  │        │  Admin  │
+    │   API   │        │   API   │        │   API   │
+    └─────────┘        └─────────┘        └─────────┘
+
+C++ Implementation (Go for API Gateway):
+// gateway.go
+package main
+
+import (
+    "github.com/gin-gonic/gin"
+    "net/http"
+    "time"
+)
+
+type APIGateway struct {
+    router *gin.Engine
+    services map[string]string
+}
+
+func NewAPIGateway() *APIGateway {
+    gw := &APIGateway{
+        router: gin.Default(),
+        services: map[string]string{
+            "strategy": "http://localhost:8001",
+            "risk":     "http://localhost:8002",
+            "oms":      "http://localhost:8003",
+        },
+    }
+
+    // Middleware
+    gw.router.Use(authMiddleware())
+    gw.router.Use(rateLimitMiddleware())
+
+    // Routes
+    gw.router.GET("/api/v1/strategy/:id", gw.proxyToStrategy)
+    gw.router.POST("/api/v1/strategy/:id/config", gw.updateStrategy)
+    gw.router.GET("/api/v1/risk/limits", gw.getRiskLimits)
+
+    return gw
+}
+
+func (gw *APIGateway) proxyToStrategy(c *gin.Context) {
+    strategyID := c.Param("id")
+
+    // Forward to strategy service
+    client := &http.Client{Timeout: 5 * time.Second}
+    resp, err := client.Get(gw.services["strategy"] + "/strategy/" + strategyID)
+    if err != nil {
+        c.JSON(500, gin.H{"error": "Service unavailable"})
+        return
+    }
+    defer resp.Body.Close()
+
+    // Proxy response
+    c.DataFromReader(resp.StatusCode, resp.ContentLength,
+                     resp.Header.Get("Content-Type"), resp.Body, nil)
+}
+
+TRADING API (Critical Path - Direct Access):
+────────────────────────────────────────────
+
+For latency-critical operations, BYPASS the API gateway:
+
+    ┌──────────────┐
+    │   Strategy   │
+    │    Engine    │
+    └──────┬───────┘
+           │ Direct ZeroMQ/SHM (no gateway)
+    ┌──────▼───────┐
+    │     OMS      │
+    └──────────────┘
+
+NO API gateway on critical trading path!
+
+================================================================================
+7. SERVICE DISCOVERY & REGISTRATION
+================================================================================
+
+Using Consul for Service Discovery:
+
+ARCHITECTURE:
+
+┌──────────────────────────────────────────────────────────────┐
+│                     Consul Cluster                           │
+│  ┌──────────┐      ┌──────────┐      ┌──────────┐          │
+│  │ Consul 1 │◄────►│ Consul 2 │◄────►│ Consul 3 │          │
+│  │ (Leader) │      │(Follower)│      │(Follower)│          │
+│  └──────────┘      └──────────┘      └──────────┘          │
+└──────────────────────────────────────────────────────────────┘
+       │                    │                    │
+       └────────────────────┼────────────────────┘
+                            │
+         ┌──────────────────┼──────────────────┐
+         │                  │                  │
+    ┌────▼────┐        ┌────▼────┐       ┌────▼────┐
+    │ Market  │        │Strategy │       │  Risk   │
+    │  Data   │        │ Engine  │       │ Manager │
+    │ Service │        │ Service │       │ Service │
+    └────┬────┘        └────┬────┘       └────┬────┘
+         │                  │                  │
+    ┌────▼────┐        ┌────▼────┐       ┌────▼────┐
+    │ Consul  │        │ Consul  │       │ Consul  │
+    │  Agent  │        │  Agent  │       │  Agent  │
+    └─────────┘        └─────────┘       └─────────┘
+
+C++ Service Registration:
+// service_registry.h
+#include <string>
+#include <memory>
+#include <curl/curl.h>
+#include <nlohmann/json.hpp>
+
+class ConsulServiceRegistry {
+    std::string consul_addr_;
+    std::string service_id_;
+    std::string service_name_;
+    int service_port_;
+
+public:
+    ConsulServiceRegistry(const std::string& consul_addr,
+                         const std::string& service_name,
+                         int service_port)
+        : consul_addr_(consul_addr)
+        , service_name_(service_name)
+        , service_port_(service_port)
+        , service_id_(service_name + "-" + std::to_string(getpid())) {}
+
+    // Register service on startup
+    bool registerService() {
+        using json = nlohmann::json;
+
+        json registration = {
+            {"ID", service_id_},
+            {"Name", service_name_},
+            {"Address", getLocalIP()},
+            {"Port", service_port_},
+            {"Tags", {"hft", "trading", "cpp"}},
+            {"Check", {
+                {"DeregisterCriticalServiceAfter", "90s"},
+                {"HTTP", "http://" + getLocalIP() + ":" +
+                        std::to_string(service_port_) + "/health"},
+                {"Interval", "10s"}
+            }}
+        };
+
+        std::string url = consul_addr_ + "/v1/agent/service/register";
+        return httpPut(url, registration.dump());
+    }
+
+    // Deregister on shutdown
+    bool deregisterService() {
+        std::string url = consul_addr_ + "/v1/agent/service/deregister/" + service_id_;
+        return httpPut(url, "");
+    }
+
+    // Discover services
+    std::vector<ServiceInstance> discoverService(const std::string& service_name) {
+        std::string url = consul_addr_ + "/v1/health/service/" + service_name + "?passing";
+        std::string response = httpGet(url);
+
+        using json = nlohmann::json;
+        auto j = json::parse(response);
+
+        std::vector<ServiceInstance> instances;
+        for (const auto& item : j) {
+            ServiceInstance inst;
+            inst.id = item["Service"]["ID"];
+            inst.address = item["Service"]["Address"];
+            inst.port = item["Service"]["Port"];
+            instances.push_back(inst);
+        }
+        return instances;
+    }
+
+private:
+    std::string getLocalIP() {
+        // Implementation to get local IP
+        return "127.0.0.1";
+    }
+
+    bool httpPut(const std::string& url, const std::string& data) {
+        CURL* curl = curl_easy_init();
+        if (!curl) return false;
+
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data.c_str());
+
+        CURLcode res = curl_easy_perform(curl);
+        curl_easy_cleanup(curl);
+
+        return res == CURLE_OK;
+    }
+
+    std::string httpGet(const std::string& url) {
+        CURL* curl = curl_easy_init();
+        std::string response;
+
+        if (curl) {
+            curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCallback);
+            curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+            curl_easy_perform(curl);
+            curl_easy_cleanup(curl);
+        }
+        return response;
+    }
+
+    static size_t writeCallback(void* contents, size_t size, size_t nmemb, void* userp) {
+        ((std::string*)userp)->append((char*)contents, size * nmemb);
+        return size * nmemb;
+    }
+};
+
+// Usage in main.cpp
+int main() {
+    // Initialize service
+    ConsulServiceRegistry registry("http://localhost:8500",
+                                   "strategy-service", 8080);
+
+    // Register on startup
+    if (!registry.registerService()) {
+        std::cerr << "Failed to register service" << std::endl;
+        return 1;
+    }
+
+    // Ensure deregistration on shutdown
+    std::atexit([]() {
+        registry.deregisterService();
+    });
+
+    // Discover OMS service
+    auto oms_instances = registry.discoverService("oms-service");
+    if (oms_instances.empty()) {
+        std::cerr << "No OMS service available" << std::endl;
+        return 1;
+    }
+
+    // Connect to OMS
+    std::string oms_endpoint = "tcp://" + oms_instances[0].address +
+                               ":" + std::to_string(oms_instances[0].port);
+
+    // Start service...
+    runService();
+
+    return 0;
+}
+
+================================================================================
+8. CIRCUIT BREAKER PATTERN
+================================================================================
+
+Circuit breaker prevents cascading failures by failing fast when a service
+is unavailable.
+
+CIRCUIT STATES:
+
+CLOSED (Normal Operation):
+┌────────┐    Success    ┌────────┐
+│ Client │──────────────>│Service │
+└────────┘<──────────────└────────┘
+
+OPEN (Fast Fail):
+┌────────┐    Fail Fast
+│ Client │───────────X  (Service unhealthy)
+└────────┘    Error
+
+HALF-OPEN (Testing):
+┌────────┐    Test Request  ┌────────┐
+│ Client │─────────────────>│Service │
+└────────┘                  └────────┘
+           If success -> CLOSED
+           If failure -> OPEN
+
+C++ Implementation:
+// circuit_breaker.h
+#include <atomic>
+#include <chrono>
+#include <functional>
+#include <stdexcept>
+
+enum class CircuitState {
+    CLOSED,      // Normal operation
+    OPEN,        // Failing fast
+    HALF_OPEN    // Testing recovery
+};
+
+class CircuitBreaker {
+    std::atomic<CircuitState> state_{CircuitState::CLOSED};
+    std::atomic<int> failure_count_{0};
+    std::atomic<int> success_count_{0};
+
+    const int failure_threshold_;
+    const int success_threshold_;
+    const std::chrono::milliseconds timeout_;
+
+    std::chrono::steady_clock::time_point last_failure_time_;
+
+public:
+    CircuitBreaker(int failure_threshold = 5,
+                  int success_threshold = 2,
+                  std::chrono::milliseconds timeout = std::chrono::seconds(30))
+        : failure_threshold_(failure_threshold)
+        , success_threshold_(success_threshold)
+        , timeout_(timeout) {}
+
+    template<typename Func, typename... Args>
+    auto call(Func&& func, Args&&... args)
+        -> decltype(func(std::forward<Args>(args)...)) {
+
+        CircuitState current_state = state_.load();
+
+        // Fast fail if circuit is open
+        if (current_state == CircuitState::OPEN) {
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed = now - last_failure_time_;
+
+            if (elapsed < timeout_) {
+                throw std::runtime_error("Circuit breaker is OPEN");
+            }
+
+            // Try to recover (move to HALF_OPEN)
+            state_.store(CircuitState::HALF_OPEN);
+            current_state = CircuitState::HALF_OPEN;
+        }
+
+        try {
+            // Execute function
+            auto result = func(std::forward<Args>(args)...);
+
+            // Record success
+            onSuccess();
+
+            return result;
+        }
+        catch (...) {
+            // Record failure
+            onFailure();
+            throw;
+        }
+    }
+
+    CircuitState getState() const {
+        return state_.load();
+    }
+
+private:
+    void onSuccess() {
+        failure_count_.store(0);
+
+        CircuitState current = state_.load();
+
+        if (current == CircuitState::HALF_OPEN) {
+            int success = success_count_.fetch_add(1) + 1;
+
+            if (success >= success_threshold_) {
+                state_.store(CircuitState::CLOSED);
+                success_count_.store(0);
+            }
+        }
+    }
+
+    void onFailure() {
+        success_count_.store(0);
+
+        int failures = failure_count_.fetch_add(1) + 1;
+
+        if (failures >= failure_threshold_) {
+            state_.store(CircuitState::OPEN);
+            last_failure_time_ = std::chrono::steady_clock::now();
+        }
+    }
+};
+
+// Usage example
+class RiskServiceClientWithCircuitBreaker {
+    zmq::socket_t socket_;
+    CircuitBreaker circuit_breaker_;
+
+public:
+    ValidationResult validateOrder(const Order& order) {
+        return circuit_breaker_.call([this, &order]() {
+            // ZeroMQ call with timeout
+            return this->validateOrderInternal(order);
+        });
+    }
+
+private:
+    ValidationResult validateOrderInternal(const Order& order) {
+        // Send request
+        sendRequest(order);
+
+        // Receive with timeout
+        zmq::message_t reply;
+        auto result = socket_.recv(reply, zmq::recv_flags::none);
+
+        if (!result) {
+            throw std::runtime_error("Receive timeout");
+        }
+
+        ValidationResult validation;
+        validation.ParseFromArray(reply.data(), reply.size());
+        return validation;
+    }
+};
+
+================================================================================
+9. SAGA PATTERN FOR DISTRIBUTED TRANSACTIONS
+================================================================================
+
+HFT systems need to coordinate multiple services for complex operations.
+The Saga pattern provides distributed transaction management.
+
+Example: Order Placement Saga
+
+Step 1: Validate with Risk         -> Success
+Step 2: Allocate Capital            -> Success
+Step 3: Submit Order to Exchange    -> FAIL
+Compensation 2: Release Capital
+Compensation 1: Release Risk Limit
+
+C++ Implementation:
+// saga.h
+#include <vector>
+#include <functional>
+#include <stdexcept>
+
+class SagaStep {
+public:
+    std::function<void()> action;
+    std::function<void()> compensation;
+    std::string name;
+
+    SagaStep(const std::string& name,
+            std::function<void()> action,
+            std::function<void()> compensation)
+        : name(name), action(action), compensation(compensation) {}
+};
+
+class Saga {
+    std::vector<SagaStep> steps_;
+    std::vector<SagaStep> completed_steps_;
+
+public:
+    void addStep(const SagaStep& step) {
+        steps_.push_back(step);
+    }
+
+    void execute() {
+        completed_steps_.clear();
+
+        try {
+            for (const auto& step : steps_) {
+                std::cout << "Executing step: " << step.name << std::endl;
+
+                step.action();
+                completed_steps_.push_back(step);
+            }
+
+            std::cout << "Saga completed successfully" << std::endl;
+        }
+        catch (const std::exception& e) {
+            std::cerr << "Saga failed: " << e.what() << std::endl;
+            compensate();
+            throw;
+        }
+    }
+
+private:
+    void compensate() {
+        std::cout << "Starting compensation..." << std::endl;
+
+        // Execute compensations in reverse order
+        for (auto it = completed_steps_.rbegin();
+             it != completed_steps_.rend(); ++it) {
+            try {
+                std::cout << "Compensating step: " << it->name << std::endl;
+                it->compensation();
+            }
+            catch (const std::exception& e) {
+                std::cerr << "Compensation failed for " << it->name
+                         << ": " << e.what() << std::endl;
+                // Continue compensating other steps
+            }
+        }
+
+        std::cout << "Compensation completed" << std::endl;
+    }
+};
+
+// Usage: Order Placement Saga
+class OrderPlacementSaga {
+    RiskService& risk_service_;
+    CapitalService& capital_service_;
+    ExecutionService& execution_service_;
+
+public:
+    OrderPlacementSaga(RiskService& risk,
+                      CapitalService& capital,
+                      ExecutionService& execution)
+        : risk_service_(risk)
+        , capital_service_(capital)
+        , execution_service_(execution) {}
+
+    void placeOrder(const Order& order) {
+        Saga saga;
+
+        std::string risk_check_id;
+        std::string capital_id;
+        std::string order_id;
+
+        // Step 1: Risk validation
+        saga.addStep(SagaStep(
+            "RiskValidation",
+            [this, &order, &risk_check_id]() {
+                risk_check_id = risk_service_.validateAndReserve(order);
+            },
+            [this, &risk_check_id]() {
+                if (!risk_check_id.empty()) {
+                    risk_service_.releaseReservation(risk_check_id);
+                }
+            }
+        ));
+
+        // Step 2: Capital allocation
+        saga.addStep(SagaStep(
+            "CapitalAllocation",
+            [this, &order, &capital_id]() {
+                capital_id = capital_service_.allocate(order.notional());
+            },
+            [this, &capital_id]() {
+                if (!capital_id.empty()) {
+                    capital_service_.release(capital_id);
+                }
+            }
+        ));
+
+        // Step 3: Order submission
+        saga.addStep(SagaStep(
+            "OrderSubmission",
+            [this, &order, &order_id]() {
+                order_id = execution_service_.submit(order);
+            },
+            [this, &order_id]() {
+                if (!order_id.empty()) {
+                    execution_service_.cancel(order_id);
+                }
+            }
+        ));
+
+        // Execute saga
+        saga.execute();
+    }
+};
+
+================================================================================
+10. C++ IMPLEMENTATION EXAMPLES
+================================================================================
+
+Complete Microservice Template:
+
+// strategy_service.cpp
+#include <zmq.hpp>
+#include <thread>
+#include <atomic>
+#include "service_registry.h"
+#include "circuit_breaker.h"
+
+class StrategyService {
+    // ZeroMQ context
+    zmq::context_t ctx_;
+
+    // Market data subscriber
+    std::unique_ptr<zmq::socket_t> market_data_sub_;
+
+    // Order publisher
+    std::unique_ptr<zmq::socket_t> order_pub_;
+
+    // Risk service client
+    std::unique_ptr<zmq::socket_t> risk_client_;
+    CircuitBreaker risk_circuit_breaker_;
+
+    // Service registry
+    std::unique_ptr<ConsulServiceRegistry> registry_;
+
+    // Running flag
+    std::atomic<bool> running_{true};
+
+public:
+    StrategyService(const std::string& consul_addr)
+        : ctx_(1)
+        , risk_circuit_breaker_(5, 2, std::chrono::seconds(10)) {
+
+        // Initialize market data subscriber
+        market_data_sub_ = std::make_unique<zmq::socket_t>(
+            ctx_, zmq::socket_type::sub);
+        market_data_sub_->connect("ipc:///tmp/market_data.ipc");
+        market_data_sub_->set(zmq::sockopt::subscribe, "MARKET.");
+
+        // Initialize order publisher
+        order_pub_ = std::make_unique<zmq::socket_t>(
+            ctx_, zmq::socket_type::pub);
+        order_pub_->bind("ipc:///tmp/strategy_orders.ipc");
+
+        // Initialize risk client
+        risk_client_ = std::make_unique<zmq::socket_t>(
+            ctx_, zmq::socket_type::req);
+        risk_client_->connect("ipc:///tmp/risk_service.ipc");
+
+        // Set socket timeouts
+        int timeout = 100; // 100ms
+        risk_client_->set(zmq::sockopt::rcvtimeo, timeout);
+        risk_client_->set(zmq::sockopt::sndtimeo, timeout);
+
+        // Register with Consul
+        registry_ = std::make_unique<ConsulServiceRegistry>(
+            consul_addr, "strategy-service", 8080);
+        registry_->registerService();
+    }
+
+    ~StrategyService() {
+        registry_->deregisterService();
+    }
+
+    void run() {
+        std::cout << "Strategy service started" << std::endl;
+
+        while (running_) {
+            // Receive market data
+            zmq::message_t topic_msg, data_msg;
+
+            auto result = market_data_sub_->recv(topic_msg, zmq::recv_flags::dontwait);
+            if (!result) {
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+                continue;
+            }
+
+            market_data_sub_->recv(data_msg, zmq::recv_flags::none);
+
+            // Process market data
+            MarketData md = deserializeMarketData(data_msg);
+
+            // Generate trading signal
+            auto signal = generateSignal(md);
+
+            if (signal.action != Action::NONE) {
+                // Create order
+                Order order = createOrder(signal);
+
+                // Validate with risk service
+                try {
+                    bool valid = risk_circuit_breaker_.call([this, &order]() {
+                        return validateWithRisk(order);
+                    });
+
+                    if (valid) {
+                        // Publish order
+                        publishOrder(order);
+                    }
+                }
+                catch (const std::exception& e) {
+                    std::cerr << "Risk check failed: " << e.what() << std::endl;
+                }
+            }
+        }
+    }
+
+    void stop() {
+        running_ = false;
+    }
+
+private:
+    MarketData deserializeMarketData(const zmq::message_t& msg) {
+        MarketData md;
+        md.ParseFromArray(msg.data(), msg.size());
+        return md;
+    }
+
+    TradingSignal generateSignal(const MarketData& md) {
+        // Strategy logic here
+        TradingSignal signal;
+        signal.action = Action::BUY;
+        signal.quantity = 100;
+        signal.price = md.bid();
+        return signal;
+    }
+
+    Order createOrder(const TradingSignal& signal) {
+        Order order;
+        order.set_symbol(signal.symbol);
+        order.set_side(signal.action == Action::BUY ? Side::BUY : Side::SELL);
+        order.set_quantity(signal.quantity);
+        order.set_price(signal.price);
+        order.set_type(OrderType::LIMIT);
+        return order;
+    }
+
+    bool validateWithRisk(const Order& order) {
+        // Serialize order
+        std::string serialized = order.SerializeAsString();
+        zmq::message_t request(serialized.size());
+        memcpy(request.data(), serialized.data(), serialized.size());
+
+        // Send to risk service
+        risk_client_->send(request, zmq::send_flags::none);
+
+        // Receive response
+        zmq::message_t reply;
+        auto result = risk_client_->recv(reply, zmq::recv_flags::none);
+
+        if (!result) {
+            throw std::runtime_error("Risk service timeout");
+        }
+
+        ValidationResult validation;
+        validation.ParseFromArray(reply.data(), reply.size());
+
+        return validation.approved();
+    }
+
+    void publishOrder(const Order& order) {
+        std::string topic = "ORDER.NEW";
+        std::string serialized = order.SerializeAsString();
+
+        zmq::message_t topic_msg(topic.size());
+        memcpy(topic_msg.data(), topic.data(), topic.size());
+        order_pub_->send(topic_msg, zmq::send_flags::sndmore);
+
+        zmq::message_t data_msg(serialized.size());
+        memcpy(data_msg.data(), serialized.data(), serialized.size());
+        order_pub_->send(data_msg, zmq::send_flags::none);
+    }
+};
+
+// main.cpp
+int main(int argc, char** argv) {
+    // Set CPU affinity
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(4, &cpuset);  // Pin to CPU 4
+    CPU_SET(5, &cpuset);  // Pin to CPU 5
+    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+
+    // Set real-time priority
+    struct sched_param param;
+    param.sched_priority = 97;
+    sched_setscheduler(0, SCHED_FIFO, &param);
+
+    // Create service
+    StrategyService service("http://localhost:8500");
+
+    // Handle signals
+    signal(SIGINT, [](int) {
+        service.stop();
+    });
+
+    // Run service
+    service.run();
+
+    return 0;
+}
+
+================================================================================
+11. CONFIGURATION & DEPLOYMENT
+================================================================================
+
+Service Configuration File (YAML):
+
+# strategy_service.yaml
+service:
+  name: strategy-service
+  version: 1.0.0
+  environment: production
+
+consul:
+  address: http://localhost:8500
+  service_id: strategy-service-1
+  health_check_interval: 10s
+
+zeromq:
+  market_data:
+    endpoint: ipc:///tmp/market_data.ipc
+    topics:
+      - MARKET.AAPL
+      - MARKET.GOOGL
+      - MARKET.MSFT
+
+  orders:
+    endpoint: ipc:///tmp/strategy_orders.ipc
+
+  risk_service:
+    endpoint: ipc:///tmp/risk_service.ipc
+    timeout_ms: 100
+
+strategy:
+  name: momentum_strategy
+  parameters:
+    lookback_period: 20
+    threshold: 0.02
+
+  risk_limits:
+    max_position: 1000
+    max_order_size: 100
+
+logging:
+  level: INFO
+  file: /var/log/hft/strategy_service.log
+
+monitoring:
+  prometheus_port: 9090
+  metrics:
+    - latency_histogram
+    - order_count
+    - signal_count
+
+Docker Deployment:
+
+# Dockerfile
+FROM ubuntu:22.04
+
+# Install dependencies
+RUN apt-get update && apt-get install -y \
+    libzmq3-dev \
+    libssl-dev \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy binaries
+COPY bin/strategy_service /usr/local/bin/
+COPY config/strategy_service.yaml /etc/hft/
+
+# Set capabilities for real-time scheduling
+RUN setcap cap_sys_nice=eip /usr/local/bin/strategy_service
+
+# Run as non-root user
+RUN useradd -m hft
+USER hft
+
+CMD ["/usr/local/bin/strategy_service", "--config", "/etc/hft/strategy_service.yaml"]
+
+Docker Compose:
+
+# docker-compose.yml
+version: '3.8'
+
+services:
+  consul:
+    image: consul:1.16
+    ports:
+      - "8500:8500"
+    command: agent -dev -ui -client=0.0.0.0
+
+  redis:
+    image: redis:7.0
+    ports:
+      - "6379:6379"
+
+  market-data-service:
+    build: ./market-data
+    depends_on:
+      - consul
+      - redis
+    volumes:
+      - /tmp:/tmp
+    ipc: host
+
+  strategy-service:
+    build: ./strategy
+    depends_on:
+      - market-data-service
+      - risk-service
+    volumes:
+      - /tmp:/tmp
+    ipc: host
+
+  risk-service:
+    build: ./risk
+    depends_on:
+      - consul
+      - redis
+    volumes:
+      - /tmp:/tmp
+    ipc: host
+
+================================================================================
+12. PERFORMANCE CONSIDERATIONS
+================================================================================
+
+Microservices Overhead Analysis:
+
+Operation               Monolith    Microservices   Overhead
+────────────────────────────────────────────────────────────
+Function Call           0.01 μs     -               -
+Shared Memory IPC       -           0.5 μs          +0.49 μs
+ZeroMQ IPC             -           10 μs           +9.99 μs
+TCP Localhost          -           50 μs           +49.99 μs
+HTTP/REST              -           500 μs          +499.99 μs
+
+Optimization Strategies:
+
+1. Collocate Latency-Critical Services
+   - Run on same host
+   - Use shared memory IPC
+   - Pin to same NUMA node
+
+2. Batch Processing
+   - Aggregate multiple requests
+   - Amortize serialization overhead
+   - Pipeline for throughput
+
+3. Async Communication
+   - Use pub/sub for fan-out
+   - Avoid blocking calls
+   - Event-driven architecture
+
+4. Caching
+   - Cache reference data locally
+   - Use Redis for shared state
+   - Invalidate on updates
+
+5. Connection Pooling
+   - Reuse ZeroMQ sockets
+   - Keep persistent connections
+   - Avoid connection overhead
+
+================================================================================
+13. BEST PRACTICES
+================================================================================
+
+DO:
+✓ Use shared memory for same-host, latency-critical communication
+✓ Implement circuit breakers for all external dependencies
+✓ Use service discovery for dynamic environments
+✓ Monitor service health continuously
+✓ Design for failure (bulkheads, timeouts)
+✓ Use compensating transactions (Saga pattern)
+✓ Version APIs explicitly
+✓ Implement comprehensive logging
+✓ Use correlation IDs for distributed tracing
+✓ Test failure scenarios regularly
+
+DON'T:
+✗ Use HTTP/REST for latency-critical trading operations
+✗ Deploy sidecar proxies on the critical path
+✗ Share databases between services (if avoidable)
+✗ Implement distributed transactions with two-phase commit
+✗ Over-decompose services (nano-services anti-pattern)
+✗ Ignore the network fallacy (network is unreliable)
+✗ Use synchronous calls for everything
+✗ Forget about service discovery
+✗ Ignore monitoring and observability
+✗ Deploy to Kubernetes for ultra-low-latency components
+
+================================================================================
+END OF MICROSERVICES ARCHITECTURE
+================================================================================

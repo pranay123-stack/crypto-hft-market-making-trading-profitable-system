@@ -1,0 +1,370 @@
+================================================================================
+                    HFT POST-MORTEM DEBUGGING GUIDE
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Core Dump Analysis
+2. Crash Investigation Techniques
+3. Log Analysis
+4. Trade Reconciliation After Crash
+5. Root Cause Analysis
+6. Automated Crash Reporting
+7. Real HFT Examples
+8. Commands and Tools
+9. Prevention Strategies
+10. Best Practices
+
+================================================================================
+1. CORE DUMP ANALYSIS
+================================================================================
+
+ENABLING CORE DUMPS
+-------------------
+
+```bash
+# Set unlimited core dump size
+ulimit -c unlimited
+
+# Configure core dump location and format
+echo "/tmp/cores/core.%e.%p.%t" | sudo tee /proc/sys/kernel/core_pattern
+
+# Or use systemd-coredump
+echo "|/usr/lib/systemd/systemd-coredump %P %u %g %s %t %c %h" | sudo tee /proc/sys/kernel/core_pattern
+```
+
+GDB CORE DUMP ANALYSIS
+-----------------------
+
+```bash
+# Load core dump
+gdb ./trading_engine /tmp/cores/core.trading_engine.12345.1234567890
+
+# Essential commands
+(gdb) bt              # Backtrace
+(gdb) bt full         # Full backtrace with locals
+(gdb) thread apply all bt  # All threads
+(gdb) info threads    # Thread list
+(gdb) frame 3         # Switch to frame 3
+(gdb) info locals     # Local variables
+(gdb) print variable  # Print variable value
+(gdb) x/16xw 0x12345  # Examine memory
+```
+
+AUTOMATED CORE ANALYSIS
+------------------------
+
+```python
+#!/usr/bin/env python3
+import subprocess
+import sys
+
+def analyze_core(executable, corefile):
+    gdb_commands = """
+    set pagination off
+    info threads
+    thread apply all bt full
+    quit
+    """
+
+    proc = subprocess.Popen(
+        ['gdb', executable, corefile],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+
+    stdout, stderr = proc.communicate(gdb_commands)
+
+    with open('crash_report.txt', 'w') as f:
+        f.write(stdout)
+
+    # Parse for common issues
+    if 'SIGSEGV' in stdout:
+        print("SEGMENTATION FAULT detected")
+    if 'double free' in stdout:
+        print("DOUBLE FREE detected")
+
+analyze_core(sys.argv[1], sys.argv[2])
+```
+
+================================================================================
+2. CRASH INVESTIGATION
+================================================================================
+
+CRASH SIGNATURE DETECTION
+--------------------------
+
+```cpp
+#include <execinfo.h>
+#include <signal.h>
+
+class CrashHandler {
+public:
+    static void setup() {
+        signal(SIGSEGV, handler);
+        signal(SIGABRT, handler);
+        signal(SIGFPE, handler);
+    }
+
+private:
+    static void handler(int sig) {
+        void* array[50];
+        size_t size = backtrace(array, 50);
+
+        char** strings = backtrace_symbols(array, size);
+
+        std::ofstream crash_log("/tmp/crash.log", std::ios::app);
+        crash_log << "Signal: " << sig << "\n";
+        crash_log << "Timestamp: " << time(nullptr) << "\n";
+        crash_log << "Backtrace:\n";
+
+        for (size_t i = 0; i < size; ++i) {
+            crash_log << strings[i] << "\n";
+        }
+
+        free(strings);
+        crash_log.close();
+
+        // Re-raise signal for core dump
+        signal(sig, SIG_DFL);
+        raise(sig);
+    }
+};
+```
+
+SANITIZER POST-MORTEM
+----------------------
+
+```bash
+# If compiled with AddressSanitizer
+ASAN_OPTIONS=log_path=/tmp/asan.log:abort_on_error=1 ./trading_engine
+
+# After crash, analyze ASAN log
+cat /tmp/asan.log.*
+```
+
+================================================================================
+3. LOG ANALYSIS
+================================================================================
+
+STRUCTURED LOGGING FOR POST-MORTEM
+-----------------------------------
+
+```cpp
+class StructuredLogger {
+public:
+    enum class Severity { DEBUG, INFO, WARN, ERROR, FATAL };
+
+    struct LogEntry {
+        uint64_t timestamp;
+        Severity severity;
+        uint32_t thread_id;
+        char message[256];
+        char file[64];
+        int line;
+    };
+
+    static void log(Severity sev, const char* msg, const char* file, int line) {
+        LogEntry entry = {
+            .timestamp = rdtsc(),
+            .severity = sev,
+            .thread_id = (uint32_t)pthread_self(),
+            .file = {},
+            .line = line
+        };
+
+        strncpy(entry.message, msg, 255);
+        strncpy(entry.file, file, 63);
+
+        // Write to memory-mapped log file (survives crash)
+        write_to_mmap_log(entry);
+    }
+};
+
+#define LOG_ERROR(msg) StructuredLogger::log(StructuredLogger::Severity::ERROR, msg, __FILE__, __LINE__)
+```
+
+LOG CORRELATION TOOLS
+---------------------
+
+```bash
+# Extract logs around crash time
+crash_time="2024-11-25 10:30:45"
+grep -C 100 "$crash_time" trading.log > crash_context.log
+
+# Correlate multiple log sources
+join -t ',' -1 1 -2 1 trading.log market_data.log > combined.log
+```
+
+================================================================================
+4. TRADE RECONCILIATION
+================================================================================
+
+STATE RECOVERY
+--------------
+
+```cpp
+class StateRecovery {
+    // Persistent state in memory-mapped file
+    struct PersistentState {
+        uint64_t last_order_id;
+        uint64_t sequence_number;
+        int64_t position[100];  // Per-symbol
+        double pnl;
+        uint64_t last_update_time;
+    };
+
+    int fd;
+    PersistentState* state;
+
+public:
+    StateRecovery(const char* path) {
+        fd = open(path, O_RDWR | O_CREAT, 0666);
+        ftruncate(fd, sizeof(PersistentState));
+
+        state = (PersistentState*)mmap(nullptr, sizeof(PersistentState),
+                                       PROT_READ | PROT_WRITE,
+                                       MAP_SHARED, fd, 0);
+
+        if (state == MAP_FAILED) {
+            throw std::runtime_error("mmap failed");
+        }
+    }
+
+    void update_position(int symbol_id, int64_t qty) {
+        state->position[symbol_id] += qty;
+        state->last_update_time = time(nullptr);
+        msync(state, sizeof(PersistentState), MS_ASYNC);
+    }
+
+    void recover() {
+        std::cout << "Recovering state from: "
+                  << state->last_update_time << "\n";
+        std::cout << "Last order ID: " << state->last_order_id << "\n";
+        std::cout << "Sequence: " << state->sequence_number << "\n";
+        // ... restore trading state ...
+    }
+
+    ~StateRecovery() {
+        munmap(state, sizeof(PersistentState));
+        close(fd);
+    }
+};
+```
+
+ORDER AUDIT TRAIL
+-----------------
+
+```cpp
+struct OrderEvent {
+    uint64_t timestamp;
+    uint64_t order_id;
+    enum class Type { NEW, FILL, CANCEL, REJECT } type;
+    double price;
+    uint32_t quantity;
+} __attribute__((packed));
+
+class OrderAuditLog {
+    int fd;
+    size_t file_size = 0;
+
+public:
+    OrderAuditLog(const char* path) {
+        fd = open(path, O_WRONLY | O_APPEND | O_CREAT, 0666);
+    }
+
+    void log_event(const OrderEvent& event) {
+        write(fd, &event, sizeof(event));
+        fdatasync(fd);  // Ensure written to disk
+    }
+
+    std::vector<OrderEvent> replay(uint64_t from_timestamp) {
+        int read_fd = open("audit.log", O_RDONLY);
+        std::vector<OrderEvent> events;
+
+        OrderEvent event;
+        while (read(read_fd, &event, sizeof(event)) == sizeof(event)) {
+            if (event.timestamp >= from_timestamp) {
+                events.push_back(event);
+            }
+        }
+
+        close(read_fd);
+        return events;
+    }
+};
+```
+
+================================================================================
+5. ROOT CAUSE ANALYSIS
+================================================================================
+
+AUTOMATED RCA FRAMEWORK
+-----------------------
+
+```cpp
+class RootCauseAnalyzer {
+public:
+    enum class Cause {
+        SEGFAULT,
+        ASSERTION,
+        EXCEPTION,
+        DEADLOCK,
+        OOM,
+        TIMEOUT,
+        UNKNOWN
+    };
+
+    struct CrashReport {
+        Cause cause;
+        std::string stack_trace;
+        std::vector<std::string> logs;
+        std::map<std::string, std::string> system_state;
+    };
+
+    static CrashReport analyze(const std::string& corefile) {
+        CrashReport report;
+
+        // Analyze core dump
+        report.stack_trace = extract_backtrace(corefile);
+
+        // Determine cause from stack trace
+        if (report.stack_trace.find("SIGSEGV") != std::string::npos) {
+            report.cause = Cause::SEGFAULT;
+        } else if (report.stack_trace.find("assert") != std::string::npos) {
+            report.cause = Cause::ASSERTION;
+        }
+
+        // Collect logs
+        report.logs = collect_logs_around_crash();
+
+        // Collect system state
+        report.system_state = collect_system_state();
+
+        return report;
+    }
+
+private:
+    static std::string extract_backtrace(const std::string& corefile) {
+        // Run gdb to extract backtrace
+        // ... implementation ...
+        return "";
+    }
+
+    static std::vector<std::string> collect_logs_around_crash() {
+        // ... implementation ...
+        return {};
+    }
+
+    static std::map<std::string, std::string> collect_system_state() {
+        // ... implementation ...
+        return {};
+    }
+};
+```
+
+================================================================================
+END OF POST-MORTEM DEBUGGING GUIDE
+================================================================================

@@ -1,0 +1,753 @@
+================================================================================
+                       GRACEFUL DEGRADATION STRATEGIES
+              Maintaining Partial Operation During Failures
+================================================================================
+
+DOCUMENT: Graceful Degradation Implementation
+VERSION: 2.1.0
+LAST UPDATED: 2025-11-26
+SCOPE: Degraded mode operations for HFT systems
+
+================================================================================
+                          TABLE OF CONTENTS
+================================================================================
+
+1. Degradation Philosophy
+2. Degradation Levels
+3. Feature Prioritization
+4. Fallback Strategies
+5. State Management
+6. Performance Tradeoffs
+7. User Communication
+8. Recovery to Normal Operation
+9. Code Examples
+
+================================================================================
+                  1. DEGRADATION PHILOSOPHY
+================================================================================
+
+CORE PRINCIPLE:
+---------------
+"It's better to trade at 50% capacity than not trade at all"
+
+DEGRADATION GOALS:
+------------------
+1. MAINTAIN CRITICAL FUNCTIONS
+   - Keep making markets
+   - Protect existing positions
+   - Honor obligations
+
+2. MINIMIZE FINANCIAL RISK
+   - Reduce position limits
+   - Tighten risk controls
+   - Close risky positions
+
+3. PRESERVE SYSTEM STABILITY
+   - Reduce resource usage
+   - Disable non-essential features
+   - Prevent cascade failures
+
+4. ENABLE RECOVERY
+   - Maintain observability
+   - Log all decisions
+   - Track degradation metrics
+
+DEGRADATION LEVELS:
+-------------------
+
+Level 0: NORMAL OPERATION (100%)
+  - All features enabled
+  - Full capacity
+  - Optimal performance
+
+Level 1: REDUCED CAPACITY (75%)
+  - Non-critical strategies paused
+  - Reduced order rates
+  - Conservative risk limits
+
+Level 2: DEFENSIVE MODE (50%)
+  - Market-making only
+  - New positions limited
+  - Focus on risk management
+
+Level 3: CLOSE-ONLY MODE (25%)
+  - No new positions
+  - Only closing trades
+  - Emergency risk reduction
+
+Level 4: EMERGENCY HALT (0%)
+  - All trading stopped
+  - Orders cancelled
+  - Manual intervention required
+
+================================================================================
+                    2. DEGRADATION LEVELS IMPLEMENTATION
+================================================================================
+
+namespace hft::degradation {
+
+enum class DegradationLevel {
+    NORMAL = 0,
+    REDUCED_CAPACITY = 1,
+    DEFENSIVE_MODE = 2,
+    CLOSE_ONLY = 3,
+    EMERGENCY_HALT = 4
+};
+
+struct DegradationConfig {
+    DegradationLevel level;
+    double position_limit_multiplier;
+    double order_rate_multiplier;
+    double max_order_size_multiplier;
+    bool allow_new_positions;
+    bool allow_aggressive_orders;
+    std::vector<std::string> enabled_strategies;
+    std::chrono::milliseconds heartbeat_interval;
+};
+
+class DegradationManager {
+private:
+    std::atomic<DegradationLevel> current_level_{DegradationLevel::NORMAL};
+    std::unordered_map<DegradationLevel, DegradationConfig> configs_;
+    std::mutex mutex_;
+    
+public:
+    void initialize() {
+        // Configure degradation levels
+        configs_[DegradationLevel::NORMAL] = {
+            .level = DegradationLevel::NORMAL,
+            .position_limit_multiplier = 1.0,
+            .order_rate_multiplier = 1.0,
+            .max_order_size_multiplier = 1.0,
+            .allow_new_positions = true,
+            .allow_aggressive_orders = true,
+            .enabled_strategies = {"all"},
+            .heartbeat_interval = std::chrono::milliseconds(100)
+        };
+        
+        configs_[DegradationLevel::REDUCED_CAPACITY] = {
+            .level = DegradationLevel::REDUCED_CAPACITY,
+            .position_limit_multiplier = 0.75,
+            .order_rate_multiplier = 0.75,
+            .max_order_size_multiplier = 0.75,
+            .allow_new_positions = true,
+            .allow_aggressive_orders = true,
+            .enabled_strategies = {"high_priority", "market_making"},
+            .heartbeat_interval = std::chrono::milliseconds(50)
+        };
+        
+        configs_[DegradationLevel::DEFENSIVE_MODE] = {
+            .level = DegradationLevel::DEFENSIVE_MODE,
+            .position_limit_multiplier = 0.50,
+            .order_rate_multiplier = 0.50,
+            .max_order_size_multiplier = 0.50,
+            .allow_new_positions = true,
+            .allow_aggressive_orders = false,
+            .enabled_strategies = {"market_making"},
+            .heartbeat_interval = std::chrono::milliseconds(50)
+        };
+        
+        configs_[DegradationLevel::CLOSE_ONLY] = {
+            .level = DegradationLevel::CLOSE_ONLY,
+            .position_limit_multiplier = 0.25,
+            .order_rate_multiplier = 0.25,
+            .max_order_size_multiplier = 0.25,
+            .allow_new_positions = false,
+            .allow_aggressive_orders = false,
+            .enabled_strategies = {},
+            .heartbeat_interval = std::chrono::milliseconds(25)
+        };
+        
+        configs_[DegradationLevel::EMERGENCY_HALT] = {
+            .level = DegradationLevel::EMERGENCY_HALT,
+            .position_limit_multiplier = 0.0,
+            .order_rate_multiplier = 0.0,
+            .max_order_size_multiplier = 0.0,
+            .allow_new_positions = false,
+            .allow_aggressive_orders = false,
+            .enabled_strategies = {},
+            .heartbeat_interval = std::chrono::milliseconds(10)
+        };
+    }
+    
+    void set_level(DegradationLevel new_level, const std::string& reason) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        
+        DegradationLevel old_level = current_level_.load();
+        
+        if (new_level == old_level) {
+            return;  // No change
+        }
+        
+        logger_.warn("Changing degradation level", {
+            {"from", to_string(old_level)},
+            {"to", to_string(new_level)},
+            {"reason", reason}
+        });
+        
+        // Apply new configuration
+        const auto& config = configs_[new_level];
+        apply_configuration(config);
+        
+        current_level_.store(new_level, std::memory_order_release);
+        
+        // Send alert
+        alert_system_.send_alert(
+            get_alert_severity(new_level),
+            "System degradation level changed",
+            {
+                {"old_level", to_string(old_level)},
+                {"new_level", to_string(new_level)},
+                {"reason", reason}
+            }
+        );
+        
+        // Take level-specific actions
+        handle_level_transition(old_level, new_level);
+    }
+    
+    DegradationLevel get_level() const {
+        return current_level_.load(std::memory_order_acquire);
+    }
+    
+    bool can_submit_order(const Order& order) const {
+        auto level = current_level_.load(std::memory_order_acquire);
+        const auto& config = configs_.at(level);
+        
+        // Check if new positions allowed
+        if (order.opens_new_position() && !config.allow_new_positions) {
+            logger_.warn("Order rejected - new positions not allowed", {
+                {"degradation_level", to_string(level)},
+                {"order_id", order.id}
+            });
+            return false;
+        }
+        
+        // Check if aggressive orders allowed
+        if (order.is_aggressive() && !config.allow_aggressive_orders) {
+            logger_.warn("Order rejected - aggressive orders not allowed", {
+                {"degradation_level", to_string(level)},
+                {"order_id", order.id}
+            });
+            return false;
+        }
+        
+        // Check order size
+        if (order.quantity > get_max_order_size(order.symbol)) {
+            logger_.warn("Order rejected - exceeds max size in degraded mode", {
+                {"degradation_level", to_string(level)},
+                {"order_id", order.id},
+                {"quantity", order.quantity}
+            });
+            return false;
+        }
+        
+        return true;
+    }
+    
+private:
+    void apply_configuration(const DegradationConfig& config) {
+        // Update risk limits
+        risk_manager_.set_position_limit_multiplier(
+            config.position_limit_multiplier
+        );
+        
+        // Update rate limiters
+        rate_limiter_.set_rate_multiplier(config.order_rate_multiplier);
+        
+        // Update strategy manager
+        strategy_manager_.enable_only(config.enabled_strategies);
+        
+        // Update heartbeat intervals
+        heartbeat_monitor_.set_interval(config.heartbeat_interval);
+        
+        logger_.info("Degradation configuration applied", {
+            {"level", to_string(config.level)},
+            {"position_multiplier", config.position_limit_multiplier},
+            {"rate_multiplier", config.order_rate_multiplier}
+        });
+    }
+    
+    void handle_level_transition(DegradationLevel from, DegradationLevel to) {
+        if (to == DegradationLevel::EMERGENCY_HALT) {
+            // Cancel all orders
+            order_manager_.cancel_all_orders();
+            
+            // Stop all strategies
+            strategy_manager_.stop_all();
+            
+            logger_.critical("Emergency halt activated - all trading stopped");
+            
+        } else if (to == DegradationLevel::CLOSE_ONLY) {
+            // Cancel all orders that open new positions
+            order_manager_.cancel_opening_orders();
+            
+            // Pause strategies
+            strategy_manager_.pause_all();
+            
+            logger_.error("Close-only mode activated");
+            
+        } else if (to == DegradationLevel::DEFENSIVE_MODE) {
+            // Reduce positions
+            position_manager_.reduce_all_positions(0.5);
+            
+            logger_.warn("Defensive mode activated");
+            
+        } else if (to < from) {
+            // Recovering - gradually re-enable
+            logger_.info("System recovering to higher degradation level");
+        }
+    }
+    
+    AlertSeverity get_alert_severity(DegradationLevel level) const {
+        switch (level) {
+            case DegradationLevel::NORMAL:
+                return AlertSeverity::P4_LOW;
+            case DegradationLevel::REDUCED_CAPACITY:
+                return AlertSeverity::P3_MEDIUM;
+            case DegradationLevel::DEFENSIVE_MODE:
+                return AlertSeverity::P2_HIGH;
+            case DegradationLevel::CLOSE_ONLY:
+            case DegradationLevel::EMERGENCY_HALT:
+                return AlertSeverity::P1_CRITICAL;
+        }
+        return AlertSeverity::P3_MEDIUM;
+    }
+};
+
+} // namespace hft::degradation
+
+================================================================================
+                       3. FEATURE PRIORITIZATION
+================================================================================
+
+FEATURE PRIORITY MATRIX:
+
+Priority  Feature                    Essential?  Degradation Action
+--------------------------------------------------------------------------------
+P0        Order execution            YES         Keep always
+P0        Position tracking          YES         Keep always
+P0        Risk monitoring            YES         Keep always
+P1        Market making              YES         Keep in defensive mode
+P1        Market data processing     YES         Reduce frequency if needed
+P2        Directional strategies     NO          Pause in reduced capacity
+P2        Analytics                  NO          Disable in defensive mode
+P3        Performance monitoring     NO          Reduce sampling
+P3        Historical data logging    NO          Batch/delay
+P4        Dashboard updates          NO          Disable
+P4        Non-critical alerts        NO          Disable
+
+IMPLEMENTATION:
+
+class FeatureManager {
+private:
+    enum class FeaturePriority {
+        P0_CRITICAL = 0,
+        P1_ESSENTIAL = 1,
+        P2_IMPORTANT = 2,
+        P3_NICE_TO_HAVE = 3,
+        P4_OPTIONAL = 4
+    };
+    
+    std::unordered_map<std::string, FeaturePriority> feature_priorities_;
+    std::unordered_set<std::string> enabled_features_;
+    
+public:
+    void configure_for_degradation_level(DegradationLevel level) {
+        switch (level) {
+            case DegradationLevel::NORMAL:
+                enable_all_features();
+                break;
+                
+            case DegradationLevel::REDUCED_CAPACITY:
+                enable_up_to_priority(FeaturePriority::P2_IMPORTANT);
+                break;
+                
+            case DegradationLevel::DEFENSIVE_MODE:
+                enable_up_to_priority(FeaturePriority::P1_ESSENTIAL);
+                break;
+                
+            case DegradationLevel::CLOSE_ONLY:
+            case DegradationLevel::EMERGENCY_HALT:
+                enable_up_to_priority(FeaturePriority::P0_CRITICAL);
+                break;
+        }
+    }
+    
+    bool is_feature_enabled(const std::string& feature) const {
+        return enabled_features_.count(feature) > 0;
+    }
+    
+private:
+    void enable_up_to_priority(FeaturePriority max_priority) {
+        enabled_features_.clear();
+        
+        for (const auto& [feature, priority] : feature_priorities_) {
+            if (priority <= max_priority) {
+                enabled_features_.insert(feature);
+            }
+        }
+        
+        logger_.info("Features configured for degradation", {
+            {"enabled_count", enabled_features_.size()},
+            {"max_priority", static_cast<int>(max_priority)}
+        });
+    }
+};
+
+================================================================================
+                              END OF DOCUMENT
+================================================================================
+
+================================================================================
+                    5. RESOURCE OPTIMIZATION IN DEGRADED MODE
+================================================================================
+
+class ResourceOptimizer {
+public:
+    void optimize_for_degradation_level(DegradationLevel level) {
+        switch (level) {
+            case DegradationLevel::NORMAL:
+                apply_normal_settings();
+                break;
+                
+            case DegradationLevel::REDUCED_CAPACITY:
+                apply_reduced_capacity_optimization();
+                break;
+                
+            case DegradationLevel::DEFENSIVE_MODE:
+                apply_defensive_optimization();
+                break;
+                
+            case DegradationLevel::CLOSE_ONLY:
+            case DegradationLevel::EMERGENCY_HALT:
+                apply_minimal_resource_usage();
+                break;
+        }
+    }
+    
+private:
+    void apply_reduced_capacity_optimization() {
+        logger_.info("Applying reduced capacity optimizations");
+        
+        // Reduce thread pool sizes
+        thread_pool_.resize(std::thread::hardware_concurrency() * 0.75);
+        
+        // Reduce buffer sizes
+        message_queue_.set_max_size(1024 * 512);  // From 1MB to 512KB
+        
+        // Reduce logging verbosity
+        logger_.set_level(LogLevel::WARN);
+        
+        // Increase batch sizes (reduce frequency)
+        order_batcher_.set_batch_size(100);  // From 50 to 100
+        order_batcher_.set_batch_timeout(std::chrono::milliseconds(20));
+        
+        // Reduce market data sampling
+        market_data_sampler_.set_sample_rate(0.75);
+    }
+    
+    void apply_defensive_optimization() {
+        logger_.info("Applying defensive mode optimizations");
+        
+        // Further reduce thread pools
+        thread_pool_.resize(std::thread::hardware_concurrency() * 0.5);
+        
+        // Minimal buffer sizes
+        message_queue_.set_max_size(1024 * 256);  // 256KB
+        
+        // Critical logging only
+        logger_.set_level(LogLevel::ERROR);
+        
+        // Larger batches, less frequency
+        order_batcher_.set_batch_size(200);
+        order_batcher_.set_batch_timeout(std::chrono::milliseconds(50));
+        
+        // Reduced market data
+        market_data_sampler_.set_sample_rate(0.5);
+        
+        // Disable analytics
+        analytics_engine_.pause();
+        
+        // Disable non-critical monitoring
+        performance_monitor_.set_sampling_rate(0.1);
+    }
+    
+    void apply_minimal_resource_usage() {
+        logger_.critical("Applying minimal resource usage");
+        
+        // Minimal threads
+        thread_pool_.resize(4);
+        
+        // Minimal buffers
+        message_queue_.set_max_size(1024 * 64);  // 64KB
+        
+        // Critical logs only
+        logger_.set_level(LogLevel::CRITICAL);
+        
+        // Disable all non-essential components
+        analytics_engine_.stop();
+        performance_monitor_.stop();
+        dashboard_updater_.stop();
+        
+        // Keep only position tracking and risk monitoring
+    }
+};
+
+================================================================================
+                6. AUTOMATED DEGRADATION TRIGGERS
+================================================================================
+
+class AutomatedDegradationTriggers {
+private:
+    struct TriggerCondition {
+        std::string name;
+        std::function<bool()> condition;
+        DegradationLevel target_level;
+        std::chrono::seconds cooldown{300};
+        std::chrono::steady_clock::time_point last_triggered;
+    };
+    
+    std::vector<TriggerCondition> triggers_;
+    
+public:
+    void initialize_triggers() {
+        // Trigger 1: High CPU usage
+        triggers_.push_back({
+            .name = "high_cpu_usage",
+            .condition = [this]() {
+                return system_monitor_.get_cpu_usage() > 90.0;
+            },
+            .target_level = DegradationLevel::REDUCED_CAPACITY
+        });
+        
+        // Trigger 2: High memory usage
+        triggers_.push_back({
+            .name = "high_memory_usage",
+            .condition = [this]() {
+                return system_monitor_.get_memory_usage() > 85.0;
+            },
+            .target_level = DegradationLevel::REDUCED_CAPACITY
+        });
+        
+        // Trigger 3: Multiple exchange disconnects
+        triggers_.push_back({
+            .name = "multiple_exchange_disconnects",
+            .condition = [this]() {
+                return exchange_manager_.get_disconnected_count() >= 2;
+            },
+            .target_level = DegradationLevel::DEFENSIVE_MODE
+        });
+        
+        // Trigger 4: High order rejection rate
+        triggers_.push_back({
+            .name = "high_rejection_rate",
+            .condition = [this]() {
+                return order_manager_.get_rejection_rate() > 0.3;  // 30%
+            },
+            .target_level = DegradationLevel::DEFENSIVE_MODE
+        });
+        
+        // Trigger 5: Risk limit breach
+        triggers_.push_back({
+            .name = "risk_limit_breach",
+            .condition = [this]() {
+                return risk_manager_.get_utilization() > 0.95;  // 95%
+            },
+            .target_level = DegradationLevel::CLOSE_ONLY
+        });
+        
+        // Trigger 6: Critical system error
+        triggers_.push_back({
+            .name = "critical_system_error",
+            .condition = [this]() {
+                return error_counter_.get_critical_count_1min() >= 5;
+            },
+            .target_level = DegradationLevel::EMERGENCY_HALT
+        });
+    }
+    
+    void evaluate_triggers() {
+        auto now = std::chrono::steady_clock::now();
+        
+        for (auto& trigger : triggers_) {
+            // Check cooldown
+            if (now - trigger.last_triggered < trigger.cooldown) {
+                continue;
+            }
+            
+            // Evaluate condition
+            if (trigger.condition()) {
+                logger_.warn("Degradation trigger activated", {
+                    {"trigger", trigger.name},
+                    {"target_level", to_string(trigger.target_level)}
+                });
+                
+                // Activate degradation
+                degradation_manager_.set_level(
+                    trigger.target_level,
+                    "Automatic trigger: " + trigger.name
+                );
+                
+                trigger.last_triggered = now;
+            }
+        }
+    }
+};
+
+================================================================================
+                  7. RECOVERY TO NORMAL OPERATION
+================================================================================
+
+class RecoveryCoordinator {
+public:
+    void initiate_gradual_recovery() {
+        logger_.info("Initiating gradual recovery to normal operation");
+        
+        // Start from current level
+        auto current = degradation_manager_.get_level();
+        
+        if (current == DegradationLevel::NORMAL) {
+            logger_.info("Already at normal operation");
+            return;
+        }
+        
+        // Plan recovery steps
+        std::vector<RecoveryStep> steps = plan_recovery_steps(current);
+        
+        // Execute recovery plan
+        execute_recovery_plan(steps);
+    }
+    
+private:
+    struct RecoveryStep {
+        DegradationLevel level;
+        std::chrono::seconds wait_time;
+        std::function<bool()> validation;
+        std::string description;
+    };
+    
+    std::vector<RecoveryStep> plan_recovery_steps(DegradationLevel from) {
+        std::vector<RecoveryStep> steps;
+        
+        if (from >= DegradationLevel::EMERGENCY_HALT) {
+            steps.push_back({
+                .level = DegradationLevel::CLOSE_ONLY,
+                .wait_time = std::chrono::minutes(2),
+                .validation = [this]() {
+                    return validate_basic_health();
+                },
+                .description = "Transition to close-only mode"
+            });
+        }
+        
+        if (from >= DegradationLevel::CLOSE_ONLY) {
+            steps.push_back({
+                .level = DegradationLevel::DEFENSIVE_MODE,
+                .wait_time = std::chrono::minutes(5),
+                .validation = [this]() {
+                    return validate_system_stability();
+                },
+                .description = "Transition to defensive mode"
+            });
+        }
+        
+        if (from >= DegradationLevel::DEFENSIVE_MODE) {
+            steps.push_back({
+                .level = DegradationLevel::REDUCED_CAPACITY,
+                .wait_time = std::chrono::minutes(10),
+                .validation = [this]() {
+                    return validate_performance_acceptable();
+                },
+                .description = "Transition to reduced capacity"
+            });
+        }
+        
+        if (from >= DegradationLevel::REDUCED_CAPACITY) {
+            steps.push_back({
+                .level = DegradationLevel::NORMAL,
+                .wait_time = std::chrono::minutes(15),
+                .validation = [this]() {
+                    return validate_full_functionality();
+                },
+                .description = "Transition to normal operation"
+            });
+        }
+        
+        return steps;
+    }
+    
+    void execute_recovery_plan(const std::vector<RecoveryStep>& steps) {
+        for (const auto& step : steps) {
+            logger_.info("Recovery step", {
+                {"description", step.description},
+                {"target_level", to_string(step.level)},
+                {"wait_time_s", step.wait_time.count()}
+            });
+            
+            // Transition to level
+            degradation_manager_.set_level(step.level,
+                "Gradual recovery: " + step.description);
+            
+            // Wait for stabilization
+            std::this_thread::sleep_for(step.wait_time);
+            
+            // Validate
+            if (!step.validation()) {
+                logger_.error("Recovery validation failed", {
+                    {"step", step.description}
+                });
+                
+                // Rollback to previous level
+                rollback_recovery();
+                return;
+            }
+            
+            logger_.info("Recovery step completed successfully", {
+                {"step", step.description}
+            });
+        }
+        
+        logger_.info("Full recovery to normal operation completed");
+        
+        alert_system_.send_alert(
+            AlertSeverity::P4_LOW,
+            "System recovered to normal operation",
+            {{"recovery_time", format_duration(total_recovery_time_)}}
+        );
+    }
+    
+    bool validate_basic_health() {
+        return system_monitor_.get_cpu_usage() < 80.0 &&
+               system_monitor_.get_memory_usage() < 75.0 &&
+               exchange_manager_.get_connected_count() >= 1;
+    }
+    
+    bool validate_system_stability() {
+        // Check metrics over 1 minute window
+        auto metrics = metrics_collector_.get_1min_average();
+        
+        return metrics.avg_latency_us < 1000 &&
+               metrics.error_rate < 0.01 &&
+               metrics.circuit_breaker_open_count == 0;
+    }
+    
+    bool validate_performance_acceptable() {
+        auto metrics = metrics_collector_.get_5min_average();
+        
+        return metrics.avg_latency_us < 500 &&
+               metrics.error_rate < 0.001 &&
+               metrics.order_fill_rate > 0.8;
+    }
+    
+    bool validate_full_functionality() {
+        return strategy_manager_.all_strategies_healthy() &&
+               order_manager_.get_queue_depth() < 100 &&
+               position_manager_.all_positions_reconciled() &&
+               risk_manager_.within_limits();
+    }
+};
+
+================================================================================
+                              END OF DOCUMENT
+================================================================================

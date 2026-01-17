@@ -1,0 +1,1243 @@
+================================================================================
+SIMULATION TESTING FOR HFT SYSTEMS
+Paper Trading and Real-Time Simulation Framework
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Simulation Architecture
+2. Paper Trading Engine
+3. Simulated Exchange Environment
+4. Real-Time Market Simulation
+5. Order Matching Simulation
+6. Latency Simulation
+7. Risk-Free Testing Environment
+8. Performance Monitoring
+9. Simulation to Production Transition
+10. Continuous Simulation Testing
+
+================================================================================
+1. SIMULATION ARCHITECTURE
+================================================================================
+
+1.1 Simulation Framework Overview
+----------------------------------
+// include/simulation/simulation_engine.h
+#ifndef SIMULATION_ENGINE_H
+#define SIMULATION_ENGINE_H
+
+#include <memory>
+#include <string>
+#include <chrono>
+#include "strategy_interface.h"
+#include "simulated_exchange.h"
+#include "market_data_feed.h"
+
+using namespace std::chrono;
+
+enum class SimulationMode {
+    PAPER_TRADING,      // Live data, simulated execution
+    FULL_SIMULATION,    // Simulated data and execution
+    HYBRID              // Live data with some simulation
+};
+
+struct SimulationConfig {
+    SimulationMode mode;
+    double initial_capital;
+    bool use_live_data;
+    bool simulate_latency;
+    std::vector<std::string> symbols;
+    std::string log_directory;
+
+    // Realism parameters
+    bool enable_slippage;
+    bool enable_partial_fills;
+    bool enable_rejections;
+    double rejection_rate;
+
+    // Performance tracking
+    bool record_all_events;
+    int snapshot_interval_ms;
+};
+
+class SimulationEngine {
+public:
+    explicit SimulationEngine(const SimulationConfig& config);
+    ~SimulationEngine();
+
+    void addStrategy(std::shared_ptr<Strategy> strategy);
+    void setMarketDataFeed(std::shared_ptr<MarketDataFeed> feed);
+
+    void start();
+    void stop();
+    void pause();
+    void resume();
+
+    SimulationResults getResults() const;
+    void exportResults(const std::string& filename);
+
+    // Monitoring
+    double getCurrentEquity() const;
+    std::map<std::string, Position> getCurrentPositions() const;
+    std::vector<Order> getPendingOrders() const;
+
+private:
+    void runSimulation();
+    void handleMarketData(const Quote& quote);
+    void handleTrade(const Trade& trade);
+    void processStrategySignals();
+
+    SimulationConfig config_;
+    std::shared_ptr<Strategy> strategy_;
+    std::shared_ptr<SimulatedExchange> exchange_;
+    std::shared_ptr<MarketDataFeed> market_data_;
+    std::shared_ptr<PortfolioManager> portfolio_;
+
+    bool running_;
+    std::thread simulation_thread_;
+};
+
+#endif // SIMULATION_ENGINE_H
+
+
+1.2 Simulation Engine Implementation
+-------------------------------------
+// src/simulation/simulation_engine.cpp
+#include "simulation_engine.h"
+#include <iostream>
+#include <fstream>
+
+SimulationEngine::SimulationEngine(const SimulationConfig& config)
+    : config_(config), running_(false) {
+
+    // Initialize simulated exchange
+    ExchangeConfig ex_config;
+    ex_config.enable_slippage = config.enable_slippage;
+    ex_config.enable_partial_fills = config.enable_partial_fills;
+    ex_config.rejection_rate = config.rejection_rate;
+
+    exchange_ = std::make_shared<SimulatedExchange>(ex_config);
+
+    // Initialize portfolio
+    portfolio_ = std::make_shared<PortfolioManager>(config.initial_capital);
+
+    std::cout << "Simulation engine initialized" << std::endl;
+    std::cout << "  Mode: " << getModeString(config.mode) << std::endl;
+    std::cout << "  Capital: $" << config.initial_capital << std::endl;
+    std::cout << "  Symbols: " << config.symbols.size() << std::endl;
+}
+
+SimulationEngine::~SimulationEngine() {
+    stop();
+}
+
+void SimulationEngine::start() {
+    if (running_) {
+        std::cerr << "Simulation already running" << std::endl;
+        return;
+    }
+
+    if (!strategy_) {
+        throw std::runtime_error("Strategy not set");
+    }
+
+    if (config_.use_live_data && !market_data_) {
+        throw std::runtime_error("Market data feed not set");
+    }
+
+    running_ = true;
+
+    // Initialize strategy
+    strategy_->onSimulationStart();
+
+    // Start exchange simulator
+    exchange_->start();
+
+    // Subscribe to market data
+    if (config_.use_live_data) {
+        for (const auto& symbol : config_.symbols) {
+            market_data_->subscribe(symbol);
+        }
+
+        // Set up callbacks
+        market_data_->setQuoteCallback(
+            [this](const Quote& quote) { handleMarketData(quote); }
+        );
+
+        market_data_->setTradeCallback(
+            [this](const Trade& trade) { handleTrade(trade); }
+        );
+    }
+
+    // Start simulation thread
+    simulation_thread_ = std::thread(&SimulationEngine::runSimulation, this);
+
+    std::cout << "Simulation started" << std::endl;
+}
+
+void SimulationEngine::stop() {
+    if (!running_) {
+        return;
+    }
+
+    running_ = false;
+
+    if (simulation_thread_.joinable()) {
+        simulation_thread_.join();
+    }
+
+    exchange_->stop();
+
+    if (market_data_) {
+        for (const auto& symbol : config_.symbols) {
+            market_data_->unsubscribe(symbol);
+        }
+    }
+
+    strategy_->onSimulationEnd();
+
+    std::cout << "Simulation stopped" << std::endl;
+}
+
+void SimulationEngine::runSimulation() {
+    auto last_snapshot = high_resolution_clock::now();
+
+    while (running_) {
+        // Process strategy signals
+        processStrategySignals();
+
+        // Update portfolio
+        portfolio_->update();
+
+        // Take periodic snapshots
+        auto now = high_resolution_clock::now();
+        auto elapsed = duration_cast<milliseconds>(now - last_snapshot).count();
+
+        if (elapsed >= config_.snapshot_interval_ms) {
+            recordSnapshot();
+            last_snapshot = now;
+        }
+
+        // Small sleep to prevent busy-waiting
+        std::this_thread::sleep_for(microseconds(100));
+    }
+}
+
+void SimulationEngine::handleMarketData(const Quote& quote) {
+    // Update portfolio with current prices
+    portfolio_->updateMarketPrice(quote.symbol, quote.bid_price, quote.ask_price);
+
+    // Feed to strategy
+    strategy_->onQuote(quote);
+}
+
+void SimulationEngine::processStrategySignals() {
+    auto signals = strategy_->getSignals();
+
+    for (const auto& signal : signals) {
+        // Convert signal to order
+        Order order;
+        order.symbol = signal.symbol;
+        order.side = signal.side;
+        order.quantity = signal.quantity;
+        order.price = signal.price;
+        order.order_type = signal.order_type;
+        order.timestamp = system_clock::now();
+
+        // Submit to simulated exchange
+        auto result = exchange_->submitOrder(order);
+
+        if (result.accepted) {
+            std::cout << "Order accepted: " << order.symbol << " "
+                     << (order.side == OrderSide::BUY ? "BUY" : "SELL")
+                     << " " << order.quantity << " @ " << order.price << std::endl;
+
+            // If order fills, update portfolio
+            if (result.fill) {
+                portfolio_->executeTrade(*result.fill);
+
+                // Notify strategy
+                strategy_->onFill(*result.fill);
+            }
+        } else {
+            std::cout << "Order rejected: " << result.reject_reason << std::endl;
+        }
+    }
+}
+
+
+================================================================================
+2. PAPER TRADING ENGINE
+================================================================================
+
+2.1 Paper Trading Implementation
+---------------------------------
+// include/simulation/paper_trading_engine.h
+#ifndef PAPER_TRADING_ENGINE_H
+#define PAPER_TRADING_ENGINE_H
+
+#include "simulation_engine.h"
+#include "live_market_data.h"
+
+class PaperTradingEngine : public SimulationEngine {
+public:
+    explicit PaperTradingEngine(double initial_capital);
+
+    // Connect to live market data
+    void connectToMarketData(const std::string& exchange_name);
+
+    // Real-time monitoring
+    void enableWebDashboard(int port = 8080);
+    void enableAlerts(const std::string& email);
+
+    // Comparison with live market
+    void trackRealOrders(const std::string& account_id);
+    ComparisonReport compareWithLive() const;
+
+private:
+    std::shared_ptr<LiveMarketDataFeed> live_feed_;
+    std::shared_ptr<WebDashboard> dashboard_;
+};
+
+#endif // PAPER_TRADING_ENGINE_H
+
+
+2.2 Paper Trading Example
+--------------------------
+// examples/paper_trading_example.cpp
+#include "paper_trading_engine.h"
+#include "momentum_strategy.h"
+#include <iostream>
+
+int main() {
+    // Create paper trading engine
+    PaperTradingEngine engine(100000.0);  // $100k virtual capital
+
+    // Create and configure strategy
+    MomentumStrategyConfig config;
+    config.lookback_period = 20;
+    config.entry_threshold = 0.02;  // 2% momentum
+    config.position_size = 1000;
+
+    auto strategy = std::make_shared<MomentumStrategy>(config);
+    engine.addStrategy(strategy);
+
+    // Connect to live market data
+    engine.connectToMarketData("NASDAQ");
+
+    // Enable web dashboard for monitoring
+    engine.enableWebDashboard(8080);
+
+    // Start paper trading
+    std::cout << "Starting paper trading..." << std::endl;
+    std::cout << "Dashboard: http://localhost:8080" << std::endl;
+    engine.start();
+
+    // Run for specified duration
+    std::cout << "Press Enter to stop..." << std::endl;
+    std::cin.get();
+
+    // Stop and get results
+    engine.stop();
+
+    auto results = engine.getResults();
+    std::cout << "\n=== Paper Trading Results ===" << std::endl;
+    std::cout << "Total Return: " << results.total_return * 100 << "%" << std::endl;
+    std::cout << "Sharpe Ratio: " << results.sharpe_ratio << std::endl;
+    std::cout << "Win Rate: " << results.win_rate * 100 << "%" << std::endl;
+    std::cout << "Total Trades: " << results.total_trades << std::endl;
+
+    engine.exportResults("paper_trading_results.csv");
+
+    return 0;
+}
+
+
+================================================================================
+3. SIMULATED EXCHANGE ENVIRONMENT
+================================================================================
+
+3.1 Simulated Exchange
+-----------------------
+// include/simulation/simulated_exchange.h
+#ifndef SIMULATED_EXCHANGE_H
+#define SIMULATED_EXCHANGE_H
+
+#include <map>
+#include <queue>
+#include <mutex>
+#include <random>
+#include "order_book.h"
+
+struct ExchangeConfig {
+    bool enable_slippage;
+    bool enable_partial_fills;
+    bool enable_rejections;
+    double rejection_rate;
+    double fill_probability;
+    int min_latency_us;
+    int max_latency_us;
+};
+
+struct OrderResult {
+    bool accepted;
+    std::string reject_reason;
+    std::optional<Fill> fill;
+    int latency_us;
+};
+
+class SimulatedExchange {
+public:
+    explicit SimulatedExchange(const ExchangeConfig& config);
+
+    void start();
+    void stop();
+
+    OrderResult submitOrder(const Order& order);
+    bool cancelOrder(uint64_t order_id);
+    bool modifyOrder(uint64_t order_id, double new_price, int new_quantity);
+
+    // Market simulation
+    void updateMarketData(const Quote& quote);
+    void setOrderBook(const std::string& symbol, const OrderBook& book);
+
+    // Statistics
+    ExchangeStatistics getStatistics() const;
+
+private:
+    void processOrders();
+    OrderResult matchOrder(const Order& order);
+    Fill simulateFill(const Order& order, const Quote& current_quote);
+    int simulateLatency();
+    bool shouldReject();
+
+    ExchangeConfig config_;
+    std::map<std::string, OrderBook> order_books_;
+    std::map<std::string, Quote> current_quotes_;
+    std::map<uint64_t, Order> pending_orders_;
+
+    std::thread processing_thread_;
+    std::mutex order_mutex_;
+    bool running_;
+
+    std::mt19937 rng_;
+    std::uniform_real_distribution<> uniform_dist_;
+    std::normal_distribution<> latency_dist_;
+
+    // Statistics
+    std::atomic<uint64_t> orders_submitted_;
+    std::atomic<uint64_t> orders_filled_;
+    std::atomic<uint64_t> orders_rejected_;
+};
+
+#endif // SIMULATED_EXCHANGE_H
+
+
+3.2 Simulated Exchange Implementation
+--------------------------------------
+// src/simulation/simulated_exchange.cpp
+#include "simulated_exchange.h"
+#include <iostream>
+
+SimulatedExchange::SimulatedExchange(const ExchangeConfig& config)
+    : config_(config), running_(false),
+      uniform_dist_(0.0, 1.0),
+      orders_submitted_(0),
+      orders_filled_(0),
+      orders_rejected_(0) {
+
+    // Initialize RNG
+    std::random_device rd;
+    rng_.seed(rd());
+
+    // Set up latency distribution
+    double mean_latency = (config.min_latency_us + config.max_latency_us) / 2.0;
+    double stddev = (config.max_latency_us - config.min_latency_us) / 6.0;
+    latency_dist_ = std::normal_distribution<>(mean_latency, stddev);
+}
+
+void SimulatedExchange::start() {
+    running_ = true;
+    processing_thread_ = std::thread(&SimulatedExchange::processOrders, this);
+    std::cout << "Simulated exchange started" << std::endl;
+}
+
+void SimulatedExchange::stop() {
+    running_ = false;
+    if (processing_thread_.joinable()) {
+        processing_thread_.join();
+    }
+    std::cout << "Simulated exchange stopped" << std::endl;
+}
+
+OrderResult SimulatedExchange::submitOrder(const Order& order) {
+    orders_submitted_++;
+
+    // Simulate processing latency
+    int latency = simulateLatency();
+    std::this_thread::sleep_for(microseconds(latency));
+
+    OrderResult result;
+    result.latency_us = latency;
+
+    // Check for rejection
+    if (config_.enable_rejections && shouldReject()) {
+        result.accepted = false;
+        result.reject_reason = "Random rejection (simulation)";
+        orders_rejected_++;
+        return result;
+    }
+
+    // Validate order
+    if (order.quantity <= 0) {
+        result.accepted = false;
+        result.reject_reason = "Invalid quantity";
+        orders_rejected_++;
+        return result;
+    }
+
+    if (order.price <= 0 && order.order_type == OrderType::LIMIT) {
+        result.accepted = false;
+        result.reject_reason = "Invalid price";
+        orders_rejected_++;
+        return result;
+    }
+
+    // Accept order
+    result.accepted = true;
+
+    {
+        std::lock_guard<std::mutex> lock(order_mutex_);
+        pending_orders_[order.order_id] = order;
+    }
+
+    // Attempt immediate matching
+    auto match_result = matchOrder(order);
+    if (match_result.fill) {
+        result.fill = match_result.fill;
+        orders_filled_++;
+
+        // Remove from pending if completely filled
+        if (match_result.fill->quantity == order.quantity) {
+            std::lock_guard<std::mutex> lock(order_mutex_);
+            pending_orders_.erase(order.order_id);
+        }
+    }
+
+    return result;
+}
+
+OrderResult SimulatedExchange::matchOrder(const Order& order) {
+    OrderResult result;
+    result.accepted = true;
+
+    // Get current market quote
+    auto quote_it = current_quotes_.find(order.symbol);
+    if (quote_it == current_quotes_.end()) {
+        return result;  // No fill
+    }
+
+    const Quote& quote = quote_it->second;
+
+    // Determine if order can be filled
+    bool can_fill = false;
+
+    if (order.order_type == OrderType::MARKET) {
+        can_fill = true;
+    } else if (order.order_type == OrderType::LIMIT) {
+        if (order.side == OrderSide::BUY && order.price >= quote.ask_price) {
+            can_fill = true;
+        } else if (order.side == OrderSide::SELL && order.price <= quote.bid_price) {
+            can_fill = true;
+        }
+    }
+
+    // Random fill probability
+    if (can_fill && uniform_dist_(rng_) <= config_.fill_probability) {
+        result.fill = simulateFill(order, quote);
+    }
+
+    return result;
+}
+
+Fill SimulatedExchange::simulateFill(const Order& order, const Quote& current_quote) {
+    Fill fill;
+    fill.order_id = order.order_id;
+    fill.symbol = order.symbol;
+    fill.timestamp = system_clock::now();
+
+    // Determine fill price
+    if (order.order_type == OrderType::MARKET) {
+        fill.price = (order.side == OrderSide::BUY) ? current_quote.ask_price : current_quote.bid_price;
+    } else {
+        fill.price = order.price;
+    }
+
+    // Apply slippage
+    if (config_.enable_slippage) {
+        double slippage = fill.price * 0.0001;  // 1 bp
+        if (order.side == OrderSide::BUY) {
+            fill.price += slippage;
+        } else {
+            fill.price -= slippage;
+        }
+    }
+
+    // Determine fill quantity
+    if (config_.enable_partial_fills && uniform_dist_(rng_) < 0.3) {
+        // 30% chance of partial fill
+        fill.quantity = order.quantity / 2;
+    } else {
+        fill.quantity = order.quantity;
+    }
+
+    return fill;
+}
+
+int SimulatedExchange::simulateLatency() {
+    int latency = static_cast<int>(latency_dist_(rng_));
+    return std::max(config_.min_latency_us,
+                    std::min(config_.max_latency_us, latency));
+}
+
+bool SimulatedExchange::shouldReject() {
+    return uniform_dist_(rng_) < config_.rejection_rate;
+}
+
+void SimulatedExchange::processOrders() {
+    while (running_) {
+        std::this_thread::sleep_for(milliseconds(10));
+
+        std::lock_guard<std::mutex> lock(order_mutex_);
+
+        // Process pending orders
+        for (auto it = pending_orders_.begin(); it != pending_orders_.end(); ) {
+            auto& order = it->second;
+
+            auto result = matchOrder(order);
+            if (result.fill) {
+                // Notify about fill (would callback in real implementation)
+                if (result.fill->quantity == order.quantity) {
+                    it = pending_orders_.erase(it);
+                    orders_filled_++;
+                } else {
+                    // Partial fill
+                    order.quantity -= result.fill->quantity;
+                    ++it;
+                }
+            } else {
+                ++it;
+            }
+        }
+    }
+}
+
+void SimulatedExchange::updateMarketData(const Quote& quote) {
+    std::lock_guard<std::mutex> lock(order_mutex_);
+    current_quotes_[quote.symbol] = quote;
+}
+
+ExchangeStatistics SimulatedExchange::getStatistics() const {
+    ExchangeStatistics stats;
+    stats.orders_submitted = orders_submitted_.load();
+    stats.orders_filled = orders_filled_.load();
+    stats.orders_rejected = orders_rejected_.load();
+    stats.fill_rate = static_cast<double>(stats.orders_filled) / stats.orders_submitted;
+    stats.rejection_rate = static_cast<double>(stats.orders_rejected) / stats.orders_submitted;
+    return stats;
+}
+
+
+================================================================================
+4. REAL-TIME MARKET SIMULATION
+================================================================================
+
+4.1 Market Data Generator
+--------------------------
+// include/simulation/market_data_generator.h
+#ifndef MARKET_DATA_GENERATOR_H
+#define MARKET_DATA_GENERATOR_H
+
+#include <random>
+#include <functional>
+#include "market_data.h"
+
+class MarketDataGenerator {
+public:
+    MarketDataGenerator(double initial_price, double volatility);
+
+    void start();
+    void stop();
+
+    void setQuoteCallback(std::function<void(const Quote&)> callback);
+    void setTradeCallback(std::function<void(const Trade&)> callback);
+
+    // Control market behavior
+    void setTrendBias(double bias);  // -1.0 to 1.0
+    void setSpreadBps(double bps);
+    void setTickFrequency(int updates_per_second);
+
+private:
+    void generateMarketData();
+    Quote generateQuote();
+    Trade generateTrade();
+
+    double current_price_;
+    double volatility_;
+    double trend_bias_;
+    double spread_bps_;
+    int tick_frequency_;
+
+    std::mt19937 rng_;
+    std::normal_distribution<> price_dist_;
+    std::uniform_int_distribution<> size_dist_;
+
+    bool running_;
+    std::thread generator_thread_;
+
+    std::function<void(const Quote&)> quote_callback_;
+    std::function<void(const Trade&)> trade_callback_;
+};
+
+#endif // MARKET_DATA_GENERATOR_H
+
+
+4.2 Realistic Market Simulation
+--------------------------------
+// src/simulation/market_data_generator.cpp
+#include "market_data_generator.h"
+#include <iostream>
+
+MarketDataGenerator::MarketDataGenerator(double initial_price, double volatility)
+    : current_price_(initial_price),
+      volatility_(volatility),
+      trend_bias_(0.0),
+      spread_bps_(5.0),
+      tick_frequency_(100),
+      size_dist_(100, 10000),
+      running_(false) {
+
+    std::random_device rd;
+    rng_.seed(rd());
+
+    // Price changes follow normal distribution
+    price_dist_ = std::normal_distribution<>(0.0, volatility);
+}
+
+void MarketDataGenerator::start() {
+    running_ = true;
+    generator_thread_ = std::thread(&MarketDataGenerator::generateMarketData, this);
+    std::cout << "Market data generator started" << std::endl;
+}
+
+void MarketDataGenerator::stop() {
+    running_ = false;
+    if (generator_thread_.joinable()) {
+        generator_thread_.join();
+    }
+}
+
+void MarketDataGenerator::generateMarketData() {
+    auto interval = microseconds(1000000 / tick_frequency_);
+
+    while (running_) {
+        auto start = high_resolution_clock::now();
+
+        // Update price with random walk
+        double price_change = price_dist_(rng_) + trend_bias_;
+        current_price_ += price_change;
+
+        // Generate quote
+        Quote quote = generateQuote();
+        if (quote_callback_) {
+            quote_callback_(quote);
+        }
+
+        // Occasionally generate trades
+        if (std::uniform_real_distribution<>(0.0, 1.0)(rng_) < 0.3) {
+            Trade trade = generateTrade();
+            if (trade_callback_) {
+                trade_callback_(trade);
+            }
+        }
+
+        // Sleep to maintain frequency
+        auto end = high_resolution_clock::now();
+        auto elapsed = duration_cast<microseconds>(end - start);
+        if (elapsed < interval) {
+            std::this_thread::sleep_for(interval - elapsed);
+        }
+    }
+}
+
+Quote MarketDataGenerator::generateQuote() {
+    Quote quote;
+    quote.symbol = "SIM";
+    quote.timestamp = system_clock::now();
+
+    double spread = current_price_ * spread_bps_ / 10000.0;
+    quote.bid_price = current_price_ - spread / 2.0;
+    quote.ask_price = current_price_ + spread / 2.0;
+
+    quote.bid_size = size_dist_(rng_);
+    quote.ask_size = size_dist_(rng_);
+
+    return quote;
+}
+
+Trade MarketDataGenerator::generateTrade() {
+    Trade trade;
+    trade.symbol = "SIM";
+    trade.timestamp = system_clock::now();
+    trade.price = current_price_;
+    trade.size = size_dist_(rng_) / 10;
+    trade.side = (std::uniform_real_distribution<>(0.0, 1.0)(rng_) < 0.5)
+                 ? TradeSide::BUY : TradeSide::SELL;
+
+    return trade;
+}
+
+
+================================================================================
+5. ORDER MATCHING SIMULATION
+================================================================================
+
+5.1 Matching Engine Simulator
+------------------------------
+// include/simulation/matching_engine_simulator.h
+#ifndef MATCHING_ENGINE_SIMULATOR_H
+#define MATCHING_ENGINE_SIMULATOR_H
+
+#include <map>
+#include <queue>
+#include "order_book.h"
+
+enum class MatchingAlgorithm {
+    FIFO,           // First-In-First-Out
+    PRO_RATA,       // Proportional allocation
+    FIFO_LMM        // FIFO with Lead Market Maker priority
+};
+
+class MatchingEngineSimulator {
+public:
+    explicit MatchingEngineSimulator(MatchingAlgorithm algo = MatchingAlgorithm::FIFO);
+
+    void addOrder(const Order& order);
+    std::vector<Fill> match();
+
+    OrderBook getOrderBook(const std::string& symbol) const;
+    void setMatchingAlgorithm(MatchingAlgorithm algo);
+
+private:
+    std::vector<Fill> matchFIFO(const Order& incoming);
+    std::vector<Fill> matchProRata(const Order& incoming);
+
+    MatchingAlgorithm algorithm_;
+    std::map<std::string, OrderBook> books_;
+    std::queue<Order> order_queue_;
+};
+
+#endif // MATCHING_ENGINE_SIMULATOR_H
+
+
+5.2 Advanced Order Types Simulation
+------------------------------------
+TEST(SimulationTest, IcebergOrderMatching) {
+    MatchingEngineSimulator engine;
+
+    // Add iceberg order (only shows 100 out of 1000)
+    Order iceberg;
+    iceberg.order_id = 1;
+    iceberg.symbol = "AAPL";
+    iceberg.side = OrderSide::BUY;
+    iceberg.price = 150.00;
+    iceberg.quantity = 1000;
+    iceberg.display_quantity = 100;
+    iceberg.order_type = OrderType::ICEBERG;
+
+    engine.addOrder(iceberg);
+
+    auto book = engine.getOrderBook("AAPL");
+    EXPECT_EQ(book.getBidSize(150.00), 100);  // Only display quantity visible
+
+    // Match against it
+    Order market_sell;
+    market_sell.order_id = 2;
+    market_sell.symbol = "AAPL";
+    market_sell.side = OrderSide::SELL;
+    market_sell.quantity = 150;
+    market_sell.order_type = OrderType::MARKET;
+
+    engine.addOrder(market_sell);
+    auto fills = engine.match();
+
+    EXPECT_EQ(fills.size(), 2);  // Iceberg should replenish
+    EXPECT_EQ(fills[0].quantity, 100);
+    EXPECT_EQ(fills[1].quantity, 50);
+}
+
+
+================================================================================
+6. LATENCY SIMULATION
+================================================================================
+
+6.1 Network Latency Simulator
+------------------------------
+// include/simulation/latency_simulator.h
+#ifndef LATENCY_SIMULATOR_H
+#define LATENCY_SIMULATOR_H
+
+#include <random>
+#include <chrono>
+
+enum class LatencyProfile {
+    LAN,            // < 1ms
+    WAN,            // 1-50ms
+    INTERNET,       // 50-200ms
+    CUSTOM
+};
+
+class LatencySimulator {
+public:
+    explicit LatencySimulator(LatencyProfile profile);
+
+    void setCustomLatency(int mean_us, int stddev_us);
+    void setJitter(int jitter_us);
+    void setPacketLoss(double loss_rate);
+
+    void applyLatency();
+    int getLastLatency() const { return last_latency_us_; }
+
+private:
+    LatencyProfile profile_;
+    int mean_latency_us_;
+    int stddev_latency_us_;
+    int jitter_us_;
+    double packet_loss_rate_;
+
+    int last_latency_us_;
+
+    std::mt19937 rng_;
+    std::normal_distribution<> latency_dist_;
+    std::uniform_real_distribution<> loss_dist_;
+};
+
+#endif // LATENCY_SIMULATOR_H
+
+
+6.2 Latency Simulation Implementation
+--------------------------------------
+// src/simulation/latency_simulator.cpp
+#include "latency_simulator.h"
+#include <thread>
+
+LatencySimulator::LatencySimulator(LatencyProfile profile)
+    : profile_(profile),
+      jitter_us_(0),
+      packet_loss_rate_(0.0),
+      last_latency_us_(0),
+      loss_dist_(0.0, 1.0) {
+
+    std::random_device rd;
+    rng_.seed(rd());
+
+    // Set default parameters based on profile
+    switch (profile) {
+        case LatencyProfile::LAN:
+            mean_latency_us_ = 500;
+            stddev_latency_us_ = 100;
+            break;
+
+        case LatencyProfile::WAN:
+            mean_latency_us_ = 10000;
+            stddev_latency_us_ = 3000;
+            break;
+
+        case LatencyProfile::INTERNET:
+            mean_latency_us_ = 100000;
+            stddev_latency_us_ = 30000;
+            break;
+
+        case LatencyProfile::CUSTOM:
+            // Will be set by user
+            break;
+    }
+
+    latency_dist_ = std::normal_distribution<>(mean_latency_us_, stddev_latency_us_);
+}
+
+void LatencySimulator::applyLatency() {
+    // Simulate packet loss
+    if (packet_loss_rate_ > 0.0 && loss_dist_(rng_) < packet_loss_rate_) {
+        // Packet lost, apply timeout latency
+        last_latency_us_ = mean_latency_us_ * 10;
+        std::this_thread::sleep_for(std::chrono::microseconds(last_latency_us_));
+        return;
+    }
+
+    // Calculate latency with jitter
+    int base_latency = static_cast<int>(latency_dist_(rng_));
+    int jitter = 0;
+
+    if (jitter_us_ > 0) {
+        std::uniform_int_distribution<> jitter_dist(-jitter_us_, jitter_us_);
+        jitter = jitter_dist(rng_);
+    }
+
+    last_latency_us_ = std::max(0, base_latency + jitter);
+
+    // Apply the delay
+    std::this_thread::sleep_for(std::chrono::microseconds(last_latency_us_));
+}
+
+
+================================================================================
+7. PERFORMANCE MONITORING
+================================================================================
+
+7.1 Real-Time Performance Tracker
+----------------------------------
+// include/simulation/performance_tracker.h
+#ifndef PERFORMANCE_TRACKER_H
+#define PERFORMANCE_TRACKER_H
+
+#include <deque>
+#include <chrono>
+#include "portfolio_snapshot.h"
+
+struct PerformanceMetrics {
+    double current_equity;
+    double total_pnl;
+    double unrealized_pnl;
+    double realized_pnl;
+    double daily_pnl;
+    double sharpe_ratio_live;
+    double win_rate;
+    int trades_today;
+    int total_trades;
+    std::map<std::string, double> symbol_pnl;
+};
+
+class PerformanceTracker {
+public:
+    PerformanceTracker();
+
+    void update(const PortfolioSnapshot& snapshot);
+    PerformanceMetrics getCurrentMetrics() const;
+
+    void resetDaily();
+    void exportMetrics(const std::string& filename);
+
+private:
+    void calculateLiveSharpe();
+
+    std::deque<PortfolioSnapshot> snapshots_;
+    std::deque<double> returns_;
+    PerformanceMetrics current_metrics_;
+
+    std::chrono::system_clock::time_point last_reset_;
+};
+
+#endif // PERFORMANCE_TRACKER_H
+
+
+================================================================================
+8. SIMULATION TO PRODUCTION TRANSITION
+================================================================================
+
+8.1 Gradual Rollout Strategy
+-----------------------------
+// include/simulation/hybrid_mode.h
+#ifndef HYBRID_MODE_H
+#define HYBRID_MODE_H
+
+#include "simulation_engine.h"
+#include "live_trading_engine.h"
+
+class HybridTradingEngine {
+public:
+    HybridTradingEngine(
+        double initial_capital,
+        double production_allocation_pct
+    );
+
+    // Gradually increase live trading
+    void setProductionAllocation(double pct);
+    double getProductionAllocation() const;
+
+    // Compare simulation vs live performance
+    ComparisonReport comparePerformance() const;
+
+    void start();
+    void stop();
+
+private:
+    std::shared_ptr<SimulationEngine> sim_engine_;
+    std::shared_ptr<LiveTradingEngine> live_engine_;
+
+    double production_allocation_pct_;
+};
+
+#endif // HYBRID_MODE_H
+
+
+8.2 Validation Before Going Live
+---------------------------------
+// Test simulation accuracy
+TEST(SimulationValidation, CompareWithHistorical) {
+    // Run simulation on historical period
+    SimulationConfig sim_config;
+    sim_config.initial_capital = 100000;
+    sim_config.use_live_data = false;
+
+    SimulationEngine sim_engine(sim_config);
+    // ... configure with historical data
+    sim_engine.start();
+    auto sim_results = sim_engine.getResults();
+
+    // Compare with actual backtest
+    BacktestEngine backtest_engine(/* same period */);
+    backtest_engine.run();
+    auto backtest_results = backtest_engine.getResults();
+
+    // Results should be very similar
+    double return_diff = std::abs(sim_results.total_return - backtest_results.total_return);
+    EXPECT_LT(return_diff, 0.01) << "Simulation diverged from backtest";
+}
+
+
+================================================================================
+9. CONTINUOUS SIMULATION TESTING
+================================================================================
+
+9.1 Automated Simulation Tests
+-------------------------------
+# .github/workflows/simulation_tests.yml
+name: Continuous Simulation Tests
+
+on:
+  schedule:
+    - cron: '0 0 * * *'  # Daily
+
+jobs:
+  simulation:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Build simulation
+      run: |
+        mkdir build && cd build
+        cmake -DBUILD_SIMULATION=ON ..
+        make
+
+    - name: Run 24-hour simulation
+      run: |
+        cd build
+        timeout 86400 ./hft_simulation --config simulation_config.json
+
+    - name: Analyze results
+      run: |
+        python scripts/analyze_simulation.py build/simulation_results.csv
+
+    - name: Upload results
+      uses: actions/upload-artifact@v3
+      with:
+        name: simulation-results
+        path: build/simulation_results.csv
+
+
+================================================================================
+10. COMPLETE SIMULATION TEST EXAMPLE
+================================================================================
+
+10.1 Full Simulation Test Suite
+--------------------------------
+// tests/simulation/full_simulation_test.cpp
+#include <gtest/gtest.h>
+#include "simulation_engine.h"
+#include "market_data_generator.h"
+#include "mean_reversion_strategy.h"
+
+class FullSimulationTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        // Configure simulation
+        SimulationConfig config;
+        config.mode = SimulationMode::FULL_SIMULATION;
+        config.initial_capital = 100000.0;
+        config.symbols = {"SIM1", "SIM2"};
+        config.use_live_data = false;
+        config.simulate_latency = true;
+        config.enable_slippage = true;
+        config.enable_partial_fills = true;
+
+        engine_ = std::make_unique<SimulationEngine>(config);
+
+        // Set up market data generator
+        market_gen_ = std::make_shared<MarketDataGenerator>(150.0, 0.01);
+
+        // Create strategy
+        strategy_ = std::make_shared<MeanReversionStrategy>();
+    }
+
+    std::unique_ptr<SimulationEngine> engine_;
+    std::shared_ptr<MarketDataGenerator> market_gen_;
+    std::shared_ptr<Strategy> strategy_;
+};
+
+TEST_F(FullSimulationTest, RunFullDay Simulation) {
+    engine_->addStrategy(strategy_);
+
+    // Start market data generation
+    market_gen_->start();
+
+    // Run simulation for simulated trading day
+    engine_->start();
+
+    // Let it run for 10 seconds (simulates full day)
+    std::this_thread::sleep_for(seconds(10));
+
+    engine_->stop();
+    market_gen_->stop();
+
+    // Analyze results
+    auto results = engine_->getResults();
+
+    EXPECT_GT(results.total_trades, 0);
+    EXPECT_GT(std::abs(results.total_return), 0.0);
+
+    std::cout << "Simulation Results:" << std::endl;
+    std::cout << "  Total Trades: " << results.total_trades << std::endl;
+    std::cout << "  Win Rate: " << results.win_rate * 100 << "%" << std::endl;
+    std::cout << "  Final Equity: $" << results.final_equity << std::endl;
+}
+
+TEST_F(FullSimulationTest, StressTestWithHighVolatility) {
+    market_gen_->setVolatility(0.05);  // 5% volatility
+    market_gen_->setTickFrequency(1000);  // 1000 updates/sec
+
+    engine_->addStrategy(strategy_);
+    market_gen_->start();
+    engine_->start();
+
+    std::this_thread::sleep_for(seconds(5));
+
+    engine_->stop();
+    market_gen_->stop();
+
+    auto results = engine_->getResults();
+
+    // Verify system handled high update rate
+    EXPECT_GT(results.total_trades, 10);
+
+    // Check for any errors
+    auto errors = engine_->getErrors();
+    EXPECT_TRUE(errors.empty()) << "Errors occurred during high-frequency simulation";
+}
+
+
+================================================================================
+END OF SIMULATION TESTING
+================================================================================

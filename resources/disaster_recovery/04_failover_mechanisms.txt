@@ -1,0 +1,1257 @@
+================================================================================
+DISASTER RECOVERY - FAILOVER MECHANISMS & TESTING
+High-Frequency Trading System
+Target: Automated Failover in <60 seconds
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Failover Overview & Strategy
+2. Automated Failover Mechanisms
+3. Manual Failover Procedures
+4. Split-Brain Prevention
+5. Failover Testing Protocols
+6. Failback Procedures
+7. Cross-Data Center Failover
+8. Application-Level Failover
+9. Network Failover
+10. Failover Validation & Monitoring
+
+================================================================================
+1. FAILOVER OVERVIEW & STRATEGY
+================================================================================
+
+1.1 FAILOVER TYPES & TRIGGERS
+------------------------------
+
+┌─────────────────────────────────────────────────────────────────────┐
+│                    FAILOVER DECISION TREE                           │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│                     [Failure Detected]                              │
+│                            │                                        │
+│                            ▼                                        │
+│                   [Assess Severity]                                 │
+│                            │                                        │
+│           ┌────────────────┼────────────────┐                      │
+│           │                │                │                      │
+│           ▼                ▼                ▼                      │
+│     [Transient]      [Component]      [System]                     │
+│      Failure          Failure          Failure                     │
+│           │                │                │                      │
+│           ▼                ▼                ▼                      │
+│     [Retry 3x]     [Component        [Full                         │
+│                     Failover]        Failover]                     │
+│           │                │                │                      │
+│           ▼                ▼                ▼                      │
+│     [Resolved?]    [Activate         [DR Site                      │
+│     No → Escalate   Standby]         Activation]                   │
+│                                                                     │
+│  Automatic Triggers:                                                │
+│  - Health check failures (3 consecutive)                            │
+│  - Response time > 1000ms (sustained)                              │
+│  - Error rate > 5% (1 minute)                                      │
+│  - Memory/CPU > 95% (5 minutes)                                    │
+│  - Network partition detected                                      │
+│  - Data corruption detected                                        │
+└─────────────────────────────────────────────────────────────────────┘
+
+FAILOVER CATEGORIES
+-------------------
+
+1. HOT FAILOVER (Automated, <30 seconds)
+   - Component: Trading Engine, Market Data Gateway
+   - Trigger: Health check failure
+   - Method: Load balancer redirect
+   - Data Loss: None (synchronous replication)
+
+2. WARM FAILOVER (Semi-automated, 1-5 minutes)
+   - Component: Order Management, Risk Engine
+   - Trigger: Service degradation
+   - Method: Standby promotion
+   - Data Loss: <5 seconds
+
+3. COLD FAILOVER (Manual, 5-60 minutes)
+   - Component: Analytics, Reporting
+   - Trigger: Manual intervention
+   - Method: Service restart from backup
+   - Data Loss: Up to last checkpoint
+
+1.2 FAILOVER SLA MATRIX
+------------------------
+
+┌──────────────────────┬────────────┬─────────────┬──────────────┐
+│ Component            │ Type       │ RTO Target  │ Automation   │
+├──────────────────────┼────────────┼─────────────┼──────────────┤
+│ Trading Engine       │ Hot        │ 30s         │ Full         │
+│ Market Data Gateway  │ Hot        │ 15s         │ Full         │
+│ Order Management     │ Warm       │ 60s         │ Semi         │
+│ Risk Engine          │ Warm       │ 60s         │ Semi         │
+│ Database Primary     │ Warm       │ 120s        │ Full (Patroni│
+│ Redis Cache          │ Hot        │ 5s          │ Full (Sentinel│
+│ Load Balancer        │ Hot        │ 1s          │ Full (VRRP)  │
+│ Analytics Platform   │ Cold       │ 15min       │ Manual       │
+│ Reporting System     │ Cold       │ 30min       │ Manual       │
+└──────────────────────┴────────────┴─────────────┴──────────────┘
+
+================================================================================
+2. AUTOMATED FAILOVER MECHANISMS
+================================================================================
+
+2.1 HEALTH CHECK FRAMEWORK
+---------------------------
+
+Multi-Layer Health Monitoring:
+
+Layer 1: Process Level (1-second interval)
+Layer 2: Application Level (2-second interval)
+Layer 3: Business Logic Level (5-second interval)
+Layer 4: End-to-End Test (10-second interval)
+
+Health Check Daemon: /opt/hft/scripts/health_monitor.py
+
+```python
+#!/usr/bin/env python3
+"""
+Comprehensive Health Monitoring Daemon
+Performs multi-layer health checks and triggers failover
+"""
+
+import time
+import subprocess
+import requests
+import psycopg2
+import redis
+import logging
+from datetime import datetime
+import json
+import socket
+
+class HealthMonitor:
+    def __init__(self):
+        self.logger = logging.getLogger(__name__)
+        self.failure_count = {}
+        self.max_failures = 3
+        self.check_interval = 2  # seconds
+        self.alert_cooldown = {}
+
+    def check_process(self, process_name):
+        """Layer 1: Check if process is running"""
+        try:
+            result = subprocess.run(
+                ['pgrep', '-f', process_name],
+                capture_output=True,
+                timeout=1
+            )
+            return result.returncode == 0
+        except Exception as e:
+            self.logger.error(f"Process check failed for {process_name}: {e}")
+            return False
+
+    def check_port(self, host, port, timeout=2):
+        """Layer 1: Check if port is open"""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            result = sock.connect_ex((host, port))
+            sock.close()
+            return result == 0
+        except Exception as e:
+            self.logger.error(f"Port check failed for {host}:{port}: {e}")
+            return False
+
+    def check_http_endpoint(self, url, expected_status=200, timeout=2):
+        """Layer 2: Check HTTP health endpoint"""
+        try:
+            start = time.time()
+            response = requests.get(url, timeout=timeout)
+            latency = (time.time() - start) * 1000
+
+            if response.status_code != expected_status:
+                self.logger.warning(
+                    f"Unexpected status {response.status_code} from {url}"
+                )
+                return False
+
+            # Check latency
+            if latency > 1000:  # 1 second threshold
+                self.logger.warning(
+                    f"High latency ({latency:.2f}ms) from {url}"
+                )
+                return False
+
+            return True
+
+        except Exception as e:
+            self.logger.error(f"HTTP check failed for {url}: {e}")
+            return False
+
+    def check_database(self):
+        """Layer 2: Check database connectivity and performance"""
+        try:
+            start = time.time()
+            conn = psycopg2.connect(
+                host='localhost',
+                database='trading',
+                user='hft',
+                password='password',
+                connect_timeout=3
+            )
+            cursor = conn.cursor()
+
+            # Simple query
+            cursor.execute("SELECT 1;")
+            result = cursor.fetchone()
+
+            latency = (time.time() - start) * 1000
+
+            # Check replication lag if standby
+            cursor.execute("SELECT pg_is_in_recovery();")
+            is_standby = cursor.fetchone()[0]
+
+            if is_standby:
+                cursor.execute("""
+                    SELECT EXTRACT(EPOCH FROM
+                        (NOW() - pg_last_xact_replay_timestamp())
+                    ) AS lag;
+                """)
+                lag = cursor.fetchone()[0]
+
+                if lag and lag > 10:  # 10 second threshold
+                    self.logger.warning(f"High replication lag: {lag}s")
+                    conn.close()
+                    return False
+
+            conn.close()
+
+            if latency > 100:  # 100ms threshold
+                self.logger.warning(f"High database latency: {latency:.2f}ms")
+                return False
+
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Database check failed: {e}")
+            return False
+
+    def check_redis(self):
+        """Layer 2: Check Redis connectivity and performance"""
+        try:
+            r = redis.StrictRedis(host='localhost', port=6379, db=0)
+
+            start = time.time()
+            r.ping()
+            latency = (time.time() - start) * 1000
+
+            # Check memory usage
+            info = r.info('memory')
+            used_memory = info['used_memory']
+            maxmemory = info.get('maxmemory', 0)
+
+            if maxmemory > 0 and (used_memory / maxmemory) > 0.95:
+                self.logger.warning("Redis memory usage > 95%")
+                return False
+
+            if latency > 10:  # 10ms threshold
+                self.logger.warning(f"High Redis latency: {latency:.2f}ms")
+                return False
+
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Redis check failed: {e}")
+            return False
+
+    def check_trading_engine(self):
+        """Layer 3: Check trading engine business logic"""
+        try:
+            # Check if trading is enabled
+            r = redis.StrictRedis(host='localhost', port=6379, db=0)
+            trading_enabled = r.get('trading:enabled')
+
+            if not trading_enabled or trading_enabled.decode() != 'true':
+                self.logger.warning("Trading is disabled")
+                return False
+
+            # Check last order timestamp
+            last_order_ts = r.get('last_order_timestamp')
+            if last_order_ts:
+                last_order_ts = int(last_order_ts.decode())
+                age = time.time() - last_order_ts
+
+                # If no orders in last 60 seconds during market hours
+                # (this is simplified - add actual market hours check)
+                if age > 60:
+                    self.logger.info(f"No orders in last {age}s")
+
+            # Check active order count
+            active_orders = r.get('active_order_count')
+            if active_orders:
+                count = int(active_orders.decode())
+                if count > 10000:  # Threshold
+                    self.logger.warning(f"High active order count: {count}")
+
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Trading engine check failed: {e}")
+            return False
+
+    def check_market_data(self):
+        """Layer 3: Check market data freshness"""
+        try:
+            r = redis.StrictRedis(host='localhost', port=6379, db=0)
+
+            last_update = r.get('last_market_update')
+            if not last_update:
+                self.logger.error("No market data updates found")
+                return False
+
+            last_update_ts = int(last_update.decode())
+            age = time.time() - last_update_ts
+
+            # Market data must be fresh (<5 seconds)
+            if age > 5:
+                self.logger.error(f"Stale market data: {age}s old")
+                return False
+
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Market data check failed: {e}")
+            return False
+
+    def perform_end_to_end_test(self):
+        """Layer 4: End-to-end functional test"""
+        try:
+            # Submit test order (dry run)
+            response = requests.post(
+                'http://localhost:8080/api/orders/test',
+                json={
+                    'symbol': 'TEST',
+                    'quantity': 1,
+                    'side': 'BUY',
+                    'type': 'LIMIT',
+                    'price': 100.0,
+                    'dry_run': True
+                },
+                timeout=5
+            )
+
+            if response.status_code != 200:
+                self.logger.error(
+                    f"E2E test failed: HTTP {response.status_code}"
+                )
+                return False
+
+            result = response.json()
+            if result.get('status') != 'SUCCESS':
+                self.logger.error(f"E2E test failed: {result}")
+                return False
+
+            return True
+
+        except Exception as e:
+            self.logger.error(f"E2E test failed: {e}")
+            return False
+
+    def record_failure(self, component):
+        """Record component failure"""
+        if component not in self.failure_count:
+            self.failure_count[component] = 0
+
+        self.failure_count[component] += 1
+
+        self.logger.warning(
+            f"{component} failed (count: {self.failure_count[component]})"
+        )
+
+        if self.failure_count[component] >= self.max_failures:
+            return True  # Trigger failover
+        return False
+
+    def reset_failure_count(self, component):
+        """Reset failure count on success"""
+        if component in self.failure_count:
+            self.failure_count[component] = 0
+
+    def trigger_failover(self, component, reason):
+        """Trigger failover for component"""
+        # Check cooldown to prevent flapping
+        now = time.time()
+        if component in self.alert_cooldown:
+            if now - self.alert_cooldown[component] < 300:  # 5 min cooldown
+                self.logger.info(
+                    f"Failover for {component} in cooldown, skipping"
+                )
+                return
+
+        self.logger.critical(
+            f"TRIGGERING FAILOVER for {component}: {reason}"
+        )
+
+        # Log failover event
+        event = {
+            'timestamp': datetime.now().isoformat(),
+            'component': component,
+            'reason': reason,
+            'action': 'failover_triggered'
+        }
+
+        with open('/var/log/hft/failover_events.json', 'a') as f:
+            f.write(json.dumps(event) + '\n')
+
+        # Execute failover script
+        script_map = {
+            'trading_engine': '/opt/hft/scripts/failover_trading.sh',
+            'database': '/opt/hft/scripts/failover_database.sh',
+            'redis': '/opt/hft/scripts/failover_redis.sh',
+            'market_data': '/opt/hft/scripts/failover_market_data.sh'
+        }
+
+        if component in script_map:
+            try:
+                subprocess.run(
+                    [script_map[component]],
+                    timeout=120,
+                    check=True
+                )
+                self.logger.info(f"Failover completed for {component}")
+
+                # Send alerts
+                self.send_alert(
+                    f"FAILOVER: {component}",
+                    f"Failover triggered for {component}: {reason}"
+                )
+
+            except Exception as e:
+                self.logger.error(f"Failover failed for {component}: {e}")
+
+                # Send critical alert
+                self.send_alert(
+                    f"FAILOVER FAILED: {component}",
+                    f"Failover FAILED for {component}: {str(e)}",
+                    severity='critical'
+                )
+
+        self.alert_cooldown[component] = now
+
+    def send_alert(self, subject, message, severity='warning'):
+        """Send alert via multiple channels"""
+        # Log alert
+        if severity == 'critical':
+            self.logger.critical(f"{subject}: {message}")
+        else:
+            self.logger.warning(f"{subject}: {message}")
+
+        # Email alert
+        try:
+            subprocess.run(
+                ['mail', '-s', subject, 'ops@trading.com'],
+                input=message.encode(),
+                timeout=5
+            )
+        except Exception as e:
+            self.logger.error(f"Failed to send email alert: {e}")
+
+        # Slack alert
+        try:
+            requests.post(
+                'https://hooks.slack.com/services/YOUR/WEBHOOK',
+                json={'text': f"{subject}\n{message}"},
+                timeout=5
+            )
+        except Exception as e:
+            self.logger.error(f"Failed to send Slack alert: {e}")
+
+        # PagerDuty (for critical)
+        if severity == 'critical':
+            try:
+                requests.post(
+                    'https://events.pagerduty.com/v2/enqueue',
+                    json={
+                        'routing_key': 'YOUR_KEY',
+                        'event_action': 'trigger',
+                        'payload': {
+                            'summary': subject,
+                            'severity': 'critical',
+                            'source': 'hft-health-monitor',
+                            'custom_details': {'message': message}
+                        }
+                    },
+                    timeout=5
+                )
+            except Exception as e:
+                self.logger.error(f"Failed to send PagerDuty alert: {e}")
+
+    def run_checks(self):
+        """Run all health checks"""
+        checks = {
+            'trading_engine_process': lambda: self.check_process('trading_engine'),
+            'trading_engine_http': lambda: self.check_http_endpoint(
+                'http://localhost:8080/health'
+            ),
+            'trading_engine_logic': self.check_trading_engine,
+            'database': self.check_database,
+            'redis': self.check_redis,
+            'market_data': self.check_market_data,
+        }
+
+        results = {}
+
+        for name, check_func in checks.items():
+            try:
+                result = check_func()
+                results[name] = result
+
+                if result:
+                    self.reset_failure_count(name)
+                else:
+                    if self.record_failure(name):
+                        # Max failures reached, trigger failover
+                        component = name.split('_')[0]  # Extract component
+                        self.trigger_failover(
+                            component,
+                            f"{name} failed {self.max_failures} times"
+                        )
+
+            except Exception as e:
+                self.logger.error(f"Check {name} raised exception: {e}")
+                results[name] = False
+
+        # Log summary
+        failed_checks = [k for k, v in results.items() if not v]
+        if failed_checks:
+            self.logger.warning(f"Failed checks: {failed_checks}")
+
+        return results
+
+    def monitor_loop(self):
+        """Main monitoring loop"""
+        self.logger.info("Starting health monitor")
+
+        e2e_counter = 0
+
+        while True:
+            try:
+                # Run standard checks
+                self.run_checks()
+
+                # Run E2E test every 10 iterations (20 seconds)
+                e2e_counter += 1
+                if e2e_counter >= 10:
+                    self.perform_end_to_end_test()
+                    e2e_counter = 0
+
+                time.sleep(self.check_interval)
+
+            except KeyboardInterrupt:
+                self.logger.info("Health monitor stopped")
+                break
+            except Exception as e:
+                self.logger.error(f"Monitor loop error: {e}")
+                time.sleep(self.check_interval)
+
+if __name__ == '__main__':
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler('/var/log/hft/health_monitor.log'),
+            logging.StreamHandler()
+        ]
+    )
+
+    monitor = HealthMonitor()
+    monitor.monitor_loop()
+```
+
+Systemd Service: /etc/systemd/system/hft-health-monitor.service
+
+```ini
+[Unit]
+Description=HFT Health Monitor
+After=network.target
+
+[Service]
+Type=simple
+User=hft
+Group=hft
+WorkingDirectory=/opt/hft
+ExecStart=/usr/bin/python3 /opt/hft/scripts/health_monitor.py
+Restart=always
+RestartSec=10
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hft-health-monitor
+
+# Resource limits
+LimitNOFILE=65536
+MemoryLimit=1G
+
+[Install]
+WantedBy=multi-user.target
+```
+
+2.2 AUTOMATIC FAILOVER SCRIPTS
+-------------------------------
+
+Trading Engine Failover: /opt/hft/scripts/failover_trading.sh
+
+```bash
+#!/bin/bash
+# Automatic Trading Engine Failover
+
+set -e
+
+LOG_FILE="/var/log/hft/failover_trading.log"
+START_TIME=$(date +%s)
+
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a $LOG_FILE
+}
+
+log "=== TRADING ENGINE FAILOVER INITIATED ==="
+
+# 1. Verify failure on primary
+log "Verifying primary failure..."
+if curl -sf --max-time 2 http://primary:8080/health > /dev/null 2>&1; then
+    log "WARNING: Primary appears healthy, aborting failover"
+    exit 1
+fi
+
+# 2. Check standby health
+log "Checking standby health..."
+if ! curl -sf --max-time 2 http://standby:8080/health > /dev/null 2>&1; then
+    log "ERROR: Standby is not healthy!"
+    /opt/hft/scripts/send_alert.sh "CRITICAL" \
+        "Trading failover failed: Standby unhealthy"
+    exit 1
+fi
+
+# 3. Stop primary (force if needed)
+log "Stopping primary..."
+ssh primary "systemctl stop hft-trading-engine" || true
+
+# 4. Promote standby to primary
+log "Promoting standby to primary..."
+ssh standby "systemctl start hft-trading-engine-primary"
+
+sleep 5
+
+# 5. Update load balancer
+log "Updating load balancer..."
+curl -X POST http://lb.hft.local/api/backend/update \
+    -H "Content-Type: application/json" \
+    -d '{
+        "service": "trading",
+        "action": "failover",
+        "primary": "standby.hft.local:5555"
+    }'
+
+# 6. Update DNS (if applicable)
+log "Updating DNS..."
+curl -X POST http://dns-api.hft.local/update \
+    -d "name=trading.hft.local&ip=$(dig +short standby.hft.local)"
+
+# 7. Update service discovery
+log "Updating service discovery..."
+consul kv put service/trading/primary "standby.hft.local"
+consul kv put service/trading/failover_timestamp "$(date -Iseconds)"
+
+# 8. Verify failover
+log "Verifying failover..."
+sleep 5
+
+if curl -sf http://standby:8080/health > /dev/null 2>&1; then
+    log "Failover successful"
+else
+    log "ERROR: Failover verification failed"
+    exit 1
+fi
+
+# 9. Test trading capability
+log "Testing trading capability..."
+RESPONSE=$(curl -sf -X POST http://standby:8080/api/orders/test \
+    -H "Content-Type: application/json" \
+    -d '{"symbol":"TEST","quantity":1,"side":"BUY","type":"LIMIT","price":100,"dry_run":true}')
+
+if echo "$RESPONSE" | grep -q "SUCCESS"; then
+    log "Trading test passed"
+else
+    log "WARNING: Trading test failed: $RESPONSE"
+fi
+
+# 10. Calculate failover time
+END_TIME=$(date +%s)
+DURATION=$((END_TIME - START_TIME))
+
+log "=== FAILOVER COMPLETE ==="
+log "Duration: ${DURATION} seconds"
+
+# 11. Send notification
+/opt/hft/scripts/send_alert.sh "INFO" \
+    "Trading engine failover completed in ${DURATION}s. New primary: standby.hft.local"
+
+# 12. Log event
+echo "{\"timestamp\":\"$(date -Iseconds)\",\"component\":\"trading_engine\",\"action\":\"failover\",\"duration\":${DURATION},\"new_primary\":\"standby.hft.local\"}" >> /var/log/hft/failover_events.json
+
+exit 0
+```
+
+Database Failover: /opt/hft/scripts/failover_database.sh
+
+```bash
+#!/bin/bash
+# Automatic Database Failover using Patroni
+
+LOG_FILE="/var/log/hft/failover_database.log"
+
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a $LOG_FILE
+}
+
+log "=== DATABASE FAILOVER INITIATED ==="
+
+# Use Patroni for automatic failover
+patronictl -c /etc/patroni/patroni.yml failover --force
+
+if [ $? -eq 0 ]; then
+    log "Database failover successful"
+
+    # Wait for new primary
+    sleep 10
+
+    # Verify new primary
+    NEW_PRIMARY=$(patronictl -c /etc/patroni/patroni.yml list | grep Leader | awk '{print $2}')
+    log "New primary: $NEW_PRIMARY"
+
+    # Update service discovery
+    consul kv put database/primary "$NEW_PRIMARY"
+
+    /opt/hft/scripts/send_alert.sh "INFO" \
+        "Database failover completed. New primary: $NEW_PRIMARY"
+
+    exit 0
+else
+    log "ERROR: Database failover failed"
+
+    /opt/hft/scripts/send_alert.sh "CRITICAL" \
+        "Database failover FAILED"
+
+    exit 1
+fi
+```
+
+Redis Failover: /opt/hft/scripts/failover_redis.sh
+
+```bash
+#!/bin/bash
+# Redis Sentinel Automatic Failover
+
+LOG_FILE="/var/log/hft/failover_redis.log"
+
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a $LOG_FILE
+}
+
+log "=== REDIS FAILOVER INITIATED ==="
+
+# Redis Sentinel handles automatic failover
+# This script just monitors and validates
+
+# Check sentinel status
+SENTINEL_INFO=$(redis-cli -h localhost -p 26379 SENTINEL masters)
+
+log "Sentinel status:"
+log "$SENTINEL_INFO"
+
+# Get current master
+MASTER=$(redis-cli -h localhost -p 26379 SENTINEL get-master-addr-by-name mymaster | head -1)
+
+log "Current master: $MASTER"
+
+# Verify master is accepting connections
+if redis-cli -h $MASTER PING | grep -q PONG; then
+    log "New master is operational"
+
+    # Update service discovery
+    consul kv put redis/master "$MASTER"
+
+    /opt/hft/scripts/send_alert.sh "INFO" \
+        "Redis failover completed. New master: $MASTER"
+
+    exit 0
+else
+    log "ERROR: New master not responding"
+
+    /opt/hft/scripts/send_alert.sh "CRITICAL" \
+        "Redis failover verification failed"
+
+    exit 1
+fi
+```
+
+================================================================================
+3. MANUAL FAILOVER PROCEDURES
+================================================================================
+
+3.1 MANUAL FAILOVER RUNBOOK
+----------------------------
+
+Procedure: FAILOVER-MANUAL-001
+Purpose: Perform controlled manual failover
+Use Case: Planned maintenance, upgrades, DR drills
+
+PREREQUISITES
+-------------
+☐ Approval from CTO or designated authority
+☐ Change ticket created and approved
+☐ All stakeholders notified (30 min advance notice)
+☐ Standby system verified healthy
+☐ Backup completed within last hour
+☐ Current positions reconciled
+☐ Open orders documented
+
+STEP-BY-STEP PROCEDURE
+----------------------
+
+Step 1: Pre-Failover Validation (5 minutes)
+--------------------------------------------
+
+```bash
+# Execute pre-failover checklist
+/opt/hft/scripts/prefailover_check.sh
+```
+
+Pre-Failover Check Script: /opt/hft/scripts/prefailover_check.sh
+
+```bash
+#!/bin/bash
+# Pre-Failover Validation
+
+echo "=== PRE-FAILOVER VALIDATION ==="
+
+VALIDATION_FAILED=0
+
+# 1. Check standby health
+echo "Checking standby health..."
+if curl -sf http://standby:8080/health > /dev/null; then
+    echo "✓ Standby is healthy"
+else
+    echo "✗ Standby is NOT healthy"
+    ((VALIDATION_FAILED++))
+fi
+
+# 2. Check replication lag
+echo "Checking replication lag..."
+LAG=$(ssh standby "psql -t -c \"SELECT EXTRACT(EPOCH FROM (NOW() - pg_last_xact_replay_timestamp()));\"" | tr -d ' ')
+
+if (( $(echo "$LAG < 5" | bc -l) )); then
+    echo "✓ Replication lag acceptable: ${LAG}s"
+else
+    echo "✗ High replication lag: ${LAG}s"
+    ((VALIDATION_FAILED++))
+fi
+
+# 3. Check recent backup
+echo "Checking recent backup..."
+LAST_BACKUP=$(ls -t /backup/daily/postgres_* | head -1)
+BACKUP_AGE=$(( $(date +%s) - $(stat -c %Y "$LAST_BACKUP") ))
+BACKUP_AGE_HOURS=$(( BACKUP_AGE / 3600 ))
+
+if [ $BACKUP_AGE_HOURS -lt 24 ]; then
+    echo "✓ Recent backup found: $LAST_BACKUP (${BACKUP_AGE_HOURS}h old)"
+else
+    echo "⚠ Backup is old: ${BACKUP_AGE_HOURS}h"
+fi
+
+# 4. Check open orders
+echo "Checking open orders..."
+OPEN_ORDERS=$(psql -t -c "SELECT COUNT(*) FROM orders WHERE status IN ('PENDING','PARTIAL');" | tr -d ' ')
+echo "Open orders: $OPEN_ORDERS"
+
+# 5. Check current positions
+echo "Checking positions..."
+psql -c "SELECT symbol, SUM(quantity) as position FROM trades WHERE status='FILLED' GROUP BY symbol HAVING ABS(SUM(quantity)) > 0;"
+
+# 6. Check standby data freshness
+echo "Checking standby data freshness..."
+PRIMARY_COUNT=$(psql -h primary -t -c "SELECT COUNT(*) FROM trades;" | tr -d ' ')
+STANDBY_COUNT=$(psql -h standby -t -c "SELECT COUNT(*) FROM trades;" | tr -d ' ')
+DIFF=$((PRIMARY_COUNT - STANDBY_COUNT))
+
+if [ $DIFF -eq 0 ]; then
+    echo "✓ Standby data is current"
+else
+    echo "⚠ Standby is $DIFF records behind"
+fi
+
+# Summary
+echo ""
+echo "=== VALIDATION SUMMARY ==="
+if [ $VALIDATION_FAILED -eq 0 ]; then
+    echo "✓ All checks passed - Ready for failover"
+    exit 0
+else
+    echo "✗ $VALIDATION_FAILED checks failed - NOT ready for failover"
+    exit 1
+fi
+```
+
+Step 2: Notify and Prepare (5 minutes)
+---------------------------------------
+
+```bash
+# Send notification
+/opt/hft/scripts/send_alert.sh "INFO" \
+    "Manual failover starting in 5 minutes. Initiated by: $(whoami)"
+
+# Put system in maintenance mode (graceful)
+redis-cli SET system:maintenance_mode true
+redis-cli SET system:maintenance_reason "Planned failover"
+
+# Wait for current orders to complete
+sleep 300  # 5 minutes
+```
+
+Step 3: Stop Trading on Primary (2 minutes)
+--------------------------------------------
+
+```bash
+# Disable new order acceptance
+redis-cli SET trading:enabled false
+
+# Wait for in-flight orders
+sleep 30
+
+# Stop trading engine
+systemctl stop hft-trading-engine
+
+# Verify stopped
+systemctl status hft-trading-engine
+```
+
+Step 4: Final Data Sync (2 minutes)
+------------------------------------
+
+```bash
+# Ensure all WAL shipped to standby
+ssh primary "psql -c 'CHECKPOINT;'"
+
+# Verify standby caught up
+ssh standby "./check_replication_lag.sh"
+
+# Wait for sync
+sleep 10
+```
+
+Step 5: Promote Standby (3 minutes)
+------------------------------------
+
+```bash
+# Promote standby to primary
+ssh standby "pg_ctl promote -D /var/lib/pgsql/data"
+
+# Wait for promotion
+sleep 15
+
+# Verify promotion
+ssh standby "psql -t -c 'SELECT NOT pg_is_in_recovery();'"
+
+# Start trading engine on new primary
+ssh standby "systemctl start hft-trading-engine-primary"
+```
+
+Step 6: Update Infrastructure (2 minutes)
+------------------------------------------
+
+```bash
+# Update load balancer
+curl -X POST http://lb.hft.local/api/backend/failover \
+    -d "service=trading&new_primary=standby.hft.local"
+
+# Update DNS
+/opt/hft/scripts/update_dns.sh trading.hft.local standby.hft.local
+
+# Update service discovery
+consul kv put service/trading/primary "standby.hft.local"
+consul kv put service/database/primary "standby.hft.local"
+```
+
+Step 7: Validation (5 minutes)
+-------------------------------
+
+```bash
+# Run post-failover validation
+/opt/hft/scripts/postfailover_check.sh
+```
+
+Post-Failover Check Script: /opt/hft/scripts/postfailover_check.sh
+
+```bash
+#!/bin/bash
+# Post-Failover Validation
+
+echo "=== POST-FAILOVER VALIDATION ==="
+
+# 1. Check new primary health
+echo "Checking new primary health..."
+curl -sf http://standby:8080/health || exit 1
+
+# 2. Test database
+echo "Testing database..."
+psql -h standby -c "SELECT NOW();" || exit 1
+
+# 3. Verify write capability
+echo "Testing write capability..."
+psql -h standby -c "INSERT INTO health_check (timestamp) VALUES (NOW());" || exit 1
+
+# 4. Test order submission
+echo "Testing order submission..."
+curl -sf -X POST http://standby:8080/api/orders/test \
+    -H "Content-Type: application/json" \
+    -d '{"symbol":"TEST","quantity":1,"side":"BUY","price":100,"dry_run":true}' || exit 1
+
+# 5. Check market data
+echo "Checking market data..."
+MARKET_AGE=$(redis-cli GET last_market_update)
+NOW=$(date +%s)
+AGE=$((NOW - MARKET_AGE))
+
+if [ $AGE -lt 10 ]; then
+    echo "✓ Market data is fresh (${AGE}s)"
+else
+    echo "⚠ Market data age: ${AGE}s"
+fi
+
+# 6. Verify positions
+echo "Verifying positions..."
+/opt/hft/scripts/reconcile_positions.py
+
+echo "=== VALIDATION COMPLETE ==="
+```
+
+Step 8: Resume Trading (1 minute)
+----------------------------------
+
+```bash
+# Enable trading
+redis-cli SET trading:enabled true
+
+# Disable maintenance mode
+redis-cli SET system:maintenance_mode false
+
+# Send notification
+/opt/hft/scripts/send_alert.sh "INFO" \
+    "Failover complete. Trading resumed on new primary: standby.hft.local"
+```
+
+Step 9: Monitor (30 minutes)
+-----------------------------
+
+```bash
+# Monitor for next 30 minutes
+watch -n 10 '/opt/hft/scripts/system_status.sh'
+
+# Check logs
+tail -f /var/log/hft/*.log
+
+# Monitor metrics
+# Open Grafana dashboard and watch for anomalies
+```
+
+Step 10: Documentation (Post-failover)
+---------------------------------------
+
+```bash
+# Generate failover report
+/opt/hft/scripts/generate_failover_report.sh > /tmp/failover_report_$(date +%Y%m%d_%H%M%S).txt
+
+# Update runbook with any issues encountered
+# Update change ticket with results
+# Conduct post-mortem if any issues
+```
+
+================================================================================
+4. SPLIT-BRAIN PREVENTION
+================================================================================
+
+4.1 SPLIT-BRAIN SCENARIOS
+--------------------------
+
+Split-brain occurs when multiple nodes believe they are primary due to:
+- Network partition
+- Failed health checks
+- Clock skew
+- Delayed messages
+
+PREVENTION MECHANISMS
+---------------------
+
+1. Quorum-Based Decisions
+2. Fencing/STONITH
+3. Witness/Tiebreaker Node
+4. Distributed Consensus (etcd/Consul)
+
+4.2 FENCING IMPLEMENTATION
+---------------------------
+
+Fencing Script: /opt/hft/scripts/fence_node.sh
+
+```bash
+#!/bin/bash
+# Fence (isolate) a node to prevent split-brain
+
+NODE=$1
+
+if [ -z "$NODE" ]; then
+    echo "Usage: $0 <node>"
+    exit 1
+fi
+
+echo "Fencing node: $NODE"
+
+# 1. Remove from load balancer
+echo "Removing from load balancer..."
+curl -X POST http://lb.hft.local/api/backend/disable \
+    -d "server=$NODE"
+
+# 2. Isolate network (if IPMI available)
+echo "Isolating network..."
+# ipmitool -H $NODE -U admin -P password chassis power off
+
+# 3. Update firewall to block traffic
+echo "Updating firewall..."
+ssh $NODE "iptables -I INPUT -j DROP" || true
+
+# 4. Mark in service discovery
+echo "Marking as fenced..."
+consul kv put nodes/$NODE/fenced true
+
+# 5. Force stop services
+echo "Stopping services..."
+ssh $NODE "systemctl stop hft-*" || true
+
+echo "Node $NODE fenced successfully"
+```
+
+4.3 QUORUM CHECK
+----------------
+
+Script: /opt/hft/scripts/check_quorum.sh
+
+```bash
+#!/bin/bash
+# Check cluster quorum before making decisions
+
+CLUSTER_NODES=("node1" "node2" "node3")
+TOTAL_NODES=${#CLUSTER_NODES[@]}
+REQUIRED_QUORUM=$(( (TOTAL_NODES / 2) + 1 ))
+
+REACHABLE=0
+
+for node in "${CLUSTER_NODES[@]}"; do
+    if ping -c 1 -W 1 $node > /dev/null 2>&1; then
+        ((REACHABLE++))
+    fi
+done
+
+echo "Reachable nodes: $REACHABLE / $TOTAL_NODES"
+echo "Required quorum: $REQUIRED_QUORUM"
+
+if [ $REACHABLE -ge $REQUIRED_QUORUM ]; then
+    echo "Quorum available: YES"
+    exit 0
+else
+    echo "Quorum available: NO"
+    echo "Cannot proceed with failover - insufficient quorum"
+    exit 1
+fi
+```
+
+================================================================================
+5. FAILOVER TESTING PROTOCOLS
+================================================================================
+
+5.1 MONTHLY FAILOVER DRILL
+---------------------------
+
+Schedule: First Saturday of each month, 2:00 AM
+
+Drill Script: /opt/hft/scripts/failover_drill.sh
+
+```bash
+#!/bin/bash
+# Monthly Failover Drill
+
+DRILL_LOG="/var/log/hft/failover_drills/drill_$(date +%Y%m%d_%H%M%S).log"
+mkdir -p $(dirname $DRILL_LOG)
+
+exec > >(tee -a $DRILL_LOG)
+exec 2>&1
+
+echo "=================================="
+echo "FAILOVER DRILL"
+echo "Date: $(date)"
+echo "Operator: $(whoami)"
+echo "=================================="
+
+# Record start time
+START=$(date +%s)
+
+# 1. Pre-drill checks
+echo ""
+echo "[Step 1] Pre-drill validation..."
+/opt/hft/scripts/prefailover_check.sh
+if [ $? -ne 0 ]; then
+    echo "Pre-drill validation FAILED - aborting drill"
+    exit 1
+fi
+
+# 2. Execute failover
+echo ""
+echo "[Step 2] Executing failover..."
+/opt/hft/scripts/failover_trading.sh
+FAILOVER_RESULT=$?
+
+# 3. Post-failover validation
+echo ""
+echo "[Step 3] Post-failover validation..."
+sleep 30
+/opt/hft/scripts/postfailover_check.sh
+VALIDATION_RESULT=$?
+
+# 4. Measure RTO
+END=$(date +%s)
+RTO=$((END - START))
+
+echo ""
+echo "=================================="
+echo "DRILL RESULTS"
+echo "=================================="
+echo "Failover Result: $([ $FAILOVER_RESULT -eq 0 ] && echo 'SUCCESS' || echo 'FAILED')"
+echo "Validation Result: $([ $VALIDATION_RESULT -eq 0 ] && echo 'SUCCESS' || echo 'FAILED')"
+echo "Measured RTO: ${RTO} seconds"
+echo "Target RTO: 60 seconds"
+echo "RTO Met: $([ $RTO -le 60 ] && echo 'YES' || echo 'NO')"
+echo "=================================="
+
+# 5. Generate report
+/opt/hft/scripts/generate_drill_report.sh $DRILL_LOG
+
+# 6. Send summary
+if [ $FAILOVER_RESULT -eq 0 ] && [ $VALIDATION_RESULT -eq 0 ]; then
+    /opt/hft/scripts/send_alert.sh "INFO" \
+        "Failover drill completed successfully. RTO: ${RTO}s"
+else
+    /opt/hft/scripts/send_alert.sh "WARNING" \
+        "Failover drill had issues. Check log: $DRILL_LOG"
+fi
+```
+
+================================================================================
+END OF DOCUMENT
+================================================================================

@@ -1,0 +1,1216 @@
+================================================================================
+KUBERNETES DEPLOYMENT FOR HFT SYSTEMS
+================================================================================
+Complete Kubernetes manifests and Helm charts for deploying high-frequency
+trading systems with high availability and low latency.
+
+Last Updated: 2025-11-25
+================================================================================
+
+TABLE OF CONTENTS
+================================================================================
+1. Namespace and Resource Quotas
+2. ConfigMaps and Secrets
+3. StatefulSet Deployment
+4. Services and Networking
+5. Horizontal Pod Autoscaler
+6. Pod Disruption Budgets
+7. Network Policies
+8. Helm Charts
+9. Storage Configuration
+10. Monitoring and Observability
+
+================================================================================
+1. NAMESPACE AND RESOURCE QUOTAS
+================================================================================
+
+# k8s/namespace.yaml
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: hft-trading
+  labels:
+    name: hft-trading
+    environment: production
+    team: trading-platform
+
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: hft-resource-quota
+  namespace: hft-trading
+spec:
+  hard:
+    requests.cpu: "32"
+    requests.memory: 64Gi
+    limits.cpu: "64"
+    limits.memory: 128Gi
+    persistentvolumeclaims: "10"
+    services.loadbalancers: "2"
+    services.nodeports: "5"
+
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: hft-limit-range
+  namespace: hft-trading
+spec:
+  limits:
+  - max:
+      cpu: "8"
+      memory: 16Gi
+    min:
+      cpu: "1"
+      memory: 2Gi
+    default:
+      cpu: "4"
+      memory: 8Gi
+    defaultRequest:
+      cpu: "2"
+      memory: 4Gi
+    type: Container
+  - max:
+      cpu: "16"
+      memory: 32Gi
+    min:
+      cpu: "2"
+      memory: 4Gi
+    type: Pod
+
+================================================================================
+2. CONFIGMAPS AND SECRETS
+================================================================================
+
+# k8s/configmap.yaml
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trading-engine-config
+  namespace: hft-trading
+data:
+  application.yaml: |
+    server:
+      host: 0.0.0.0
+      port: 8080
+      threads: 8
+
+    trading:
+      symbols:
+        - AAPL
+        - GOOGL
+        - MSFT
+        - TSLA
+
+      risk_limits:
+        max_order_size: 10000
+        max_position_size: 100000
+        max_daily_loss: 50000
+
+      latency:
+        target_p99_us: 100
+        target_p999_us: 500
+
+    network:
+      tcp_nodelay: true
+      so_reuseaddr: true
+      buffer_size: 2097152
+
+    logging:
+      level: info
+      format: json
+      output: /var/log/trading/app.log
+
+    metrics:
+      enabled: true
+      port: 9090
+      interval: 1s
+
+  prometheus.yaml: |
+    global:
+      scrape_interval: 1s
+      evaluation_interval: 1s
+
+    scrape_configs:
+      - job_name: 'trading-engine'
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names:
+                - hft-trading
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            action: keep
+            regex: trading-engine
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: trading-engine-secrets
+  namespace: hft-trading
+type: Opaque
+stringData:
+  database-url: "postgresql://hftuser:password@postgres:5432/hft_trading"
+  redis-password: "redis-secret-password"
+  api-key: "your-api-key-here"
+  jwt-secret: "your-jwt-secret-here"
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: tls-certificates
+  namespace: hft-trading
+type: kubernetes.io/tls
+data:
+  tls.crt: LS0tLS1CRUdJTi... # Base64 encoded certificate
+  tls.key: LS0tLS1CRUdJTi... # Base64 encoded private key
+
+================================================================================
+3. STATEFULSET DEPLOYMENT
+================================================================================
+
+# k8s/statefulset.yaml
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: trading-engine
+  namespace: hft-trading
+  labels:
+    app: trading-engine
+    version: v1.0.0
+spec:
+  serviceName: trading-engine-headless
+  replicas: 3
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      partition: 0
+  selector:
+    matchLabels:
+      app: trading-engine
+  template:
+    metadata:
+      labels:
+        app: trading-engine
+        version: v1.0.0
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      # Performance optimizations
+      priorityClassName: high-priority
+      nodeSelector:
+        node-type: high-performance
+        cpu-type: intel-xeon
+
+      # Affinity rules for optimal placement
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - trading-engine
+            topologyKey: kubernetes.io/hostname
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: node.kubernetes.io/instance-type
+                operator: In
+                values:
+                - c5.4xlarge
+                - c6i.4xlarge
+
+      # Init containers
+      initContainers:
+      - name: sysctl-tuning
+        image: busybox:latest
+        command:
+        - sh
+        - -c
+        - |
+          sysctl -w net.core.somaxconn=4096
+          sysctl -w net.ipv4.tcp_max_syn_backlog=8192
+          sysctl -w net.core.rmem_max=16777216
+          sysctl -w net.core.wmem_max=16777216
+        securityContext:
+          privileged: true
+
+      - name: wait-for-dependencies
+        image: busybox:latest
+        command:
+        - sh
+        - -c
+        - |
+          until nc -z postgres 5432; do
+            echo "Waiting for PostgreSQL..."
+            sleep 2
+          done
+          until nc -z redis 6379; do
+            echo "Waiting for Redis..."
+            sleep 2
+          done
+
+      # Main container
+      containers:
+      - name: trading-engine
+        image: registry.example.com/hft-trading-engine:v1.0.0
+        imagePullPolicy: IfNotPresent
+
+        ports:
+        - name: http
+          containerPort: 8080
+          protocol: TCP
+        - name: websocket
+          containerPort: 8443
+          protocol: TCP
+        - name: metrics
+          containerPort: 9090
+          protocol: TCP
+
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: HFT_ENV
+          value: "production"
+        - name: HFT_INSTANCE_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: trading-engine-secrets
+              key: database-url
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: trading-engine-secrets
+              key: redis-password
+
+        # Resource allocation
+        resources:
+          requests:
+            cpu: "4000m"
+            memory: 8Gi
+            ephemeral-storage: 10Gi
+          limits:
+            cpu: "8000m"
+            memory: 16Gi
+            ephemeral-storage: 20Gi
+
+        # Volume mounts
+        volumeMounts:
+        - name: config
+          mountPath: /app/config
+          readOnly: true
+        - name: logs
+          mountPath: /var/log/trading
+        - name: data
+          mountPath: /app/data
+        - name: tmp
+          mountPath: /tmp
+        - name: hugepages
+          mountPath: /dev/hugepages
+
+        # Probes
+        livenessProbe:
+          httpGet:
+            path: /health/live
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+          successThreshold: 1
+
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+          successThreshold: 1
+
+        startupProbe:
+          httpGet:
+            path: /health/startup
+            port: 8080
+          initialDelaySeconds: 0
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 30
+          successThreshold: 1
+
+        # Lifecycle hooks
+        lifecycle:
+          preStop:
+            exec:
+              command:
+              - /bin/sh
+              - -c
+              - |
+                # Graceful shutdown: stop accepting new connections
+                kill -TERM 1
+                # Wait for existing requests to complete
+                sleep 15
+
+        # Security context
+        securityContext:
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
+          runAsUser: 1000
+          runAsGroup: 1000
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+          readOnlyRootFilesystem: true
+
+      # Sidecar container for log shipping
+      - name: log-shipper
+        image: fluent/fluent-bit:2.1
+        volumeMounts:
+        - name: logs
+          mountPath: /var/log/trading
+          readOnly: true
+        - name: fluent-bit-config
+          mountPath: /fluent-bit/etc/
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 200m
+            memory: 256Mi
+
+      # Volumes
+      volumes:
+      - name: config
+        configMap:
+          name: trading-engine-config
+      - name: fluent-bit-config
+        configMap:
+          name: fluent-bit-config
+      - name: tmp
+        emptyDir:
+          medium: Memory
+          sizeLimit: 1Gi
+      - name: hugepages
+        emptyDir:
+          medium: HugePages-2Mi
+          sizeLimit: 2Gi
+
+      # DNS configuration for low latency
+      dnsPolicy: ClusterFirst
+      dnsConfig:
+        options:
+        - name: ndots
+          value: "1"
+        - name: timeout
+          value: "1"
+        - name: attempts
+          value: "2"
+
+      # Termination grace period
+      terminationGracePeriodSeconds: 30
+
+  # Persistent volume claims
+  volumeClaimTemplates:
+  - metadata:
+      name: logs
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: fast-ssd
+      resources:
+        requests:
+          storage: 50Gi
+  - metadata:
+      name: data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: fast-ssd
+      resources:
+        requests:
+          storage: 100Gi
+
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: high-priority
+value: 1000000
+globalDefault: false
+description: "High priority for HFT trading engines"
+
+================================================================================
+4. SERVICES AND NETWORKING
+================================================================================
+
+# k8s/service.yaml
+---
+# Headless service for StatefulSet
+apiVersion: v1
+kind: Service
+metadata:
+  name: trading-engine-headless
+  namespace: hft-trading
+  labels:
+    app: trading-engine
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: trading-engine
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
+    protocol: TCP
+  - name: websocket
+    port: 8443
+    targetPort: 8443
+    protocol: TCP
+  - name: metrics
+    port: 9090
+    targetPort: 9090
+    protocol: TCP
+
+---
+# ClusterIP service for internal access
+apiVersion: v1
+kind: Service
+metadata:
+  name: trading-engine-internal
+  namespace: hft-trading
+  labels:
+    app: trading-engine
+spec:
+  type: ClusterIP
+  selector:
+    app: trading-engine
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
+    protocol: TCP
+  - name: websocket
+    port: 8443
+    targetPort: 8443
+    protocol: TCP
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 3600
+
+---
+# LoadBalancer service for external access
+apiVersion: v1
+kind: Service
+metadata:
+  name: trading-engine-external
+  namespace: hft-trading
+  labels:
+    app: trading-engine
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+    service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+    service.beta.kubernetes.io/aws-load-balancer-backend-protocol: "tcp"
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local  # Preserve client IP
+  selector:
+    app: trading-engine
+  ports:
+  - name: https
+    port: 443
+    targetPort: 8443
+    protocol: TCP
+
+---
+# Ingress for HTTP/HTTPS routing
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: trading-engine-ingress
+  namespace: hft-trading
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "5"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "30"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "30"
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+spec:
+  tls:
+  - hosts:
+    - trading.example.com
+    secretName: trading-tls-cert
+  rules:
+  - host: trading.example.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: trading-engine-internal
+            port:
+              number: 8080
+
+================================================================================
+5. HORIZONTAL POD AUTOSCALER
+================================================================================
+
+# k8s/hpa.yaml
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: trading-engine-hpa
+  namespace: hft-trading
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: trading-engine
+  minReplicas: 3
+  maxReplicas: 10
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 50
+        periodSeconds: 60
+      - type: Pods
+        value: 2
+        periodSeconds: 60
+      selectPolicy: Min
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 30
+      - type: Pods
+        value: 4
+        periodSeconds: 30
+      selectPolicy: Max
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  - type: Pods
+    pods:
+      metric:
+        name: latency_p99_milliseconds
+      target:
+        type: AverageValue
+        averageValue: "1"  # 1ms P99 latency
+
+---
+# Vertical Pod Autoscaler (optional)
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: trading-engine-vpa
+  namespace: hft-trading
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: trading-engine
+  updatePolicy:
+    updateMode: "Auto"
+  resourcePolicy:
+    containerPolicies:
+    - containerName: trading-engine
+      minAllowed:
+        cpu: 2000m
+        memory: 4Gi
+      maxAllowed:
+        cpu: 8000m
+        memory: 16Gi
+      controlledResources:
+      - cpu
+      - memory
+
+================================================================================
+6. POD DISRUPTION BUDGETS
+================================================================================
+
+# k8s/pdb.yaml
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: trading-engine-pdb
+  namespace: hft-trading
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: trading-engine
+  unhealthyPodEvictionPolicy: AlwaysAllow
+
+================================================================================
+7. NETWORK POLICIES
+================================================================================
+
+# k8s/networkpolicy.yaml
+---
+# Default deny all ingress
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: hft-trading
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+
+---
+# Allow specific ingress to trading engine
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: trading-engine-ingress
+  namespace: hft-trading
+spec:
+  podSelector:
+    matchLabels:
+      app: trading-engine
+  policyTypes:
+  - Ingress
+  ingress:
+  # Allow from ingress controller
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: ingress-nginx
+    ports:
+    - protocol: TCP
+      port: 8080
+    - protocol: TCP
+      port: 8443
+  # Allow from monitoring
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: monitoring
+    ports:
+    - protocol: TCP
+      port: 9090
+  # Allow inter-pod communication
+  - from:
+    - podSelector:
+        matchLabels:
+          app: trading-engine
+    ports:
+    - protocol: TCP
+      port: 8080
+
+---
+# Allow egress to external services
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: trading-engine-egress
+  namespace: hft-trading
+spec:
+  podSelector:
+    matchLabels:
+      app: trading-engine
+  policyTypes:
+  - Egress
+  egress:
+  # Allow DNS
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: kube-system
+    ports:
+    - protocol: UDP
+      port: 53
+  # Allow PostgreSQL
+  - to:
+    - podSelector:
+        matchLabels:
+          app: postgres
+    ports:
+    - protocol: TCP
+      port: 5432
+  # Allow Redis
+  - to:
+    - podSelector:
+        matchLabels:
+          app: redis
+    ports:
+    - protocol: TCP
+      port: 6379
+  # Allow external APIs
+  - to:
+    - podSelector: {}
+    ports:
+    - protocol: TCP
+      port: 443
+
+================================================================================
+8. HELM CHARTS
+================================================================================
+
+# helm/hft-trading/Chart.yaml
+apiVersion: v2
+name: hft-trading-engine
+description: High-Frequency Trading Engine Helm Chart
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+keywords:
+  - trading
+  - hft
+  - financial
+maintainers:
+  - name: Trading Platform Team
+    email: trading-platform@example.com
+
+dependencies:
+  - name: postgresql
+    version: 12.x.x
+    repository: https://charts.bitnami.com/bitnami
+    condition: postgresql.enabled
+  - name: redis
+    version: 17.x.x
+    repository: https://charts.bitnami.com/bitnami
+    condition: redis.enabled
+
+---
+# helm/hft-trading/values.yaml
+replicaCount: 3
+
+image:
+  repository: registry.example.com/hft-trading-engine
+  pullPolicy: IfNotPresent
+  tag: "v1.0.0"
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "9090"
+
+podSecurityContext:
+  fsGroup: 1000
+  runAsNonRoot: true
+  runAsUser: 1000
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+    - ALL
+    add:
+    - NET_BIND_SERVICE
+  readOnlyRootFilesystem: true
+
+service:
+  type: ClusterIP
+  port: 8080
+  targetPort: 8080
+  annotations: {}
+
+ingress:
+  enabled: true
+  className: "nginx"
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+  hosts:
+    - host: trading.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: trading-tls
+      hosts:
+        - trading.example.com
+
+resources:
+  limits:
+    cpu: 8000m
+    memory: 16Gi
+  requests:
+    cpu: 4000m
+    memory: 8Gi
+
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+
+nodeSelector:
+  node-type: high-performance
+
+tolerations: []
+
+affinity:
+  podAntiAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+    - labelSelector:
+        matchExpressions:
+        - key: app
+          operator: In
+          values:
+          - trading-engine
+      topologyKey: kubernetes.io/hostname
+
+persistence:
+  enabled: true
+  storageClass: "fast-ssd"
+  accessMode: ReadWriteOnce
+  size: 100Gi
+
+config:
+  logLevel: info
+  threadCount: 8
+  tcpNodelay: true
+
+postgresql:
+  enabled: true
+  auth:
+    username: hftuser
+    password: ""
+    database: hft_trading
+  primary:
+    persistence:
+      enabled: true
+      size: 100Gi
+
+redis:
+  enabled: true
+  auth:
+    enabled: true
+    password: ""
+  master:
+    persistence:
+      enabled: true
+      size: 10Gi
+
+monitoring:
+  enabled: true
+  serviceMonitor:
+    enabled: true
+    interval: 1s
+
+---
+# helm/hft-trading/templates/statefulset.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "hft-trading-engine.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "hft-trading-engine.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "hft-trading-engine.fullname" . }}-headless
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "hft-trading-engine.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        {{- toYaml .Values.podAnnotations | nindent 8 }}
+      labels:
+        {{- include "hft-trading-engine.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "hft-trading-engine.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+      - name: {{ .Chart.Name }}
+        securityContext:
+          {{- toYaml .Values.securityContext | nindent 12 }}
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        ports:
+        - name: http
+          containerPort: {{ .Values.service.targetPort }}
+          protocol: TCP
+        - name: metrics
+          containerPort: 9090
+          protocol: TCP
+        livenessProbe:
+          httpGet:
+            path: /health/live
+            port: http
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        resources:
+          {{- toYaml .Values.resources | nindent 12 }}
+        volumeMounts:
+        - name: config
+          mountPath: /app/config
+        - name: data
+          mountPath: /app/data
+      volumes:
+      - name: config
+        configMap:
+          name: {{ include "hft-trading-engine.fullname" . }}-config
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  {{- if .Values.persistence.enabled }}
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes:
+      - {{ .Values.persistence.accessMode }}
+      storageClassName: {{ .Values.persistence.storageClass }}
+      resources:
+        requests:
+          storage: {{ .Values.persistence.size }}
+  {{- end }}
+
+================================================================================
+9. STORAGE CONFIGURATION
+================================================================================
+
+# k8s/storage.yaml
+---
+# StorageClass for fast SSD storage
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: fast-ssd
+provisioner: kubernetes.io/aws-ebs
+parameters:
+  type: gp3
+  iops: "16000"
+  throughput: "1000"
+  fsType: ext4
+  encrypted: "true"
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+reclaimPolicy: Retain
+
+---
+# PersistentVolume for shared data
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: trading-shared-data
+spec:
+  capacity:
+    storage: 500Gi
+  volumeMode: Filesystem
+  accessModes:
+  - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: efs-sc
+  csi:
+    driver: efs.csi.aws.com
+    volumeHandle: fs-12345678
+
+---
+# PersistentVolumeClaim
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: trading-shared-data
+  namespace: hft-trading
+spec:
+  accessModes:
+  - ReadWriteMany
+  storageClassName: efs-sc
+  resources:
+    requests:
+      storage: 500Gi
+
+================================================================================
+10. MONITORING AND OBSERVABILITY
+================================================================================
+
+# k8s/servicemonitor.yaml
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: trading-engine-metrics
+  namespace: hft-trading
+  labels:
+    app: trading-engine
+spec:
+  selector:
+    matchLabels:
+      app: trading-engine
+  endpoints:
+  - port: metrics
+    interval: 1s
+    path: /metrics
+
+---
+# k8s/prometheusrule.yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: trading-engine-alerts
+  namespace: hft-trading
+spec:
+  groups:
+  - name: trading-engine
+    interval: 10s
+    rules:
+    - alert: HighLatency
+      expr: histogram_quantile(0.99, latency_seconds_bucket) > 0.001
+      for: 1m
+      labels:
+        severity: critical
+      annotations:
+        summary: "High P99 latency detected"
+        description: "P99 latency is {{ $value }}s"
+
+    - alert: HighErrorRate
+      expr: rate(errors_total[5m]) > 0.01
+      for: 2m
+      labels:
+        severity: warning
+      annotations:
+        summary: "High error rate detected"
+        description: "Error rate is {{ $value }}/s"
+
+    - alert: PodNotReady
+      expr: kube_pod_status_ready{namespace="hft-trading",condition="false"} == 1
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Pod not ready"
+        description: "Pod {{ $labels.pod }} not ready for 5 minutes"
+
+================================================================================
+DEPLOYMENT SCRIPTS
+================================================================================
+
+# scripts/k8s-deploy.sh
+#!/bin/bash
+set -e
+
+NAMESPACE="hft-trading"
+VERSION="${1:-v1.0.0}"
+
+echo "Deploying HFT Trading Engine version ${VERSION} to ${NAMESPACE}"
+
+# Create namespace if it doesn't exist
+kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
+
+# Apply configurations
+kubectl apply -f k8s/namespace.yaml
+kubectl apply -f k8s/configmap.yaml
+kubectl apply -f k8s/secret.yaml
+kubectl apply -f k8s/storage.yaml
+kubectl apply -f k8s/networkpolicy.yaml
+kubectl apply -f k8s/pdb.yaml
+
+# Deploy StatefulSet
+kubectl apply -f k8s/statefulset.yaml
+
+# Deploy Services
+kubectl apply -f k8s/service.yaml
+
+# Deploy HPA
+kubectl apply -f k8s/hpa.yaml
+
+# Wait for rollout
+kubectl rollout status statefulset/trading-engine -n ${NAMESPACE}
+
+echo "Deployment completed successfully"
+
+# Helm deployment script
+# scripts/helm-deploy.sh
+#!/bin/bash
+set -e
+
+RELEASE_NAME="hft-trading"
+NAMESPACE="hft-trading"
+VERSION="${1:-1.0.0}"
+
+helm upgrade --install ${RELEASE_NAME} ./helm/hft-trading \
+  --namespace ${NAMESPACE} \
+  --create-namespace \
+  --version ${VERSION} \
+  --values helm/hft-trading/values.yaml \
+  --values helm/hft-trading/values-production.yaml \
+  --wait \
+  --timeout 10m
+
+echo "Helm deployment completed"
+
+================================================================================
+END OF KUBERNETES DEPLOYMENT GUIDE
+================================================================================

@@ -1,0 +1,1185 @@
+================================================================================
+                  NOTIFICATION SYSTEM - DETAILED ARCHITECTURE
+================================================================================
+
+VERSION: 2.1.0
+DOCUMENT STATUS: PRODUCTION
+CLASSIFICATION: INTERNAL
+LAST REVIEWED: 2025-11-25
+
+================================================================================
+                              TABLE OF CONTENTS
+================================================================================
+
+1. System Overview & Design Philosophy
+2. Core Architecture Components
+3. Threading Model & Concurrency
+4. Message Flow & Data Pipeline
+5. Queue Implementation Details
+6. Channel Abstraction Layer
+7. Routing Engine Architecture
+8. Rate Limiting Implementation
+9. Template Engine Design
+10. Monitoring & Observability
+11. Failure Handling & Recovery
+12. Performance Optimization Techniques
+13. Deployment Architecture
+14. Complete C++ Implementation
+
+================================================================================
+                1. SYSTEM OVERVIEW & DESIGN PHILOSOPHY
+================================================================================
+
+ARCHITECTURAL PRINCIPLES:
+
+1. LOCK-FREE DESIGN
+   - SPSC (Single Producer Single Consumer) queues for main path
+   - MPMC (Multi Producer Multi Consumer) for parallel submissions
+   - CAS (Compare-And-Swap) operations for atomic updates
+   - Memory barriers for cross-thread visibility
+
+2. ZERO-ALLOCATION HOT PATH
+   - Pre-allocated memory pools
+   - Object reuse via ring buffers
+   - Stack allocation for small objects
+   - Custom allocators for hot structures
+
+3. SEPARATION OF CONCERNS
+   - Submission layer (fast path)
+   - Processing layer (medium path)
+   - Dispatch layer (slow path, external I/O)
+   - Each layer runs in separate threads
+
+4. BACKPRESSURE HANDLING
+   - Bounded queues with overflow policy
+   - Flow control between layers
+   - Circuit breakers for failing channels
+   - Adaptive rate limiting
+
+5. OBSERVABILITY BY DESIGN
+   - Low-overhead metrics collection
+   - Distributed tracing support
+   - Structured logging
+   - Performance profiling hooks
+
+TECHNOLOGY STACK:
+
+- Language: C++20 (gcc 12+ or clang 15+)
+- Build System: CMake 3.20+
+- Dependencies:
+  - libcurl: HTTP/HTTPS requests
+  - OpenSSL: TLS encryption
+  - RapidJSON: JSON parsing
+  - spdlog: High-performance logging
+  - Prometheus C++: Metrics export
+  - libpqxx: PostgreSQL for audit logs
+  - Redis++: Deduplication cache
+  - gRPC: Service communication
+  - Boost.ASIO: Async I/O
+
+DESIGN PATTERNS USED:
+
+- Factory Pattern: Channel creation
+- Strategy Pattern: Routing algorithms
+- Observer Pattern: Event notifications
+- Circuit Breaker: Channel failure handling
+- Object Pool: Memory management
+- Command Pattern: Alert encapsulation
+- Chain of Responsibility: Alert processing pipeline
+
+================================================================================
+                   2. CORE ARCHITECTURE COMPONENTS
+================================================================================
+
+COMPONENT DIAGRAM:
+
+┌─────────────────────────────────────────────────────────────────┐
+│                        CLIENT APPLICATIONS                       │
+│  (Trading System, Risk Engine, Market Data, Monitoring)         │
+└───────────────┬─────────────────────────────────────────────────┘
+                │
+                ▼
+┌───────────────────────────────────────────────────────────────┐
+│                    NOTIFICATION MANAGER                        │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐        │
+│  │ Alert Queue  │  │ Deduplicator │  │ Rate Limiter │        │
+│  │  (Lock-Free) │  │   (Redis)    │  │ (Token Bucket)│       │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘        │
+│         │                  │                  │                 │
+│         └──────────────────┴──────────────────┘                │
+│                            │                                    │
+└────────────────────────────┼────────────────────────────────────┘
+                             ▼
+┌───────────────────────────────────────────────────────────────┐
+│                      ALERT ROUTER                              │
+│  ┌────────────────┐  ┌────────────────┐  ┌────────────────┐  │
+│  │ Severity       │  │ Time-Based     │  │  User          │  │
+│  │ Routing        │  │ Routing        │  │  Preferences   │  │
+│  └────────┬───────┘  └────────┬───────┘  └────────┬───────┘  │
+│           └──────────────┬─────────────────────────┘          │
+└──────────────────────────┼────────────────────────────────────┘
+                           ▼
+┌───────────────────────────────────────────────────────────────┐
+│                   CHANNEL DISPATCHER                           │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐     │
+│  │  Email   │  │   SMS    │  │  Slack   │  │ PagerDuty│     │
+│  │ Channel  │  │ Channel  │  │ Channel  │  │  Channel │     │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘     │
+└───────┼─────────────┼─────────────┼─────────────┼────────────┘
+        │             │             │             │
+        ▼             ▼             ▼             ▼
+┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐
+│  SMTP    │  │ Twilio   │  │  Slack   │  │ PagerDuty│
+│  Server  │  │   API    │  │   API    │  │   API    │
+└──────────┘  └──────────┘  └──────────┘  └──────────┘
+
+CORE CLASSES:
+
+1. NotificationManager
+   - Singleton orchestrator
+   - Manages lifecycle of all components
+   - Provides high-level API
+   - Coordinates shutdown
+
+2. AlertQueue
+   - Lock-free SPSC queue for single-threaded submission
+   - MPMC queue for multi-threaded scenarios
+   - Bounded capacity with overflow handling
+   - Wait-free operations for producer
+
+3. Deduplicator
+   - Redis-backed deduplication
+   - Configurable time windows
+   - Content-based and ID-based dedup
+   - LRU cache for hot keys
+
+4. RateLimiter
+   - Token bucket algorithm
+   - Per-user and per-channel limits
+   - Burst allowance configuration
+   - P1 bypass mechanism
+
+5. AlertRouter
+   - Rule-based routing engine
+   - Time-zone aware scheduling
+   - On-call rotation support
+   - Dynamic rule reloading
+
+6. ChannelDispatcher
+   - Manages all notification channels
+   - Parallel dispatch for multi-channel alerts
+   - Circuit breaker per channel
+   - Retry logic with exponential backoff
+
+7. Channel (Abstract Base)
+   - Interface for all channel implementations
+   - send(), health_check(), get_metrics()
+   - Standardized error handling
+   - Async operation support
+
+8. TemplateEngine
+   - Mustache-style template syntax
+   - Context variable substitution
+   - Conditional rendering
+   - Loop constructs
+
+================================================================================
+                   3. THREADING MODEL & CONCURRENCY
+================================================================================
+
+THREAD ARCHITECTURE:
+
+Main Thread:
+- Application integration point
+- API call handling
+- Configuration loading
+- Lifecycle management
+
+Submission Thread:
+- Fast path: < 10 microseconds
+- Lock-free alert queuing
+- Immediate return to caller
+- Memory pool allocation
+
+Processing Thread:
+- Deduplication check (Redis)
+- Rate limit enforcement
+- Alert routing decision
+- Template rendering
+- Queue depth: 10,000 alerts
+
+Dispatch Threads (Pool):
+- One thread per active channel
+- External I/O operations
+- Retry logic
+- Result tracking
+- Thread pool size: 4-16 threads
+
+Housekeeping Thread:
+- Metrics collection
+- Log rotation
+- Cache cleanup
+- Health checks
+- Interval: 60 seconds
+
+CONCURRENCY PRIMITIVES:
+
+Lock-Free Queue Implementation:
+
+template<typename T, size_t Size>
+class LockFreeQueue {
+private:
+    struct Node {
+        std::atomic<T*> data;
+        char padding[64 - sizeof(std::atomic<T*>)]; // Cache line padding
+    };
+
+    Node buffer[Size];
+    std::atomic<size_t> write_pos{0};
+    std::atomic<size_t> read_pos{0};
+
+public:
+    bool try_push(T* item) {
+        size_t current_write = write_pos.load(std::memory_order_relaxed);
+        size_t next_write = (current_write + 1) % Size;
+
+        if (next_write == read_pos.load(std::memory_order_acquire)) {
+            return false; // Queue full
+        }
+
+        buffer[current_write].data.store(item, std::memory_order_release);
+        write_pos.store(next_write, std::memory_order_release);
+        return true;
+    }
+
+    T* try_pop() {
+        size_t current_read = read_pos.load(std::memory_order_relaxed);
+
+        if (current_read == write_pos.load(std::memory_order_acquire)) {
+            return nullptr; // Queue empty
+        }
+
+        T* item = buffer[current_read].data.load(std::memory_order_acquire);
+        read_pos.store((current_read + 1) % Size, std::memory_order_release);
+        return item;
+    }
+
+    size_t size() const {
+        size_t write = write_pos.load(std::memory_order_acquire);
+        size_t read = read_pos.load(std::memory_order_acquire);
+        return (write >= read) ? (write - read) : (Size - read + write);
+    }
+};
+
+Memory Pool for Zero-Allocation:
+
+template<typename T, size_t PoolSize>
+class ObjectPool {
+private:
+    struct alignas(64) PoolNode {
+        T object;
+        std::atomic<PoolNode*> next;
+    };
+
+    PoolNode pool[PoolSize];
+    std::atomic<PoolNode*> free_list;
+
+public:
+    ObjectPool() {
+        for (size_t i = 0; i < PoolSize - 1; ++i) {
+            pool[i].next.store(&pool[i + 1], std::memory_order_relaxed);
+        }
+        pool[PoolSize - 1].next.store(nullptr, std::memory_order_relaxed);
+        free_list.store(&pool[0], std::memory_order_release);
+    }
+
+    T* acquire() {
+        PoolNode* node = free_list.load(std::memory_order_acquire);
+        while (node != nullptr) {
+            PoolNode* next = node->next.load(std::memory_order_acquire);
+            if (free_list.compare_exchange_weak(node, next,
+                std::memory_order_release, std::memory_order_acquire)) {
+                return &node->object;
+            }
+        }
+        return nullptr; // Pool exhausted
+    }
+
+    void release(T* obj) {
+        PoolNode* node = reinterpret_cast<PoolNode*>(
+            reinterpret_cast<char*>(obj) - offsetof(PoolNode, object));
+
+        PoolNode* old_head = free_list.load(std::memory_order_acquire);
+        do {
+            node->next.store(old_head, std::memory_order_release);
+        } while (!free_list.compare_exchange_weak(old_head, node,
+            std::memory_order_release, std::memory_order_acquire));
+    }
+};
+
+THREAD SYNCHRONIZATION:
+
+// Wait-free alert submission
+void NotificationManager::submitAlert(const Alert& alert) {
+    Alert* pooled_alert = alert_pool_.acquire();
+    if (!pooled_alert) {
+        metrics_.pool_exhaustion_count++;
+        pooled_alert = new Alert(); // Fallback to dynamic allocation
+    }
+
+    *pooled_alert = alert;
+
+    if (!alert_queue_.try_push(pooled_alert)) {
+        metrics_.queue_overflow_count++;
+        // Handle overflow: drop, log, or escalate
+        handleQueueOverflow(pooled_alert);
+    }
+}
+
+// Processing thread main loop
+void NotificationManager::processingLoop() {
+    while (running_.load(std::memory_order_acquire)) {
+        Alert* alert = alert_queue_.try_pop();
+        if (!alert) {
+            // No work available, sleep briefly
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+            continue;
+        }
+
+        // Check deduplication
+        if (deduplicator_.isDuplicate(*alert)) {
+            metrics_.deduplicated_count++;
+            alert_pool_.release(alert);
+            continue;
+        }
+
+        // Check rate limits
+        if (!rate_limiter_.allowAlert(*alert)) {
+            metrics_.rate_limited_count++;
+            if (alert->severity != AlertSeverity::P1) {
+                alert_pool_.release(alert);
+                continue;
+            }
+        }
+
+        // Route alert to appropriate channels
+        auto channels = alert_router_.routeAlert(*alert);
+
+        // Dispatch to channels
+        dispatcher_.dispatch(*alert, channels);
+
+        // Return to pool
+        alert_pool_.release(alert);
+    }
+}
+
+================================================================================
+                    4. MESSAGE FLOW & DATA PIPELINE
+================================================================================
+
+DETAILED MESSAGE FLOW:
+
+STEP 1: Alert Submission (< 10 us)
+┌────────────────────────────────────────────────────────────┐
+│ Application Code                                           │
+│   notifier.sendAlert(P1, "Trading Halted", details)       │
+└────────────────────────┬───────────────────────────────────┘
+                         │
+                         ▼
+┌────────────────────────────────────────────────────────────┐
+│ Acquire Alert Object from Pool                             │
+│   - Zero allocation if pool has capacity                   │
+│   - Fallback to new if pool exhausted                      │
+└────────────────────────┬───────────────────────────────────┘
+                         │
+                         ▼
+┌────────────────────────────────────────────────────────────┐
+│ Push to Lock-Free Queue                                    │
+│   - CAS operation for thread safety                        │
+│   - Immediate return to caller                             │
+│   - Latency: < 10 microseconds                             │
+└────────────────────────┬───────────────────────────────────┘
+                         │
+                         ▼ Return to caller immediately
+
+STEP 2: Alert Processing (< 500 us)
+┌────────────────────────────────────────────────────────────┐
+│ Pop from Queue (Processing Thread)                         │
+│   - Wait-free pop operation                                │
+│   - Batching for efficiency (optional)                     │
+└────────────────────────┬───────────────────────────────────┘
+                         │
+                         ▼
+┌────────────────────────────────────────────────────────────┐
+│ Deduplication Check                                        │
+│   - Generate alert fingerprint (hash)                      │
+│   - Redis lookup: EXISTS dedup:{fingerprint}               │
+│   - If exists: discard alert                               │
+│   - If new: SET dedup:{fingerprint} EX 300                 │
+│   - Latency: < 200 microseconds (local Redis)              │
+└────────────────────────┬───────────────────────────────────┘
+                         │
+                         ▼
+┌────────────────────────────────────────────────────────────┐
+│ Rate Limit Check                                           │
+│   - Token bucket algorithm                                 │
+│   - Per-user and per-channel limits                        │
+│   - P1 alerts bypass rate limits                           │
+│   - Latency: < 50 microseconds (in-memory)                 │
+└────────────────────────┬───────────────────────────────────┘
+                         │
+                         ▼
+┌────────────────────────────────────────────────────────────┐
+│ Alert Routing                                              │
+│   - Match severity to channel rules                        │
+│   - Apply time-based routing (business hours)              │
+│   - Resolve user preferences                               │
+│   - Determine recipient list                               │
+│   - Latency: < 100 microseconds                            │
+└────────────────────────┬───────────────────────────────────┘
+                         │
+                         ▼
+┌────────────────────────────────────────────────────────────┐
+│ Template Rendering                                         │
+│   - Load template for channel + severity                   │
+│   - Substitute context variables                           │
+│   - Generate HTML and plain text versions                  │
+│   - Latency: < 150 microseconds                            │
+└────────────────────────┬───────────────────────────────────┘
+                         │
+                         ▼
+
+STEP 3: Channel Dispatch (1-10 seconds)
+┌────────────────────────────────────────────────────────────┐
+│ Submit to Channel Queues                                   │
+│   - Separate queue per channel type                        │
+│   - Parallel submission for multi-channel                  │
+│   - Each channel has dedicated thread pool                 │
+└────────────────────────┬───────────────────────────────────┘
+                         │
+                         ▼
+┌────────────────────────────────────────────────────────────┐
+│ Channel-Specific Dispatch                                  │
+│                                                             │
+│ Email Channel:                                             │
+│   1. Connect to SMTP server (TLS)                          │
+│   2. Authenticate                                          │
+│   3. Send MIME-encoded message                             │
+│   4. Wait for confirmation                                 │
+│   Latency: 2-10 seconds                                    │
+│                                                             │
+│ SMS Channel:                                               │
+│   1. HTTP POST to Twilio API                               │
+│   2. Include API key and phone number                      │
+│   3. Receive message SID                                   │
+│   Latency: 1-5 seconds                                     │
+│                                                             │
+│ Slack Channel:                                             │
+│   1. HTTP POST to webhook URL                              │
+│   2. Format as Slack Block Kit JSON                        │
+│   3. Receive acknowledgment                                │
+│   Latency: 0.5-2 seconds                                   │
+│                                                             │
+│ PagerDuty Channel:                                         │
+│   1. HTTP POST to Events API v2                            │
+│   2. Include routing key and incident details              │
+│   3. Receive dedup_key for tracking                        │
+│   Latency: 1-3 seconds                                     │
+└────────────────────────┬───────────────────────────────────┘
+                         │
+                         ▼
+┌────────────────────────────────────────────────────────────┐
+│ Result Handling                                            │
+│   - Success: Log and update metrics                        │
+│   - Failure: Retry with exponential backoff                │
+│   - Circuit Breaker: Open on repeated failures             │
+│   - Audit Log: Record all attempts                         │
+└────────────────────────────────────────────────────────────┘
+
+DATA STRUCTURES:
+
+struct Alert {
+    uint64_t id;                          // Unique alert ID
+    AlertSeverity severity;               // P1, P2, P3, P4
+    std::string title;                    // Short summary
+    std::string message;                  // Detailed description
+    std::chrono::system_clock::time_point timestamp;
+    std::unordered_map<std::string, std::string> context;
+    std::vector<std::string> tags;        // For categorization
+    std::string source;                   // Originating system
+    std::optional<std::string> dedup_key; // For explicit deduplication
+    std::optional<std::string> incident_key; // For PagerDuty
+};
+
+struct RoutingDecision {
+    std::vector<ChannelType> channels;    // Which channels to use
+    std::vector<std::string> recipients;  // Who should receive it
+    std::chrono::seconds delay;           // Delivery delay (for scheduling)
+    bool allow_dedup;                     // Enable deduplication
+    bool bypass_rate_limit;               // Skip rate limiting
+};
+
+struct DispatchResult {
+    bool success;
+    ChannelType channel;
+    std::string recipient;
+    std::chrono::milliseconds latency;
+    std::optional<std::string> error_message;
+    std::optional<std::string> external_id; // Message ID from provider
+    int attempt_number;
+};
+
+================================================================================
+                    5. QUEUE IMPLEMENTATION DETAILS
+================================================================================
+
+MULTI-LEVEL QUEUE HIERARCHY:
+
+Level 1: Submission Queue (Lock-Free SPSC/MPMC)
+- Purpose: Fast alert submission from application
+- Type: Ring buffer with atomic operations
+- Capacity: 100,000 alerts
+- Overflow policy: Drop oldest P4 alerts first
+- Latency: < 10 microseconds
+
+Level 2: Processing Queue (Priority Queue)
+- Purpose: Prioritize P1 > P2 > P3 > P4
+- Type: Array of lock-free queues (one per priority)
+- Capacity: 10,000 alerts per priority
+- Processing order: Always drain P1 first
+- Latency: < 50 microseconds
+
+Level 3: Channel Queues (Bounded FIFO)
+- Purpose: Buffer alerts per channel for batching
+- Type: std::queue with mutex (external I/O, less critical)
+- Capacity: 1,000 alerts per channel
+- Batching: Group up to 10 alerts per dispatch
+- Latency: Variable (depends on channel)
+
+PRIORITY QUEUE IMPLEMENTATION:
+
+template<size_t NumPriorities>
+class PriorityAlertQueue {
+private:
+    std::array<LockFreeQueue<Alert, 10000>, NumPriorities> queues_;
+    std::atomic<uint64_t> total_size_{0};
+
+public:
+    bool push(Alert* alert) {
+        size_t priority = static_cast<size_t>(alert->severity);
+        if (priority >= NumPriorities) {
+            priority = NumPriorities - 1;
+        }
+
+        if (queues_[priority].try_push(alert)) {
+            total_size_.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+        return false;
+    }
+
+    Alert* pop() {
+        // Always check highest priority (P1 = 0) first
+        for (size_t i = 0; i < NumPriorities; ++i) {
+            Alert* alert = queues_[i].try_pop();
+            if (alert) {
+                total_size_.fetch_sub(1, std::memory_order_relaxed);
+                return alert;
+            }
+        }
+        return nullptr;
+    }
+
+    uint64_t size() const {
+        return total_size_.load(std::memory_order_relaxed);
+    }
+
+    // Per-priority size for monitoring
+    std::array<size_t, NumPriorities> get_priority_sizes() const {
+        std::array<size_t, NumPriorities> sizes;
+        for (size_t i = 0; i < NumPriorities; ++i) {
+            sizes[i] = queues_[i].size();
+        }
+        return sizes;
+    }
+};
+
+QUEUE OVERFLOW HANDLING:
+
+enum class OverflowPolicy {
+    DROP_OLDEST_LOW_PRIORITY,  // Drop P4, then P3, then P2
+    DROP_NEWEST,               // Drop incoming alert
+    BLOCK_UNTIL_SPACE,         // Block caller (not recommended)
+    ESCALATE_TO_EMERGENCY,     // Emergency notification channel
+};
+
+class QueueOverflowHandler {
+private:
+    OverflowPolicy policy_;
+    EmergencyChannel emergency_channel_;
+    std::atomic<uint64_t> overflow_count_{0};
+
+public:
+    void handleOverflow(Alert* alert, PriorityAlertQueue& queue) {
+        overflow_count_.fetch_add(1, std::memory_order_relaxed);
+
+        switch (policy_) {
+        case OverflowPolicy::DROP_OLDEST_LOW_PRIORITY:
+            // Try to make space by dropping low priority alerts
+            for (int priority = 3; priority >= 0; --priority) {
+                if (priority == static_cast<int>(alert->severity)) {
+                    break; // Don't drop same priority
+                }
+                Alert* dropped = queue.popFromPriority(priority);
+                if (dropped) {
+                    logDroppedAlert(*dropped);
+                    alert_pool_.release(dropped);
+                    // Try to push again
+                    if (queue.push(alert)) {
+                        return;
+                    }
+                }
+            }
+            // Still no space, fall through to drop newest
+            [[fallthrough]];
+
+        case OverflowPolicy::DROP_NEWEST:
+            logDroppedAlert(*alert);
+            alert_pool_.release(alert);
+            break;
+
+        case OverflowPolicy::ESCALATE_TO_EMERGENCY:
+            // Send emergency notification about system overload
+            emergency_channel_.send(
+                "Notification queue overflow - dropping alerts");
+            logDroppedAlert(*alert);
+            alert_pool_.release(alert);
+            break;
+
+        case OverflowPolicy::BLOCK_UNTIL_SPACE:
+            // Wait for space (not recommended for HFT)
+            while (!queue.push(alert)) {
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+            }
+            break;
+        }
+    }
+};
+
+QUEUE MONITORING:
+
+struct QueueMetrics {
+    std::atomic<uint64_t> total_pushed{0};
+    std::atomic<uint64_t> total_popped{0};
+    std::atomic<uint64_t> overflow_count{0};
+    std::atomic<uint64_t> current_size{0};
+    std::atomic<uint64_t> max_size_observed{0};
+
+    // Latency histogram
+    std::array<std::atomic<uint64_t>, 10> latency_buckets{}; // 0-10us, 10-100us, etc.
+
+    void recordPush(std::chrono::nanoseconds latency) {
+        total_pushed.fetch_add(1, std::memory_order_relaxed);
+        size_t bucket = std::min(9UL, static_cast<size_t>(
+            std::log10(latency.count()) - 3)); // 3 = log10(1000ns = 1us)
+        latency_buckets[bucket].fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void recordPop() {
+        total_popped.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void updateSize(uint64_t size) {
+        current_size.store(size, std::memory_order_relaxed);
+        uint64_t current_max = max_size_observed.load(std::memory_order_relaxed);
+        while (size > current_max) {
+            if (max_size_observed.compare_exchange_weak(current_max, size,
+                std::memory_order_relaxed)) {
+                break;
+            }
+        }
+    }
+};
+
+================================================================================
+                    6. CHANNEL ABSTRACTION LAYER
+================================================================================
+
+CHANNEL INTERFACE:
+
+class INotificationChannel {
+public:
+    virtual ~INotificationChannel() = default;
+
+    // Core operations
+    virtual DispatchResult send(
+        const Alert& alert,
+        const std::vector<std::string>& recipients) = 0;
+
+    virtual bool health_check() = 0;
+
+    virtual ChannelMetrics get_metrics() const = 0;
+
+    // Configuration
+    virtual void set_config(const ChannelConfig& config) = 0;
+
+    virtual ChannelConfig get_config() const = 0;
+
+    // Lifecycle
+    virtual bool start() = 0;
+
+    virtual void stop() = 0;
+
+    virtual bool is_running() const = 0;
+
+    // Metadata
+    virtual ChannelType get_type() const = 0;
+
+    virtual std::string get_name() const = 0;
+};
+
+CIRCUIT BREAKER PATTERN:
+
+class CircuitBreaker {
+public:
+    enum class State {
+        CLOSED,      // Normal operation
+        OPEN,        // Too many failures, reject requests
+        HALF_OPEN    // Testing if service recovered
+    };
+
+private:
+    std::atomic<State> state_{State::CLOSED};
+    std::atomic<uint32_t> failure_count_{0};
+    std::atomic<uint32_t> success_count_{0};
+    std::chrono::steady_clock::time_point last_failure_time_;
+
+    const uint32_t failure_threshold_{5};
+    const uint32_t success_threshold_{2};
+    const std::chrono::seconds reset_timeout_{60};
+
+    mutable std::shared_mutex mutex_;
+
+public:
+    bool allow_request() {
+        State current_state = state_.load(std::memory_order_acquire);
+
+        if (current_state == State::CLOSED) {
+            return true;
+        }
+
+        if (current_state == State::OPEN) {
+            std::shared_lock lock(mutex_);
+            auto now = std::chrono::steady_clock::now();
+            if (now - last_failure_time_ >= reset_timeout_) {
+                // Try to transition to HALF_OPEN
+                State expected = State::OPEN;
+                if (state_.compare_exchange_strong(expected, State::HALF_OPEN,
+                    std::memory_order_release, std::memory_order_acquire)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // HALF_OPEN state - allow limited requests to test recovery
+        return true;
+    }
+
+    void record_success() {
+        State current_state = state_.load(std::memory_order_acquire);
+
+        if (current_state == State::HALF_OPEN) {
+            uint32_t successes = success_count_.fetch_add(1, std::memory_order_relaxed);
+            if (successes + 1 >= success_threshold_) {
+                // Recovered! Close the circuit
+                state_.store(State::CLOSED, std::memory_order_release);
+                failure_count_.store(0, std::memory_order_relaxed);
+                success_count_.store(0, std::memory_order_relaxed);
+            }
+        } else if (current_state == State::CLOSED) {
+            // Reset failure count on success
+            failure_count_.store(0, std::memory_order_relaxed);
+        }
+    }
+
+    void record_failure() {
+        uint32_t failures = failure_count_.fetch_add(1, std::memory_order_relaxed);
+
+        std::unique_lock lock(mutex_);
+        last_failure_time_ = std::chrono::steady_clock::now();
+        lock.unlock();
+
+        State current_state = state_.load(std::memory_order_acquire);
+
+        if (current_state == State::HALF_OPEN) {
+            // Failed during recovery, go back to OPEN
+            state_.store(State::OPEN, std::memory_order_release);
+            success_count_.store(0, std::memory_order_relaxed);
+        } else if (failures + 1 >= failure_threshold_) {
+            // Too many failures, open the circuit
+            State expected = State::CLOSED;
+            state_.compare_exchange_strong(expected, State::OPEN,
+                std::memory_order_release, std::memory_order_acquire);
+        }
+    }
+
+    State get_state() const {
+        return state_.load(std::memory_order_acquire);
+    }
+};
+
+RETRY LOGIC:
+
+class RetryPolicy {
+private:
+    uint32_t max_attempts_{3};
+    std::chrono::milliseconds initial_delay_{100};
+    double backoff_multiplier_{2.0};
+    std::chrono::milliseconds max_delay_{30000};
+    bool jitter_enabled_{true};
+
+public:
+    struct RetryContext {
+        uint32_t attempt;
+        std::chrono::milliseconds delay;
+        bool should_retry;
+        std::string last_error;
+    };
+
+    RetryContext next_attempt(const RetryContext& current) const {
+        RetryContext next;
+        next.attempt = current.attempt + 1;
+
+        if (next.attempt >= max_attempts_) {
+            next.should_retry = false;
+            return next;
+        }
+
+        // Calculate delay with exponential backoff
+        auto delay = std::chrono::duration_cast<std::chrono::milliseconds>(
+            initial_delay_ * std::pow(backoff_multiplier_, next.attempt - 1));
+
+        delay = std::min(delay, max_delay_);
+
+        // Add jitter to prevent thundering herd
+        if (jitter_enabled_) {
+            std::random_device rd;
+            std::mt19937 gen(rd());
+            std::uniform_real_distribution<> dis(0.5, 1.5);
+            delay = std::chrono::duration_cast<std::chrono::milliseconds>(
+                delay * dis(gen));
+        }
+
+        next.delay = delay;
+        next.should_retry = true;
+
+        return next;
+    }
+
+    RetryContext initial() const {
+        return {0, std::chrono::milliseconds(0), true, ""};
+    }
+};
+
+// Retry wrapper for channel operations
+template<typename Func>
+DispatchResult retry_with_policy(
+    const RetryPolicy& policy,
+    CircuitBreaker& breaker,
+    Func&& operation)
+{
+    auto context = policy.initial();
+
+    while (context.should_retry) {
+        if (!breaker.allow_request()) {
+            DispatchResult result;
+            result.success = false;
+            result.error_message = "Circuit breaker open";
+            return result;
+        }
+
+        context.attempt++;
+
+        try {
+            auto result = operation();
+
+            if (result.success) {
+                breaker.record_success();
+                result.attempt_number = context.attempt;
+                return result;
+            }
+
+            // Operation failed, check if we should retry
+            context.last_error = result.error_message.value_or("Unknown error");
+            context = policy.next_attempt(context);
+
+            if (context.should_retry) {
+                breaker.record_failure();
+                std::this_thread::sleep_for(context.delay);
+            } else {
+                breaker.record_failure();
+                result.attempt_number = context.attempt;
+                return result;
+            }
+
+        } catch (const std::exception& e) {
+            breaker.record_failure();
+            context.last_error = e.what();
+            context = policy.next_attempt(context);
+
+            if (!context.should_retry) {
+                DispatchResult result;
+                result.success = false;
+                result.error_message = context.last_error;
+                result.attempt_number = context.attempt;
+                return result;
+            }
+
+            std::this_thread::sleep_for(context.delay);
+        }
+    }
+
+    DispatchResult result;
+    result.success = false;
+    result.error_message = "Max retries exceeded: " + context.last_error;
+    result.attempt_number = context.attempt;
+    return result;
+}
+
+================================================================================
+                       7. ROUTING ENGINE ARCHITECTURE
+================================================================================
+
+ROUTING RULE STRUCTURE:
+
+struct RoutingRule {
+    std::string rule_id;
+    int priority;  // Higher priority rules evaluated first
+
+    // Matching criteria
+    std::optional<AlertSeverity> severity;
+    std::optional<std::regex> title_pattern;
+    std::optional<std::regex> source_pattern;
+    std::optional<std::vector<std::string>> tags;
+
+    // Time-based criteria
+    struct TimeWindow {
+        std::chrono::system_clock::time_point start;
+        std::chrono::system_clock::time_point end;
+        std::vector<std::string> days_of_week; // "Mon", "Tue", etc.
+        std::optional<std::string> timezone; // "America/New_York"
+    };
+    std::optional<TimeWindow> time_window;
+
+    // Actions
+    std::vector<ChannelType> channels;
+    std::vector<std::string> recipients;
+    std::optional<std::chrono::seconds> delay;
+    bool bypass_dedup;
+    bool bypass_rate_limit;
+    bool stop_processing; // Don't evaluate further rules
+};
+
+ROUTING ENGINE IMPLEMENTATION:
+
+class AlertRouter {
+private:
+    std::vector<RoutingRule> rules_;
+    mutable std::shared_mutex rules_mutex_;
+    OnCallSchedule on_call_schedule_;
+    UserPreferences user_prefs_;
+
+public:
+    RoutingDecision routeAlert(const Alert& alert) const {
+        std::shared_lock lock(rules_mutex_);
+
+        RoutingDecision decision;
+
+        // Sort rules by priority
+        auto sorted_rules = rules_;
+        std::sort(sorted_rules.begin(), sorted_rules.end(),
+            [](const auto& a, const auto& b) { return a.priority > b.priority; });
+
+        for (const auto& rule : sorted_rules) {
+            if (matches(rule, alert)) {
+                apply_rule(rule, alert, decision);
+
+                if (rule.stop_processing) {
+                    break;
+                }
+            }
+        }
+
+        // Apply default routing if no rules matched
+        if (decision.channels.empty()) {
+            apply_default_routing(alert, decision);
+        }
+
+        // Apply user preferences
+        apply_user_preferences(alert, decision);
+
+        // Resolve on-call recipients
+        resolve_on_call(alert, decision);
+
+        return decision;
+    }
+
+private:
+    bool matches(const RoutingRule& rule, const Alert& alert) const {
+        // Check severity
+        if (rule.severity && *rule.severity != alert.severity) {
+            return false;
+        }
+
+        // Check title pattern
+        if (rule.title_pattern && !std::regex_match(alert.title, *rule.title_pattern)) {
+            return false;
+        }
+
+        // Check source pattern
+        if (rule.source_pattern && !std::regex_match(alert.source, *rule.source_pattern)) {
+            return false;
+        }
+
+        // Check tags
+        if (rule.tags) {
+            bool has_any_tag = false;
+            for (const auto& tag : *rule.tags) {
+                if (std::find(alert.tags.begin(), alert.tags.end(), tag) != alert.tags.end()) {
+                    has_any_tag = true;
+                    break;
+                }
+            }
+            if (!has_any_tag) {
+                return false;
+            }
+        }
+
+        // Check time window
+        if (rule.time_window) {
+            if (!is_in_time_window(*rule.time_window, alert.timestamp)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    void apply_rule(const RoutingRule& rule, const Alert& alert,
+                    RoutingDecision& decision) const {
+        // Add channels
+        decision.channels.insert(decision.channels.end(),
+            rule.channels.begin(), rule.channels.end());
+
+        // Add recipients
+        decision.recipients.insert(decision.recipients.end(),
+            rule.recipients.begin(), rule.recipients.end());
+
+        // Set delay
+        if (rule.delay) {
+            decision.delay = *rule.delay;
+        }
+
+        // Set bypass flags
+        decision.allow_dedup = decision.allow_dedup && !rule.bypass_dedup;
+        decision.bypass_rate_limit = decision.bypass_rate_limit || rule.bypass_rate_limit;
+    }
+
+    void apply_default_routing(const Alert& alert, RoutingDecision& decision) const {
+        // Default routing based on severity
+        switch (alert.severity) {
+        case AlertSeverity::P1:
+            decision.channels = {ChannelType::PagerDuty, ChannelType::SMS,
+                               ChannelType::Slack, ChannelType::Email};
+            decision.recipients = {"on-call", "team-lead", "vp-eng"};
+            decision.bypass_rate_limit = true;
+            break;
+
+        case AlertSeverity::P2:
+            decision.channels = {ChannelType::PagerDuty, ChannelType::Slack,
+                               ChannelType::Email};
+            decision.recipients = {"on-call", "team-lead"};
+            break;
+
+        case AlertSeverity::P3:
+            decision.channels = {ChannelType::Slack, ChannelType::Email};
+            decision.recipients = {"team"};
+            break;
+
+        case AlertSeverity::P4:
+            decision.channels = {ChannelType::Email};
+            decision.recipients = {"team"};
+            break;
+        }
+    }
+
+    void resolve_on_call(const Alert& alert, RoutingDecision& decision) const {
+        std::vector<std::string> resolved_recipients;
+
+        for (const auto& recipient : decision.recipients) {
+            if (recipient == "on-call") {
+                // Resolve current on-call engineer
+                auto on_call_list = on_call_schedule_.get_current_on_call(
+                    alert.timestamp);
+                resolved_recipients.insert(resolved_recipients.end(),
+                    on_call_list.begin(), on_call_list.end());
+            } else {
+                resolved_recipients.push_back(recipient);
+            }
+        }
+
+        decision.recipients = std::move(resolved_recipients);
+    }
+};
+
+ON-CALL SCHEDULE:
+
+class OnCallSchedule {
+private:
+    struct Schedule {
+        std::string team;
+        std::vector<std::string> rotation;  // List of users
+        size_t current_index;
+        std::chrono::hours shift_duration;
+        std::chrono::system_clock::time_point rotation_start;
+    };
+
+    std::unordered_map<std::string, Schedule> schedules_;
+    mutable std::shared_mutex mutex_;
+
+public:
+    std::vector<std::string> get_current_on_call(
+        std::chrono::system_clock::time_point now) const {
+        std::shared_lock lock(mutex_);
+
+        std::vector<std::string> on_call_users;
+
+        for (const auto& [team, schedule] : schedules_) {
+            auto hours_since_start = std::chrono::duration_cast<std::chrono::hours>(
+                now - schedule.rotation_start);
+
+            size_t rotations = hours_since_start.count() / schedule.shift_duration.count();
+            size_t index = (schedule.current_index + rotations) % schedule.rotation.size();
+
+            on_call_users.push_back(schedule.rotation[index]);
+        }
+
+        return on_call_users;
+    }
+
+    void add_schedule(const std::string& team, const Schedule& schedule) {
+        std::unique_lock lock(mutex_);
+        schedules_[team] = schedule;
+    }
+
+    void load_from_file(const std::string& filepath) {
+        // Load schedule configuration from JSON file
+        std::ifstream file(filepath);
+        // ... JSON parsing logic ...
+    }
+};
+
+================================================================================
+           (CONTINUED IN NEXT SECTION - CHARACTER LIMIT REACHED)
+================================================================================

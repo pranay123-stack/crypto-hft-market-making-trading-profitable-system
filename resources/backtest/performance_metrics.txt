@@ -1,0 +1,1004 @@
+================================================================================
+PERFORMANCE METRICS FOR HFT BACKTESTING
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Core Performance Metrics
+2. Return Calculations
+3. Risk Metrics (Sharpe, Sortino, Calmar)
+4. Drawdown Analysis
+5. Trade Statistics
+6. High-Frequency Specific Metrics
+7. Attribution Analysis
+8. Statistical Tests
+9. Performance Reporter
+10. Complete Implementation
+
+================================================================================
+1. CORE PERFORMANCE METRICS
+================================================================================
+
+/*******************************************************************************
+ * PERFORMANCE METRICS CALCULATOR
+ ******************************************************************************/
+
+#pragma once
+#include <vector>
+#include <cmath>
+#include <algorithm>
+#include <numeric>
+#include <map>
+#include <chrono>
+
+namespace HFT {
+namespace Backtest {
+namespace Metrics {
+
+using Timestamp = std::chrono::time_point<std::chrono::system_clock,
+                                          std::chrono::nanoseconds>;
+
+/*******************************************************************************
+ * TRADE RECORD
+ ******************************************************************************/
+
+struct TradeRecord {
+    Timestamp entry_time;
+    Timestamp exit_time;
+    std::string symbol;
+    std::string strategy_id;
+
+    enum class Side { LONG, SHORT };
+    Side side;
+
+    double entry_price;
+    double exit_price;
+    int64_t quantity;
+
+    double pnl;
+    double pnl_percent;
+    double commission;
+    double slippage;
+
+    Duration holding_period;
+
+    TradeRecord()
+        : side(Side::LONG),
+          entry_price(0.0),
+          exit_price(0.0),
+          quantity(0),
+          pnl(0.0),
+          pnl_percent(0.0),
+          commission(0.0),
+          slippage(0.0) {}
+
+    void calculate_pnl() {
+        double multiplier = (side == Side::LONG) ? 1.0 : -1.0;
+        pnl = (exit_price - entry_price) * quantity * multiplier - commission;
+        pnl_percent = (pnl / (entry_price * quantity)) * 100.0;
+        holding_period = exit_time - entry_time;
+    }
+
+    bool is_winner() const {
+        return pnl > 0.0;
+    }
+
+    double get_return() const {
+        return pnl_percent / 100.0;
+    }
+};
+
+/*******************************************************************************
+ * EQUITY CURVE DATA
+ ******************************************************************************/
+
+struct EquityPoint {
+    Timestamp timestamp;
+    double equity;
+    double cash;
+    double unrealized_pnl;
+    double realized_pnl;
+    double total_commission;
+
+    EquityPoint()
+        : equity(0.0), cash(0.0),
+          unrealized_pnl(0.0), realized_pnl(0.0),
+          total_commission(0.0) {}
+};
+
+================================================================================
+2. RETURN CALCULATIONS
+================================================================================
+
+/*******************************************************************************
+ * RETURN METRICS
+ ******************************************************************************/
+
+class ReturnCalculator {
+public:
+    // Total return
+    static double calculate_total_return(double initial_capital,
+                                         double final_capital) {
+        return (final_capital - initial_capital) / initial_capital;
+    }
+
+    // Annualized return
+    static double calculate_annualized_return(double total_return,
+                                             Duration period) {
+        double years = std::chrono::duration<double, std::ratio<31536000>>(
+            period).count();
+        return std::pow(1.0 + total_return, 1.0 / years) - 1.0;
+    }
+
+    // Compound annual growth rate (CAGR)
+    static double calculate_cagr(double initial_capital,
+                                double final_capital,
+                                Duration period) {
+        double years = std::chrono::duration<double, std::ratio<31536000>>(
+            period).count();
+        return std::pow(final_capital / initial_capital, 1.0 / years) - 1.0;
+    }
+
+    // Calculate returns from equity curve
+    static std::vector<double> calculate_returns(
+        const std::vector<EquityPoint>& equity_curve) {
+
+        std::vector<double> returns;
+        returns.reserve(equity_curve.size() - 1);
+
+        for (size_t i = 1; i < equity_curve.size(); ++i) {
+            double ret = (equity_curve[i].equity - equity_curve[i-1].equity) /
+                        equity_curve[i-1].equity;
+            returns.push_back(ret);
+        }
+
+        return returns;
+    }
+
+    // Calculate log returns
+    static std::vector<double> calculate_log_returns(
+        const std::vector<EquityPoint>& equity_curve) {
+
+        std::vector<double> returns;
+        returns.reserve(equity_curve.size() - 1);
+
+        for (size_t i = 1; i < equity_curve.size(); ++i) {
+            double ret = std::log(equity_curve[i].equity /
+                                 equity_curve[i-1].equity);
+            returns.push_back(ret);
+        }
+
+        return returns;
+    }
+
+    // Average return
+    static double calculate_average_return(const std::vector<double>& returns) {
+        if (returns.empty()) return 0.0;
+        return std::accumulate(returns.begin(), returns.end(), 0.0) /
+               returns.size();
+    }
+
+    // Geometric mean return
+    static double calculate_geometric_mean(const std::vector<double>& returns) {
+        if (returns.empty()) return 0.0;
+
+        double product = 1.0;
+        for (double ret : returns) {
+            product *= (1.0 + ret);
+        }
+
+        return std::pow(product, 1.0 / returns.size()) - 1.0;
+    }
+};
+
+================================================================================
+3. RISK METRICS
+================================================================================
+
+/*******************************************************************************
+ * VOLATILITY CALCULATIONS
+ ******************************************************************************/
+
+class VolatilityCalculator {
+public:
+    // Standard deviation of returns
+    static double calculate_std_dev(const std::vector<double>& returns) {
+        if (returns.size() < 2) return 0.0;
+
+        double mean = std::accumulate(returns.begin(), returns.end(), 0.0) /
+                     returns.size();
+
+        double sq_sum = 0.0;
+        for (double ret : returns) {
+            sq_sum += (ret - mean) * (ret - mean);
+        }
+
+        return std::sqrt(sq_sum / (returns.size() - 1));
+    }
+
+    // Annualized volatility
+    static double calculate_annualized_volatility(
+        const std::vector<double>& returns,
+        int periods_per_year = 252) {
+
+        double daily_vol = calculate_std_dev(returns);
+        return daily_vol * std::sqrt(static_cast<double>(periods_per_year));
+    }
+
+    // Downside deviation (for Sortino ratio)
+    static double calculate_downside_deviation(
+        const std::vector<double>& returns,
+        double target_return = 0.0) {
+
+        if (returns.size() < 2) return 0.0;
+
+        double sum_squared_downside = 0.0;
+        int count = 0;
+
+        for (double ret : returns) {
+            if (ret < target_return) {
+                double diff = ret - target_return;
+                sum_squared_downside += diff * diff;
+                count++;
+            }
+        }
+
+        if (count == 0) return 0.0;
+        return std::sqrt(sum_squared_downside / count);
+    }
+};
+
+/*******************************************************************************
+ * SHARPE RATIO
+ ******************************************************************************/
+
+class SharpeRatioCalculator {
+public:
+    // Classic Sharpe ratio
+    static double calculate(const std::vector<double>& returns,
+                           double risk_free_rate = 0.0) {
+
+        if (returns.empty()) return 0.0;
+
+        double avg_return = ReturnCalculator::calculate_average_return(returns);
+        double std_dev = VolatilityCalculator::calculate_std_dev(returns);
+
+        if (std_dev == 0.0) return 0.0;
+
+        return (avg_return - risk_free_rate) / std_dev;
+    }
+
+    // Annualized Sharpe ratio
+    static double calculate_annualized(
+        const std::vector<double>& returns,
+        double risk_free_rate = 0.0,
+        int periods_per_year = 252) {
+
+        double sharpe = calculate(returns, risk_free_rate);
+        return sharpe * std::sqrt(static_cast<double>(periods_per_year));
+    }
+
+    // Sharpe ratio from equity curve
+    static double calculate_from_equity(
+        const std::vector<EquityPoint>& equity_curve,
+        double risk_free_rate = 0.0,
+        int periods_per_year = 252) {
+
+        auto returns = ReturnCalculator::calculate_returns(equity_curve);
+        return calculate_annualized(returns, risk_free_rate, periods_per_year);
+    }
+};
+
+/*******************************************************************************
+ * SORTINO RATIO
+ ******************************************************************************/
+
+class SortinoRatioCalculator {
+public:
+    // Sortino ratio (uses downside deviation instead of total volatility)
+    static double calculate(const std::vector<double>& returns,
+                           double target_return = 0.0) {
+
+        if (returns.empty()) return 0.0;
+
+        double avg_return = ReturnCalculator::calculate_average_return(returns);
+        double downside_dev = VolatilityCalculator::calculate_downside_deviation(
+            returns, target_return);
+
+        if (downside_dev == 0.0) return 0.0;
+
+        return (avg_return - target_return) / downside_dev;
+    }
+
+    // Annualized Sortino ratio
+    static double calculate_annualized(
+        const std::vector<double>& returns,
+        double target_return = 0.0,
+        int periods_per_year = 252) {
+
+        double sortino = calculate(returns, target_return);
+        return sortino * std::sqrt(static_cast<double>(periods_per_year));
+    }
+};
+
+/*******************************************************************************
+ * CALMAR RATIO
+ ******************************************************************************/
+
+class CalmarRatioCalculator {
+public:
+    // Calmar ratio = Annualized return / Max drawdown
+    static double calculate(double annualized_return,
+                           double max_drawdown) {
+        if (max_drawdown == 0.0) return 0.0;
+        return annualized_return / std::abs(max_drawdown);
+    }
+};
+
+================================================================================
+4. DRAWDOWN ANALYSIS
+================================================================================
+
+/*******************************************************************************
+ * DRAWDOWN CALCULATOR
+ ******************************************************************************/
+
+struct DrawdownPeriod {
+    Timestamp start_time;
+    Timestamp trough_time;
+    Timestamp recovery_time;
+
+    double peak_equity;
+    double trough_equity;
+    double drawdown;
+    double drawdown_percent;
+
+    Duration duration;
+    Duration recovery_duration;
+
+    bool recovered;
+
+    DrawdownPeriod()
+        : peak_equity(0.0), trough_equity(0.0),
+          drawdown(0.0), drawdown_percent(0.0),
+          recovered(false) {}
+};
+
+class DrawdownCalculator {
+public:
+    // Calculate all drawdown periods
+    static std::vector<DrawdownPeriod> calculate_drawdowns(
+        const std::vector<EquityPoint>& equity_curve) {
+
+        std::vector<DrawdownPeriod> drawdowns;
+
+        if (equity_curve.size() < 2) {
+            return drawdowns;
+        }
+
+        double peak = equity_curve[0].equity;
+        Timestamp peak_time = equity_curve[0].timestamp;
+        bool in_drawdown = false;
+        DrawdownPeriod current_dd;
+
+        for (size_t i = 1; i < equity_curve.size(); ++i) {
+            double equity = equity_curve[i].equity;
+            Timestamp time = equity_curve[i].timestamp;
+
+            if (equity >= peak) {
+                // New peak or recovery
+                if (in_drawdown) {
+                    // End of drawdown - recovery
+                    current_dd.recovery_time = time;
+                    current_dd.recovered = true;
+                    current_dd.recovery_duration =
+                        current_dd.recovery_time - current_dd.trough_time;
+
+                    drawdowns.push_back(current_dd);
+                    in_drawdown = false;
+                }
+
+                peak = equity;
+                peak_time = time;
+
+            } else {
+                // In drawdown
+                if (!in_drawdown) {
+                    // Start of new drawdown
+                    in_drawdown = true;
+                    current_dd = DrawdownPeriod();
+                    current_dd.start_time = peak_time;
+                    current_dd.peak_equity = peak;
+                }
+
+                // Update trough if this is a new low
+                if (current_dd.trough_equity == 0.0 ||
+                    equity < current_dd.trough_equity) {
+
+                    current_dd.trough_equity = equity;
+                    current_dd.trough_time = time;
+                    current_dd.drawdown = peak - equity;
+                    current_dd.drawdown_percent = (peak - equity) / peak;
+                    current_dd.duration = time - current_dd.start_time;
+                }
+            }
+        }
+
+        // Handle unclosed drawdown
+        if (in_drawdown) {
+            current_dd.recovered = false;
+            drawdowns.push_back(current_dd);
+        }
+
+        return drawdowns;
+    }
+
+    // Calculate maximum drawdown
+    static double calculate_max_drawdown(
+        const std::vector<EquityPoint>& equity_curve) {
+
+        auto drawdowns = calculate_drawdowns(equity_curve);
+
+        if (drawdowns.empty()) return 0.0;
+
+        double max_dd = 0.0;
+        for (const auto& dd : drawdowns) {
+            if (dd.drawdown_percent > max_dd) {
+                max_dd = dd.drawdown_percent;
+            }
+        }
+
+        return max_dd;
+    }
+
+    // Calculate average drawdown
+    static double calculate_avg_drawdown(
+        const std::vector<EquityPoint>& equity_curve) {
+
+        auto drawdowns = calculate_drawdowns(equity_curve);
+
+        if (drawdowns.empty()) return 0.0;
+
+        double sum = 0.0;
+        for (const auto& dd : drawdowns) {
+            sum += dd.drawdown_percent;
+        }
+
+        return sum / drawdowns.size();
+    }
+
+    // Calculate average recovery time
+    static Duration calculate_avg_recovery_time(
+        const std::vector<EquityPoint>& equity_curve) {
+
+        auto drawdowns = calculate_drawdowns(equity_curve);
+
+        Duration total_recovery(0);
+        int recovered_count = 0;
+
+        for (const auto& dd : drawdowns) {
+            if (dd.recovered) {
+                total_recovery += dd.recovery_duration;
+                recovered_count++;
+            }
+        }
+
+        if (recovered_count == 0) {
+            return Duration(0);
+        }
+
+        return total_recovery / recovered_count;
+    }
+};
+
+================================================================================
+5. TRADE STATISTICS
+================================================================================
+
+/*******************************************************************************
+ * TRADE ANALYZER
+ ******************************************************************************/
+
+class TradeAnalyzer {
+public:
+    struct TradeStats {
+        // Basic counts
+        int total_trades;
+        int winning_trades;
+        int losing_trades;
+
+        // Win/Loss ratios
+        double win_rate;
+        double loss_rate;
+
+        // P&L statistics
+        double total_pnl;
+        double avg_pnl;
+        double avg_win;
+        double avg_loss;
+        double largest_win;
+        double largest_loss;
+
+        // Profit factor
+        double profit_factor;
+
+        // Expectancy
+        double expectancy;
+
+        // Average holding period
+        Duration avg_holding_period;
+        Duration avg_win_holding_period;
+        Duration avg_loss_holding_period;
+
+        // Commission and slippage
+        double total_commission;
+        double total_slippage;
+        double avg_commission_per_trade;
+
+        TradeStats() : total_trades(0), winning_trades(0), losing_trades(0),
+                      win_rate(0.0), loss_rate(0.0),
+                      total_pnl(0.0), avg_pnl(0.0),
+                      avg_win(0.0), avg_loss(0.0),
+                      largest_win(0.0), largest_loss(0.0),
+                      profit_factor(0.0), expectancy(0.0),
+                      total_commission(0.0), total_slippage(0.0),
+                      avg_commission_per_trade(0.0) {}
+    };
+
+    static TradeStats analyze(const std::vector<TradeRecord>& trades) {
+        TradeStats stats;
+
+        if (trades.empty()) {
+            return stats;
+        }
+
+        stats.total_trades = trades.size();
+
+        double total_wins = 0.0;
+        double total_losses = 0.0;
+        Duration win_duration(0);
+        Duration loss_duration(0);
+
+        for (const auto& trade : trades) {
+            stats.total_pnl += trade.pnl;
+            stats.total_commission += trade.commission;
+            stats.total_slippage += trade.slippage;
+
+            if (trade.is_winner()) {
+                stats.winning_trades++;
+                total_wins += trade.pnl;
+                win_duration += trade.holding_period;
+
+                if (trade.pnl > stats.largest_win) {
+                    stats.largest_win = trade.pnl;
+                }
+            } else {
+                stats.losing_trades++;
+                total_losses += std::abs(trade.pnl);
+                loss_duration += trade.holding_period;
+
+                if (trade.pnl < stats.largest_loss) {
+                    stats.largest_loss = trade.pnl;
+                }
+            }
+        }
+
+        // Calculate derived statistics
+        stats.win_rate = static_cast<double>(stats.winning_trades) /
+                        stats.total_trades;
+        stats.loss_rate = 1.0 - stats.win_rate;
+
+        stats.avg_pnl = stats.total_pnl / stats.total_trades;
+
+        if (stats.winning_trades > 0) {
+            stats.avg_win = total_wins / stats.winning_trades;
+            stats.avg_win_holding_period = win_duration / stats.winning_trades;
+        }
+
+        if (stats.losing_trades > 0) {
+            stats.avg_loss = total_losses / stats.losing_trades;
+            stats.avg_loss_holding_period = loss_duration / stats.losing_trades;
+        }
+
+        // Profit factor
+        if (total_losses > 0.0) {
+            stats.profit_factor = total_wins / total_losses;
+        }
+
+        // Expectancy
+        stats.expectancy = (stats.win_rate * stats.avg_win) -
+                          (stats.loss_rate * stats.avg_loss);
+
+        // Average holding period
+        Duration total_duration(0);
+        for (const auto& trade : trades) {
+            total_duration += trade.holding_period;
+        }
+        stats.avg_holding_period = total_duration / trades.size();
+
+        stats.avg_commission_per_trade = stats.total_commission /
+                                         stats.total_trades;
+
+        return stats;
+    }
+
+    // Consecutive wins/losses
+    static int calculate_max_consecutive_wins(
+        const std::vector<TradeRecord>& trades) {
+
+        int max_consecutive = 0;
+        int current_consecutive = 0;
+
+        for (const auto& trade : trades) {
+            if (trade.is_winner()) {
+                current_consecutive++;
+                max_consecutive = std::max(max_consecutive, current_consecutive);
+            } else {
+                current_consecutive = 0;
+            }
+        }
+
+        return max_consecutive;
+    }
+
+    static int calculate_max_consecutive_losses(
+        const std::vector<TradeRecord>& trades) {
+
+        int max_consecutive = 0;
+        int current_consecutive = 0;
+
+        for (const auto& trade : trades) {
+            if (!trade.is_winner()) {
+                current_consecutive++;
+                max_consecutive = std::max(max_consecutive, current_consecutive);
+            } else {
+                current_consecutive = 0;
+            }
+        }
+
+        return max_consecutive;
+    }
+};
+
+================================================================================
+6. HIGH-FREQUENCY SPECIFIC METRICS
+================================================================================
+
+/*******************************************************************************
+ * HFT METRICS
+ ******************************************************************************/
+
+class HFTMetrics {
+public:
+    // Trades per day
+    static double calculate_trades_per_day(
+        const std::vector<TradeRecord>& trades,
+        Duration total_period) {
+
+        if (trades.empty()) return 0.0;
+
+        double days = std::chrono::duration<double, std::ratio<86400>>(
+            total_period).count();
+
+        return trades.size() / days;
+    }
+
+    // Average trade duration (for HFT, should be seconds/minutes)
+    static Duration calculate_avg_trade_duration(
+        const std::vector<TradeRecord>& trades) {
+
+        if (trades.empty()) return Duration(0);
+
+        Duration total(0);
+        for (const auto& trade : trades) {
+            total += trade.holding_period;
+        }
+
+        return total / trades.size();
+    }
+
+    // Microstructure quality: bid-ask spread capture
+    static double calculate_spread_capture_ratio(
+        const std::vector<TradeRecord>& trades,
+        double avg_spread) {
+
+        if (trades.empty() || avg_spread == 0.0) return 0.0;
+
+        double total_slippage = 0.0;
+        for (const auto& trade : trades) {
+            total_slippage += trade.slippage;
+        }
+
+        double avg_slippage = total_slippage / trades.size();
+        return avg_slippage / avg_spread;
+    }
+
+    // Fill ratio (for aggressive orders)
+    static double calculate_fill_ratio(int orders_submitted,
+                                       int orders_filled) {
+        if (orders_submitted == 0) return 0.0;
+        return static_cast<double>(orders_filled) / orders_submitted;
+    }
+
+    // Latency impact on P&L
+    static double calculate_latency_cost(
+        const std::vector<TradeRecord>& trades,
+        double avg_price_move_per_ms) {
+
+        // Estimate cost of latency based on price movements
+        double total_latency_cost = 0.0;
+
+        for (const auto& trade : trades) {
+            // Assuming latency in entry and exit
+            double latency_ms = 1.0; // Example: 1ms latency
+            double cost = trade.quantity * avg_price_move_per_ms * latency_ms;
+            total_latency_cost += cost;
+        }
+
+        return total_latency_cost;
+    }
+
+    // Order-to-trade ratio (measure of aggressiveness)
+    static double calculate_order_to_trade_ratio(int total_orders,
+                                                 int total_trades) {
+        if (total_trades == 0) return 0.0;
+        return static_cast<double>(total_orders) / total_trades;
+    }
+};
+
+================================================================================
+7. STATISTICAL TESTS
+================================================================================
+
+/*******************************************************************************
+ * STATISTICAL SIGNIFICANCE TESTS
+ ******************************************************************************/
+
+class StatisticalTests {
+public:
+    // T-statistic for mean return
+    static double calculate_t_statistic(const std::vector<double>& returns) {
+        if (returns.size() < 2) return 0.0;
+
+        double mean = ReturnCalculator::calculate_average_return(returns);
+        double std_dev = VolatilityCalculator::calculate_std_dev(returns);
+
+        if (std_dev == 0.0) return 0.0;
+
+        return mean / (std_dev / std::sqrt(static_cast<double>(returns.size())));
+    }
+
+    // Z-score for Sharpe ratio
+    static double calculate_sharpe_z_score(double sharpe_ratio,
+                                          int num_observations) {
+        if (num_observations < 2) return 0.0;
+
+        // Approximate standard error of Sharpe ratio
+        double se = std::sqrt((1.0 + 0.5 * sharpe_ratio * sharpe_ratio) /
+                             num_observations);
+
+        return sharpe_ratio / se;
+    }
+
+    // Confidence interval for mean return
+    static std::pair<double, double> calculate_return_confidence_interval(
+        const std::vector<double>& returns,
+        double confidence_level = 0.95) {
+
+        if (returns.size() < 2) return {0.0, 0.0};
+
+        double mean = ReturnCalculator::calculate_average_return(returns);
+        double std_dev = VolatilityCalculator::calculate_std_dev(returns);
+        double se = std_dev / std::sqrt(static_cast<double>(returns.size()));
+
+        // Using normal approximation (for large samples)
+        double z = 1.96; // For 95% confidence
+
+        if (confidence_level == 0.99) {
+            z = 2.576;
+        } else if (confidence_level == 0.90) {
+            z = 1.645;
+        }
+
+        double margin = z * se;
+        return {mean - margin, mean + margin};
+    }
+};
+
+================================================================================
+8. COMPLETE PERFORMANCE METRICS SUITE
+================================================================================
+
+/*******************************************************************************
+ * UNIFIED PERFORMANCE METRICS
+ ******************************************************************************/
+
+class PerformanceMetrics {
+public:
+    struct ComprehensiveMetrics {
+        // Basic metrics
+        double initial_capital;
+        double final_capital;
+        double total_pnl;
+        double total_return;
+        double annualized_return;
+        double cagr;
+
+        // Risk metrics
+        double sharpe_ratio;
+        double sortino_ratio;
+        double calmar_ratio;
+        double max_drawdown;
+        double avg_drawdown;
+        double volatility;
+        Duration avg_recovery_time;
+
+        // Trade statistics
+        TradeAnalyzer::TradeStats trade_stats;
+
+        // HFT metrics
+        double trades_per_day;
+        Duration avg_trade_duration;
+        double fill_ratio;
+
+        // Statistical significance
+        double t_statistic;
+        double sharpe_z_score;
+        std::pair<double, double> return_confidence_interval;
+
+        // Drawdown details
+        std::vector<DrawdownPeriod> drawdowns;
+
+        ComprehensiveMetrics()
+            : initial_capital(0.0), final_capital(0.0),
+              total_pnl(0.0), total_return(0.0),
+              annualized_return(0.0), cagr(0.0),
+              sharpe_ratio(0.0), sortino_ratio(0.0),
+              calmar_ratio(0.0), max_drawdown(0.0),
+              avg_drawdown(0.0), volatility(0.0),
+              trades_per_day(0.0), fill_ratio(0.0),
+              t_statistic(0.0), sharpe_z_score(0.0) {}
+    };
+
+    static ComprehensiveMetrics calculate(
+        const std::vector<EquityPoint>& equity_curve,
+        const std::vector<TradeRecord>& trades,
+        double risk_free_rate = 0.0,
+        int periods_per_year = 252) {
+
+        ComprehensiveMetrics metrics;
+
+        if (equity_curve.empty()) {
+            return metrics;
+        }
+
+        // Basic metrics
+        metrics.initial_capital = equity_curve.front().equity;
+        metrics.final_capital = equity_curve.back().equity;
+        metrics.total_pnl = metrics.final_capital - metrics.initial_capital;
+        metrics.total_return = ReturnCalculator::calculate_total_return(
+            metrics.initial_capital, metrics.final_capital);
+
+        Duration period = equity_curve.back().timestamp -
+                         equity_curve.front().timestamp;
+
+        metrics.annualized_return = ReturnCalculator::calculate_annualized_return(
+            metrics.total_return, period);
+
+        metrics.cagr = ReturnCalculator::calculate_cagr(
+            metrics.initial_capital, metrics.final_capital, period);
+
+        // Calculate returns
+        auto returns = ReturnCalculator::calculate_returns(equity_curve);
+
+        // Risk metrics
+        metrics.sharpe_ratio = SharpeRatioCalculator::calculate_annualized(
+            returns, risk_free_rate, periods_per_year);
+
+        metrics.sortino_ratio = SortinoRatioCalculator::calculate_annualized(
+            returns, 0.0, periods_per_year);
+
+        metrics.volatility = VolatilityCalculator::calculate_annualized_volatility(
+            returns, periods_per_year);
+
+        // Drawdown metrics
+        metrics.drawdowns = DrawdownCalculator::calculate_drawdowns(equity_curve);
+        metrics.max_drawdown = DrawdownCalculator::calculate_max_drawdown(
+            equity_curve);
+        metrics.avg_drawdown = DrawdownCalculator::calculate_avg_drawdown(
+            equity_curve);
+        metrics.avg_recovery_time = DrawdownCalculator::calculate_avg_recovery_time(
+            equity_curve);
+
+        metrics.calmar_ratio = CalmarRatioCalculator::calculate(
+            metrics.annualized_return, metrics.max_drawdown);
+
+        // Trade statistics
+        metrics.trade_stats = TradeAnalyzer::analyze(trades);
+
+        // HFT metrics
+        metrics.trades_per_day = HFTMetrics::calculate_trades_per_day(
+            trades, period);
+        metrics.avg_trade_duration = HFTMetrics::calculate_avg_trade_duration(
+            trades);
+
+        // Statistical tests
+        metrics.t_statistic = StatisticalTests::calculate_t_statistic(returns);
+        metrics.sharpe_z_score = StatisticalTests::calculate_sharpe_z_score(
+            metrics.sharpe_ratio, returns.size());
+        metrics.return_confidence_interval =
+            StatisticalTests::calculate_return_confidence_interval(returns);
+
+        return metrics;
+    }
+
+    // Print comprehensive report
+    static void print_report(const ComprehensiveMetrics& metrics) {
+        printf("\n");
+        printf("================================================================================\n");
+        printf("PERFORMANCE METRICS REPORT\n");
+        printf("================================================================================\n\n");
+
+        printf("RETURNS\n");
+        printf("-------\n");
+        printf("Initial Capital:         $%.2f\n", metrics.initial_capital);
+        printf("Final Capital:           $%.2f\n", metrics.final_capital);
+        printf("Total P&L:               $%.2f\n", metrics.total_pnl);
+        printf("Total Return:            %.2f%%\n", metrics.total_return * 100);
+        printf("Annualized Return:       %.2f%%\n", metrics.annualized_return * 100);
+        printf("CAGR:                    %.2f%%\n", metrics.cagr * 100);
+        printf("\n");
+
+        printf("RISK METRICS\n");
+        printf("------------\n");
+        printf("Sharpe Ratio:            %.3f\n", metrics.sharpe_ratio);
+        printf("Sortino Ratio:           %.3f\n", metrics.sortino_ratio);
+        printf("Calmar Ratio:            %.3f\n", metrics.calmar_ratio);
+        printf("Volatility (annual):     %.2f%%\n", metrics.volatility * 100);
+        printf("Max Drawdown:            %.2f%%\n", metrics.max_drawdown * 100);
+        printf("Avg Drawdown:            %.2f%%\n", metrics.avg_drawdown * 100);
+        printf("\n");
+
+        printf("TRADE STATISTICS\n");
+        printf("----------------\n");
+        printf("Total Trades:            %d\n", metrics.trade_stats.total_trades);
+        printf("Winning Trades:          %d\n", metrics.trade_stats.winning_trades);
+        printf("Losing Trades:           %d\n", metrics.trade_stats.losing_trades);
+        printf("Win Rate:                %.2f%%\n", metrics.trade_stats.win_rate * 100);
+        printf("Avg P&L per Trade:       $%.2f\n", metrics.trade_stats.avg_pnl);
+        printf("Avg Win:                 $%.2f\n", metrics.trade_stats.avg_win);
+        printf("Avg Loss:                $%.2f\n", metrics.trade_stats.avg_loss);
+        printf("Profit Factor:           %.2f\n", metrics.trade_stats.profit_factor);
+        printf("Expectancy:              $%.2f\n", metrics.trade_stats.expectancy);
+        printf("Total Commission:        $%.2f\n", metrics.trade_stats.total_commission);
+        printf("\n");
+
+        printf("HFT METRICS\n");
+        printf("-----------\n");
+        printf("Trades per Day:          %.1f\n", metrics.trades_per_day);
+
+        auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            metrics.avg_trade_duration);
+        printf("Avg Trade Duration:      %ld ms\n", duration_ms.count());
+        printf("\n");
+
+        printf("STATISTICAL SIGNIFICANCE\n");
+        printf("------------------------\n");
+        printf("T-Statistic:             %.3f\n", metrics.t_statistic);
+        printf("Sharpe Z-Score:          %.3f\n", metrics.sharpe_z_score);
+        printf("95%% CI Return:           [%.2f%%, %.2f%%]\n",
+               metrics.return_confidence_interval.first * 100,
+               metrics.return_confidence_interval.second * 100);
+        printf("\n");
+
+        printf("================================================================================\n");
+    }
+};
+
+} // namespace Metrics
+} // namespace Backtest
+} // namespace HFT
+
+================================================================================
+END OF PERFORMANCE METRICS
+================================================================================

@@ -1,0 +1,1035 @@
+================================================================================
+INTEGRATION TESTING FOR HFT SYSTEMS
+Exchange Connector and System Integration Testing
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Integration Test Architecture
+2. Exchange Connector Testing
+3. End-to-End Order Flow Testing
+4. Market Data Integration Tests
+5. Multi-Component Integration
+6. Test Environments Setup
+7. Test Data Management
+8. Performance Integration Tests
+9. Failover and Recovery Tests
+10. CI/CD Integration Pipeline
+
+================================================================================
+1. INTEGRATION TEST ARCHITECTURE
+================================================================================
+
+1.1 Integration Test Framework Structure
+-----------------------------------------
+HFT_system/
+├── tests/
+│   ├── integration/
+│   │   ├── exchange_integration_test.cpp
+│   │   ├── market_data_integration_test.cpp
+│   │   ├── order_flow_test.cpp
+│   │   ├── strategy_integration_test.cpp
+│   │   └── system_integration_test.cpp
+│   ├── test_environments/
+│   │   ├── staging_exchange_config.json
+│   │   ├── mock_exchange_config.json
+│   │   └── testnet_credentials.json
+│   └── integration_fixtures/
+│       ├── integration_test_base.h
+│       └── exchange_simulator.h
+
+
+1.2 CMakeLists.txt for Integration Tests
+-----------------------------------------
+# CMakeLists.txt (integration tests section)
+add_executable(hft_integration_tests
+    tests/integration/exchange_integration_test.cpp
+    tests/integration/market_data_integration_test.cpp
+    tests/integration/order_flow_test.cpp
+    tests/integration/strategy_integration_test.cpp
+    tests/integration/system_integration_test.cpp
+    src/exchange_connector.cpp
+    src/market_data_handler.cpp
+    src/order_manager.cpp
+    src/strategy_engine.cpp
+    src/risk_manager.cpp
+)
+
+target_link_libraries(hft_integration_tests
+    GTest::gtest_main
+    GTest::gmock_main
+    pthread
+    ssl
+    crypto
+    curl
+    boost_system
+    boost_thread
+)
+
+# Integration tests run separately with longer timeout
+add_test(NAME IntegrationTests
+         COMMAND hft_integration_tests
+         WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+
+set_tests_properties(IntegrationTests PROPERTIES
+    TIMEOUT 300  # 5 minutes for integration tests
+    LABELS "integration"
+)
+
+
+================================================================================
+2. EXCHANGE CONNECTOR TESTING
+================================================================================
+
+2.1 FIX Protocol Connector Test
+--------------------------------
+// tests/integration/exchange_integration_test.cpp
+#include <gtest/gtest.h>
+#include "fix_connector.h"
+#include "test_fix_server.h"
+#include <thread>
+#include <chrono>
+
+using namespace std::chrono;
+
+class FIXConnectorIntegrationTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        // Start test FIX server
+        test_server_ = std::make_unique<TestFIXServer>(9878);
+        test_server_->start();
+
+        // Wait for server to be ready
+        std::this_thread::sleep_for(milliseconds(100));
+
+        // Configure FIX connector
+        FIXConfig config;
+        config.host = "localhost";
+        config.port = 9878;
+        config.sender_comp_id = "TEST_CLIENT";
+        config.target_comp_id = "TEST_SERVER";
+        config.heartbeat_interval = 30;
+
+        connector_ = std::make_unique<FIXConnector>(config);
+    }
+
+    void TearDown() override {
+        if (connector_ && connector_->isConnected()) {
+            connector_->disconnect();
+        }
+        test_server_->stop();
+    }
+
+    std::unique_ptr<FIXConnector> connector_;
+    std::unique_ptr<TestFIXServer> test_server_;
+};
+
+TEST_F(FIXConnectorIntegrationTest, ConnectionEstablishment) {
+    auto start = high_resolution_clock::now();
+
+    bool connected = connector_->connect();
+
+    auto end = high_resolution_clock::now();
+    auto connection_time = duration_cast<milliseconds>(end - start).count();
+
+    EXPECT_TRUE(connected);
+    EXPECT_LT(connection_time, 1000) << "Connection took " << connection_time << "ms";
+
+    // Verify session is established
+    EXPECT_TRUE(connector_->isLoggedOn());
+    EXPECT_EQ(connector_->getSessionState(), SessionState::LOGGED_ON);
+}
+
+TEST_F(FIXConnectorIntegrationTest, NewOrderSingle) {
+    ASSERT_TRUE(connector_->connect());
+
+    // Create new order
+    FIXOrder order;
+    order.cl_ord_id = "ORDER_001";
+    order.symbol = "AAPL";
+    order.side = '1';  // Buy
+    order.order_qty = 100;
+    order.price = 150.25;
+    order.ord_type = '2';  // Limit
+
+    // Send order
+    auto start = high_resolution_clock::now();
+    bool sent = connector_->sendNewOrder(order);
+    auto end = high_resolution_clock::now();
+
+    EXPECT_TRUE(sent);
+
+    // Wait for execution report
+    ExecutionReport exec_report;
+    bool received = connector_->waitForExecutionReport(
+        order.cl_ord_id, exec_report, milliseconds(5000)
+    );
+
+    EXPECT_TRUE(received);
+    EXPECT_EQ(exec_report.cl_ord_id, order.cl_ord_id);
+    EXPECT_EQ(exec_report.ord_status, '0');  // New
+
+    // Measure round-trip latency
+    auto total_latency = duration_cast<microseconds>(end - start).count();
+    EXPECT_LT(total_latency, 10000) << "Order RTT: " << total_latency << "us";
+}
+
+TEST_F(FIXConnectorIntegrationTest, OrderCancellation) {
+    ASSERT_TRUE(connector_->connect());
+
+    // First, send an order
+    FIXOrder order;
+    order.cl_ord_id = "ORDER_002";
+    order.symbol = "AAPL";
+    order.side = '1';
+    order.order_qty = 100;
+    order.price = 150.25;
+    order.ord_type = '2';
+
+    connector_->sendNewOrder(order);
+
+    ExecutionReport new_order_report;
+    connector_->waitForExecutionReport(order.cl_ord_id, new_order_report, milliseconds(5000));
+
+    // Cancel the order
+    FIXCancelRequest cancel;
+    cancel.orig_cl_ord_id = order.cl_ord_id;
+    cancel.cl_ord_id = "CANCEL_002";
+    cancel.symbol = order.symbol;
+    cancel.side = order.side;
+
+    auto start = high_resolution_clock::now();
+    bool sent = connector_->sendCancelRequest(cancel);
+    auto end = high_resolution_clock::now();
+
+    EXPECT_TRUE(sent);
+
+    // Wait for cancel confirmation
+    ExecutionReport cancel_report;
+    bool received = connector_->waitForExecutionReport(
+        cancel.cl_ord_id, cancel_report, milliseconds(5000)
+    );
+
+    EXPECT_TRUE(received);
+    EXPECT_EQ(cancel_report.ord_status, '4');  // Canceled
+
+    auto cancel_latency = duration_cast<microseconds>(end - start).count();
+    EXPECT_LT(cancel_latency, 5000) << "Cancel RTT: " << cancel_latency << "us";
+}
+
+TEST_F(FIXConnectorIntegrationTest, OrderModification) {
+    ASSERT_TRUE(connector_->connect());
+
+    // Send original order
+    FIXOrder order;
+    order.cl_ord_id = "ORDER_003";
+    order.symbol = "AAPL";
+    order.side = '1';
+    order.order_qty = 100;
+    order.price = 150.25;
+    order.ord_type = '2';
+
+    connector_->sendNewOrder(order);
+
+    ExecutionReport new_report;
+    connector_->waitForExecutionReport(order.cl_ord_id, new_report, milliseconds(5000));
+
+    // Modify the order
+    FIXReplaceRequest replace;
+    replace.orig_cl_ord_id = order.cl_ord_id;
+    replace.cl_ord_id = "REPLACE_003";
+    replace.symbol = order.symbol;
+    replace.side = order.side;
+    replace.order_qty = 200;  // Changed
+    replace.price = 150.50;   // Changed
+
+    bool sent = connector_->sendReplaceRequest(replace);
+    EXPECT_TRUE(sent);
+
+    ExecutionReport replace_report;
+    bool received = connector_->waitForExecutionReport(
+        replace.cl_ord_id, replace_report, milliseconds(5000)
+    );
+
+    EXPECT_TRUE(received);
+    EXPECT_EQ(replace_report.order_qty, 200);
+    EXPECT_DOUBLE_EQ(replace_report.price, 150.50);
+}
+
+TEST_F(FIXConnectorIntegrationTest, HeartbeatMechanism) {
+    ASSERT_TRUE(connector_->connect());
+
+    // Wait for at least 2 heartbeat intervals
+    std::this_thread::sleep_for(seconds(65));
+
+    // Connection should still be active
+    EXPECT_TRUE(connector_->isConnected());
+    EXPECT_GE(connector_->getHeartbeatsSent(), 2);
+    EXPECT_GE(connector_->getHeartbeatsReceived(), 2);
+}
+
+TEST_F(FIXConnectorIntegrationTest, ReconnectionLogic) {
+    ASSERT_TRUE(connector_->connect());
+
+    // Simulate server disconnect
+    test_server_->disconnectClient();
+
+    // Wait for connector to detect disconnect
+    std::this_thread::sleep_for(milliseconds(500));
+
+    EXPECT_FALSE(connector_->isConnected());
+
+    // Restart server
+    test_server_->start();
+    std::this_thread::sleep_for(milliseconds(100));
+
+    // Attempt reconnection
+    auto start = high_resolution_clock::now();
+    bool reconnected = connector_->reconnect();
+    auto end = high_resolution_clock::now();
+
+    EXPECT_TRUE(reconnected);
+
+    auto reconnect_time = duration_cast<milliseconds>(end - start).count();
+    EXPECT_LT(reconnect_time, 2000) << "Reconnection took " << reconnect_time << "ms";
+}
+
+
+2.2 WebSocket Connector Test
+-----------------------------
+// tests/integration/websocket_connector_test.cpp
+#include <gtest/gtest.h>
+#include "websocket_connector.h"
+#include "test_websocket_server.h"
+
+class WebSocketConnectorTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        // Start test WebSocket server
+        test_server_ = std::make_unique<TestWebSocketServer>(8080);
+        test_server_->start();
+
+        std::this_thread::sleep_for(milliseconds(100));
+
+        connector_ = std::make_unique<WebSocketConnector>("ws://localhost:8080");
+    }
+
+    void TearDown() override {
+        connector_->disconnect();
+        test_server_->stop();
+    }
+
+    std::unique_ptr<WebSocketConnector> connector_;
+    std::unique_ptr<TestWebSocketServer> test_server_;
+};
+
+TEST_F(WebSocketConnectorTest, ConnectionAndSubscription) {
+    bool connected = connector_->connect();
+    EXPECT_TRUE(connected);
+
+    // Subscribe to market data
+    json subscription = {
+        {"type", "subscribe"},
+        {"channels", {"ticker", "orderbook"}},
+        {"symbols", {"AAPL", "GOOGL"}}
+    };
+
+    connector_->send(subscription.dump());
+
+    // Wait for subscription confirmation
+    std::string response;
+    bool received = connector_->receive(response, milliseconds(5000));
+
+    EXPECT_TRUE(received);
+
+    json response_json = json::parse(response);
+    EXPECT_EQ(response_json["type"], "subscribed");
+}
+
+TEST_F(WebSocketConnectorTest, MarketDataStream) {
+    connector_->connect();
+
+    // Subscribe to ticker
+    json sub = {{"type", "subscribe"}, {"channel", "ticker"}, {"symbol", "AAPL"}};
+    connector_->send(sub.dump());
+
+    // Receive multiple ticks
+    std::vector<json> ticks;
+    for (int i = 0; i < 10; ++i) {
+        std::string msg;
+        if (connector_->receive(msg, milliseconds(1000))) {
+            ticks.push_back(json::parse(msg));
+        }
+    }
+
+    EXPECT_GE(ticks.size(), 10);
+
+    // Verify tick structure
+    for (const auto& tick : ticks) {
+        EXPECT_TRUE(tick.contains("symbol"));
+        EXPECT_TRUE(tick.contains("price"));
+        EXPECT_TRUE(tick.contains("timestamp"));
+    }
+}
+
+TEST_F(WebSocketConnectorTest, OrderSubmissionViaWebSocket) {
+    connector_->connect();
+
+    json order = {
+        {"type", "new_order"},
+        {"symbol", "AAPL"},
+        {"side", "buy"},
+        {"quantity", 100},
+        {"price", 150.25},
+        {"order_type", "limit"}
+    };
+
+    auto start = high_resolution_clock::now();
+    connector_->send(order.dump());
+
+    std::string response;
+    bool received = connector_->receive(response, milliseconds(5000));
+    auto end = high_resolution_clock::now();
+
+    EXPECT_TRUE(received);
+
+    json response_json = json::parse(response);
+    EXPECT_EQ(response_json["type"], "order_ack");
+    EXPECT_TRUE(response_json.contains("order_id"));
+
+    auto latency = duration_cast<microseconds>(end - start).count();
+    EXPECT_LT(latency, 50000) << "WebSocket order RTT: " << latency << "us";
+}
+
+
+2.3 REST API Connector Test
+----------------------------
+// tests/integration/rest_api_test.cpp
+#include <gtest/gtest.h>
+#include "rest_api_client.h"
+#include <curl/curl.h>
+
+class RESTAPITest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        APIConfig config;
+        config.base_url = "https://api.exchange.test";
+        config.api_key = "test_api_key";
+        config.api_secret = "test_api_secret";
+        config.timeout_ms = 5000;
+
+        client_ = std::make_unique<RESTAPIClient>(config);
+    }
+
+    std::unique_ptr<RESTAPIClient> client_;
+};
+
+TEST_F(RESTAPITest, GetAccountInfo) {
+    auto response = client_->get("/account");
+
+    EXPECT_EQ(response.status_code, 200);
+    EXPECT_FALSE(response.body.empty());
+
+    json account = json::parse(response.body);
+    EXPECT_TRUE(account.contains("account_id"));
+    EXPECT_TRUE(account.contains("balance"));
+}
+
+TEST_F(RESTAPITest, PlaceOrder) {
+    json order_request = {
+        {"symbol", "AAPL"},
+        {"side", "buy"},
+        {"quantity", 100},
+        {"price", 150.25},
+        {"type", "limit"}
+    };
+
+    auto start = high_resolution_clock::now();
+    auto response = client_->post("/orders", order_request.dump());
+    auto end = high_resolution_clock::now();
+
+    EXPECT_EQ(response.status_code, 201);
+
+    json order_response = json::parse(response.body);
+    EXPECT_TRUE(order_response.contains("order_id"));
+    EXPECT_EQ(order_response["status"], "new");
+
+    auto latency = duration_cast<milliseconds>(end - start).count();
+    EXPECT_LT(latency, 500) << "REST API latency: " << latency << "ms";
+}
+
+TEST_F(RESTAPITest, CancelOrder) {
+    // First create an order
+    json order_request = {{"symbol", "AAPL"}, {"side", "buy"}, {"quantity", 100}, {"price", 150.25}};
+    auto create_response = client_->post("/orders", order_request.dump());
+    json order = json::parse(create_response.body);
+    std::string order_id = order["order_id"];
+
+    // Cancel the order
+    auto cancel_response = client_->del("/orders/" + order_id);
+
+    EXPECT_EQ(cancel_response.status_code, 200);
+
+    json cancel_result = json::parse(cancel_response.body);
+    EXPECT_EQ(cancel_result["status"], "canceled");
+}
+
+TEST_F(RESTAPITest, RateLimitHandling) {
+    std::vector<int> status_codes;
+
+    // Send 100 rapid requests
+    for (int i = 0; i < 100; ++i) {
+        auto response = client_->get("/account");
+        status_codes.push_back(response.status_code);
+    }
+
+    // Should handle rate limits gracefully
+    int rate_limit_count = std::count(status_codes.begin(), status_codes.end(), 429);
+
+    if (rate_limit_count > 0) {
+        // Verify client backs off on rate limits
+        EXPECT_TRUE(client_->hasRateLimitBackoff());
+    }
+}
+
+
+================================================================================
+3. END-TO-END ORDER FLOW TESTING
+================================================================================
+
+3.1 Complete Order Lifecycle Test
+----------------------------------
+// tests/integration/order_flow_test.cpp
+#include <gtest/gtest.h>
+#include "trading_system.h"
+#include "mock_exchange.h"
+
+class OrderFlowIntegrationTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        // Initialize mock exchange
+        exchange_ = std::make_shared<MockExchange>();
+        exchange_->start();
+
+        // Initialize trading system components
+        SystemConfig config;
+        config.exchange = exchange_;
+        config.enable_risk_checks = true;
+
+        trading_system_ = std::make_unique<TradingSystem>(config);
+        trading_system_->initialize();
+    }
+
+    void TearDown() override {
+        trading_system_->shutdown();
+        exchange_->stop();
+    }
+
+    std::shared_ptr<MockExchange> exchange_;
+    std::unique_ptr<TradingSystem> trading_system_;
+};
+
+TEST_F(OrderFlowIntegrationTest, FullOrderLifecycle) {
+    // 1. Market data arrives
+    Quote quote;
+    quote.symbol = "AAPL";
+    quote.bid_price = 150.00;
+    quote.ask_price = 150.05;
+    quote.bid_size = 1000;
+    quote.ask_size = 1000;
+
+    trading_system_->onMarketData(quote);
+
+    // 2. Strategy generates signal
+    std::this_thread::sleep_for(milliseconds(10));
+
+    // 3. Risk check passes
+    auto risk_status = trading_system_->getRiskStatus();
+    EXPECT_TRUE(risk_status.ok_to_trade);
+
+    // 4. Order submitted
+    Order order;
+    order.symbol = "AAPL";
+    order.side = OrderSide::BUY;
+    order.price = 150.03;
+    order.quantity = 100;
+    order.order_type = OrderType::LIMIT;
+
+    auto order_id = trading_system_->submitOrder(order);
+    EXPECT_GT(order_id, 0);
+
+    // 5. Exchange accepts order
+    std::this_thread::sleep_for(milliseconds(50));
+    auto order_status = trading_system_->getOrderStatus(order_id);
+    EXPECT_EQ(order_status, OrderStatus::ACCEPTED);
+
+    // 6. Partial fill received
+    Fill fill;
+    fill.order_id = order_id;
+    fill.symbol = "AAPL";
+    fill.price = 150.03;
+    fill.quantity = 50;
+    fill.timestamp = system_clock::now();
+
+    exchange_->sendFill(fill);
+    std::this_thread::sleep_for(milliseconds(10));
+
+    auto position = trading_system_->getPosition("AAPL");
+    EXPECT_EQ(position.quantity, 50);
+
+    // 7. Complete fill
+    fill.quantity = 50;
+    exchange_->sendFill(fill);
+    std::this_thread::sleep_for(milliseconds(10));
+
+    position = trading_system_->getPosition("AAPL");
+    EXPECT_EQ(position.quantity, 100);
+
+    order_status = trading_system_->getOrderStatus(order_id);
+    EXPECT_EQ(order_status, OrderStatus::FILLED);
+}
+
+TEST_F(OrderFlowIntegrationTest, OrderRejectionHandling) {
+    Order order;
+    order.symbol = "INVALID";
+    order.side = OrderSide::BUY;
+    order.price = 150.00;
+    order.quantity = 100;
+
+    auto order_id = trading_system_->submitOrder(order);
+
+    std::this_thread::sleep_for(milliseconds(50));
+
+    auto order_status = trading_system_->getOrderStatus(order_id);
+    EXPECT_EQ(order_status, OrderStatus::REJECTED);
+
+    auto rejection = trading_system_->getOrderRejection(order_id);
+    EXPECT_FALSE(rejection.reason.empty());
+}
+
+TEST_F(OrderFlowIntegrationTest, CancelReplaceFlow) {
+    // Submit original order
+    Order order;
+    order.symbol = "AAPL";
+    order.side = OrderSide::BUY;
+    order.price = 150.00;
+    order.quantity = 100;
+
+    auto order_id = trading_system_->submitOrder(order);
+    std::this_thread::sleep_for(milliseconds(50));
+
+    // Modify order
+    bool modified = trading_system_->modifyOrder(order_id, 150.10, 150);
+    EXPECT_TRUE(modified);
+
+    std::this_thread::sleep_for(milliseconds(50));
+
+    auto updated_order = trading_system_->getOrder(order_id);
+    EXPECT_DOUBLE_EQ(updated_order.price, 150.10);
+    EXPECT_EQ(updated_order.quantity, 150);
+}
+
+
+================================================================================
+4. MARKET DATA INTEGRATION TESTS
+================================================================================
+
+4.1 Market Data Feed Integration
+---------------------------------
+// tests/integration/market_data_integration_test.cpp
+#include <gtest/gtest.h>
+#include "market_data_aggregator.h"
+#include "multiple_feed_sources.h"
+
+class MarketDataIntegrationTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        // Set up multiple data sources
+        sources_.push_back(std::make_shared<ExchangeFeed1>("exchange1"));
+        sources_.push_back(std::make_shared<ExchangeFeed2>("exchange2"));
+        sources_.push_back(std::make_shared<ExchangeFeed3>("exchange3"));
+
+        aggregator_ = std::make_unique<MarketDataAggregator>(sources_);
+    }
+
+    std::vector<std::shared_ptr<MarketDataSource>> sources_;
+    std::unique_ptr<MarketDataAggregator> aggregator_;
+};
+
+TEST_F(MarketDataIntegrationTest, MultiSourceAggregation) {
+    aggregator_->subscribe("AAPL");
+
+    std::vector<Quote> quotes;
+    auto callback = [&](const Quote& quote) {
+        quotes.push_back(quote);
+    };
+
+    aggregator_->registerCallback(callback);
+
+    // Let data flow for 1 second
+    std::this_thread::sleep_for(seconds(1));
+
+    // Should receive quotes from all sources
+    EXPECT_GE(quotes.size(), 100);
+
+    // Verify consolidation
+    std::set<std::string> sources_seen;
+    for (const auto& quote : quotes) {
+        sources_seen.insert(quote.source);
+    }
+
+    EXPECT_EQ(sources_seen.size(), 3);
+}
+
+TEST_F(MarketDataIntegrationTest, LatencyMeasurement) {
+    std::vector<long long> latencies;
+
+    aggregator_->subscribe("AAPL");
+    aggregator_->registerCallback([&](const Quote& quote) {
+        auto now = high_resolution_clock::now();
+        auto latency = duration_cast<microseconds>(now - quote.exchange_timestamp).count();
+        latencies.push_back(latency);
+    });
+
+    std::this_thread::sleep_for(seconds(5));
+
+    ASSERT_GE(latencies.size(), 100);
+
+    // Calculate percentiles
+    std::sort(latencies.begin(), latencies.end());
+    auto p50 = latencies[latencies.size() / 2];
+    auto p99 = latencies[latencies.size() * 99 / 100];
+    auto max = latencies.back();
+
+    std::cout << "Market Data Latency:" << std::endl;
+    std::cout << "  P50: " << p50 << " us" << std::endl;
+    std::cout << "  P99: " << p99 << " us" << std::endl;
+    std::cout << "  Max: " << max << " us" << std::endl;
+
+    EXPECT_LT(p99, 1000);  // P99 < 1ms
+}
+
+TEST_F(MarketDataIntegrationTest, DataQualityValidation) {
+    aggregator_->subscribe("AAPL");
+
+    int invalid_count = 0;
+    int valid_count = 0;
+
+    aggregator_->registerCallback([&](const Quote& quote) {
+        // Validate quote
+        if (quote.bid_price <= 0 || quote.ask_price <= 0) {
+            invalid_count++;
+        } else if (quote.ask_price <= quote.bid_price) {
+            invalid_count++;
+        } else if (quote.bid_size <= 0 || quote.ask_size <= 0) {
+            invalid_count++;
+        } else {
+            valid_count++;
+        }
+    });
+
+    std::this_thread::sleep_for(seconds(5));
+
+    // Should have minimal invalid data
+    double error_rate = static_cast<double>(invalid_count) / (valid_count + invalid_count);
+    EXPECT_LT(error_rate, 0.01);  // < 1% error rate
+}
+
+
+================================================================================
+5. MULTI-COMPONENT INTEGRATION TESTS
+================================================================================
+
+5.1 Strategy-Risk-Execution Integration
+----------------------------------------
+// tests/integration/strategy_integration_test.cpp
+#include <gtest/gtest.h>
+#include "strategy_engine.h"
+#include "risk_manager.h"
+#include "execution_engine.h"
+
+class StrategyIntegrationTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        risk_manager_ = std::make_shared<RiskManager>();
+        execution_engine_ = std::make_shared<ExecutionEngine>();
+        strategy_ = std::make_unique<MomentumStrategy>(risk_manager_, execution_engine_);
+
+        // Configure risk limits
+        RiskLimits limits;
+        limits.max_position = 10000;
+        limits.max_order_value = 1000000;
+        limits.max_daily_loss = 50000;
+
+        risk_manager_->setLimits(limits);
+    }
+
+    std::shared_ptr<RiskManager> risk_manager_;
+    std::shared_ptr<ExecutionEngine> execution_engine_;
+    std::unique_ptr<MomentumStrategy> strategy_;
+};
+
+TEST_F(StrategyIntegrationTest, SignalGenerationToExecution) {
+    // Feed market data to strategy
+    std::vector<Quote> historical_quotes = loadHistoricalData("AAPL", 1000);
+
+    for (const auto& quote : historical_quotes) {
+        strategy_->onMarketData(quote);
+    }
+
+    // Wait for strategy to process
+    std::this_thread::sleep_for(milliseconds(100));
+
+    // Check if strategy generated signals
+    auto signals = strategy_->getSignals();
+    EXPECT_GT(signals.size(), 0);
+
+    // Verify risk checks were performed
+    auto risk_checks = risk_manager_->getCheckHistory();
+    EXPECT_GE(risk_checks.size(), signals.size());
+
+    // Verify orders were sent to execution
+    auto orders = execution_engine_->getOrderHistory();
+    EXPECT_GT(orders.size(), 0);
+}
+
+TEST_F(StrategyIntegrationTest, RiskLimitEnforcement) {
+    // Set very low risk limits
+    RiskLimits strict_limits;
+    strict_limits.max_position = 100;
+    strict_limits.max_order_value = 10000;
+
+    risk_manager_->setLimits(strict_limits);
+
+    // Generate many signals
+    for (int i = 0; i < 100; ++i) {
+        Quote quote;
+        quote.symbol = "AAPL";
+        quote.bid_price = 150.00 + i * 0.01;
+        quote.ask_price = 150.05 + i * 0.01;
+
+        strategy_->onMarketData(quote);
+    }
+
+    std::this_thread::sleep_for(milliseconds(500));
+
+    // Verify position stayed within limits
+    auto position = risk_manager_->getPosition("AAPL");
+    EXPECT_LE(std::abs(position.quantity), strict_limits.max_position);
+
+    // Verify some orders were blocked
+    auto blocked_orders = risk_manager_->getBlockedOrders();
+    EXPECT_GT(blocked_orders.size(), 0);
+}
+
+
+================================================================================
+6. TEST ENVIRONMENTS SETUP
+================================================================================
+
+6.1 Exchange Configuration Files
+---------------------------------
+// test_environments/staging_exchange_config.json
+{
+    "exchange_name": "STAGING_EXCHANGE",
+    "connection_type": "FIX",
+    "fix_config": {
+        "host": "staging.exchange.com",
+        "port": 9876,
+        "sender_comp_id": "TEST_CLIENT",
+        "target_comp_id": "EXCHANGE",
+        "use_ssl": true,
+        "heartbeat_interval": 30
+    },
+    "credentials": {
+        "username": "test_user",
+        "password": "${STAGING_PASSWORD}",
+        "api_key": "${STAGING_API_KEY}"
+    },
+    "rate_limits": {
+        "orders_per_second": 50,
+        "cancels_per_second": 100,
+        "messages_per_second": 200
+    }
+}
+
+// test_environments/mock_exchange_config.json
+{
+    "exchange_name": "MOCK_EXCHANGE",
+    "connection_type": "LOCAL",
+    "mock_config": {
+        "latency_ms": 5,
+        "fill_probability": 0.8,
+        "rejection_probability": 0.05,
+        "support_modifications": true
+    }
+}
+
+
+6.2 Environment Manager
+------------------------
+// tests/integration_fixtures/environment_manager.h
+#ifndef ENVIRONMENT_MANAGER_H
+#define ENVIRONMENT_MANAGER_H
+
+#include <string>
+#include <memory>
+#include "exchange_connector.h"
+
+enum class TestEnvironment {
+    UNIT_TEST,
+    MOCK_EXCHANGE,
+    STAGING,
+    PRODUCTION_TESTNET
+};
+
+class EnvironmentManager {
+public:
+    static std::shared_ptr<ExchangeConnector> createConnector(TestEnvironment env) {
+        switch (env) {
+            case TestEnvironment::MOCK_EXCHANGE:
+                return createMockConnector();
+            case TestEnvironment::STAGING:
+                return createStagingConnector();
+            case TestEnvironment::PRODUCTION_TESTNET:
+                return createTestnetConnector();
+            default:
+                throw std::runtime_error("Unknown environment");
+        }
+    }
+
+    static void loadEnvironmentConfig(const std::string& config_file) {
+        // Load configuration from file
+        // Set environment variables
+        // Initialize logging
+    }
+
+private:
+    static std::shared_ptr<ExchangeConnector> createMockConnector();
+    static std::shared_ptr<ExchangeConnector> createStagingConnector();
+    static std::shared_ptr<ExchangeConnector> createTestnetConnector();
+};
+
+#endif
+
+
+================================================================================
+7. CI/CD INTEGRATION PIPELINE
+================================================================================
+
+7.1 GitHub Actions Workflow
+----------------------------
+# .github/workflows/integration_tests.yml
+name: Integration Tests
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 */6 * * *'  # Every 6 hours
+
+jobs:
+  integration-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    services:
+      mock-exchange:
+        image: hft/mock-exchange:latest
+        ports:
+          - 9878:9878
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake g++ libssl-dev libcurl4-openssl-dev
+
+    - name: Build
+      run: |
+        mkdir build && cd build
+        cmake -DBUILD_INTEGRATION_TESTS=ON ..
+        make -j$(nproc) hft_integration_tests
+
+    - name: Run integration tests
+      env:
+        TEST_ENV: staging
+        STAGING_API_KEY: ${{ secrets.STAGING_API_KEY }}
+        STAGING_PASSWORD: ${{ secrets.STAGING_PASSWORD }}
+      run: |
+        cd build
+        ./hft_integration_tests --gtest_output=xml:integration_results.xml
+
+    - name: Publish test results
+      uses: EnricoMi/publish-unit-test-result-action@v2
+      if: always()
+      with:
+        files: build/integration_results.xml
+
+    - name: Upload logs
+      if: failure()
+      uses: actions/upload-artifact@v3
+      with:
+        name: integration-test-logs
+        path: build/logs/
+
+
+================================================================================
+8. PERFORMANCE INTEGRATION TESTS
+================================================================================
+
+8.1 Latency Benchmarks
+-----------------------
+TEST_F(ExchangeIntegrationTest, OrderLatencyBenchmark) {
+    const int num_orders = 1000;
+    std::vector<long long> latencies;
+
+    connector_->connect();
+
+    for (int i = 0; i < num_orders; ++i) {
+        Order order;
+        order.order_id = i;
+        order.symbol = "AAPL";
+        order.side = OrderSide::BUY;
+        order.price = 150.00;
+        order.quantity = 100;
+
+        auto start = high_resolution_clock::now();
+        connector_->sendOrder(order);
+
+        ExecutionReport report;
+        connector_->waitForExecutionReport(order.order_id, report, milliseconds(1000));
+
+        auto end = high_resolution_clock::now();
+        auto latency = duration_cast<microseconds>(end - start).count();
+        latencies.push_back(latency);
+    }
+
+    // Calculate statistics
+    std::sort(latencies.begin(), latencies.end());
+    auto min = latencies.front();
+    auto p50 = latencies[latencies.size() / 2];
+    auto p95 = latencies[latencies.size() * 95 / 100];
+    auto p99 = latencies[latencies.size() * 99 / 100];
+    auto max = latencies.back();
+
+    std::cout << "Order Latency Benchmark Results:" << std::endl;
+    std::cout << "  Min: " << min << " us" << std::endl;
+    std::cout << "  P50: " << p50 << " us" << std::endl;
+    std::cout << "  P95: " << p95 << " us" << std::endl;
+    std::cout << "  P99: " << p99 << " us" << std::endl;
+    std::cout << "  Max: " << max << " us" << std::endl;
+
+    // Assertions for HFT requirements
+    EXPECT_LT(p50, 1000);   // P50 < 1ms
+    EXPECT_LT(p99, 10000);  // P99 < 10ms
+}
+
+
+================================================================================
+END OF INTEGRATION TESTING GUIDE
+================================================================================

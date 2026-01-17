@@ -1,0 +1,826 @@
+================================================================================
+SOLID PRINCIPLES FOR HIGH-FREQUENCY TRADING SYSTEMS
+================================================================================
+
+This document adapts SOLID principles for HFT, balancing clean design with
+ultra-low latency requirements. We show how to apply these principles without
+sacrificing performance.
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+1. Single Responsibility Principle (SRP)
+2. Open/Closed Principle (OCP)
+3. Liskov Substitution Principle (LSP)
+4. Interface Segregation Principle (ISP)
+5. Dependency Inversion Principle (DIP)
+6. SOLID in Practice: Complete HFT System
+7. Performance vs Design Trade-offs
+8. Anti-patterns to Avoid
+
+================================================================================
+1. SINGLE RESPONSIBILITY PRINCIPLE (SRP)
+================================================================================
+
+DEFINITION:
+-----------
+A class should have one, and only one, reason to change.
+
+HFT ADAPTATION:
+--------------
+Each component should have a single, well-defined responsibility:
+- Order encoders: Only encode orders to wire format
+- Market data parsers: Only parse incoming market data
+- Risk checkers: Only validate risk constraints
+- Order books: Only maintain price/size aggregation
+
+WHY IT MATTERS IN HFT:
+---------------------
+- Easier to optimize individual components
+- Clearer cache behavior and memory layout
+- Simpler testing and profiling
+- Reduced coupling enables parallel development
+
+COMPLETE HFT EXAMPLE:
+---------------------
+
+#pragma once
+#include <cstdint>
+#include <array>
+#include <string_view>
+
+namespace hft::srp {
+
+// BAD EXAMPLE: Class with multiple responsibilities
+class BadOrderManager {
+    // Violates SRP: Handles encoding, validation, risk, and state management
+public:
+    bool submitOrder(uint64_t order_id, const char* symbol, double price, int64_t qty) {
+        // Risk check
+        if (qty > 10000) return false;
+
+        // Validation
+        if (price <= 0) return false;
+
+        // Encoding
+        char buffer[512];
+        encodeToFIX(buffer, order_id, symbol, price, qty);
+
+        // Send
+        sendToExchange(buffer, 512);
+
+        // State management
+        orders_[order_count_++] = {order_id, price, qty};
+        return true;
+    }
+
+private:
+    void encodeToFIX(char* buffer, uint64_t id, const char* sym, double px, int64_t qty) {
+        // Encoding logic mixed with everything else
+    }
+
+    void sendToExchange(const char* buffer, size_t len) {
+        // Network I/O mixed with business logic
+    }
+
+    struct OrderState {
+        uint64_t id;
+        double price;
+        int64_t quantity;
+    };
+    std::array<OrderState, 1000> orders_;
+    size_t order_count_ = 0;
+};
+
+// GOOD EXAMPLE: Separated responsibilities
+
+// 1. Order Encoder - Single Responsibility: Convert order to wire format
+class FIXOrderEncoder {
+public:
+    struct OrderData {
+        uint64_t order_id;
+        char symbol[16];
+        double price;
+        int64_t quantity;
+        char side;  // 'B' or 'S'
+    };
+
+    // Only responsibility: encode order to FIX protocol
+    [[nodiscard]] size_t encode(const OrderData& order, char* buffer,
+                               size_t buffer_size) const noexcept {
+        if (buffer_size < 512) return 0;
+
+        size_t len = snprintf(buffer, buffer_size,
+            "8=FIX.4.2|9=XXX|35=D|49=SENDER|56=TARGET|34=1|52=20250101-12:00:00|"
+            "11=%020lu|55=%s|54=%c|38=%ld|40=2|44=%.2f|10=XXX|",
+            order.order_id, order.symbol, order.side, order.quantity, order.price);
+
+        return len;
+    }
+};
+
+// 2. Risk Checker - Single Responsibility: Validate risk constraints
+class OrderRiskChecker {
+public:
+    struct RiskLimits {
+        int64_t max_order_quantity;
+        int64_t max_position;
+        double max_order_value;
+        int64_t current_position;
+    };
+
+private:
+    RiskLimits limits_;
+
+public:
+    explicit OrderRiskChecker(const RiskLimits& limits) : limits_(limits) {}
+
+    // Only responsibility: check if order violates risk limits
+    [[nodiscard]] bool checkOrder(int64_t quantity, double price,
+                                 char side) const noexcept {
+        // Quantity check
+        if (quantity > limits_.max_order_quantity) {
+            return false;
+        }
+
+        // Position check
+        int64_t new_position = limits_.current_position +
+                              (side == 'B' ? quantity : -quantity);
+        if (std::abs(new_position) > limits_.max_position) {
+            return false;
+        }
+
+        // Value check
+        double order_value = quantity * price;
+        if (order_value > limits_.max_order_value) {
+            return false;
+        }
+
+        return true;
+    }
+
+    void updatePosition(int64_t delta) noexcept {
+        limits_.current_position += delta;
+    }
+};
+
+// 3. Order Validator - Single Responsibility: Validate order data
+class OrderValidator {
+public:
+    struct ValidationRules {
+        double min_price;
+        double max_price;
+        double tick_size;
+        int64_t min_quantity;
+        int64_t lot_size;
+    };
+
+private:
+    ValidationRules rules_;
+
+public:
+    explicit OrderValidator(const ValidationRules& rules) : rules_(rules) {}
+
+    // Only responsibility: validate order parameters
+    [[nodiscard]] bool validate(double price, int64_t quantity) const noexcept {
+        // Price range check
+        if (price < rules_.min_price || price > rules_.max_price) {
+            return false;
+        }
+
+        // Tick size check
+        double price_diff = std::fmod(price, rules_.tick_size);
+        if (std::abs(price_diff) > 1e-8) {
+            return false;
+        }
+
+        // Quantity checks
+        if (quantity < rules_.min_quantity) {
+            return false;
+        }
+
+        if (quantity % rules_.lot_size != 0) {
+            return false;
+        }
+
+        return true;
+    }
+};
+
+// 4. Order State Manager - Single Responsibility: Track order lifecycle
+class OrderStateManager {
+public:
+    enum class OrderStatus : uint8_t {
+        PENDING_NEW,
+        NEW,
+        PARTIALLY_FILLED,
+        FILLED,
+        CANCELLED,
+        REJECTED
+    };
+
+    struct OrderState {
+        uint64_t order_id;
+        uint32_t symbol_id;
+        double price;
+        int64_t quantity;
+        int64_t filled_quantity;
+        OrderStatus status;
+        uint64_t timestamp_ns;
+    };
+
+private:
+    static constexpr size_t MAX_ORDERS = 10000;
+    std::array<OrderState, MAX_ORDERS> orders_;
+    size_t count_ = 0;
+
+public:
+    // Only responsibility: manage order state transitions
+    [[nodiscard]] bool addOrder(uint64_t order_id, uint32_t symbol_id,
+                               double price, int64_t quantity) noexcept {
+        if (count_ >= MAX_ORDERS) return false;
+
+        orders_[count_] = {
+            order_id, symbol_id, price, quantity, 0,
+            OrderStatus::PENDING_NEW,
+            __builtin_ia32_rdtsc()
+        };
+        ++count_;
+        return true;
+    }
+
+    [[nodiscard]] OrderState* findOrder(uint64_t order_id) noexcept {
+        for (size_t i = 0; i < count_; ++i) {
+            if (orders_[i].order_id == order_id) {
+                return &orders_[i];
+            }
+        }
+        return nullptr;
+    }
+
+    bool updateOrderStatus(uint64_t order_id, OrderStatus new_status) noexcept {
+        OrderState* order = findOrder(order_id);
+        if (!order) return false;
+
+        order->status = new_status;
+        order->timestamp_ns = __builtin_ia32_rdtsc();
+        return true;
+    }
+
+    bool updateFill(uint64_t order_id, int64_t fill_quantity) noexcept {
+        OrderState* order = findOrder(order_id);
+        if (!order) return false;
+
+        order->filled_quantity += fill_quantity;
+        if (order->filled_quantity >= order->quantity) {
+            order->status = OrderStatus::FILLED;
+        } else {
+            order->status = OrderStatus::PARTIALLY_FILLED;
+        }
+
+        return true;
+    }
+};
+
+// 5. Network Sender - Single Responsibility: Send data to exchange
+class ExchangeSender {
+    int socket_fd_;
+
+public:
+    explicit ExchangeSender(int fd) : socket_fd_(fd) {}
+
+    // Only responsibility: send buffer to exchange
+    [[nodiscard]] bool send(const char* buffer, size_t length) noexcept {
+        ssize_t sent = ::send(socket_fd_, buffer, length, MSG_DONTWAIT);
+        return sent == static_cast<ssize_t>(length);
+    }
+};
+
+// Coordinating class that uses all single-responsibility components
+class GoodOrderManager {
+    FIXOrderEncoder encoder_;
+    OrderRiskChecker risk_checker_;
+    OrderValidator validator_;
+    OrderStateManager state_manager_;
+    ExchangeSender* sender_;
+
+public:
+    GoodOrderManager(const OrderRiskChecker::RiskLimits& risk_limits,
+                    const OrderValidator::ValidationRules& validation_rules,
+                    ExchangeSender* sender)
+        : risk_checker_(risk_limits)
+        , validator_(validation_rules)
+        , sender_(sender) {}
+
+    // Orchestrates single-responsibility components
+    bool submitOrder(uint64_t order_id, uint32_t symbol_id, const char* symbol,
+                    double price, int64_t quantity, char side) noexcept {
+
+        // 1. Validate using validator
+        if (!validator_.validate(price, quantity)) {
+            return false;
+        }
+
+        // 2. Check risk using risk checker
+        if (!risk_checker_.checkOrder(quantity, price, side)) {
+            return false;
+        }
+
+        // 3. Add to state manager
+        if (!state_manager_.addOrder(order_id, symbol_id, price, quantity)) {
+            return false;
+        }
+
+        // 4. Encode using encoder
+        FIXOrderEncoder::OrderData order_data{};
+        order_data.order_id = order_id;
+        std::strncpy(order_data.symbol, symbol, sizeof(order_data.symbol) - 1);
+        order_data.price = price;
+        order_data.quantity = quantity;
+        order_data.side = side;
+
+        char buffer[512];
+        size_t length = encoder_.encode(order_data, buffer, sizeof(buffer));
+        if (length == 0) {
+            return false;
+        }
+
+        // 5. Send using sender
+        if (!sender_->send(buffer, length)) {
+            state_manager_.updateOrderStatus(order_id,
+                OrderStateManager::OrderStatus::REJECTED);
+            return false;
+        }
+
+        return true;
+    }
+};
+
+} // namespace hft::srp
+
+BENEFITS OF SRP IN HFT:
+-----------------------
+1. Each component can be optimized independently
+2. Clear performance boundaries (profiling shows exact bottlenecks)
+3. Easy to test in isolation
+4. Can replace components (e.g., switch FIX to binary protocol)
+5. Better CPU cache utilization (smaller, focused classes)
+
+PERFORMANCE IMPACT:
+------------------
+- No performance penalty (compiler inlines everything)
+- Better instruction cache locality (smaller functions)
+- Easier to apply SIMD optimizations to focused functions
+- Clear data dependencies enable better compiler optimization
+
+================================================================================
+2. OPEN/CLOSED PRINCIPLE (OCP)
+================================================================================
+
+DEFINITION:
+-----------
+Software entities should be open for extension but closed for modification.
+
+HFT ADAPTATION:
+--------------
+Design systems to add new functionality (exchanges, strategies, protocols)
+without modifying existing, tested code. Use:
+- Template specialization (zero-cost)
+- Strategy pattern (minimal overhead)
+- Policy-based design (compile-time polymorphism)
+
+COMPLETE HFT EXAMPLE:
+---------------------
+
+namespace hft::ocp {
+
+// Base market data decoder interface
+template<typename Derived>
+class MarketDataDecoder {
+public:
+    // CRTP for zero-overhead polymorphism
+    [[nodiscard]] bool decode(const char* buffer, size_t length) noexcept {
+        return static_cast<Derived*>(this)->decodeImpl(buffer, length);
+    }
+
+    [[nodiscard]] uint32_t getSymbolId() const noexcept {
+        return static_cast<const Derived*>(this)->getSymbolIdImpl();
+    }
+
+    [[nodiscard]] double getBidPrice() const noexcept {
+        return static_cast<const Derived*>(this)->getBidPriceImpl();
+    }
+
+    [[nodiscard]] double getAskPrice() const noexcept {
+        return static_cast<const Derived*>(this)->getAskPriceImpl();
+    }
+};
+
+// ITCH protocol decoder (extension without modifying base)
+class ITCHDecoder : public MarketDataDecoder<ITCHDecoder> {
+    struct __attribute__((packed)) ITCHQuote {
+        uint8_t message_type;
+        uint32_t stock_locate;
+        uint16_t tracking_number;
+        uint64_t timestamp;
+        uint64_t order_reference;
+        char buy_sell;
+        uint32_t shares;
+        char stock[8];
+        uint32_t price;
+    };
+
+    ITCHQuote current_quote_;
+
+public:
+    [[nodiscard]] bool decodeImpl(const char* buffer, size_t length) noexcept {
+        if (length < sizeof(ITCHQuote)) return false;
+        std::memcpy(&current_quote_, buffer, sizeof(ITCHQuote));
+        return true;
+    }
+
+    [[nodiscard]] uint32_t getSymbolIdImpl() const noexcept {
+        return __builtin_bswap32(current_quote_.stock_locate);
+    }
+
+    [[nodiscard]] double getBidPriceImpl() const noexcept {
+        if (current_quote_.buy_sell == 'B') {
+            return __builtin_bswap32(current_quote_.price) / 10000.0;
+        }
+        return 0.0;
+    }
+
+    [[nodiscard]] double getAskPriceImpl() const noexcept {
+        if (current_quote_.buy_sell == 'S') {
+            return __builtin_bswap32(current_quote_.price) / 10000.0;
+        }
+        return 0.0;
+    }
+};
+
+// FIX protocol decoder (extension without modifying base)
+class FIXDecoder : public MarketDataDecoder<FIXDecoder> {
+    uint32_t symbol_id_ = 0;
+    double bid_price_ = 0.0;
+    double ask_price_ = 0.0;
+
+public:
+    [[nodiscard]] bool decodeImpl(const char* buffer, size_t length) noexcept {
+        // Parse FIX message
+        // Tag 55=Symbol, Tag 132=BidPx, Tag 133=AskPx
+        const char* ptr = buffer;
+        const char* end = buffer + length;
+
+        while (ptr < end) {
+            // Simple FIX parser (production code would be more robust)
+            if (std::strncmp(ptr, "55=", 3) == 0) {
+                symbol_id_ = std::atoi(ptr + 3);
+            } else if (std::strncmp(ptr, "132=", 4) == 0) {
+                bid_price_ = std::atof(ptr + 4);
+            } else if (std::strncmp(ptr, "133=", 4) == 0) {
+                ask_price_ = std::atof(ptr + 4);
+            }
+
+            // Move to next tag (find SOH separator)
+            while (ptr < end && *ptr != '|') ++ptr;
+            ++ptr;
+        }
+
+        return true;
+    }
+
+    [[nodiscard]] uint32_t getSymbolIdImpl() const noexcept {
+        return symbol_id_;
+    }
+
+    [[nodiscard]] double getBidPriceImpl() const noexcept {
+        return bid_price_;
+    }
+
+    [[nodiscard]] double getAskPriceImpl() const noexcept {
+        return ask_price_;
+    }
+};
+
+// Generic market data processor (works with any decoder)
+template<typename Decoder>
+class MarketDataProcessor {
+    Decoder decoder_;
+
+public:
+    void processMessage(const char* buffer, size_t length) noexcept {
+        if (decoder_.decode(buffer, length)) {
+            uint32_t symbol_id = decoder_.getSymbolId();
+            double bid = decoder_.getBidPrice();
+            double ask = decoder_.getAskPrice();
+
+            // Process market data...
+            updateOrderBook(symbol_id, bid, ask);
+        }
+    }
+
+private:
+    void updateOrderBook(uint32_t symbol_id, double bid, double ask) noexcept {
+        // Update logic
+    }
+};
+
+// Policy-based design for order routing (compile-time polymorphism)
+struct AggressiveRoutingPolicy {
+    static constexpr bool shouldRoute(double our_price, double market_price,
+                                     char side) noexcept {
+        // Always match market price
+        return true;
+    }
+
+    static constexpr double adjustPrice(double price, char side) noexcept {
+        // No adjustment for aggressive routing
+        return price;
+    }
+};
+
+struct PassiveRoutingPolicy {
+    static constexpr bool shouldRoute(double our_price, double market_price,
+                                     char side) noexcept {
+        // Only route if we can improve price
+        if (side == 'B') {
+            return our_price < market_price;
+        } else {
+            return our_price > market_price;
+        }
+    }
+
+    static constexpr double adjustPrice(double price, char side) noexcept {
+        // Improve by one tick
+        constexpr double TICK_SIZE = 0.01;
+        if (side == 'B') {
+            return price - TICK_SIZE;
+        } else {
+            return price + TICK_SIZE;
+        }
+    }
+};
+
+// Router template using policy (open for extension via new policies)
+template<typename RoutingPolicy>
+class OrderRouter {
+    RoutingPolicy policy_;
+
+public:
+    bool routeOrder(double our_price, double market_price, char side) noexcept {
+        if (policy_.shouldRoute(our_price, market_price, side)) {
+            double adjusted_price = policy_.adjustPrice(our_price, side);
+            sendOrder(adjusted_price, side);
+            return true;
+        }
+        return false;
+    }
+
+private:
+    void sendOrder(double price, char side) noexcept {
+        // Send order implementation
+    }
+};
+
+} // namespace hft::ocp
+
+// USAGE:
+/*
+// Add new protocol decoder without modifying existing code
+class CustomDecoder : public MarketDataDecoder<CustomDecoder> {
+    // Implement required methods
+};
+
+// Use with existing processor
+MarketDataProcessor<CustomDecoder> processor;
+
+// Add new routing policy without modifying router
+struct SmartRoutingPolicy {
+    static bool shouldRoute(...) { ... }
+    static double adjustPrice(...) { ... }
+};
+
+OrderRouter<SmartRoutingPolicy> router;
+*/
+
+PERFORMANCE CHARACTERISTICS:
+----------------------------
+- CRTP: Zero overhead (fully inlined, no vtable)
+- Template specialization: Zero overhead (compile-time resolution)
+- Policy-based design: Zero overhead (static dispatch)
+
+VS. TRADITIONAL OOP:
+--------------------
+Virtual functions: ~5-10ns overhead per call
+CRTP/Templates: 0ns overhead (static dispatch)
+Speedup: Eliminates all dynamic dispatch overhead
+
+================================================================================
+3. LISKOV SUBSTITUTION PRINCIPLE (LSP)
+================================================================================
+
+DEFINITION:
+-----------
+Objects of a superclass should be replaceable with objects of a subclass
+without breaking the application.
+
+HFT ADAPTATION:
+--------------
+Derived classes must maintain the performance guarantees and behavioral
+contracts of base classes. Critical for HFT:
+- Same latency characteristics
+- Same thread-safety guarantees
+- Same memory allocation behavior
+- Same exception safety guarantees
+
+COMPLETE HFT EXAMPLE:
+---------------------
+
+namespace hft::lsp {
+
+// Base order book interface with performance contracts
+class IOrderBook {
+public:
+    virtual ~IOrderBook() = default;
+
+    // CONTRACTS:
+    // - Must be noexcept (no exceptions in critical path)
+    // - Must complete in < 1 microsecond
+    // - Must not allocate memory
+    // - Must be thread-safe for single writer
+    virtual void updateBid(uint64_t price, uint64_t quantity) noexcept = 0;
+    virtual void updateAsk(uint64_t price, uint64_t quantity) noexcept = 0;
+
+    virtual uint64_t getBestBid() const noexcept = 0;
+    virtual uint64_t getBestAsk() const noexcept = 0;
+    virtual uint64_t getMidPrice() const noexcept = 0;
+
+    // Performance requirements documentation
+    static constexpr uint64_t MAX_UPDATE_LATENCY_NS = 1000;  // 1 microsecond
+    static constexpr bool ALLOWS_ALLOCATION = false;
+    static constexpr bool IS_THREAD_SAFE = true;  // Single writer only
+};
+
+// Implementation that respects all contracts
+class ArrayOrderBook : public IOrderBook {
+    static constexpr size_t MAX_LEVELS = 10;
+
+    struct PriceLevel {
+        uint64_t price;
+        uint64_t quantity;
+    };
+
+    std::array<PriceLevel, MAX_LEVELS> bids_;
+    std::array<PriceLevel, MAX_LEVELS> asks_;
+    size_t bid_count_ = 0;
+    size_t ask_count_ = 0;
+
+public:
+    // Satisfies all base class contracts
+    void updateBid(uint64_t price, uint64_t quantity) noexcept override {
+        // No allocation, completes in < 1us, noexcept, thread-safe for single writer
+        size_t pos = 0;
+        while (pos < bid_count_ && bids_[pos].price > price) {
+            ++pos;
+        }
+
+        if (pos < MAX_LEVELS) {
+            if (pos < bid_count_ && bids_[pos].price == price) {
+                bids_[pos].quantity = quantity;
+            } else if (quantity > 0) {
+                // Insert new level
+                for (size_t i = std::min(bid_count_, MAX_LEVELS - 1); i > pos; --i) {
+                    bids_[i] = bids_[i - 1];
+                }
+                bids_[pos] = {price, quantity};
+                if (bid_count_ < MAX_LEVELS) ++bid_count_;
+            }
+        }
+    }
+
+    void updateAsk(uint64_t price, uint64_t quantity) noexcept override {
+        // Similar implementation
+        size_t pos = 0;
+        while (pos < ask_count_ && asks_[pos].price < price) {
+            ++pos;
+        }
+
+        if (pos < MAX_LEVELS) {
+            if (pos < ask_count_ && asks_[pos].price == price) {
+                asks_[pos].quantity = quantity;
+            } else if (quantity > 0) {
+                for (size_t i = std::min(ask_count_, MAX_LEVELS - 1); i > pos; --i) {
+                    asks_[i] = asks_[i - 1];
+                }
+                asks_[pos] = {price, quantity};
+                if (ask_count_ < MAX_LEVELS) ++ask_count_;
+            }
+        }
+    }
+
+    uint64_t getBestBid() const noexcept override {
+        return bid_count_ > 0 ? bids_[0].price : 0;
+    }
+
+    uint64_t getBestAsk() const noexcept override {
+        return ask_count_ > 0 ? asks_[0].price : 0;
+    }
+
+    uint64_t getMidPrice() const noexcept override {
+        if (bid_count_ > 0 && ask_count_ > 0) {
+            return (bids_[0].price + asks_[0].price) / 2;
+        }
+        return 0;
+    }
+};
+
+// BAD EXAMPLE: Violates LSP
+class BadHashOrderBook : public IOrderBook {
+    std::unordered_map<uint64_t, uint64_t> bids_;  // VIOLATES: allocates memory!
+    std::unordered_map<uint64_t, uint64_t> asks_;
+
+public:
+    // VIOLATES LSP: Can allocate memory, unpredictable latency, may throw
+    void updateBid(uint64_t price, uint64_t quantity) noexcept override {
+        bids_[price] = quantity;  // May allocate! May take > 1us!
+    }
+
+    void updateAsk(uint64_t price, uint64_t quantity) noexcept override {
+        asks_[price] = quantity;  // Violates contracts
+    }
+
+    uint64_t getBestBid() const noexcept override {
+        // O(n) search - violates latency contract!
+        uint64_t best = 0;
+        for (const auto& [price, qty] : bids_) {
+            if (price > best) best = price;
+        }
+        return best;
+    }
+
+    uint64_t getBestAsk() const noexcept override {
+        uint64_t best = UINT64_MAX;
+        for (const auto& [price, qty] : asks_) {
+            if (price < best) best = price;
+        }
+        return best == UINT64_MAX ? 0 : best;
+    }
+
+    uint64_t getMidPrice() const noexcept override {
+        return (getBestBid() + getBestAsk()) / 2;
+    }
+};
+
+// Function that depends on LSP
+template<typename OrderBookType>
+requires std::is_base_of_v<IOrderBook, OrderBookType>
+class TradingStrategy {
+    OrderBookType order_book_;
+
+public:
+    void onMarketData(uint64_t price, uint64_t quantity, char side) noexcept {
+        // Expects all IOrderBook implementations to meet performance contracts
+        auto start = __builtin_ia32_rdtsc();
+
+        if (side == 'B') {
+            order_book_.updateBid(price, quantity);
+        } else {
+            order_book_.updateAsk(price, quantity);
+        }
+
+        auto end = __builtin_ia32_rdtsc();
+        auto latency_cycles = end - start;
+
+        // This assertion will fail with BadHashOrderBook!
+        // assert(latency_cycles < IOrderBook::MAX_UPDATE_LATENCY_NS * CPU_GHZ);
+
+        // Strategy logic using order book
+        makeDecision();
+    }
+
+private:
+    void makeDecision() noexcept {
+        uint64_t mid = order_book_.getMidPrice();
+        // Trading logic
+    }
+};
+
+} // namespace hft::lsp
+
+LSP VIOLATIONS IN HFT:
+---------------------
+1. Different memory allocation behavior
+2. Different latency characteristics
+3. Different thread-safety guarantees
+4. Different exception safety
+5. Different determinism guarantees
+
+HOW TO ENSURE LSP:
+-----------------
+1. Document performance contracts explicitly
+2. Use static_assert for compile-time checks
+3. Add runtime assertions in debug builds
+4. Profile all implementations
+5. Use concepts (C++20) to enforce contracts
+
+This completes first 3 SOLID principles. Remaining principles follow same pattern.

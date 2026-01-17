@@ -1,0 +1,1627 @@
+================================================================================
+                    TICK DATA QUERY OPTIMIZATION
+                    High-Performance Data Retrieval for HFT
+================================================================================
+
+Table of Contents:
+1. Query Optimization Fundamentals
+2. Index Design and Strategy
+3. Query Patterns for HFT
+4. Caching Strategies
+5. Connection Pooling
+6. Batch Query Optimization
+7. Real-Time Query Performance
+8. Query Monitoring and Tuning
+
+================================================================================
+SECTION 1: QUERY OPTIMIZATION FUNDAMENTALS
+================================================================================
+
+1.1 HFT Query Requirements
+--------------------------
+
+Query Latency Targets:
+┌─────────────────────────┬──────────────────┬─────────────────┐
+│ Query Type              │ Target Latency   │ P99 Latency     │
+├─────────────────────────┼──────────────────┼─────────────────┤
+│ Single tick lookup      │ < 10 µs          │ < 50 µs         │
+│ Recent ticks (100)      │ < 100 µs         │ < 500 µs        │
+│ Time range (1 minute)   │ < 1 ms           │ < 5 ms          │
+│ Time range (1 hour)     │ < 10 ms          │ < 50 ms         │
+│ Aggregations (OHLCV)    │ < 5 ms           │ < 20 ms         │
+│ Complex analytics       │ < 100 ms         │ < 500 ms        │
+└─────────────────────────┴──────────────────┴─────────────────┘
+
+1.2 Query Optimization Principles
+---------------------------------
+
+Core Principles:
+1. Minimize data scanning (use indexes effectively)
+2. Reduce network round trips (batch queries)
+3. Cache frequently accessed data
+4. Pre-compute common aggregations
+5. Use appropriate data types (minimize conversions)
+6. Optimize memory access patterns
+
+Query Cost Model:
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Total Cost = Index Lookup + Data Scan + Network Transfer + Deserialization │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+================================================================================
+SECTION 2: INDEX DESIGN AND STRATEGY
+================================================================================
+
+2.1 Index Types for Tick Data
+-----------------------------
+
+Index Selection Matrix:
+┌─────────────────────┬────────────────┬────────────────┬─────────────────┐
+│ Index Type          │ Best For       │ Overhead       │ Use Case        │
+├─────────────────────┼────────────────┼────────────────┼─────────────────┤
+│ B-Tree              │ Range queries  │ Medium         │ Time ranges     │
+│ Hash                │ Point lookups  │ Low            │ Symbol lookup   │
+│ Bitmap              │ Low cardinality│ Low            │ Exchange filter │
+│ Columnar (zone map) │ Large scans    │ Very low       │ Analytics       │
+│ Inverted            │ Text search    │ High           │ Rare in HFT     │
+└─────────────────────┴────────────────┴────────────────┴─────────────────┘
+
+2.2 Composite Index Design
+--------------------------
+
+```cpp
+// index_manager.hpp - Custom Index Management
+#pragma once
+
+#include <vector>
+#include <unordered_map>
+#include <map>
+#include <shared_mutex>
+#include <memory>
+#include <cstdint>
+
+namespace hft {
+namespace storage {
+
+// Time-based index with symbol partitioning
+struct TimeIndex {
+    uint64_t timestamp_ns;
+    uint32_t file_offset;
+    uint16_t partition_id;
+    uint16_t block_offset;
+};
+
+// Symbol index for fast symbol lookups
+struct SymbolIndex {
+    uint32_t symbol_id;
+    uint64_t start_offset;
+    uint64_t end_offset;
+    uint64_t tick_count;
+};
+
+class CompositeIndexManager {
+public:
+    CompositeIndexManager(size_t time_bucket_ns = 1000000000ULL)  // 1 second buckets
+        : time_bucket_ns_(time_bucket_ns) {}
+
+    // Build index from tick data
+    void buildIndex(const std::string& partition_path) {
+        std::unique_lock lock(mutex_);
+
+        // Parse partition path to get metadata
+        auto partition_info = parsePartitionPath(partition_path);
+
+        // Build time index (sparse - every N ticks)
+        buildTimeIndex(partition_path, partition_info);
+
+        // Build symbol index
+        buildSymbolIndex(partition_path, partition_info);
+
+        // Mark as indexed
+        indexed_partitions_.insert(partition_path);
+    }
+
+    // Find offset for timestamp
+    uint64_t findByTimestamp(uint64_t timestamp_ns, uint32_t symbol_id) const {
+        std::shared_lock lock(mutex_);
+
+        // Find time bucket
+        uint64_t bucket = timestamp_ns / time_bucket_ns_;
+
+        auto it = time_index_.find(bucket);
+        if (it == time_index_.end()) {
+            // Find nearest bucket
+            auto lower = time_index_.lower_bound(bucket);
+            if (lower == time_index_.begin()) {
+                return 0;  // Start from beginning
+            }
+            --lower;
+            it = lower;
+        }
+
+        return it->second.file_offset;
+    }
+
+    // Find offset range for symbol
+    std::pair<uint64_t, uint64_t> findBySymbol(uint32_t symbol_id) const {
+        std::shared_lock lock(mutex_);
+
+        auto it = symbol_index_.find(symbol_id);
+        if (it == symbol_index_.end()) {
+            return {0, 0};
+        }
+
+        return {it->second.start_offset, it->second.end_offset};
+    }
+
+    // Combined lookup for time + symbol
+    uint64_t findByTimestampAndSymbol(uint64_t timestamp_ns, uint32_t symbol_id) const {
+        std::shared_lock lock(mutex_);
+
+        // Use composite key for fastest lookup
+        CompositeKey key{timestamp_ns / time_bucket_ns_, symbol_id};
+
+        auto it = composite_index_.find(key);
+        if (it != composite_index_.end()) {
+            return it->second;
+        }
+
+        // Fall back to separate lookups
+        uint64_t time_offset = findByTimestamp(timestamp_ns, symbol_id);
+        auto [sym_start, sym_end] = findBySymbol(symbol_id);
+
+        return std::max(time_offset, sym_start);
+    }
+
+private:
+    struct CompositeKey {
+        uint64_t time_bucket;
+        uint32_t symbol_id;
+
+        bool operator==(const CompositeKey& other) const {
+            return time_bucket == other.time_bucket && symbol_id == other.symbol_id;
+        }
+    };
+
+    struct CompositeKeyHash {
+        size_t operator()(const CompositeKey& key) const {
+            return std::hash<uint64_t>()(key.time_bucket) ^
+                   (std::hash<uint32_t>()(key.symbol_id) << 1);
+        }
+    };
+
+    struct PartitionInfo {
+        std::string date;
+        std::string symbol;
+        std::string exchange;
+    };
+
+    PartitionInfo parsePartitionPath(const std::string& path) {
+        // Parse partition path like /data/2024/01/15/BTCUSDT/binance/
+        PartitionInfo info;
+        // Implementation...
+        return info;
+    }
+
+    void buildTimeIndex(const std::string& path, const PartitionInfo& info) {
+        // Scan file and build sparse time index
+        // Index every 1000th tick for memory efficiency
+    }
+
+    void buildSymbolIndex(const std::string& path, const PartitionInfo& info) {
+        // Build symbol offset ranges
+    }
+
+    size_t time_bucket_ns_;
+    mutable std::shared_mutex mutex_;
+
+    std::map<uint64_t, TimeIndex> time_index_;
+    std::unordered_map<uint32_t, SymbolIndex> symbol_index_;
+    std::unordered_map<CompositeKey, uint64_t, CompositeKeyHash> composite_index_;
+    std::set<std::string> indexed_partitions_;
+};
+
+} // namespace storage
+} // namespace hft
+```
+
+2.3 Zone Maps for Partition Pruning
+-----------------------------------
+
+```cpp
+// zone_map.hpp - Min/Max Statistics for Fast Filtering
+#pragma once
+
+#include <limits>
+#include <vector>
+
+namespace hft {
+namespace storage {
+
+struct ZoneMap {
+    // Time bounds
+    uint64_t min_timestamp_ns;
+    uint64_t max_timestamp_ns;
+
+    // Price bounds
+    int64_t min_price;
+    int64_t max_price;
+
+    // Volume bounds
+    uint64_t min_volume;
+    uint64_t max_volume;
+
+    // Statistics
+    uint64_t tick_count;
+    uint64_t buy_count;
+    uint64_t sell_count;
+
+    // Check if zone might contain matching data
+    bool mightContainTimeRange(uint64_t start_ns, uint64_t end_ns) const {
+        return !(end_ns < min_timestamp_ns || start_ns > max_timestamp_ns);
+    }
+
+    bool mightContainPriceRange(int64_t min_p, int64_t max_p) const {
+        return !(max_p < min_price || min_p > max_price);
+    }
+
+    // Serialize for storage
+    void serialize(char* buffer) const {
+        memcpy(buffer, this, sizeof(ZoneMap));
+    }
+
+    static ZoneMap deserialize(const char* buffer) {
+        ZoneMap zm;
+        memcpy(&zm, buffer, sizeof(ZoneMap));
+        return zm;
+    }
+};
+
+class ZoneMapBuilder {
+public:
+    ZoneMapBuilder() { reset(); }
+
+    void reset() {
+        zone_.min_timestamp_ns = std::numeric_limits<uint64_t>::max();
+        zone_.max_timestamp_ns = 0;
+        zone_.min_price = std::numeric_limits<int64_t>::max();
+        zone_.max_price = std::numeric_limits<int64_t>::min();
+        zone_.min_volume = std::numeric_limits<uint64_t>::max();
+        zone_.max_volume = 0;
+        zone_.tick_count = 0;
+        zone_.buy_count = 0;
+        zone_.sell_count = 0;
+    }
+
+    void addTick(uint64_t timestamp, int64_t price, uint64_t volume, bool is_buy) {
+        zone_.min_timestamp_ns = std::min(zone_.min_timestamp_ns, timestamp);
+        zone_.max_timestamp_ns = std::max(zone_.max_timestamp_ns, timestamp);
+        zone_.min_price = std::min(zone_.min_price, price);
+        zone_.max_price = std::max(zone_.max_price, price);
+        zone_.min_volume = std::min(zone_.min_volume, volume);
+        zone_.max_volume = std::max(zone_.max_volume, volume);
+        zone_.tick_count++;
+
+        if (is_buy) {
+            zone_.buy_count++;
+        } else {
+            zone_.sell_count++;
+        }
+    }
+
+    ZoneMap build() const { return zone_; }
+
+private:
+    ZoneMap zone_;
+};
+
+} // namespace storage
+} // namespace hft
+```
+
+================================================================================
+SECTION 3: QUERY PATTERNS FOR HFT
+================================================================================
+
+3.1 Common Query Patterns
+-------------------------
+
+```cpp
+// query_patterns.hpp - Optimized Query Implementations
+#pragma once
+
+#include <vector>
+#include <span>
+#include "tick.hpp"
+#include "index_manager.hpp"
+
+namespace hft {
+namespace query {
+
+// Query result with metadata
+template<typename T>
+struct QueryResult {
+    std::vector<T> data;
+    uint64_t query_time_ns;
+    uint64_t scan_count;
+    uint64_t result_count;
+    bool truncated;
+};
+
+class TickQueryExecutor {
+public:
+    explicit TickQueryExecutor(storage::CompositeIndexManager& index)
+        : index_(index) {}
+
+    // Pattern 1: Latest N ticks for symbol
+    QueryResult<Tick> getLatestTicks(
+        uint32_t symbol_id,
+        size_t count,
+        const std::string& partition_path
+    ) {
+        auto start = std::chrono::high_resolution_clock::now();
+        QueryResult<Tick> result;
+
+        // Get symbol range
+        auto [start_offset, end_offset] = index_.findBySymbol(symbol_id);
+
+        // Read from end, seeking backwards
+        result.data = readTicksReverse(partition_path, end_offset, count);
+
+        auto end = std::chrono::high_resolution_clock::now();
+        result.query_time_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            end - start).count();
+        result.result_count = result.data.size();
+
+        return result;
+    }
+
+    // Pattern 2: Time range query
+    QueryResult<Tick> getTicksByTimeRange(
+        uint32_t symbol_id,
+        uint64_t start_ns,
+        uint64_t end_ns,
+        const std::string& partition_path,
+        size_t max_results = 100000
+    ) {
+        auto start = std::chrono::high_resolution_clock::now();
+        QueryResult<Tick> result;
+
+        // Use index to find starting offset
+        uint64_t offset = index_.findByTimestampAndSymbol(start_ns, symbol_id);
+
+        // Scan forward until end timestamp
+        result.data.reserve(std::min(max_results, size_t(10000)));
+
+        scanTicksInRange(partition_path, offset, start_ns, end_ns,
+                        symbol_id, result.data, max_results);
+
+        auto end = std::chrono::high_resolution_clock::now();
+        result.query_time_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            end - start).count();
+        result.result_count = result.data.size();
+        result.truncated = result.data.size() >= max_results;
+
+        return result;
+    }
+
+    // Pattern 3: OHLCV aggregation
+    struct OHLCV {
+        uint64_t timestamp_ns;
+        int64_t open;
+        int64_t high;
+        int64_t low;
+        int64_t close;
+        uint64_t volume;
+        uint64_t trade_count;
+        uint64_t buy_volume;
+        uint64_t sell_volume;
+    };
+
+    QueryResult<OHLCV> getOHLCV(
+        uint32_t symbol_id,
+        uint64_t start_ns,
+        uint64_t end_ns,
+        uint64_t interval_ns,  // e.g., 60000000000 for 1 minute
+        const std::string& partition_path
+    ) {
+        auto start = std::chrono::high_resolution_clock::now();
+        QueryResult<OHLCV> result;
+
+        // Calculate number of intervals
+        size_t num_intervals = (end_ns - start_ns) / interval_ns + 1;
+        result.data.reserve(num_intervals);
+
+        // Get raw ticks
+        auto ticks_result = getTicksByTimeRange(symbol_id, start_ns, end_ns, partition_path);
+
+        // Aggregate into OHLCV
+        aggregateToOHLCV(ticks_result.data, start_ns, interval_ns, result.data);
+
+        auto end = std::chrono::high_resolution_clock::now();
+        result.query_time_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            end - start).count();
+        result.result_count = result.data.size();
+
+        return result;
+    }
+
+    // Pattern 4: VWAP calculation
+    struct VWAPResult {
+        int64_t vwap_price;  // Fixed-point
+        uint64_t total_volume;
+        uint64_t tick_count;
+    };
+
+    VWAPResult calculateVWAP(
+        uint32_t symbol_id,
+        uint64_t start_ns,
+        uint64_t end_ns,
+        const std::string& partition_path
+    ) {
+        VWAPResult result{0, 0, 0};
+
+        auto ticks_result = getTicksByTimeRange(symbol_id, start_ns, end_ns, partition_path);
+
+        __int128 price_volume_sum = 0;
+        for (const auto& tick : ticks_result.data) {
+            price_volume_sum += static_cast<__int128>(tick.price) * tick.quantity;
+            result.total_volume += tick.quantity;
+            result.tick_count++;
+        }
+
+        if (result.total_volume > 0) {
+            result.vwap_price = static_cast<int64_t>(price_volume_sum / result.total_volume);
+        }
+
+        return result;
+    }
+
+    // Pattern 5: Trade imbalance (buy/sell ratio)
+    struct ImbalanceResult {
+        double buy_sell_ratio;
+        uint64_t buy_volume;
+        uint64_t sell_volume;
+        int64_t net_volume;  // buy - sell
+    };
+
+    ImbalanceResult calculateImbalance(
+        uint32_t symbol_id,
+        uint64_t start_ns,
+        uint64_t end_ns,
+        const std::string& partition_path
+    ) {
+        ImbalanceResult result{0.0, 0, 0, 0};
+
+        auto ticks_result = getTicksByTimeRange(symbol_id, start_ns, end_ns, partition_path);
+
+        for (const auto& tick : ticks_result.data) {
+            if (tick.flags & 0x01) {  // Buy flag
+                result.buy_volume += tick.quantity;
+            } else {
+                result.sell_volume += tick.quantity;
+            }
+        }
+
+        if (result.sell_volume > 0) {
+            result.buy_sell_ratio = static_cast<double>(result.buy_volume) / result.sell_volume;
+        }
+        result.net_volume = static_cast<int64_t>(result.buy_volume) -
+                           static_cast<int64_t>(result.sell_volume);
+
+        return result;
+    }
+
+private:
+    std::vector<Tick> readTicksReverse(
+        const std::string& path,
+        uint64_t end_offset,
+        size_t count
+    ) {
+        // Implementation: mmap file and read backwards
+        std::vector<Tick> ticks;
+        // ...
+        return ticks;
+    }
+
+    void scanTicksInRange(
+        const std::string& path,
+        uint64_t offset,
+        uint64_t start_ns,
+        uint64_t end_ns,
+        uint32_t symbol_id,
+        std::vector<Tick>& output,
+        size_t max_results
+    ) {
+        // Implementation: scan ticks in time range
+        // Use SIMD for filtering where possible
+    }
+
+    void aggregateToOHLCV(
+        const std::vector<Tick>& ticks,
+        uint64_t start_ns,
+        uint64_t interval_ns,
+        std::vector<OHLCV>& output
+    ) {
+        if (ticks.empty()) return;
+
+        OHLCV current;
+        uint64_t current_interval_start = start_ns;
+        uint64_t current_interval_end = start_ns + interval_ns;
+        bool first_in_interval = true;
+
+        for (const auto& tick : ticks) {
+            // Check if we've moved to next interval
+            while (tick.timestamp >= current_interval_end) {
+                if (!first_in_interval) {
+                    output.push_back(current);
+                }
+                current_interval_start = current_interval_end;
+                current_interval_end += interval_ns;
+                first_in_interval = true;
+            }
+
+            if (first_in_interval) {
+                current = OHLCV{};
+                current.timestamp_ns = current_interval_start;
+                current.open = tick.price;
+                current.high = tick.price;
+                current.low = tick.price;
+                first_in_interval = false;
+            }
+
+            current.high = std::max(current.high, tick.price);
+            current.low = std::min(current.low, tick.price);
+            current.close = tick.price;
+            current.volume += tick.quantity;
+            current.trade_count++;
+
+            if (tick.flags & 0x01) {
+                current.buy_volume += tick.quantity;
+            } else {
+                current.sell_volume += tick.quantity;
+            }
+        }
+
+        // Don't forget last interval
+        if (!first_in_interval) {
+            output.push_back(current);
+        }
+    }
+
+    storage::CompositeIndexManager& index_;
+};
+
+} // namespace query
+} // namespace hft
+```
+
+================================================================================
+SECTION 4: CACHING STRATEGIES
+================================================================================
+
+4.1 Multi-Level Cache Architecture
+----------------------------------
+
+Cache Hierarchy:
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ L1: In-Memory Hot Cache (Recent ticks, <1µs access)                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ L2: Pre-computed Aggregations Cache (OHLCV, VWAP, <10µs access)            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ L3: Memory-Mapped File Cache (OS page cache, <100µs access)                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ L4: SSD Storage (<1ms access)                                               │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+4.2 Hot Tick Cache Implementation
+---------------------------------
+
+```cpp
+// tick_cache.hpp - High-Performance Tick Cache
+#pragma once
+
+#include <array>
+#include <atomic>
+#include <unordered_map>
+#include <shared_mutex>
+#include "tick.hpp"
+
+namespace hft {
+namespace cache {
+
+// Lock-free ring buffer for recent ticks per symbol
+template<size_t Capacity = 10000>
+class TickRingBuffer {
+public:
+    static_assert((Capacity & (Capacity - 1)) == 0, "Capacity must be power of 2");
+
+    void push(const Tick& tick) {
+        size_t idx = write_pos_.fetch_add(1, std::memory_order_relaxed) & (Capacity - 1);
+        buffer_[idx] = tick;
+    }
+
+    // Get last N ticks (most recent first)
+    std::vector<Tick> getRecent(size_t count) const {
+        std::vector<Tick> result;
+        result.reserve(std::min(count, Capacity));
+
+        size_t current_write = write_pos_.load(std::memory_order_acquire);
+        size_t start = (current_write > count) ? current_write - count : 0;
+
+        for (size_t i = current_write; i > start && i > 0; --i) {
+            size_t idx = (i - 1) & (Capacity - 1);
+            result.push_back(buffer_[idx]);
+        }
+
+        return result;
+    }
+
+    // Get ticks in time range
+    std::vector<Tick> getTimeRange(uint64_t start_ns, uint64_t end_ns) const {
+        std::vector<Tick> result;
+
+        size_t current_write = write_pos_.load(std::memory_order_acquire);
+        size_t scan_start = (current_write > Capacity) ? current_write - Capacity : 0;
+
+        for (size_t i = scan_start; i < current_write; ++i) {
+            size_t idx = i & (Capacity - 1);
+            const Tick& tick = buffer_[idx];
+
+            if (tick.timestamp >= start_ns && tick.timestamp <= end_ns) {
+                result.push_back(tick);
+            }
+        }
+
+        return result;
+    }
+
+private:
+    alignas(64) std::array<Tick, Capacity> buffer_;
+    alignas(64) std::atomic<size_t> write_pos_{0};
+};
+
+// Multi-symbol cache manager
+class HotTickCache {
+public:
+    HotTickCache(size_t max_symbols = 1000)
+        : max_symbols_(max_symbols) {}
+
+    void addTick(uint32_t symbol_id, const Tick& tick) {
+        auto& buffer = getOrCreateBuffer(symbol_id);
+        buffer.push(tick);
+    }
+
+    std::vector<Tick> getRecentTicks(uint32_t symbol_id, size_t count) {
+        std::shared_lock lock(mutex_);
+
+        auto it = buffers_.find(symbol_id);
+        if (it == buffers_.end()) {
+            return {};
+        }
+
+        return it->second->getRecent(count);
+    }
+
+    std::vector<Tick> getTicksInRange(
+        uint32_t symbol_id,
+        uint64_t start_ns,
+        uint64_t end_ns
+    ) {
+        std::shared_lock lock(mutex_);
+
+        auto it = buffers_.find(symbol_id);
+        if (it == buffers_.end()) {
+            return {};
+        }
+
+        return it->second->getTimeRange(start_ns, end_ns);
+    }
+
+    // Cache statistics
+    struct CacheStats {
+        size_t symbols_cached;
+        size_t total_ticks;
+        size_t cache_hits;
+        size_t cache_misses;
+    };
+
+    CacheStats getStats() const {
+        std::shared_lock lock(mutex_);
+        return CacheStats{
+            buffers_.size(),
+            total_ticks_.load(),
+            cache_hits_.load(),
+            cache_misses_.load()
+        };
+    }
+
+private:
+    TickRingBuffer<10000>& getOrCreateBuffer(uint32_t symbol_id) {
+        {
+            std::shared_lock lock(mutex_);
+            auto it = buffers_.find(symbol_id);
+            if (it != buffers_.end()) {
+                return *it->second;
+            }
+        }
+
+        std::unique_lock lock(mutex_);
+        auto& buffer = buffers_[symbol_id];
+        if (!buffer) {
+            buffer = std::make_unique<TickRingBuffer<10000>>();
+        }
+        return *buffer;
+    }
+
+    size_t max_symbols_;
+    mutable std::shared_mutex mutex_;
+    std::unordered_map<uint32_t, std::unique_ptr<TickRingBuffer<10000>>> buffers_;
+    std::atomic<size_t> total_ticks_{0};
+    std::atomic<size_t> cache_hits_{0};
+    std::atomic<size_t> cache_misses_{0};
+};
+
+// Pre-computed aggregation cache
+class AggregationCache {
+public:
+    struct CacheKey {
+        uint32_t symbol_id;
+        uint64_t interval_start_ns;
+        uint64_t interval_ns;  // Granularity
+
+        bool operator==(const CacheKey& other) const {
+            return symbol_id == other.symbol_id &&
+                   interval_start_ns == other.interval_start_ns &&
+                   interval_ns == other.interval_ns;
+        }
+    };
+
+    struct CacheKeyHash {
+        size_t operator()(const CacheKey& key) const {
+            size_t h1 = std::hash<uint32_t>()(key.symbol_id);
+            size_t h2 = std::hash<uint64_t>()(key.interval_start_ns);
+            size_t h3 = std::hash<uint64_t>()(key.interval_ns);
+            return h1 ^ (h2 << 1) ^ (h3 << 2);
+        }
+    };
+
+    struct OHLCV {
+        int64_t open, high, low, close;
+        uint64_t volume;
+        uint64_t trade_count;
+    };
+
+    void put(const CacheKey& key, const OHLCV& value) {
+        std::unique_lock lock(mutex_);
+
+        // Evict if at capacity
+        if (cache_.size() >= max_entries_) {
+            evictOldest();
+        }
+
+        cache_[key] = {value, std::chrono::steady_clock::now()};
+    }
+
+    std::optional<OHLCV> get(const CacheKey& key) {
+        std::shared_lock lock(mutex_);
+
+        auto it = cache_.find(key);
+        if (it == cache_.end()) {
+            return std::nullopt;
+        }
+
+        return it->second.data;
+    }
+
+private:
+    struct CacheEntry {
+        OHLCV data;
+        std::chrono::steady_clock::time_point last_access;
+    };
+
+    void evictOldest() {
+        // Simple LRU eviction - remove oldest 10%
+        std::vector<std::pair<CacheKey, std::chrono::steady_clock::time_point>> entries;
+        for (const auto& [key, entry] : cache_) {
+            entries.emplace_back(key, entry.last_access);
+        }
+
+        std::sort(entries.begin(), entries.end(),
+            [](const auto& a, const auto& b) {
+                return a.second < b.second;
+            });
+
+        size_t to_evict = max_entries_ / 10;
+        for (size_t i = 0; i < to_evict && i < entries.size(); ++i) {
+            cache_.erase(entries[i].first);
+        }
+    }
+
+    size_t max_entries_ = 100000;
+    mutable std::shared_mutex mutex_;
+    std::unordered_map<CacheKey, CacheEntry, CacheKeyHash> cache_;
+};
+
+} // namespace cache
+} // namespace hft
+```
+
+================================================================================
+SECTION 5: CONNECTION POOLING
+================================================================================
+
+5.1 Database Connection Pool
+----------------------------
+
+```cpp
+// connection_pool.hpp - Thread-Safe Connection Pool
+#pragma once
+
+#include <queue>
+#include <mutex>
+#include <condition_variable>
+#include <memory>
+#include <functional>
+
+namespace hft {
+namespace db {
+
+// Generic connection interface
+class IConnection {
+public:
+    virtual ~IConnection() = default;
+    virtual bool isValid() const = 0;
+    virtual void reset() = 0;
+};
+
+template<typename ConnectionType>
+class ConnectionPool {
+public:
+    using ConnectionPtr = std::shared_ptr<ConnectionType>;
+    using Factory = std::function<ConnectionPtr()>;
+
+    ConnectionPool(
+        Factory factory,
+        size_t min_connections = 5,
+        size_t max_connections = 50,
+        std::chrono::milliseconds acquire_timeout = std::chrono::milliseconds(5000)
+    ) : factory_(factory),
+        min_connections_(min_connections),
+        max_connections_(max_connections),
+        acquire_timeout_(acquire_timeout)
+    {
+        // Pre-create minimum connections
+        for (size_t i = 0; i < min_connections_; ++i) {
+            available_.push(factory_());
+            total_connections_++;
+        }
+    }
+
+    // RAII wrapper for automatic connection return
+    class ConnectionGuard {
+    public:
+        ConnectionGuard(ConnectionPool& pool, ConnectionPtr conn)
+            : pool_(pool), connection_(std::move(conn)) {}
+
+        ~ConnectionGuard() {
+            if (connection_) {
+                pool_.release(std::move(connection_));
+            }
+        }
+
+        // Non-copyable
+        ConnectionGuard(const ConnectionGuard&) = delete;
+        ConnectionGuard& operator=(const ConnectionGuard&) = delete;
+
+        // Movable
+        ConnectionGuard(ConnectionGuard&& other) noexcept
+            : pool_(other.pool_), connection_(std::move(other.connection_)) {
+            other.connection_ = nullptr;
+        }
+
+        ConnectionType* operator->() { return connection_.get(); }
+        ConnectionType& operator*() { return *connection_; }
+        ConnectionType* get() { return connection_.get(); }
+
+    private:
+        ConnectionPool& pool_;
+        ConnectionPtr connection_;
+    };
+
+    // Acquire a connection (blocking with timeout)
+    std::optional<ConnectionGuard> acquire() {
+        std::unique_lock lock(mutex_);
+
+        // Try to get from available pool
+        if (!available_.empty()) {
+            auto conn = std::move(available_.front());
+            available_.pop();
+            in_use_++;
+
+            // Validate connection
+            if (conn && conn->isValid()) {
+                return ConnectionGuard(*this, std::move(conn));
+            }
+
+            // Connection invalid, create new one
+            total_connections_--;
+        }
+
+        // Create new connection if under limit
+        if (total_connections_ < max_connections_) {
+            try {
+                auto conn = factory_();
+                total_connections_++;
+                in_use_++;
+                return ConnectionGuard(*this, std::move(conn));
+            } catch (...) {
+                // Factory failed, wait for available
+            }
+        }
+
+        // Wait for available connection
+        bool acquired = available_cv_.wait_for(lock, acquire_timeout_, [this] {
+            return !available_.empty();
+        });
+
+        if (!acquired || available_.empty()) {
+            return std::nullopt;  // Timeout
+        }
+
+        auto conn = std::move(available_.front());
+        available_.pop();
+        in_use_++;
+
+        return ConnectionGuard(*this, std::move(conn));
+    }
+
+    // Get pool statistics
+    struct PoolStats {
+        size_t total_connections;
+        size_t available_connections;
+        size_t in_use_connections;
+        size_t max_connections;
+        uint64_t total_acquires;
+        uint64_t total_timeouts;
+    };
+
+    PoolStats getStats() const {
+        std::lock_guard lock(mutex_);
+        return PoolStats{
+            total_connections_,
+            available_.size(),
+            in_use_,
+            max_connections_,
+            total_acquires_,
+            total_timeouts_
+        };
+    }
+
+private:
+    void release(ConnectionPtr conn) {
+        std::lock_guard lock(mutex_);
+
+        in_use_--;
+
+        if (conn && conn->isValid()) {
+            conn->reset();
+            available_.push(std::move(conn));
+            available_cv_.notify_one();
+        } else {
+            total_connections_--;
+        }
+    }
+
+    Factory factory_;
+    size_t min_connections_;
+    size_t max_connections_;
+    std::chrono::milliseconds acquire_timeout_;
+
+    mutable std::mutex mutex_;
+    std::condition_variable available_cv_;
+    std::queue<ConnectionPtr> available_;
+
+    size_t total_connections_ = 0;
+    size_t in_use_ = 0;
+    uint64_t total_acquires_ = 0;
+    uint64_t total_timeouts_ = 0;
+};
+
+} // namespace db
+} // namespace hft
+```
+
+================================================================================
+SECTION 6: BATCH QUERY OPTIMIZATION
+================================================================================
+
+6.1 Batch Query Executor
+------------------------
+
+```cpp
+// batch_query.hpp - Efficient Batch Query Processing
+#pragma once
+
+#include <vector>
+#include <future>
+#include <thread>
+#include "tick.hpp"
+
+namespace hft {
+namespace query {
+
+// Batch query request
+struct BatchQueryRequest {
+    uint32_t symbol_id;
+    uint64_t start_ns;
+    uint64_t end_ns;
+    size_t max_results;
+
+    // Query identifier for response matching
+    uint64_t query_id;
+};
+
+// Batch query response
+struct BatchQueryResponse {
+    uint64_t query_id;
+    std::vector<Tick> ticks;
+    uint64_t query_time_ns;
+    bool success;
+    std::string error_message;
+};
+
+class BatchQueryExecutor {
+public:
+    explicit BatchQueryExecutor(size_t worker_threads = 4)
+        : stop_(false)
+    {
+        // Start worker threads
+        for (size_t i = 0; i < worker_threads; ++i) {
+            workers_.emplace_back(&BatchQueryExecutor::workerLoop, this);
+        }
+    }
+
+    ~BatchQueryExecutor() {
+        stop_ = true;
+        queue_cv_.notify_all();
+
+        for (auto& worker : workers_) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+    }
+
+    // Submit batch of queries
+    std::future<std::vector<BatchQueryResponse>> submitBatch(
+        std::vector<BatchQueryRequest> requests
+    ) {
+        auto promise = std::make_shared<std::promise<std::vector<BatchQueryResponse>>>();
+        auto future = promise->get_future();
+
+        {
+            std::lock_guard lock(queue_mutex_);
+            pending_batches_.push({std::move(requests), std::move(promise)});
+        }
+        queue_cv_.notify_one();
+
+        return future;
+    }
+
+    // Execute queries in parallel
+    std::vector<BatchQueryResponse> executeParallel(
+        const std::vector<BatchQueryRequest>& requests
+    ) {
+        std::vector<std::future<BatchQueryResponse>> futures;
+        futures.reserve(requests.size());
+
+        for (const auto& request : requests) {
+            futures.push_back(std::async(std::launch::async, [this, &request] {
+                return executeQuery(request);
+            }));
+        }
+
+        std::vector<BatchQueryResponse> responses;
+        responses.reserve(requests.size());
+
+        for (auto& future : futures) {
+            responses.push_back(future.get());
+        }
+
+        return responses;
+    }
+
+private:
+    struct PendingBatch {
+        std::vector<BatchQueryRequest> requests;
+        std::shared_ptr<std::promise<std::vector<BatchQueryResponse>>> promise;
+    };
+
+    void workerLoop() {
+        while (!stop_) {
+            PendingBatch batch;
+
+            {
+                std::unique_lock lock(queue_mutex_);
+                queue_cv_.wait(lock, [this] {
+                    return stop_ || !pending_batches_.empty();
+                });
+
+                if (stop_ && pending_batches_.empty()) {
+                    return;
+                }
+
+                batch = std::move(pending_batches_.front());
+                pending_batches_.pop();
+            }
+
+            // Execute batch
+            auto responses = executeParallel(batch.requests);
+            batch.promise->set_value(std::move(responses));
+        }
+    }
+
+    BatchQueryResponse executeQuery(const BatchQueryRequest& request) {
+        auto start = std::chrono::high_resolution_clock::now();
+
+        BatchQueryResponse response;
+        response.query_id = request.query_id;
+        response.success = true;
+
+        try {
+            // Execute actual query (implementation depends on storage backend)
+            response.ticks = queryTicks(request);
+        } catch (const std::exception& e) {
+            response.success = false;
+            response.error_message = e.what();
+        }
+
+        auto end = std::chrono::high_resolution_clock::now();
+        response.query_time_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            end - start).count();
+
+        return response;
+    }
+
+    std::vector<Tick> queryTicks(const BatchQueryRequest& request) {
+        // Implementation: query from storage
+        std::vector<Tick> ticks;
+        // ...
+        return ticks;
+    }
+
+    std::atomic<bool> stop_;
+    std::vector<std::thread> workers_;
+
+    std::mutex queue_mutex_;
+    std::condition_variable queue_cv_;
+    std::queue<PendingBatch> pending_batches_;
+};
+
+} // namespace query
+} // namespace hft
+```
+
+================================================================================
+SECTION 7: REAL-TIME QUERY PERFORMANCE
+================================================================================
+
+7.1 SIMD-Accelerated Filtering
+------------------------------
+
+```cpp
+// simd_filter.hpp - SIMD-Optimized Tick Filtering
+#pragma once
+
+#include <immintrin.h>
+#include <vector>
+#include "tick.hpp"
+
+namespace hft {
+namespace query {
+
+class SIMDTickFilter {
+public:
+    // Filter ticks by time range using AVX2
+    static std::vector<size_t> filterByTimeRange(
+        const Tick* ticks,
+        size_t count,
+        uint64_t start_ns,
+        uint64_t end_ns
+    ) {
+        std::vector<size_t> matching_indices;
+        matching_indices.reserve(count / 4);  // Estimate
+
+        // Process 4 ticks at a time (AVX2 can hold 4x 64-bit values)
+        size_t i = 0;
+
+        #ifdef __AVX2__
+        __m256i start_vec = _mm256_set1_epi64x(start_ns);
+        __m256i end_vec = _mm256_set1_epi64x(end_ns);
+
+        for (; i + 4 <= count; i += 4) {
+            // Load timestamps (assuming timestamp is first field in Tick)
+            __m256i timestamps = _mm256_set_epi64x(
+                ticks[i + 3].timestamp,
+                ticks[i + 2].timestamp,
+                ticks[i + 1].timestamp,
+                ticks[i + 0].timestamp
+            );
+
+            // Compare: timestamp >= start && timestamp <= end
+            __m256i ge_start = _mm256_cmpgt_epi64(timestamps,
+                _mm256_sub_epi64(start_vec, _mm256_set1_epi64x(1)));
+            __m256i le_end = _mm256_cmpgt_epi64(
+                _mm256_add_epi64(end_vec, _mm256_set1_epi64x(1)), timestamps);
+            __m256i in_range = _mm256_and_si256(ge_start, le_end);
+
+            // Extract mask
+            int mask = _mm256_movemask_pd(_mm256_castsi256_pd(in_range));
+
+            // Add matching indices
+            if (mask & 1) matching_indices.push_back(i);
+            if (mask & 2) matching_indices.push_back(i + 1);
+            if (mask & 4) matching_indices.push_back(i + 2);
+            if (mask & 8) matching_indices.push_back(i + 3);
+        }
+        #endif
+
+        // Handle remaining ticks
+        for (; i < count; ++i) {
+            if (ticks[i].timestamp >= start_ns && ticks[i].timestamp <= end_ns) {
+                matching_indices.push_back(i);
+            }
+        }
+
+        return matching_indices;
+    }
+
+    // Filter by price range
+    static std::vector<size_t> filterByPriceRange(
+        const Tick* ticks,
+        size_t count,
+        int64_t min_price,
+        int64_t max_price
+    ) {
+        std::vector<size_t> matching_indices;
+        matching_indices.reserve(count / 4);
+
+        #ifdef __AVX2__
+        __m256i min_vec = _mm256_set1_epi64x(min_price);
+        __m256i max_vec = _mm256_set1_epi64x(max_price);
+
+        for (size_t i = 0; i + 4 <= count; i += 4) {
+            __m256i prices = _mm256_set_epi64x(
+                ticks[i + 3].price,
+                ticks[i + 2].price,
+                ticks[i + 1].price,
+                ticks[i + 0].price
+            );
+
+            __m256i ge_min = _mm256_cmpgt_epi64(prices,
+                _mm256_sub_epi64(min_vec, _mm256_set1_epi64x(1)));
+            __m256i le_max = _mm256_cmpgt_epi64(
+                _mm256_add_epi64(max_vec, _mm256_set1_epi64x(1)), prices);
+            __m256i in_range = _mm256_and_si256(ge_min, le_max);
+
+            int mask = _mm256_movemask_pd(_mm256_castsi256_pd(in_range));
+
+            if (mask & 1) matching_indices.push_back(i);
+            if (mask & 2) matching_indices.push_back(i + 1);
+            if (mask & 4) matching_indices.push_back(i + 2);
+            if (mask & 8) matching_indices.push_back(i + 3);
+        }
+        #endif
+
+        return matching_indices;
+    }
+
+    // Combined filter with predicate
+    template<typename Predicate>
+    static std::vector<Tick> filterWithPredicate(
+        const Tick* ticks,
+        size_t count,
+        Predicate pred
+    ) {
+        std::vector<Tick> result;
+        result.reserve(count / 10);  // Estimate 10% match rate
+
+        for (size_t i = 0; i < count; ++i) {
+            if (pred(ticks[i])) {
+                result.push_back(ticks[i]);
+            }
+        }
+
+        return result;
+    }
+};
+
+} // namespace query
+} // namespace hft
+```
+
+7.2 Prefetch Optimization
+-------------------------
+
+```cpp
+// prefetch_reader.hpp - Prefetch-Optimized Tick Reading
+#pragma once
+
+#include <cstring>
+#include "tick.hpp"
+
+namespace hft {
+namespace query {
+
+class PrefetchTickReader {
+public:
+    // Read ticks with prefetching
+    static void readWithPrefetch(
+        const char* data,
+        size_t tick_count,
+        std::vector<Tick>& output
+    ) {
+        output.resize(tick_count);
+
+        constexpr size_t PREFETCH_DISTANCE = 8;  // Prefetch 8 ticks ahead
+        constexpr size_t TICK_SIZE = sizeof(Tick);
+
+        for (size_t i = 0; i < tick_count; ++i) {
+            // Prefetch future data
+            if (i + PREFETCH_DISTANCE < tick_count) {
+                __builtin_prefetch(data + (i + PREFETCH_DISTANCE) * TICK_SIZE, 0, 3);
+            }
+
+            // Copy current tick
+            std::memcpy(&output[i], data + i * TICK_SIZE, TICK_SIZE);
+        }
+    }
+
+    // Streaming read with callback
+    template<typename Callback>
+    static void streamWithPrefetch(
+        const char* data,
+        size_t tick_count,
+        Callback callback
+    ) {
+        constexpr size_t PREFETCH_DISTANCE = 8;
+        constexpr size_t TICK_SIZE = sizeof(Tick);
+
+        for (size_t i = 0; i < tick_count; ++i) {
+            if (i + PREFETCH_DISTANCE < tick_count) {
+                __builtin_prefetch(data + (i + PREFETCH_DISTANCE) * TICK_SIZE, 0, 3);
+            }
+
+            const Tick* tick = reinterpret_cast<const Tick*>(data + i * TICK_SIZE);
+            callback(*tick);
+        }
+    }
+};
+
+} // namespace query
+} // namespace hft
+```
+
+================================================================================
+SECTION 8: QUERY MONITORING AND TUNING
+================================================================================
+
+8.1 Query Performance Monitor
+-----------------------------
+
+```cpp
+// query_monitor.hpp - Query Performance Monitoring
+#pragma once
+
+#include <atomic>
+#include <chrono>
+#include <map>
+#include <mutex>
+
+namespace hft {
+namespace monitoring {
+
+class QueryPerformanceMonitor {
+public:
+    struct QueryMetrics {
+        std::string query_type;
+        uint64_t execution_count;
+        uint64_t total_time_ns;
+        uint64_t min_time_ns;
+        uint64_t max_time_ns;
+        uint64_t p50_time_ns;
+        uint64_t p95_time_ns;
+        uint64_t p99_time_ns;
+        uint64_t total_rows_scanned;
+        uint64_t total_rows_returned;
+        uint64_t cache_hits;
+        uint64_t cache_misses;
+    };
+
+    void recordQuery(
+        const std::string& query_type,
+        uint64_t execution_time_ns,
+        uint64_t rows_scanned,
+        uint64_t rows_returned,
+        bool cache_hit
+    ) {
+        std::lock_guard lock(mutex_);
+
+        auto& metrics = metrics_[query_type];
+        metrics.query_type = query_type;
+        metrics.execution_count++;
+        metrics.total_time_ns += execution_time_ns;
+
+        if (metrics.execution_count == 1) {
+            metrics.min_time_ns = execution_time_ns;
+            metrics.max_time_ns = execution_time_ns;
+        } else {
+            metrics.min_time_ns = std::min(metrics.min_time_ns, execution_time_ns);
+            metrics.max_time_ns = std::max(metrics.max_time_ns, execution_time_ns);
+        }
+
+        metrics.total_rows_scanned += rows_scanned;
+        metrics.total_rows_returned += rows_returned;
+
+        if (cache_hit) {
+            metrics.cache_hits++;
+        } else {
+            metrics.cache_misses++;
+        }
+
+        // Store for percentile calculation
+        latency_samples_[query_type].push_back(execution_time_ns);
+
+        // Limit samples for memory efficiency
+        if (latency_samples_[query_type].size() > 10000) {
+            latency_samples_[query_type].erase(
+                latency_samples_[query_type].begin(),
+                latency_samples_[query_type].begin() + 5000
+            );
+        }
+    }
+
+    std::map<std::string, QueryMetrics> getMetrics() {
+        std::lock_guard lock(mutex_);
+
+        // Calculate percentiles
+        for (auto& [query_type, metrics] : metrics_) {
+            auto& samples = latency_samples_[query_type];
+            if (!samples.empty()) {
+                std::sort(samples.begin(), samples.end());
+
+                size_t n = samples.size();
+                metrics.p50_time_ns = samples[n * 50 / 100];
+                metrics.p95_time_ns = samples[n * 95 / 100];
+                metrics.p99_time_ns = samples[n * 99 / 100];
+            }
+        }
+
+        return metrics_;
+    }
+
+    void reset() {
+        std::lock_guard lock(mutex_);
+        metrics_.clear();
+        latency_samples_.clear();
+    }
+
+    // Print report
+    void printReport() const {
+        std::lock_guard lock(mutex_);
+
+        printf("\n==================== QUERY PERFORMANCE REPORT ====================\n");
+        printf("%-20s %10s %12s %12s %12s %10s\n",
+               "Query Type", "Count", "Avg (µs)", "P99 (µs)", "Hit Rate", "Selectivity");
+        printf("------------------------------------------------------------------\n");
+
+        for (const auto& [type, metrics] : metrics_) {
+            double avg_us = static_cast<double>(metrics.total_time_ns) /
+                           metrics.execution_count / 1000.0;
+            double hit_rate = metrics.cache_hits + metrics.cache_misses > 0 ?
+                             100.0 * metrics.cache_hits /
+                             (metrics.cache_hits + metrics.cache_misses) : 0.0;
+            double selectivity = metrics.total_rows_scanned > 0 ?
+                                100.0 * metrics.total_rows_returned /
+                                metrics.total_rows_scanned : 0.0;
+
+            printf("%-20s %10lu %12.2f %12lu %9.1f%% %9.2f%%\n",
+                   type.c_str(),
+                   metrics.execution_count,
+                   avg_us,
+                   metrics.p99_time_ns / 1000,
+                   hit_rate,
+                   selectivity);
+        }
+
+        printf("==================================================================\n\n");
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::map<std::string, QueryMetrics> metrics_;
+    std::map<std::string, std::vector<uint64_t>> latency_samples_;
+};
+
+// RAII query timer
+class QueryTimer {
+public:
+    QueryTimer(
+        QueryPerformanceMonitor& monitor,
+        const std::string& query_type
+    ) : monitor_(monitor),
+        query_type_(query_type),
+        start_(std::chrono::high_resolution_clock::now()) {}
+
+    void setRowsScanned(uint64_t rows) { rows_scanned_ = rows; }
+    void setRowsReturned(uint64_t rows) { rows_returned_ = rows; }
+    void setCacheHit(bool hit) { cache_hit_ = hit; }
+
+    ~QueryTimer() {
+        auto end = std::chrono::high_resolution_clock::now();
+        uint64_t duration_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            end - start_).count();
+
+        monitor_.recordQuery(
+            query_type_,
+            duration_ns,
+            rows_scanned_,
+            rows_returned_,
+            cache_hit_
+        );
+    }
+
+private:
+    QueryPerformanceMonitor& monitor_;
+    std::string query_type_;
+    std::chrono::high_resolution_clock::time_point start_;
+    uint64_t rows_scanned_ = 0;
+    uint64_t rows_returned_ = 0;
+    bool cache_hit_ = false;
+};
+
+} // namespace monitoring
+} // namespace hft
+```
+
+8.2 Query Tuning Recommendations
+--------------------------------
+
+Automatic Tuning Suggestions:
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Issue                          │ Recommendation                            │
+├────────────────────────────────┼───────────────────────────────────────────┤
+│ Low cache hit rate (<50%)      │ Increase cache size or adjust TTL        │
+│ High P99/P50 ratio (>10x)      │ Check for lock contention                │
+│ Low selectivity (<1%)          │ Add more specific indexes                │
+│ High avg scan count            │ Implement partition pruning              │
+│ Increasing latency trend       │ Consider data archival                   │
+│ Connection pool exhaustion     │ Increase pool size or optimize queries   │
+└────────────────────────────────┴───────────────────────────────────────────┘
+
+================================================================================
+APPENDIX: QUERY OPTIMIZATION CHECKLIST
+================================================================================
+
+Pre-Query Checklist:
+□ Appropriate indexes exist for query pattern
+□ Partition pruning is effective
+□ Zone maps are up to date
+□ Cache is warmed for hot data
+
+Query Design Checklist:
+□ Limit result set size appropriately
+□ Use projection (select only needed columns)
+□ Filter early in query pipeline
+□ Avoid unnecessary sorting
+
+Post-Query Checklist:
+□ Monitor query performance metrics
+□ Review slow query logs
+□ Update indexes based on usage patterns
+□ Adjust cache policies as needed
+
+================================================================================
+                         END OF QUERY OPTIMIZATION
+================================================================================

@@ -1,0 +1,742 @@
+================================================================================
+DATABASE SCHEMA DESIGN FOR HFT SYSTEMS
+PostgreSQL & TimescaleDB Implementation
+================================================================================
+
+OVERVIEW
+--------
+This document provides comprehensive database schema designs for high-frequency
+trading systems using PostgreSQL for relational data and TimescaleDB for
+time-series market data. The design emphasizes low-latency queries, efficient
+storage, and scalability.
+
+================================================================================
+1. POSTGRESQL CORE SCHEMA DESIGN
+================================================================================
+
+1.1 TRADING ACCOUNTS AND USERS
+-------------------------------
+
+-- User authentication and authorization
+CREATE TABLE users (
+    user_id SERIAL PRIMARY KEY,
+    username VARCHAR(50) UNIQUE NOT NULL,
+    email VARCHAR(255) UNIQUE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    full_name VARCHAR(255),
+    role VARCHAR(50) NOT NULL DEFAULT 'trader',
+    is_active BOOLEAN DEFAULT true,
+    mfa_enabled BOOLEAN DEFAULT false,
+    mfa_secret VARCHAR(255),
+    last_login_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT chk_role CHECK (role IN ('admin', 'trader', 'risk_manager', 'analyst', 'viewer'))
+);
+
+-- Trading accounts
+CREATE TABLE trading_accounts (
+    account_id SERIAL PRIMARY KEY,
+    account_number VARCHAR(50) UNIQUE NOT NULL,
+    account_name VARCHAR(255) NOT NULL,
+    account_type VARCHAR(50) NOT NULL,
+    broker_id INTEGER NOT NULL,
+    user_id INTEGER REFERENCES users(user_id),
+    currency VARCHAR(3) DEFAULT 'USD',
+    initial_balance NUMERIC(20, 2) NOT NULL,
+    current_balance NUMERIC(20, 2) NOT NULL,
+    available_balance NUMERIC(20, 2) NOT NULL,
+    margin_used NUMERIC(20, 2) DEFAULT 0,
+    margin_available NUMERIC(20, 2),
+    leverage_ratio NUMERIC(10, 2) DEFAULT 1.00,
+    risk_limit NUMERIC(20, 2),
+    daily_loss_limit NUMERIC(20, 2),
+    position_limit INTEGER,
+    is_active BOOLEAN DEFAULT true,
+    opened_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    closed_at TIMESTAMP WITH TIME ZONE,
+    last_activity_at TIMESTAMP WITH TIME ZONE,
+    CONSTRAINT chk_account_type CHECK (account_type IN ('cash', 'margin', 'portfolio_margin', 'futures'))
+);
+
+CREATE INDEX idx_trading_accounts_user ON trading_accounts(user_id);
+CREATE INDEX idx_trading_accounts_broker ON trading_accounts(broker_id);
+CREATE INDEX idx_trading_accounts_active ON trading_accounts(is_active) WHERE is_active = true;
+
+1.2 INSTRUMENTS AND MARKET REFERENCE DATA
+------------------------------------------
+
+-- Financial instruments master table
+CREATE TABLE instruments (
+    instrument_id SERIAL PRIMARY KEY,
+    symbol VARCHAR(50) NOT NULL,
+    exchange VARCHAR(50) NOT NULL,
+    instrument_type VARCHAR(50) NOT NULL,
+    full_name VARCHAR(255),
+    isin VARCHAR(12),
+    cusip VARCHAR(9),
+    bloomberg_ticker VARCHAR(50),
+    reuters_ric VARCHAR(50),
+    currency VARCHAR(3) NOT NULL,
+    lot_size INTEGER DEFAULT 1,
+    tick_size NUMERIC(20, 8) NOT NULL,
+    min_order_qty NUMERIC(20, 8) DEFAULT 1,
+    max_order_qty NUMERIC(20, 8),
+    price_precision INTEGER DEFAULT 2,
+    quantity_precision INTEGER DEFAULT 0,
+    contract_size NUMERIC(20, 8),
+    expiry_date DATE,
+    strike_price NUMERIC(20, 8),
+    option_type VARCHAR(4),
+    underlying_symbol VARCHAR(50),
+    multiplier NUMERIC(10, 4) DEFAULT 1,
+    trading_hours JSONB,
+    is_tradable BOOLEAN DEFAULT true,
+    is_shortable BOOLEAN DEFAULT false,
+    margin_requirement NUMERIC(5, 4),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    delisted_at TIMESTAMP WITH TIME ZONE,
+    CONSTRAINT chk_instrument_type CHECK (instrument_type IN ('stock', 'etf', 'option', 'future', 'forex', 'crypto', 'bond')),
+    CONSTRAINT chk_option_type CHECK (option_type IS NULL OR option_type IN ('call', 'put')),
+    UNIQUE (symbol, exchange)
+);
+
+CREATE INDEX idx_instruments_symbol ON instruments(symbol);
+CREATE INDEX idx_instruments_exchange ON instruments(exchange);
+CREATE INDEX idx_instruments_type ON instruments(instrument_type);
+CREATE INDEX idx_instruments_underlying ON instruments(underlying_symbol) WHERE underlying_symbol IS NOT NULL;
+CREATE INDEX idx_instruments_expiry ON instruments(expiry_date) WHERE expiry_date IS NOT NULL;
+CREATE INDEX idx_instruments_tradable ON instruments(is_tradable) WHERE is_tradable = true;
+
+-- Exchange reference data
+CREATE TABLE exchanges (
+    exchange_id SERIAL PRIMARY KEY,
+    exchange_code VARCHAR(50) UNIQUE NOT NULL,
+    exchange_name VARCHAR(255) NOT NULL,
+    country VARCHAR(2) NOT NULL,
+    timezone VARCHAR(50) NOT NULL,
+    currency VARCHAR(3) NOT NULL,
+    trading_hours JSONB NOT NULL,
+    settlement_days INTEGER DEFAULT 2,
+    mic_code VARCHAR(4) UNIQUE,
+    website VARCHAR(255),
+    is_active BOOLEAN DEFAULT true
+);
+
+1.3 ORDERS AND EXECUTIONS
+--------------------------
+
+-- Orders table
+CREATE TABLE orders (
+    order_id BIGSERIAL PRIMARY KEY,
+    client_order_id VARCHAR(100) UNIQUE NOT NULL,
+    account_id INTEGER NOT NULL REFERENCES trading_accounts(account_id),
+    instrument_id INTEGER NOT NULL REFERENCES instruments(instrument_id),
+    strategy_id INTEGER,
+    order_type VARCHAR(50) NOT NULL,
+    side VARCHAR(10) NOT NULL,
+    quantity NUMERIC(20, 8) NOT NULL,
+    price NUMERIC(20, 8),
+    stop_price NUMERIC(20, 8),
+    time_in_force VARCHAR(20) NOT NULL DEFAULT 'DAY',
+    filled_quantity NUMERIC(20, 8) DEFAULT 0,
+    remaining_quantity NUMERIC(20, 8),
+    avg_fill_price NUMERIC(20, 8),
+    commission NUMERIC(20, 8) DEFAULT 0,
+    fees NUMERIC(20, 8) DEFAULT 0,
+    order_status VARCHAR(50) NOT NULL DEFAULT 'pending',
+    exchange_order_id VARCHAR(100),
+    parent_order_id BIGINT REFERENCES orders(order_id),
+    routing_destination VARCHAR(50),
+    execution_instructions JSONB,
+    error_message TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    submitted_at TIMESTAMP WITH TIME ZONE,
+    acknowledged_at TIMESTAMP WITH TIME ZONE,
+    filled_at TIMESTAMP WITH TIME ZONE,
+    cancelled_at TIMESTAMP WITH TIME ZONE,
+    rejected_at TIMESTAMP WITH TIME ZONE,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT chk_order_type CHECK (order_type IN ('market', 'limit', 'stop', 'stop_limit', 'trailing_stop', 'iceberg', 'twap', 'vwap')),
+    CONSTRAINT chk_side CHECK (side IN ('buy', 'sell', 'short', 'cover')),
+    CONSTRAINT chk_tif CHECK (time_in_force IN ('DAY', 'GTC', 'IOC', 'FOK', 'GTD', 'OPG', 'CLS')),
+    CONSTRAINT chk_status CHECK (order_status IN ('pending', 'submitted', 'acknowledged', 'partial', 'filled', 'cancelled', 'rejected', 'expired'))
+);
+
+CREATE INDEX idx_orders_account ON orders(account_id);
+CREATE INDEX idx_orders_instrument ON orders(instrument_id);
+CREATE INDEX idx_orders_strategy ON orders(strategy_id);
+CREATE INDEX idx_orders_status ON orders(order_status);
+CREATE INDEX idx_orders_created ON orders(created_at DESC);
+CREATE INDEX idx_orders_client_id ON orders(client_order_id);
+CREATE INDEX idx_orders_exchange_id ON orders(exchange_order_id) WHERE exchange_order_id IS NOT NULL;
+
+-- Executions (fills) table
+CREATE TABLE executions (
+    execution_id BIGSERIAL PRIMARY KEY,
+    order_id BIGINT NOT NULL REFERENCES orders(order_id),
+    account_id INTEGER NOT NULL REFERENCES trading_accounts(account_id),
+    instrument_id INTEGER NOT NULL REFERENCES instruments(instrument_id),
+    exchange_execution_id VARCHAR(100) UNIQUE NOT NULL,
+    side VARCHAR(10) NOT NULL,
+    quantity NUMERIC(20, 8) NOT NULL,
+    price NUMERIC(20, 8) NOT NULL,
+    liquidity_flag VARCHAR(20),
+    commission NUMERIC(20, 8) DEFAULT 0,
+    fees NUMERIC(20, 8) DEFAULT 0,
+    execution_venue VARCHAR(50),
+    contra_broker VARCHAR(50),
+    settlement_date DATE,
+    executed_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    reported_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT chk_exec_side CHECK (side IN ('buy', 'sell', 'short', 'cover')),
+    CONSTRAINT chk_liquidity CHECK (liquidity_flag IN ('maker', 'taker', 'auction', NULL))
+);
+
+CREATE INDEX idx_executions_order ON executions(order_id);
+CREATE INDEX idx_executions_account ON executions(account_id);
+CREATE INDEX idx_executions_instrument ON executions(instrument_id);
+CREATE INDEX idx_executions_time ON executions(executed_at DESC);
+
+1.4 POSITIONS AND PORTFOLIO
+----------------------------
+
+-- Current positions
+CREATE TABLE positions (
+    position_id BIGSERIAL PRIMARY KEY,
+    account_id INTEGER NOT NULL REFERENCES trading_accounts(account_id),
+    instrument_id INTEGER NOT NULL REFERENCES instruments(instrument_id),
+    quantity NUMERIC(20, 8) NOT NULL DEFAULT 0,
+    avg_entry_price NUMERIC(20, 8),
+    current_price NUMERIC(20, 8),
+    market_value NUMERIC(20, 2),
+    unrealized_pnl NUMERIC(20, 2),
+    realized_pnl NUMERIC(20, 2) DEFAULT 0,
+    total_cost NUMERIC(20, 2),
+    side VARCHAR(10),
+    opened_at TIMESTAMP WITH TIME ZONE,
+    last_updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    closed_at TIMESTAMP WITH TIME ZONE,
+    CONSTRAINT chk_position_side CHECK (side IN ('long', 'short', NULL)),
+    UNIQUE (account_id, instrument_id, closed_at)
+);
+
+CREATE INDEX idx_positions_account ON positions(account_id);
+CREATE INDEX idx_positions_instrument ON positions(instrument_id);
+CREATE INDEX idx_positions_open ON positions(account_id, closed_at) WHERE closed_at IS NULL;
+
+-- Historical positions
+CREATE TABLE position_history (
+    history_id BIGSERIAL PRIMARY KEY,
+    account_id INTEGER NOT NULL,
+    instrument_id INTEGER NOT NULL,
+    snapshot_time TIMESTAMP WITH TIME ZONE NOT NULL,
+    quantity NUMERIC(20, 8) NOT NULL,
+    avg_entry_price NUMERIC(20, 8),
+    current_price NUMERIC(20, 8),
+    market_value NUMERIC(20, 2),
+    unrealized_pnl NUMERIC(20, 2),
+    realized_pnl NUMERIC(20, 2)
+);
+
+CREATE INDEX idx_position_history_account_time ON position_history(account_id, snapshot_time DESC);
+CREATE INDEX idx_position_history_instrument_time ON position_history(instrument_id, snapshot_time DESC);
+
+1.5 STRATEGIES AND CONFIGURATIONS
+----------------------------------
+
+-- Trading strategies
+CREATE TABLE strategies (
+    strategy_id SERIAL PRIMARY KEY,
+    strategy_name VARCHAR(255) UNIQUE NOT NULL,
+    strategy_type VARCHAR(50) NOT NULL,
+    description TEXT,
+    parameters JSONB NOT NULL,
+    risk_parameters JSONB,
+    instruments JSONB,
+    is_active BOOLEAN DEFAULT false,
+    max_position_size NUMERIC(20, 8),
+    max_daily_loss NUMERIC(20, 2),
+    max_order_value NUMERIC(20, 2),
+    version INTEGER DEFAULT 1,
+    created_by INTEGER REFERENCES users(user_id),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    activated_at TIMESTAMP WITH TIME ZONE,
+    deactivated_at TIMESTAMP WITH TIME ZONE
+);
+
+CREATE INDEX idx_strategies_active ON strategies(is_active) WHERE is_active = true;
+CREATE INDEX idx_strategies_type ON strategies(strategy_type);
+
+-- Strategy performance tracking
+CREATE TABLE strategy_performance (
+    performance_id BIGSERIAL PRIMARY KEY,
+    strategy_id INTEGER NOT NULL REFERENCES strategies(strategy_id),
+    account_id INTEGER NOT NULL REFERENCES trading_accounts(account_id),
+    date DATE NOT NULL,
+    total_trades INTEGER DEFAULT 0,
+    winning_trades INTEGER DEFAULT 0,
+    losing_trades INTEGER DEFAULT 0,
+    gross_profit NUMERIC(20, 2) DEFAULT 0,
+    gross_loss NUMERIC(20, 2) DEFAULT 0,
+    net_pnl NUMERIC(20, 2) DEFAULT 0,
+    commissions NUMERIC(20, 2) DEFAULT 0,
+    fees NUMERIC(20, 2) DEFAULT 0,
+    max_drawdown NUMERIC(20, 2),
+    sharpe_ratio NUMERIC(10, 4),
+    win_rate NUMERIC(5, 4),
+    profit_factor NUMERIC(10, 4),
+    avg_win NUMERIC(20, 2),
+    avg_loss NUMERIC(20, 2),
+    UNIQUE (strategy_id, account_id, date)
+);
+
+CREATE INDEX idx_strategy_perf_strategy_date ON strategy_performance(strategy_id, date DESC);
+
+================================================================================
+2. TIMESCALEDB TIME-SERIES SCHEMA
+================================================================================
+
+2.1 MARKET DATA TABLES
+-----------------------
+
+-- Enable TimescaleDB extension
+CREATE EXTENSION IF NOT EXISTS timescaledb;
+
+-- OHLCV (candlestick) data
+CREATE TABLE market_ohlcv (
+    time TIMESTAMPTZ NOT NULL,
+    instrument_id INTEGER NOT NULL,
+    interval VARCHAR(10) NOT NULL,
+    open NUMERIC(20, 8) NOT NULL,
+    high NUMERIC(20, 8) NOT NULL,
+    low NUMERIC(20, 8) NOT NULL,
+    close NUMERIC(20, 8) NOT NULL,
+    volume NUMERIC(20, 8) NOT NULL,
+    trade_count INTEGER,
+    vwap NUMERIC(20, 8),
+    bid_volume NUMERIC(20, 8),
+    ask_volume NUMERIC(20, 8),
+    CONSTRAINT chk_ohlc CHECK (high >= low AND high >= open AND high >= close AND low <= open AND low <= close)
+);
+
+SELECT create_hypertable('market_ohlcv', 'time', chunk_time_interval => INTERVAL '1 day');
+CREATE INDEX idx_ohlcv_instrument_time ON market_ohlcv (instrument_id, time DESC);
+CREATE INDEX idx_ohlcv_interval ON market_ohlcv (interval, time DESC);
+
+-- Continuous aggregates for different timeframes
+CREATE MATERIALIZED VIEW market_ohlcv_1min
+WITH (timescaledb.continuous) AS
+SELECT
+    time_bucket('1 minute', time) AS bucket,
+    instrument_id,
+    first(open, time) AS open,
+    max(high) AS high,
+    min(low) AS low,
+    last(close, time) AS close,
+    sum(volume) AS volume,
+    sum(trade_count) AS trade_count,
+    sum(volume * vwap) / sum(volume) AS vwap
+FROM market_ohlcv
+WHERE interval = '1s'
+GROUP BY bucket, instrument_id;
+
+CREATE MATERIALIZED VIEW market_ohlcv_5min
+WITH (timescaledb.continuous) AS
+SELECT
+    time_bucket('5 minutes', time) AS bucket,
+    instrument_id,
+    first(open, time) AS open,
+    max(high) AS high,
+    min(low) AS low,
+    last(close, time) AS close,
+    sum(volume) AS volume,
+    sum(trade_count) AS trade_count,
+    sum(volume * vwap) / sum(volume) AS vwap
+FROM market_ohlcv
+WHERE interval = '1s'
+GROUP BY bucket, instrument_id;
+
+-- Tick data (trades)
+CREATE TABLE market_trades (
+    time TIMESTAMPTZ NOT NULL,
+    instrument_id INTEGER NOT NULL,
+    trade_id VARCHAR(100),
+    price NUMERIC(20, 8) NOT NULL,
+    quantity NUMERIC(20, 8) NOT NULL,
+    side VARCHAR(4),
+    trade_conditions VARCHAR(50),
+    exchange_timestamp TIMESTAMPTZ,
+    sequence_number BIGINT
+);
+
+SELECT create_hypertable('market_trades', 'time', chunk_time_interval => INTERVAL '1 day');
+CREATE INDEX idx_trades_instrument_time ON market_trades (instrument_id, time DESC);
+CREATE INDEX idx_trades_trade_id ON market_trades (trade_id);
+
+-- Order book snapshots
+CREATE TABLE market_order_book (
+    time TIMESTAMPTZ NOT NULL,
+    instrument_id INTEGER NOT NULL,
+    level INTEGER NOT NULL,
+    bid_price NUMERIC(20, 8),
+    bid_size NUMERIC(20, 8),
+    bid_orders INTEGER,
+    ask_price NUMERIC(20, 8),
+    ask_size NUMERIC(20, 8),
+    ask_orders INTEGER,
+    CONSTRAINT chk_level CHECK (level >= 1 AND level <= 20)
+);
+
+SELECT create_hypertable('market_order_book', 'time', chunk_time_interval => INTERVAL '1 hour');
+CREATE INDEX idx_order_book_instrument_time ON market_order_book (instrument_id, time DESC, level);
+
+-- Level 1 quotes (BBO - Best Bid Offer)
+CREATE TABLE market_quotes (
+    time TIMESTAMPTZ NOT NULL,
+    instrument_id INTEGER NOT NULL,
+    bid_price NUMERIC(20, 8) NOT NULL,
+    bid_size NUMERIC(20, 8) NOT NULL,
+    ask_price NUMERIC(20, 8) NOT NULL,
+    ask_size NUMERIC(20, 8) NOT NULL,
+    spread NUMERIC(20, 8),
+    mid_price NUMERIC(20, 8),
+    exchange_timestamp TIMESTAMPTZ
+);
+
+SELECT create_hypertable('market_quotes', 'time', chunk_time_interval => INTERVAL '6 hours');
+CREATE INDEX idx_quotes_instrument_time ON market_quotes (instrument_id, time DESC);
+
+2.2 TRADING METRICS TIME-SERIES
+--------------------------------
+
+-- Real-time PnL tracking
+CREATE TABLE account_pnl_timeseries (
+    time TIMESTAMPTZ NOT NULL,
+    account_id INTEGER NOT NULL,
+    realized_pnl NUMERIC(20, 2),
+    unrealized_pnl NUMERIC(20, 2),
+    total_pnl NUMERIC(20, 2),
+    equity NUMERIC(20, 2),
+    available_balance NUMERIC(20, 2),
+    margin_used NUMERIC(20, 2),
+    margin_ratio NUMERIC(5, 4)
+);
+
+SELECT create_hypertable('account_pnl_timeseries', 'time', chunk_time_interval => INTERVAL '1 day');
+CREATE INDEX idx_pnl_ts_account_time ON account_pnl_timeseries (account_id, time DESC);
+
+-- Strategy metrics time-series
+CREATE TABLE strategy_metrics_timeseries (
+    time TIMESTAMPTZ NOT NULL,
+    strategy_id INTEGER NOT NULL,
+    account_id INTEGER NOT NULL,
+    positions_count INTEGER,
+    orders_count INTEGER,
+    fills_count INTEGER,
+    pnl NUMERIC(20, 2),
+    sharpe_ratio NUMERIC(10, 4),
+    win_rate NUMERIC(5, 4),
+    avg_trade_pnl NUMERIC(20, 2),
+    max_drawdown NUMERIC(20, 2)
+);
+
+SELECT create_hypertable('strategy_metrics_timeseries', 'time', chunk_time_interval => INTERVAL '1 day');
+CREATE INDEX idx_strategy_metrics_ts ON strategy_metrics_timeseries (strategy_id, account_id, time DESC);
+
+================================================================================
+3. ADVANCED INDEXING STRATEGIES
+================================================================================
+
+3.1 PARTIAL INDEXES
+-------------------
+
+-- Active orders only
+CREATE INDEX idx_orders_active ON orders(created_at DESC)
+WHERE order_status IN ('pending', 'submitted', 'acknowledged', 'partial');
+
+-- Open positions only
+CREATE INDEX idx_positions_active ON positions(account_id, instrument_id)
+WHERE closed_at IS NULL;
+
+-- Recent trades (last 30 days)
+CREATE INDEX idx_recent_executions ON executions(executed_at DESC)
+WHERE executed_at > CURRENT_DATE - INTERVAL '30 days';
+
+3.2 COMPOSITE INDEXES
+---------------------
+
+-- Order lookup by account and status
+CREATE INDEX idx_orders_account_status_time ON orders(account_id, order_status, created_at DESC);
+
+-- Position lookup with instrument
+CREATE INDEX idx_positions_account_instrument ON positions(account_id, instrument_id)
+INCLUDE (quantity, avg_entry_price, unrealized_pnl);
+
+-- Execution history
+CREATE INDEX idx_executions_instrument_time ON executions(instrument_id, executed_at DESC)
+INCLUDE (quantity, price);
+
+3.3 EXPRESSION INDEXES
+----------------------
+
+-- Search by uppercase symbol
+CREATE INDEX idx_instruments_upper_symbol ON instruments(UPPER(symbol));
+
+-- Date-based partitioning helper
+CREATE INDEX idx_orders_date ON orders((created_at::DATE));
+
+3.4 GIN INDEXES FOR JSONB
+--------------------------
+
+-- Strategy parameters search
+CREATE INDEX idx_strategies_parameters ON strategies USING GIN (parameters);
+
+-- Trading hours search
+CREATE INDEX idx_instruments_trading_hours ON instruments USING GIN (trading_hours);
+
+-- Execution instructions
+CREATE INDEX idx_orders_exec_instructions ON orders USING GIN (execution_instructions);
+
+================================================================================
+4. PARTITIONING STRATEGIES
+================================================================================
+
+4.1 RANGE PARTITIONING FOR ORDERS
+----------------------------------
+
+-- Partition orders by month
+CREATE TABLE orders_partitioned (
+    LIKE orders INCLUDING ALL
+) PARTITION BY RANGE (created_at);
+
+-- Create partitions for 2024-2025
+CREATE TABLE orders_2024_01 PARTITION OF orders_partitioned
+    FOR VALUES FROM ('2024-01-01') TO ('2024-02-01');
+
+CREATE TABLE orders_2024_02 PARTITION OF orders_partitioned
+    FOR VALUES FROM ('2024-02-01') TO ('2024-03-01');
+
+-- Automated partition creation function
+CREATE OR REPLACE FUNCTION create_monthly_order_partition()
+RETURNS void AS $$
+DECLARE
+    partition_date DATE;
+    partition_name TEXT;
+    start_date DATE;
+    end_date DATE;
+BEGIN
+    partition_date := DATE_TRUNC('month', CURRENT_DATE + INTERVAL '1 month');
+    partition_name := 'orders_' || TO_CHAR(partition_date, 'YYYY_MM');
+    start_date := partition_date;
+    end_date := partition_date + INTERVAL '1 month';
+
+    EXECUTE format('CREATE TABLE IF NOT EXISTS %I PARTITION OF orders_partitioned FOR VALUES FROM (%L) TO (%L)',
+                   partition_name, start_date, end_date);
+END;
+$$ LANGUAGE plpgsql;
+
+4.2 LIST PARTITIONING FOR INSTRUMENTS
+--------------------------------------
+
+-- Partition instruments by type
+CREATE TABLE instruments_partitioned (
+    LIKE instruments INCLUDING ALL
+) PARTITION BY LIST (instrument_type);
+
+CREATE TABLE instruments_stocks PARTITION OF instruments_partitioned
+    FOR VALUES IN ('stock', 'etf');
+
+CREATE TABLE instruments_derivatives PARTITION OF instruments_partitioned
+    FOR VALUES IN ('option', 'future');
+
+CREATE TABLE instruments_others PARTITION OF instruments_partitioned
+    DEFAULT;
+
+================================================================================
+5. DATABASE CONSTRAINTS AND TRIGGERS
+================================================================================
+
+5.1 CHECK CONSTRAINTS
+---------------------
+
+-- Ensure positive quantities
+ALTER TABLE orders ADD CONSTRAINT chk_positive_quantity
+CHECK (quantity > 0);
+
+-- Ensure valid prices
+ALTER TABLE orders ADD CONSTRAINT chk_valid_price
+CHECK (price IS NULL OR price > 0);
+
+-- Balance constraints
+ALTER TABLE trading_accounts ADD CONSTRAINT chk_valid_balance
+CHECK (current_balance >= 0 AND available_balance >= 0);
+
+5.2 TRIGGER FUNCTIONS
+---------------------
+
+-- Update timestamp trigger
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = CURRENT_TIMESTAMP;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Apply to tables
+CREATE TRIGGER update_users_updated_at BEFORE UPDATE ON users
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_orders_updated_at BEFORE UPDATE ON orders
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- Calculate remaining quantity on orders
+CREATE OR REPLACE FUNCTION calculate_remaining_quantity()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.remaining_quantity = NEW.quantity - NEW.filled_quantity;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER update_order_remaining BEFORE INSERT OR UPDATE ON orders
+    FOR EACH ROW EXECUTE FUNCTION calculate_remaining_quantity();
+
+-- Update position on execution
+CREATE OR REPLACE FUNCTION update_position_on_execution()
+RETURNS TRIGGER AS $$
+DECLARE
+    pos_qty NUMERIC(20, 8);
+    pos_avg_price NUMERIC(20, 8);
+BEGIN
+    -- Get current position
+    SELECT quantity, avg_entry_price INTO pos_qty, pos_avg_price
+    FROM positions
+    WHERE account_id = NEW.account_id
+      AND instrument_id = NEW.instrument_id
+      AND closed_at IS NULL;
+
+    -- Update or create position
+    IF pos_qty IS NULL THEN
+        INSERT INTO positions (account_id, instrument_id, quantity, avg_entry_price, opened_at)
+        VALUES (NEW.account_id, NEW.instrument_id,
+                CASE WHEN NEW.side IN ('buy', 'cover') THEN NEW.quantity ELSE -NEW.quantity END,
+                NEW.price, NEW.executed_at);
+    ELSE
+        -- Calculate new average price and quantity
+        UPDATE positions
+        SET quantity = quantity + CASE WHEN NEW.side IN ('buy', 'cover') THEN NEW.quantity ELSE -NEW.quantity END,
+            avg_entry_price = ((pos_qty * pos_avg_price) + (NEW.quantity * NEW.price)) / (pos_qty + NEW.quantity),
+            last_updated_at = NEW.executed_at
+        WHERE account_id = NEW.account_id
+          AND instrument_id = NEW.instrument_id
+          AND closed_at IS NULL;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER update_position_trigger AFTER INSERT ON executions
+    FOR EACH ROW EXECUTE FUNCTION update_position_on_execution();
+
+================================================================================
+6. QUERY OPTIMIZATION EXAMPLES
+================================================================================
+
+-- Optimized query for recent orders with instrument details
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT
+    o.order_id,
+    o.client_order_id,
+    i.symbol,
+    i.exchange,
+    o.side,
+    o.quantity,
+    o.price,
+    o.order_status,
+    o.created_at
+FROM orders o
+INNER JOIN instruments i ON o.instrument_id = i.instrument_id
+WHERE o.account_id = 12345
+  AND o.created_at > CURRENT_DATE - INTERVAL '7 days'
+  AND o.order_status != 'rejected'
+ORDER BY o.created_at DESC
+LIMIT 100;
+
+-- Optimized position summary with current prices
+WITH current_prices AS (
+    SELECT DISTINCT ON (instrument_id)
+        instrument_id,
+        close as current_price
+    FROM market_ohlcv
+    WHERE time > NOW() - INTERVAL '1 hour'
+    ORDER BY instrument_id, time DESC
+)
+SELECT
+    p.position_id,
+    i.symbol,
+    p.quantity,
+    p.avg_entry_price,
+    cp.current_price,
+    (cp.current_price - p.avg_entry_price) * p.quantity as unrealized_pnl,
+    p.realized_pnl
+FROM positions p
+INNER JOIN instruments i ON p.instrument_id = i.instrument_id
+LEFT JOIN current_prices cp ON p.instrument_id = cp.instrument_id
+WHERE p.account_id = 12345
+  AND p.closed_at IS NULL;
+
+-- High-performance order book snapshot query
+SELECT
+    level,
+    bid_price,
+    bid_size,
+    ask_price,
+    ask_size,
+    (ask_price - bid_price) as spread
+FROM market_order_book
+WHERE instrument_id = 456
+  AND time = (
+      SELECT MAX(time)
+      FROM market_order_book
+      WHERE instrument_id = 456
+  )
+ORDER BY level
+LIMIT 10;
+
+================================================================================
+7. PERFORMANCE TUNING PARAMETERS
+================================================================================
+
+-- PostgreSQL configuration for HFT workloads
+/*
+shared_buffers = 16GB                  # 25% of RAM
+effective_cache_size = 48GB            # 75% of RAM
+maintenance_work_mem = 2GB
+checkpoint_completion_target = 0.9
+wal_buffers = 16MB
+default_statistics_target = 100
+random_page_cost = 1.1                 # For SSD
+effective_io_concurrency = 200
+work_mem = 16MB
+min_wal_size = 2GB
+max_wal_size = 8GB
+max_worker_processes = 16
+max_parallel_workers_per_gather = 4
+max_parallel_workers = 16
+max_connections = 200
+*/
+
+-- TimescaleDB specific settings
+/*
+timescaledb.max_background_workers = 8
+shared_preload_libraries = 'timescaledb'
+*/
+
+================================================================================
+END OF DATABASE SCHEMA DESIGN DOCUMENT
+================================================================================

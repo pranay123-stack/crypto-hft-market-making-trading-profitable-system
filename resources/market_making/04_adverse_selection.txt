@@ -1,0 +1,1014 @@
+================================================================================
+ADVERSE SELECTION IN MARKET MAKING
+================================================================================
+
+File: 04_adverse_selection.txt
+Purpose: Detecting informed traders and protecting against adverse selection
+Topics: Toxicity detection, quote adjustment, protective strategies
+Last Updated: 2025-11-26
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+
+1. Understanding Adverse Selection
+2. Probability of Informed Trading (PIN)
+3. Toxicity Metrics and Detection
+4. Volume-Synchronized Probability of Informed Trading (VPIN)
+5. Order Flow Toxicity
+6. Microstructure Signals
+7. Quote Adjustment Strategies
+8. Protective Order Strategies
+9. Machine Learning for Toxicity Detection
+10. C++ Implementation
+
+================================================================================
+1. UNDERSTANDING ADVERSE SELECTION
+================================================================================
+
+Adverse selection occurs when market makers trade with counterparties who have
+superior information about future price movements. This is one of the primary
+costs in market making.
+
+ADVERSE SELECTION MECHANICS:
+-----------------------------
+
+Scenario: Stock Fair Value = $100.00
+
+Informed trader knows good news coming (price will move to $102):
+1. Informed trader buys at market maker's ask ($100.05)
+2. News releases, price jumps to $102.00
+3. Market maker's short position loses $1.95 per share
+
+Market maker's loss = Information asymmetry cost
+
+QUANTIFYING ADVERSE SELECTION:
+-------------------------------
+
+Effective Half-Spread:
+EHS = (P_trade - P_mid) × Direction
+
+Realized Half-Spread (after time τ):
+RHS = (P_trade - P_mid+τ) × Direction
+
+Price Impact (Adverse Selection):
+PI = P_mid+τ - P_mid
+
+Adverse Selection Component:
+AS = EHS - RHS = PI
+
+Example:
+Trade at $100.05 (buy from MM)
+Mid before trade: $100.00
+Mid after 1 minute: $100.08
+
+EHS = $100.05 - $100.00 = $0.05
+PI = $100.08 - $100.00 = $0.08
+RHS = $0.05 - $0.08 = -$0.03 (MM loss)
+
+COST TO MARKET MAKER:
+---------------------
+
+Expected AS Cost = P(informed) × E[|Price_Impact| | informed]
+
+Typical values:
+- P(informed) = 20-40%
+- E[|Price_Impact|] = 2-5 ticks
+- AS Cost = 30-50% of quoted spread
+
+For $0.10 spread:
+AS Cost ≈ $0.03-$0.05
+
+Annual AS costs for single stock MM:
+Daily Volume: 1M shares
+AS Cost: $0.03/share
+Trading Days: 250
+Total AS Cost = 1M × $0.03 × 250 = $7.5M per year
+
+================================================================================
+2. PROBABILITY OF INFORMED TRADING (PIN)
+================================================================================
+
+PIN MODEL (Easley et al. 1996):
+--------------------------------
+
+Market participants:
+- Informed traders: arrive with rate α (only trade on info days)
+- Uninformed buyers: arrive with rate ε_b
+- Uninformed sellers: arrive with rate ε_s
+
+Information events:
+- Probability of info event: α
+- Probability of good news: δ
+- Probability of bad news: (1-δ)
+
+PIN Formula:
+PIN = (α × μ) / (α × μ + 2ε)
+
+Where:
+- μ = informed trader arrival rate
+- ε = uninformed trader arrival rate
+- α = probability of information event
+
+Interpretation:
+PIN = 0.3 means 30% of trades are informed
+Higher PIN → Higher adverse selection risk
+
+ESTIMATING PIN:
+---------------
+
+Use Maximum Likelihood Estimation (MLE) on daily order flow:
+
+Likelihood Function:
+L = ∏ P(Buys_i, Sells_i | parameters)
+
+Parameters to estimate: {α, δ, μ, ε_b, ε_s}
+
+Data required:
+- Daily buy volume
+- Daily sell volume
+- Multiple days of data (20+ days)
+
+C++ PIN ESTIMATOR:
+------------------
+
+class PINEstimator {
+private:
+    struct DayData {
+        int buys;
+        int sells;
+    };
+
+    std::vector<DayData> historical_data_;
+
+public:
+    struct PINParameters {
+        double alpha;      // Prob of info event
+        double delta;      // Prob of good news
+        double mu;         // Informed arrival rate
+        double epsilon_b;  // Uninformed buy rate
+        double epsilon_s;  // Uninformed sell rate
+        double pin;        // Computed PIN
+    };
+
+    void addDay(int buys, int sells) {
+        historical_data_.push_back({buys, sells});
+    }
+
+    // Simplified PIN estimation (closed-form approximation)
+    PINParameters estimatePIN() const {
+        if (historical_data_.empty()) {
+            return PINParameters{0, 0, 0, 0, 0, 0};
+        }
+
+        // Calculate empirical moments
+        double total_buys = 0;
+        double total_sells = 0;
+        double total_imbalance = 0;
+
+        for (const auto& day : historical_data_) {
+            total_buys += day.buys;
+            total_sells += day.sells;
+            total_imbalance += std::abs(day.buys - day.sells);
+        }
+
+        int n_days = historical_data_.size();
+        double avg_buys = total_buys / n_days;
+        double avg_sells = total_sells / n_days;
+        double avg_volume = (avg_buys + avg_sells) / 2;
+        double avg_imbalance = total_imbalance / n_days;
+
+        // Simplified estimation
+        PINParameters params;
+
+        // Estimate uninformed rates (minimum of buy/sell)
+        params.epsilon_b = std::min(avg_buys, avg_sells);
+        params.epsilon_s = params.epsilon_b;
+
+        // Estimate informed component from imbalance
+        params.mu = avg_imbalance - std::abs(avg_buys - avg_sells);
+        params.mu = std::max(0.0, params.mu);
+
+        // Estimate alpha (fraction of days with significant imbalance)
+        int imbalance_days = 0;
+        double threshold = avg_volume * 0.1;
+        for (const auto& day : historical_data_) {
+            if (std::abs(day.buys - day.sells) > threshold) {
+                imbalance_days++;
+            }
+        }
+        params.alpha = static_cast<double>(imbalance_days) / n_days;
+
+        // Estimate delta (fraction of positive imbalances)
+        int positive_imbalances = 0;
+        for (const auto& day : historical_data_) {
+            if (day.buys > day.sells) positive_imbalances++;
+        }
+        params.delta = static_cast<double>(positive_imbalances) / n_days;
+
+        // Calculate PIN
+        double denominator = params.alpha * params.mu +
+                            params.epsilon_b + params.epsilon_s;
+        if (denominator > 0) {
+            params.pin = (params.alpha * params.mu) / denominator;
+        } else {
+            params.pin = 0;
+        }
+
+        return params;
+    }
+
+    // Real-time PIN approximation (faster)
+    double estimateRealtimePIN(int recent_buys,
+                               int recent_sells,
+                               int window_size) const {
+        if (window_size == 0) return 0.0;
+
+        double total_volume = recent_buys + recent_sells;
+        double imbalance = std::abs(recent_buys - recent_sells);
+
+        if (total_volume < 1) return 0.0;
+
+        // PIN approximation from order imbalance
+        double pin_approx = imbalance / total_volume;
+
+        // Smooth with historical PIN
+        if (!historical_data_.empty()) {
+            PINParameters historical = estimatePIN();
+            pin_approx = 0.7 * pin_approx + 0.3 * historical.pin;
+        }
+
+        return std::clamp(pin_approx, 0.0, 1.0);
+    }
+};
+
+================================================================================
+3. TOXICITY METRICS AND DETECTION
+================================================================================
+
+VOLUME-SYNCHRONIZED PROBABILITY OF INFORMED TRADING (VPIN):
+------------------------------------------------------------
+
+VPIN is a real-time, high-frequency version of PIN that uses volume buckets
+instead of time buckets.
+
+Algorithm:
+1. Partition trading into equal-volume buckets (e.g., 50,000 shares each)
+2. For each bucket, classify trades as buy or sell
+3. Calculate volume imbalance for each bucket
+4. VPIN = Average absolute imbalance over n buckets
+
+VPIN Formula:
+VPIN = (1/n) × Σ |Buy_Volume_i - Sell_Volume_i| / V_bucket
+
+Where:
+- n = number of buckets (e.g., 50)
+- V_bucket = volume per bucket (e.g., 50,000 shares)
+
+Interpretation:
+VPIN > 0.7: High toxicity (dangerous to trade)
+VPIN 0.4-0.7: Moderate toxicity
+VPIN < 0.4: Low toxicity (safe to trade)
+
+C++ VPIN CALCULATOR:
+--------------------
+
+class VPINCalculator {
+private:
+    struct VolumeBucket {
+        int buy_volume;
+        int sell_volume;
+        uint64_t timestamp;
+    };
+
+    std::deque<VolumeBucket> buckets_;
+    VolumeBucket current_bucket_;
+
+    int bucket_size_;        // Volume per bucket
+    int num_buckets_;        // Number of buckets for VPIN
+    int current_volume_;     // Volume in current bucket
+
+public:
+    VPINCalculator(int bucket_size, int num_buckets)
+        : bucket_size_(bucket_size)
+        , num_buckets_(num_buckets)
+        , current_volume_(0) {
+        current_bucket_ = {0, 0, 0};
+    }
+
+    void addTrade(int size, bool is_buy, uint64_t timestamp) {
+        // Add to current bucket
+        if (is_buy) {
+            current_bucket_.buy_volume += size;
+        } else {
+            current_bucket_.sell_volume += size;
+        }
+        current_volume_ += size;
+        current_bucket_.timestamp = timestamp;
+
+        // Check if bucket is complete
+        if (current_volume_ >= bucket_size_) {
+            buckets_.push_back(current_bucket_);
+            if (buckets_.size() > num_buckets_) {
+                buckets_.pop_front();
+            }
+
+            // Start new bucket
+            current_bucket_ = {0, 0, 0};
+            current_volume_ = 0;
+        }
+    }
+
+    double calculateVPIN() const {
+        if (buckets_.empty()) return 0.0;
+
+        double total_imbalance = 0.0;
+        for (const auto& bucket : buckets_) {
+            int imbalance = std::abs(bucket.buy_volume - bucket.sell_volume);
+            total_imbalance += imbalance;
+        }
+
+        double avg_imbalance = total_imbalance / buckets_.size();
+        double vpin = avg_imbalance / bucket_size_;
+
+        return std::clamp(vpin, 0.0, 1.0);
+    }
+
+    // Get recent trend in VPIN
+    double getVPINTrend() const {
+        if (buckets_.size() < 2) return 0.0;
+
+        int half = buckets_.size() / 2;
+
+        // Calculate VPIN for first and second half
+        double first_half_imb = 0.0;
+        double second_half_imb = 0.0;
+
+        for (size_t i = 0; i < half; ++i) {
+            first_half_imb += std::abs(buckets_[i].buy_volume -
+                                       buckets_[i].sell_volume);
+        }
+
+        for (size_t i = half; i < buckets_.size(); ++i) {
+            second_half_imb += std::abs(buckets_[i].buy_volume -
+                                        buckets_[i].sell_volume);
+        }
+
+        double first_vpin = first_half_imb / (half * bucket_size_);
+        double second_vpin = second_half_imb /
+                            ((buckets_.size() - half) * bucket_size_);
+
+        return second_vpin - first_vpin;  // Positive = increasing toxicity
+    }
+
+    // Check if VPIN is in dangerous territory
+    bool isHighToxicity(double threshold = 0.7) const {
+        return calculateVPIN() > threshold;
+    }
+};
+
+ORDER FLOW TOXICITY (OFT):
+--------------------------
+
+Measures adverse selection using price impact:
+
+OFT = Cov(SignedVolume_t, Return_{t+1}) / Var(SignedVolume_t)
+
+Where:
+- SignedVolume = +Volume if buy, -Volume if sell
+- Return_{t+1} = Price change after trade
+
+High OFT means trades predict future price moves (toxic flow).
+
+C++ ORDER FLOW TOXICITY:
+------------------------
+
+class OrderFlowToxicity {
+private:
+    struct TradeImpact {
+        int signed_volume;  // +buy, -sell
+        double return_after;
+        uint64_t timestamp;
+    };
+
+    std::deque<TradeImpact> history_;
+    static constexpr size_t MAX_HISTORY = 1000;
+
+public:
+    void addTrade(int volume, bool is_buy,
+                 double price_before, double price_after,
+                 uint64_t timestamp) {
+        TradeImpact impact;
+        impact.signed_volume = is_buy ? volume : -volume;
+        impact.return_after = (price_after - price_before) / price_before;
+        impact.timestamp = timestamp;
+
+        history_.push_back(impact);
+        if (history_.size() > MAX_HISTORY) {
+            history_.pop_front();
+        }
+    }
+
+    double calculateOFT() const {
+        if (history_.size() < 10) return 0.0;
+
+        // Calculate means
+        double mean_volume = 0.0;
+        double mean_return = 0.0;
+
+        for (const auto& impact : history_) {
+            mean_volume += impact.signed_volume;
+            mean_return += impact.return_after;
+        }
+
+        mean_volume /= history_.size();
+        mean_return /= history_.size();
+
+        // Calculate covariance and variance
+        double covariance = 0.0;
+        double variance = 0.0;
+
+        for (const auto& impact : history_) {
+            double vol_dev = impact.signed_volume - mean_volume;
+            double ret_dev = impact.return_after - mean_return;
+            covariance += vol_dev * ret_dev;
+            variance += vol_dev * vol_dev;
+        }
+
+        covariance /= history_.size();
+        variance /= history_.size();
+
+        // OFT = Cov / Var
+        if (variance < 0.0001) return 0.0;
+
+        return covariance / variance;
+    }
+
+    // Calculate toxicity score (normalized)
+    double getToxicityScore() const {
+        double oft = calculateOFT();
+
+        // Normalize to [0, 1] range
+        // Typical OFT range: [-0.001, 0.001]
+        double normalized = std::abs(oft) * 1000.0;
+        return std::clamp(normalized, 0.0, 1.0);
+    }
+};
+
+================================================================================
+4. MICROSTRUCTURE SIGNALS FOR ADVERSE SELECTION
+================================================================================
+
+TRADE INTENSITY:
+----------------
+
+Unusual trade intensity indicates potential information:
+
+Intensity = Recent_Volume / Average_Volume
+
+If Intensity > threshold (e.g., 2.0): Potential informed trading
+
+C++ TRADE INTENSITY MONITOR:
+-----------------------------
+
+class TradeIntensityMonitor {
+private:
+    struct VolumeWindow {
+        int volume;
+        uint64_t timestamp;
+    };
+
+    std::deque<VolumeWindow> short_window_;   // Last 1 minute
+    std::deque<VolumeWindow> long_window_;    // Last 30 minutes
+
+    uint64_t short_window_ns_;
+    uint64_t long_window_ns_;
+
+public:
+    TradeIntensityMonitor(uint64_t short_minutes = 1,
+                         uint64_t long_minutes = 30)
+        : short_window_ns_(short_minutes * 60'000'000'000ULL)
+        , long_window_ns_(long_minutes * 60'000'000'000ULL) {}
+
+    void addTrade(int volume, uint64_t timestamp) {
+        VolumeWindow window{volume, timestamp};
+
+        short_window_.push_back(window);
+        long_window_.push_back(window);
+
+        // Clean old data
+        cleanWindow(short_window_, timestamp, short_window_ns_);
+        cleanWindow(long_window_, timestamp, long_window_ns_);
+    }
+
+    double calculateIntensity() const {
+        int short_volume = 0;
+        for (const auto& w : short_window_) {
+            short_volume += w.volume;
+        }
+
+        int long_volume = 0;
+        for (const auto& w : long_window_) {
+            long_volume += w.volume;
+        }
+
+        if (long_window_.empty()) return 1.0;
+
+        // Normalize by time window size
+        double short_rate = short_volume /
+                           (short_window_ns_ / 1e9);
+        double long_rate = long_volume /
+                          (long_window_ns_ / 1e9);
+
+        if (long_rate < 0.0001) return 1.0;
+
+        return short_rate / long_rate;
+    }
+
+    bool isHighIntensity(double threshold = 2.0) const {
+        return calculateIntensity() > threshold;
+    }
+
+private:
+    void cleanWindow(std::deque<VolumeWindow>& window,
+                    uint64_t current_time,
+                    uint64_t window_size) {
+        while (!window.empty() &&
+               current_time - window.front().timestamp > window_size) {
+            window.pop_front();
+        }
+    }
+};
+
+AGGRESSIVE ORDER RATIO:
+-----------------------
+
+Ratio of market orders (liquidity-taking) to limit orders:
+
+Aggressive_Ratio = Market_Orders / Total_Orders
+
+High ratio suggests urgency (potential information).
+
+QUOTE STUFFING DETECTION:
+--------------------------
+
+Detect rapid quote changes that may precede informed trading:
+
+Quote_Change_Rate = Quote_Updates / Time
+
+If Quote_Change_Rate > threshold: Possible manipulation or incoming info
+
+================================================================================
+5. QUOTE ADJUSTMENT STRATEGIES
+================================================================================
+
+TOXICITY-BASED SPREAD WIDENING:
+--------------------------------
+
+Widen spread when toxicity is detected:
+
+Adjusted_Spread = Base_Spread × (1 + β × Toxicity)
+
+Where:
+- β = sensitivity parameter (e.g., 2.0)
+- Toxicity ∈ [0, 1]
+
+Example:
+Base_Spread = $0.10
+Toxicity = 0.6
+β = 2.0
+
+Adjusted_Spread = $0.10 × (1 + 2.0 × 0.6) = $0.22
+
+SIZE REDUCTION:
+---------------
+
+Reduce quote size when adverse selection risk is high:
+
+Adjusted_Size = Base_Size × (1 - α × Toxicity)
+
+Where α controls aggressiveness of reduction.
+
+Example:
+Base_Size = 1000
+Toxicity = 0.7
+α = 0.8
+
+Adjusted_Size = 1000 × (1 - 0.8 × 0.7) = 440 shares
+
+QUOTE WITHDRAWAL:
+-----------------
+
+Temporarily withdraw quotes when toxicity exceeds threshold:
+
+if Toxicity > Critical_Threshold:
+    Cancel all quotes
+    Wait for cooldown period
+    Resume quoting
+
+Typical Critical_Threshold = 0.8
+
+C++ ADVERSE SELECTION PROTECTOR:
+---------------------------------
+
+class AdverseSelectionProtector {
+private:
+    VPINCalculator vpin_calc_;
+    OrderFlowToxicity oft_calc_;
+    TradeIntensityMonitor intensity_monitor_;
+
+    double spread_multiplier_;
+    double size_multiplier_;
+    double critical_threshold_;
+
+public:
+    struct ProtectiveAdjustment {
+        double spread_adjustment;  // Multiplier
+        double size_adjustment;    // Multiplier
+        bool should_withdraw;
+        double toxicity_score;
+    };
+
+    AdverseSelectionProtector(int vpin_bucket_size, int vpin_num_buckets)
+        : vpin_calc_(vpin_bucket_size, vpin_num_buckets)
+        , spread_multiplier_(2.0)
+        , size_multiplier_(0.8)
+        , critical_threshold_(0.8) {}
+
+    void onTrade(int size, bool is_buy, double price_before,
+                double price_after, uint64_t timestamp) {
+        // Update all toxicity metrics
+        vpin_calc_.addTrade(size, is_buy, timestamp);
+        oft_calc_.addTrade(size, is_buy, price_before, price_after, timestamp);
+        intensity_monitor_.addTrade(size, timestamp);
+    }
+
+    ProtectiveAdjustment calculateAdjustments() const {
+        ProtectiveAdjustment adj;
+
+        // Calculate composite toxicity score
+        double vpin = vpin_calc_.calculateVPIN();
+        double oft = oft_calc_.getToxicityScore();
+        double intensity = intensity_monitor_.calculateIntensity();
+
+        // Weighted combination
+        adj.toxicity_score = 0.4 * vpin +
+                            0.4 * oft +
+                            0.2 * std::min(intensity / 3.0, 1.0);
+
+        // Check for critical toxicity
+        adj.should_withdraw = (adj.toxicity_score > critical_threshold_);
+
+        if (adj.should_withdraw) {
+            adj.spread_adjustment = 0.0;  // Withdraw
+            adj.size_adjustment = 0.0;
+            return adj;
+        }
+
+        // Calculate adjustments
+        adj.spread_adjustment = 1.0 + spread_multiplier_ * adj.toxicity_score;
+        adj.size_adjustment = 1.0 - size_multiplier_ * adj.toxicity_score;
+
+        // Ensure reasonable bounds
+        adj.spread_adjustment = std::clamp(adj.spread_adjustment, 1.0, 5.0);
+        adj.size_adjustment = std::clamp(adj.size_adjustment, 0.2, 1.0);
+
+        return adj;
+    }
+
+    // Check if it's safe to quote
+    bool isSafeToQuote() const {
+        return !calculateAdjustments().should_withdraw;
+    }
+
+    // Get recommended cooldown period (milliseconds)
+    uint64_t getCooldownPeriod() const {
+        double toxicity = calculateAdjustments().toxicity_score;
+
+        if (toxicity < 0.5) return 0;
+        if (toxicity < 0.7) return 1000;   // 1 second
+        if (toxicity < 0.8) return 5000;   // 5 seconds
+        return 10000;                       // 10 seconds
+    }
+};
+
+================================================================================
+6. PROTECTIVE ORDER STRATEGIES
+================================================================================
+
+ICEBERG ORDERS:
+---------------
+
+Hide true order size to avoid signaling:
+
+Displayed: 100 shares
+Hidden: 900 shares
+
+Advantages:
+- Reduces information leakage
+- Maintains queue position as displayed portion fills
+
+POST-ONLY ORDERS:
+-----------------
+
+Orders that only add liquidity (never take):
+
+Order Type: POST_ONLY
+
+If order would cross spread → Rejected
+
+Advantages:
+- Avoid aggressive fills
+- Guaranteed maker rebate
+- No accidental adverse selection
+
+IMMEDIATE-OR-CANCEL WITH DISTANCE:
+-----------------------------------
+
+Post quotes with IOC if price moves away:
+
+if |Current_Price - Fair_Value| > Threshold:
+    Cancel quotes
+    Resubmit with IOC at new fair value
+
+Advantages:
+- Quickly adapt to price moves
+- Avoid fills at stale prices
+
+FAR-TOUCH QUOTING:
+------------------
+
+Post orders away from touch during high toxicity:
+
+if High_Toxicity:
+    Bid = Best_Bid - 2_ticks
+    Ask = Best_Ask + 2_ticks
+
+Advantages:
+- Reduce fill probability during dangerous periods
+- Still provide some liquidity
+- Lower adverse selection
+
+================================================================================
+7. MACHINE LEARNING FOR TOXICITY DETECTION
+================================================================================
+
+FEATURE ENGINEERING:
+--------------------
+
+Input features for ML model:
+
+1. Order Book Features:
+   - Order imbalance (5 levels)
+   - Depth at best bid/ask
+   - Depth ratio
+   - Weighted mid price
+
+2. Trade Features:
+   - Recent trade intensity
+   - Buy/sell ratio
+   - Average trade size
+   - Trade size variance
+
+3. Volatility Features:
+   - Realized volatility (1min, 5min, 30min)
+   - Volatility ratio
+   - Range (high - low)
+
+4. Microstructure Features:
+   - Effective spread
+   - Quote update frequency
+   - Cancellation rate
+   - Time since last trade
+
+5. Historical Features:
+   - Recent fills (buy/sell)
+   - Recent P&L
+   - Recent adverse selection events
+
+MODEL ARCHITECTURES:
+--------------------
+
+1. Logistic Regression (Baseline):
+   P(Toxic) = σ(w^T x + b)
+
+2. Gradient Boosting (XGBoost, LightGBM):
+   Ensemble of decision trees
+
+3. Neural Network:
+   Input → Dense(64) → ReLU → Dense(32) → ReLU → Dense(1) → Sigmoid
+
+4. LSTM (for time series):
+   Input sequence → LSTM(64) → Dense(32) → Dense(1) → Sigmoid
+
+TRAINING OBJECTIVE:
+-------------------
+
+Label: Is trade toxic?
+Toxic = (Price_After - Price_Before) × Direction > Threshold
+
+Binary classification:
+Loss = -[y log(ŷ) + (1-y) log(1-ŷ)]
+
+C++ ML TOXICITY PREDICTOR (INFERENCE):
+---------------------------------------
+
+class MLToxicityPredictor {
+private:
+    // Simple neural network for inference
+    struct Layer {
+        std::vector<std::vector<double>> weights;
+        std::vector<double> biases;
+    };
+
+    std::vector<Layer> layers_;
+
+public:
+    // Load pre-trained model weights
+    void loadModel(const std::string& model_path) {
+        // Load weights from file
+        // Implementation depends on model format
+    }
+
+    // Extract features from market state
+    std::vector<double> extractFeatures(const MarketState& state) const {
+        std::vector<double> features;
+
+        // Order book features
+        double imbalance = (state.bid_volume - state.ask_volume) /
+                          (state.bid_volume + state.ask_volume);
+        features.push_back(imbalance);
+
+        // Trade intensity
+        features.push_back(state.recent_volume / state.avg_volume);
+
+        // Volatility
+        features.push_back(state.realized_volatility);
+
+        // Spread
+        features.push_back((state.best_ask - state.best_bid) / state.mid_price);
+
+        // ... add more features
+
+        return features;
+    }
+
+    // Predict toxicity score
+    double predictToxicity(const std::vector<double>& features) const {
+        std::vector<double> activations = features;
+
+        // Forward pass through network
+        for (const auto& layer : layers_) {
+            activations = forwardLayer(activations, layer);
+        }
+
+        // Output is toxicity probability
+        return activations[0];
+    }
+
+private:
+    std::vector<double> forwardLayer(const std::vector<double>& input,
+                                     const Layer& layer) const {
+        std::vector<double> output(layer.biases.size());
+
+        for (size_t i = 0; i < layer.weights.size(); ++i) {
+            double sum = layer.biases[i];
+            for (size_t j = 0; j < input.size(); ++j) {
+                sum += layer.weights[i][j] * input[j];
+            }
+            // ReLU activation (or sigmoid for output layer)
+            output[i] = std::max(0.0, sum);
+        }
+
+        return output;
+    }
+};
+
+================================================================================
+8. COMPLETE ADVERSE SELECTION PROTECTION SYSTEM
+================================================================================
+
+class ComprehensiveAdverseSelectionSystem {
+private:
+    // Components
+    VPINCalculator vpin_;
+    OrderFlowToxicity oft_;
+    TradeIntensityMonitor intensity_;
+    MLToxicityPredictor ml_predictor_;
+    AdverseSelectionProtector protector_;
+
+    // Thresholds
+    double warning_threshold_;
+    double critical_threshold_;
+
+    // State
+    bool is_quoting_active_;
+    uint64_t cooldown_end_time_;
+
+public:
+    ComprehensiveAdverseSelectionSystem()
+        : vpin_(50000, 50)
+        , protector_(50000, 50)
+        , warning_threshold_(0.6)
+        , critical_threshold_(0.8)
+        , is_quoting_active_(true)
+        , cooldown_end_time_(0) {}
+
+    struct QuoteAdjustments {
+        double spread_multiplier;
+        double size_multiplier;
+        bool allow_quoting;
+        double toxicity_score;
+        std::string reason;
+    };
+
+    void onTrade(int size, bool is_buy, double price_before,
+                double price_after, uint64_t timestamp) {
+        // Update all metrics
+        vpin_.addTrade(size, is_buy, timestamp);
+        oft_.addTrade(size, is_buy, price_before, price_after, timestamp);
+        intensity_.addTrade(size, timestamp);
+    }
+
+    QuoteAdjustments getQuoteAdjustments(const MarketState& market_state,
+                                        uint64_t current_time) const {
+        QuoteAdjustments adj;
+
+        // Check cooldown
+        if (current_time < cooldown_end_time_) {
+            adj.allow_quoting = false;
+            adj.toxicity_score = 1.0;
+            adj.reason = "In cooldown period";
+            return adj;
+        }
+
+        // Get protector adjustments
+        auto protect_adj = protector_.calculateAdjustments();
+
+        // Get ML prediction
+        auto features = ml_predictor_.extractFeatures(market_state);
+        double ml_toxicity = ml_predictor_.predictToxicity(features);
+
+        // Combine scores
+        adj.toxicity_score = 0.6 * protect_adj.toxicity_score +
+                            0.4 * ml_toxicity;
+
+        // Determine action
+        if (adj.toxicity_score > critical_threshold_) {
+            adj.allow_quoting = false;
+            adj.spread_multiplier = 0.0;
+            adj.size_multiplier = 0.0;
+            adj.reason = "Critical toxicity detected";
+        } else if (adj.toxicity_score > warning_threshold_) {
+            adj.allow_quoting = true;
+            adj.spread_multiplier = 1.0 + 3.0 * (adj.toxicity_score - warning_threshold_) /
+                                   (critical_threshold_ - warning_threshold_);
+            adj.size_multiplier = 0.5;
+            adj.reason = "Warning: Elevated toxicity";
+        } else {
+            adj.allow_quoting = true;
+            adj.spread_multiplier = 1.0;
+            adj.size_multiplier = 1.0;
+            adj.reason = "Normal conditions";
+        }
+
+        return adj;
+    }
+
+    void triggerCooldown(uint64_t current_time, uint64_t duration_ms) {
+        cooldown_end_time_ = current_time + duration_ms * 1'000'000;
+        is_quoting_active_ = false;
+    }
+};
+
+================================================================================
+PERFORMANCE SUMMARY
+================================================================================
+
+Adverse Selection Metrics:
+- Realized Spread / Effective Spread ratio: Target > 0.6
+- Win Rate: Target 50-55% (slightly above 50%)
+- Average profit per winning trade > Average loss per losing trade
+
+Toxicity Detection Accuracy:
+- Precision: > 70% (true positive rate)
+- Recall: > 60% (sensitivity)
+- F1 Score: > 0.65
+
+Protection Effectiveness:
+- Reduction in adverse selection costs: 20-40%
+- Impact on fill rate: -10% to -20%
+- Net P&L improvement: +15% to +30%
+
+Key Strategies:
+1. Use multiple toxicity metrics (VPIN, OFT, intensity)
+2. Widen spreads and reduce sizes during high toxicity
+3. Withdraw quotes when toxicity is critical
+4. Implement cooldown periods after adverse events
+5. Use machine learning for better prediction
+
+Next: Read 05_mm_strategies.txt for different market making approaches.
+
+================================================================================
+END OF ADVERSE SELECTION
+================================================================================

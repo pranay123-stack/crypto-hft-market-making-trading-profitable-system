@@ -1,0 +1,673 @@
+================================================================================
+                    MONITORING INFRASTRUCTURE FOR HFT
+                    Metrics, Alerting, and Observability
+================================================================================
+
+TABLE OF CONTENTS
+================================================================================
+1. Monitoring Requirements for HFT
+2. Metrics Collection (Prometheus)
+3. Time-Series Storage (InfluxDB)
+4. Visualization (Grafana)
+5. Alerting Systems
+6. Application Performance Monitoring
+7. Log Aggregation
+8. Best Practices
+
+================================================================================
+1. MONITORING REQUIREMENTS FOR HFT
+================================================================================
+
+CRITICAL METRICS TO MONITOR:
+
+Latency Metrics (microseconds):
+- Order submission latency (P50, P99, P99.9)
+- Market data processing latency
+- Risk check latency
+- End-to-end trading latency
+
+Throughput Metrics:
+- Orders per second
+- Market data updates per second
+- Fills per second
+
+System Health:
+- CPU utilization per core
+- Memory usage
+- Network bandwidth
+- Disk I/O
+
+Business Metrics:
+- Active positions
+- P&L (real-time)
+- Order fill rate
+- Reject rate
+
+MONITORING ARCHITECTURE:
+
+┌─────────────────────────────────────────────────────────┐
+│                  Trading Services                       │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐             │
+│  │ Strategy │  │   Risk   │  │   OMS    │             │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘             │
+└───────┼─────────────┼─────────────┼───────────────────┘
+        │             │             │
+        │ (metrics)   │             │
+        │             │             │
+   ┌────▼─────────────▼─────────────▼────┐
+   │       Prometheus Server              │
+   │     (Metrics Collection & Storage)   │
+   └────┬──────────────┬──────────────────┘
+        │              │
+        │              │ (query)
+   ┌────▼────┐    ┌────▼────────┐
+   │ Alert   │    │  Grafana    │
+   │ Manager │    │ (Dashboards)│
+   └────┬────┘    └─────────────┘
+        │
+   ┌────▼─────┐
+   │PagerDuty │
+   │  Slack   │
+   └──────────┘
+
+================================================================================
+2. METRICS COLLECTION (PROMETHEUS)
+================================================================================
+
+PROMETHEUS ARCHITECTURE:
+
+Time-series DB + Pull-based metrics collection
+
+PROMETHEUS CONFIGURATION:
+
+# prometheus.yml
+global:
+  scrape_interval: 5s      # Scrape every 5 seconds
+  evaluation_interval: 5s  # Evaluate rules every 5 seconds
+
+scrape_configs:
+  # Trading strategy service
+  - job_name: 'strategy-service'
+    static_configs:
+      - targets: ['localhost:9090']
+    metrics_path: '/metrics'
+
+  # Risk service
+  - job_name: 'risk-service'
+    static_configs:
+      - targets: ['localhost:9091']
+
+  # OMS service
+  - job_name: 'oms-service'
+    static_configs:
+      - targets: ['localhost:9092']
+
+  # System metrics (node_exporter)
+  - job_name: 'node'
+    static_configs:
+      - targets: ['localhost:9100']
+
+C++ PROMETHEUS CLIENT:
+
+#include <prometheus/counter.h>
+#include <prometheus/exposer.h>
+#include <prometheus/registry.h>
+#include <prometheus/histogram.h>
+
+class MetricsCollector {
+    std::shared_ptr<prometheus::Registry> registry_;
+    prometheus::Exposer exposer_;
+
+    // Counters
+    prometheus::Family<prometheus::Counter>& orders_family_;
+    prometheus::Counter& orders_submitted_;
+    prometheus::Counter& orders_filled_;
+    prometheus::Counter& orders_rejected_;
+
+    // Histograms (for latency)
+    prometheus::Family<prometheus::Histogram>& latency_family_;
+    prometheus::Histogram& order_latency_;
+    prometheus::Histogram& risk_latency_;
+
+public:
+    MetricsCollector(const std::string& listen_addr = "0.0.0.0:9090")
+        : registry_(std::make_shared<prometheus::Registry>())
+        , exposer_(listen_addr)
+        , orders_family_(prometheus::BuildCounter()
+                        .Name("orders_total")
+                        .Help("Total number of orders")
+                        .Register(*registry_))
+        , orders_submitted_(orders_family_.Add({{"status", "submitted"}}))
+        , orders_filled_(orders_family_.Add({{"status", "filled"}}))
+        , orders_rejected_(orders_family_.Add({{"status", "rejected"}}))
+        , latency_family_(prometheus::BuildHistogram()
+                         .Name("latency_microseconds")
+                         .Help("Latency in microseconds")
+                         .Register(*registry_))
+        , order_latency_(latency_family_.Add(
+            {{"operation", "order_submission"}},
+            prometheus::Histogram::BucketBoundaries{1, 5, 10, 20, 50, 100, 200, 500}))
+        , risk_latency_(latency_family_.Add(
+            {{"operation", "risk_check"}},
+            prometheus::Histogram::BucketBoundaries{1, 2, 5, 10, 20, 50})) {
+
+        exposer_.RegisterCollectable(registry_);
+    }
+
+    void recordOrderSubmitted() {
+        orders_submitted_.Increment();
+    }
+
+    void recordOrderFilled() {
+        orders_filled_.Increment();
+    }
+
+    void recordOrderRejected() {
+        orders_rejected_.Increment();
+    }
+
+    void recordOrderLatency(double latency_us) {
+        order_latency_.Observe(latency_us);
+    }
+
+    void recordRiskLatency(double latency_us) {
+        risk_latency_.Observe(latency_us);
+    }
+};
+
+// Usage in trading system
+class TradingService {
+    MetricsCollector metrics_;
+
+public:
+    TradingService() : metrics_("0.0.0.0:9090") {}
+
+    void submitOrder(const Order& order) {
+        auto start = std::chrono::high_resolution_clock::now();
+
+        // Submit order...
+        bool success = doSubmitOrder(order);
+
+        auto end = std::chrono::high_resolution_clock::now();
+        auto latency = std::chrono::duration_cast<std::chrono::microseconds>(
+            end - start).count();
+
+        // Record metrics
+        metrics_.recordOrderLatency(latency);
+        if (success) {
+            metrics_.recordOrderSubmitted();
+        } else {
+            metrics_.recordOrderRejected();
+        }
+    }
+};
+
+CUSTOM METRICS:
+
+// Gauge (current value)
+auto& position_gauge = prometheus::BuildGauge()
+    .Name("current_position")
+    .Help("Current position for symbol")
+    .Register(*registry);
+
+auto& aapl_position = position_gauge.Add({{"symbol", "AAPL"}});
+aapl_position.Set(1000);  // Set position to 1000
+
+// Summary (quantiles)
+auto& summary = prometheus::BuildSummary()
+    .Name("latency_summary")
+    .Help("Latency summary")
+    .Register(*registry);
+
+auto& latency_summary = summary.Add(
+    {{"operation", "trade"}},
+    prometheus::Summary::Quantiles{{0.5, 0.05}, {0.9, 0.01}, {0.99, 0.001}});
+
+latency_summary.Observe(15.3);  // Record latency
+
+================================================================================
+3. TIME-SERIES STORAGE (INFLUXDB)
+================================================================================
+
+INFLUXDB FOR HIGH-FREQUENCY METRICS:
+
+InfluxDB is optimized for time-series data with high write throughput.
+
+C++ INFLUXDB CLIENT:
+
+#include <influxdb.hpp>
+
+class InfluxDBWriter {
+    std::unique_ptr<influxdb::InfluxDB> influx_;
+
+public:
+    InfluxDBWriter(const std::string& url = "http://localhost:8086",
+                  const std::string& db = "hft_metrics")
+        : influx_(influxdb::InfluxDBFactory::Get(url + "?db=" + db)) {}
+
+    void writeOrderMetric(const std::string& symbol,
+                         double price,
+                         int64_t quantity,
+                         const std::string& side) {
+
+        influx_->write(influxdb::Point{"order"}
+            .addTag("symbol", symbol)
+            .addTag("side", side)
+            .addField("price", price)
+            .addField("quantity", quantity)
+            .setTimestamp(std::chrono::system_clock::now()));
+    }
+
+    void writeLatencyMetric(const std::string& operation,
+                           double latency_us) {
+
+        influx_->write(influxdb::Point{"latency"}
+            .addTag("operation", operation)
+            .addField("value_us", latency_us)
+            .setTimestamp(std::chrono::system_clock::now()));
+    }
+
+    void writePnL(double pnl, const std::string& strategy) {
+        influx_->write(influxdb::Point{"pnl"}
+            .addTag("strategy", strategy)
+            .addField("value", pnl)
+            .setTimestamp(std::chrono::system_clock::now()));
+    }
+
+    // Batch write for efficiency
+    void writeBatch(const std::vector<influxdb::Point>& points) {
+        influx_->write(std::move(points));
+    }
+};
+
+// Usage
+InfluxDBWriter influx;
+
+influx.writeOrderMetric("AAPL", 150.25, 100, "BUY");
+influx.writeLatencyMetric("order_submission", 12.5);
+influx.writePnL(5432.10, "momentum_strategy");
+
+INFLUXDB QUERIES:
+
+// Query recent latency
+SELECT mean("value_us"), max("value_us"), percentile("value_us", 99)
+FROM "latency"
+WHERE "operation" = 'order_submission'
+  AND time > now() - 1h
+GROUP BY time(1m)
+
+// Query P&L over time
+SELECT sum("value")
+FROM "pnl"
+WHERE "strategy" = 'momentum_strategy'
+  AND time > now() - 24h
+GROUP BY time(1h)
+
+================================================================================
+4. VISUALIZATION (GRAFANA)
+================================================================================
+
+GRAFANA DASHBOARD CONFIGURATION:
+
+{
+  "dashboard": {
+    "title": "HFT Trading Dashboard",
+    "panels": [
+      {
+        "title": "Order Latency (P99)",
+        "type": "graph",
+        "datasource": "Prometheus",
+        "targets": [{
+          "expr": "histogram_quantile(0.99, rate(latency_microseconds_bucket{operation=\"order_submission\"}[1m]))"
+        }]
+      },
+      {
+        "title": "Orders Per Second",
+        "type": "graph",
+        "datasource": "Prometheus",
+        "targets": [{
+          "expr": "rate(orders_total[1m])"
+        }]
+      },
+      {
+        "title": "Current Positions",
+        "type": "table",
+        "datasource": "Prometheus",
+        "targets": [{
+          "expr": "current_position"
+        }]
+      },
+      {
+        "title": "Real-time P&L",
+        "type": "singlestat",
+        "datasource": "InfluxDB",
+        "targets": [{
+          "query": "SELECT last(\"value\") FROM \"pnl\""
+        }]
+      }
+    ]
+  }
+}
+
+KEY DASHBOARDS:
+
+1. Trading Performance:
+   - Order latency (P50, P99, P99.9)
+   - Orders per second
+   - Fill rate
+   - Reject rate
+
+2. System Health:
+   - CPU per core
+   - Memory usage
+   - Network bandwidth
+   - Disk I/O
+
+3. Business Metrics:
+   - Active positions by symbol
+   - Real-time P&L
+   - Daily volume
+   - Sharpe ratio
+
+4. Risk Metrics:
+   - Position limits utilization
+   - VaR
+   - Exposure by asset class
+
+================================================================================
+5. ALERTING SYSTEMS
+================================================================================
+
+PROMETHEUS ALERTING RULES:
+
+# alerts.yml
+groups:
+  - name: trading_alerts
+    interval: 10s
+    rules:
+      # High latency alert
+      - alert: HighOrderLatency
+        expr: histogram_quantile(0.99, rate(latency_microseconds_bucket{operation="order_submission"}[1m])) > 100
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Order latency P99 > 100us"
+          description: "P99 latency is {{ $value }}us"
+
+      # High reject rate
+      - alert: HighRejectRate
+        expr: rate(orders_total{status="rejected"}[1m]) / rate(orders_total[1m]) > 0.05
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Reject rate > 5%"
+
+      # Service down
+      - alert: ServiceDown
+        expr: up{job="strategy-service"} == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Strategy service is down"
+
+      # High CPU
+      - alert: HighCPU
+        expr: (100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)) > 90
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CPU usage > 90%"
+
+ALERTMANAGER CONFIGURATION:
+
+# alertmanager.yml
+global:
+  resolve_timeout: 5m
+
+route:
+  group_by: ['alertname', 'cluster']
+  group_wait: 10s
+  group_interval: 10s
+  repeat_interval: 1h
+  receiver: 'pagerduty-critical'
+  routes:
+    - match:
+        severity: critical
+      receiver: pagerduty-critical
+    - match:
+        severity: warning
+      receiver: slack-warnings
+
+receivers:
+  - name: 'pagerduty-critical'
+    pagerduty_configs:
+      - service_key: '<key>'
+
+  - name: 'slack-warnings'
+    slack_configs:
+      - api_url: '<webhook-url>'
+        channel: '#trading-alerts'
+
+C++ CUSTOM ALERTING:
+
+class AlertManager {
+    std::string slack_webhook_;
+    std::string pagerduty_key_;
+
+public:
+    AlertManager(const std::string& slack_webhook,
+                const std::string& pagerduty_key)
+        : slack_webhook_(slack_webhook)
+        , pagerduty_key_(pagerduty_key) {}
+
+    void sendCriticalAlert(const std::string& message) {
+        // Send to PagerDuty
+        sendToPagerDuty(message);
+
+        // Also send to Slack
+        sendToSlack(message, "danger");
+    }
+
+    void sendWarning(const std::string& message) {
+        sendToSlack(message, "warning");
+    }
+
+private:
+    void sendToSlack(const std::string& message, const std::string& color) {
+        json payload = {
+            {"text", message},
+            {"attachments", {{
+                {"color", color},
+                {"text", message},
+                {"ts", std::time(nullptr)}
+            }}}
+        };
+
+        // HTTP POST to Slack webhook
+        httpPost(slack_webhook_, payload.dump());
+    }
+
+    void sendToPagerDuty(const std::string& message) {
+        json payload = {
+            {"service_key", pagerduty_key_},
+            {"event_type", "trigger"},
+            {"description", message}
+        };
+
+        httpPost("https://events.pagerduty.com/generic/2010-04-15/create_event.json",
+                payload.dump());
+    }
+};
+
+// Usage
+AlertManager alerts(slack_webhook, pagerduty_key);
+
+if (latency_p99 > 100) {
+    alerts.sendCriticalAlert("Order latency P99 exceeded 100us: " + std::to_string(latency_p99));
+}
+
+================================================================================
+6. APPLICATION PERFORMANCE MONITORING
+================================================================================
+
+DISTRIBUTED TRACING (OpenTelemetry):
+
+#include <opentelemetry/trace/provider.h>
+#include <opentelemetry/exporters/jaeger/jaeger_exporter.h>
+
+class TracingService {
+    std::shared_ptr<trace::Tracer> tracer_;
+
+public:
+    TracingService() {
+        // Initialize Jaeger exporter
+        jaeger::JaegerExporterOptions opts;
+        opts.endpoint = "http://localhost:14250/api/traces";
+
+        auto exporter = std::make_unique<jaeger::JaegerExporter>(opts);
+
+        // Create tracer provider
+        auto processor = std::make_shared<trace::SimpleSpanProcessor>(std::move(exporter));
+        auto provider = std::make_shared<trace::TracerProvider>(processor);
+
+        trace::Provider::SetTracerProvider(provider);
+
+        tracer_ = provider->GetTracer("trading-service");
+    }
+
+    void traceOrderFlow(const Order& order) {
+        auto span = tracer_->StartSpan("process_order");
+        auto scope = tracer_->WithActiveSpan(span);
+
+        span->SetAttribute("order.id", order.id());
+        span->SetAttribute("order.symbol", order.symbol());
+
+        // Risk check span
+        {
+            auto risk_span = tracer_->StartSpan("risk_check");
+            auto risk_scope = tracer_->WithActiveSpan(risk_span);
+
+            bool pass = checkRisk(order);
+            risk_span->SetAttribute("risk.passed", pass);
+            risk_span->End();
+        }
+
+        // Submit order span
+        {
+            auto submit_span = tracer_->StartSpan("submit_order");
+            auto submit_scope = tracer_->WithActiveSpan(submit_span);
+
+            submitOrder(order);
+            submit_span->End();
+        }
+
+        span->End();
+    }
+};
+
+================================================================================
+7. LOG AGGREGATION
+================================================================================
+
+STRUCTURED LOGGING (spdlog):
+
+#include <spdlog/spdlog.h>
+#include <spdlog/sinks/rotating_file_sink.h>
+#include <spdlog/sinks/syslog_sink.h>
+
+class Logger {
+    std::shared_ptr<spdlog::logger> logger_;
+
+public:
+    Logger() {
+        // Rotating file sink
+        auto file_sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
+            "/var/log/hft/trading.log", 1024 * 1024 * 100, 10);  // 100MB, 10 files
+
+        // Syslog sink
+        auto syslog_sink = std::make_shared<spdlog::sinks::syslog_sink_mt>(
+            "trading-service", LOG_PID, LOG_LOCAL0, false);
+
+        logger_ = std::make_shared<spdlog::logger>("multi_sink",
+            spdlog::sinks_init_list{file_sink, syslog_sink});
+
+        logger_->set_level(spdlog::level::info);
+        logger_->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%n] [%l] %v");
+    }
+
+    void logOrderSubmitted(const Order& order, double latency_us) {
+        logger_->info("order_submitted symbol={} id={} price={} quantity={} latency_us={}",
+                     order.symbol(), order.id(), order.price(),
+                     order.quantity(), latency_us);
+    }
+
+    void logOrderFilled(const std::string& order_id, double fill_price) {
+        logger_->info("order_filled id={} fill_price={}", order_id, fill_price);
+    }
+
+    void logError(const std::string& message) {
+        logger_->error(message);
+    }
+};
+
+LOG AGGREGATION WITH ELK STACK:
+
+Elasticsearch <- Logstash <- Filebeat <- Application Logs
+
+Configuration:
+1. Application writes structured logs
+2. Filebeat ships logs to Logstash
+3. Logstash parses and enriches
+4. Elasticsearch stores and indexes
+5. Kibana visualizes
+
+================================================================================
+8. BEST PRACTICES
+================================================================================
+
+MONITORING STRATEGY:
+
+✓ Monitor latency at EVERY layer (not just end-to-end)
+✓ Use histograms for latency (not averages)
+✓ Track P99, P99.9, P99.99 (not just P50)
+✓ Alert on latency spikes immediately
+✓ Monitor queue depths (shared memory, ZeroMQ)
+✓ Track error rates by type
+✓ Monitor system metrics (CPU per core, not average)
+✓ Use low-overhead instrumentation
+✓ Separate monitoring network from trading network
+
+PERFORMANCE CONSIDERATIONS:
+
+✓ Use lock-free counters for metrics
+✓ Batch metrics writes
+✓ Use sampling for very high frequency metrics
+✓ Asynchronous metric export
+✓ Minimize string allocations in hot path
+✓ Pre-allocate metric objects
+
+DON'T:
+
+✗ Block on metric writes
+✗ Log/monitor on every market data update
+✗ Use synchronous HTTP calls for metrics
+✗ Ignore tail latencies
+✗ Alert fatigue (too many alerts)
+✗ Monitor without actionable alerts
+
+DASHBOARD DESIGN:
+
+✓ Top row: Critical metrics (latency, error rate)
+✓ Second row: Business metrics (P&L, positions)
+✓ Third row: System health (CPU, memory, network)
+✓ Use red for critical, yellow for warning
+✓ Auto-refresh every 5-10 seconds
+✓ Include time range selector
+
+================================================================================
+END OF MONITORING INFRASTRUCTURE
+================================================================================

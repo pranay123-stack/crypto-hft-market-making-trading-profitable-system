@@ -1,0 +1,962 @@
+================================================================================
+SIGNAL TESTING FRAMEWORK
+Strategy Signal Validation and Analysis
+================================================================================
+
+VERSION: 1.0
+DOCUMENT: Trading Signal Testing and Validation
+LAST UPDATED: 2025-11-26
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+
+1. Overview
+2. Signal Definition and Types
+3. Signal Generation Framework
+4. Signal Validation Metrics
+5. Backtesting Signal Performance
+6. Signal Quality Analysis
+7. Signal Correlation and Independence
+8. Complete Implementation
+
+================================================================================
+1. OVERVIEW
+================================================================================
+
+The Signal Testing Framework provides comprehensive tools for generating,
+validating, and analyzing trading signals before deploying strategies to
+production. It ensures signal quality, robustness, and profitability.
+
+KEY FEATURES:
+-------------
+- Multiple signal type support (entry, exit, sizing)
+- Real-time signal validation during replay
+- Statistical signal quality metrics
+- Signal correlation analysis
+- Walk-forward optimization
+- Out-of-sample testing
+- Monte Carlo signal validation
+- Signal decay analysis
+
+PERFORMANCE METRICS:
+--------------------
+- Hit Rate: Percentage of profitable signals
+- Sharpe Ratio: Risk-adjusted returns
+- Information Ratio: Alpha generation vs benchmark
+- Maximum Drawdown: Worst peak-to-trough decline
+- Win/Loss Ratio: Average win vs average loss
+- Signal Decay: How quickly signal loses predictive power
+
+================================================================================
+2. SIGNAL DEFINITION AND TYPES
+================================================================================
+
+2.1 SIGNAL STRUCTURE
+--------------------
+
+enum class SignalType : uint8_t {
+    ENTRY_LONG,      // Open long position
+    ENTRY_SHORT,     // Open short position
+    EXIT_LONG,       // Close long position
+    EXIT_SHORT,      // Close short position
+    INCREASE_LONG,   // Add to long position
+    DECREASE_LONG,   // Reduce long position
+    INCREASE_SHORT,  // Add to short position
+    DECREASE_SHORT,  // Reduce short position
+    STOP_LOSS,       // Stop loss trigger
+    TAKE_PROFIT      // Take profit trigger
+};
+
+enum class SignalStrength : uint8_t {
+    WEAK = 1,
+    MODERATE = 2,
+    STRONG = 3,
+    VERY_STRONG = 4
+};
+
+struct TradingSignal {
+    uint64_t signal_id;
+    uint64_t timestamp_ns;
+    char symbol[16];
+
+    SignalType type;
+    SignalStrength strength;
+
+    // Signal parameters
+    double price;              // Reference price
+    double target_price;       // Expected target
+    double stop_loss_price;    // Stop loss level
+    uint64_t quantity;         // Recommended quantity
+    double confidence;         // 0.0 - 1.0
+
+    // Signal source
+    char strategy_id[32];
+    char signal_name[64];
+
+    // Feature values that generated signal
+    std::unordered_map<std::string, double> features;
+
+    // Metadata
+    double expected_profit_bps;
+    double expected_risk_bps;
+    uint64_t expected_duration_ns;
+
+    TradingSignal()
+        : signal_id(0), timestamp_ns(0), type(SignalType::ENTRY_LONG),
+          strength(SignalStrength::MODERATE), price(0.0), target_price(0.0),
+          stop_loss_price(0.0), quantity(0), confidence(0.5),
+          expected_profit_bps(0.0), expected_risk_bps(0.0),
+          expected_duration_ns(0) {
+        symbol[0] = '\0';
+        strategy_id[0] = '\0';
+        signal_name[0] = '\0';
+    }
+
+    double getRiskRewardRatio() const {
+        if (expected_risk_bps == 0) return 0.0;
+        return expected_profit_bps / expected_risk_bps;
+    }
+
+    bool isEntry() const {
+        return type == SignalType::ENTRY_LONG ||
+               type == SignalType::ENTRY_SHORT;
+    }
+
+    bool isExit() const {
+        return type == SignalType::EXIT_LONG ||
+               type == SignalType::EXIT_SHORT;
+    }
+};
+
+2.2 SIGNAL GENERATOR INTERFACE
+-------------------------------
+
+class ISignalGenerator {
+public:
+    virtual ~ISignalGenerator() = default;
+
+    // Generate signals based on market data
+    virtual std::vector<TradingSignal> generateSignals(
+        const MarketData& market_data,
+        const PortfolioState& portfolio) = 0;
+
+    // Update internal state
+    virtual void onMarketData(const MarketData& data) = 0;
+    virtual void onFill(const Fill& fill) = 0;
+
+    // Configuration
+    virtual void setParameters(const std::unordered_map<std::string, double>& params) = 0;
+    virtual std::string getName() const = 0;
+
+    // Warm-up period
+    virtual bool isWarmedUp() const = 0;
+    virtual size_t getWarmupPeriod() const = 0;
+};
+
+2.3 EXAMPLE: MOMENTUM SIGNAL GENERATOR
+---------------------------------------
+
+class MomentumSignalGenerator : public ISignalGenerator {
+public:
+    struct Parameters {
+        size_t lookback_period{100};
+        double entry_threshold{2.0};    // Standard deviations
+        double exit_threshold{0.5};
+        size_t volume_ma_period{20};
+        double min_volume_ratio{1.5};
+    };
+
+    explicit MomentumSignalGenerator(const Parameters& params = Parameters())
+        : params_(params) {}
+
+    std::vector<TradingSignal> generateSignals(
+        const MarketData& market_data,
+        const PortfolioState& portfolio) override {
+
+        std::vector<TradingSignal> signals;
+
+        // Update price history
+        price_history_.push_back(market_data.mid_price);
+        if (price_history_.size() > params_.lookback_period) {
+            price_history_.pop_front();
+        }
+
+        volume_history_.push_back(market_data.volume);
+        if (volume_history_.size() > params_.volume_ma_period) {
+            volume_history_.pop_front();
+        }
+
+        if (!isWarmedUp()) {
+            return signals;
+        }
+
+        // Calculate momentum
+        double momentum = calculateMomentum();
+        double momentum_zscore = calculateZScore(momentum);
+
+        // Calculate volume ratio
+        double volume_ratio = calculateVolumeRatio();
+
+        // Generate entry signals
+        if (momentum_zscore > params_.entry_threshold &&
+            volume_ratio > params_.min_volume_ratio) {
+
+            TradingSignal signal;
+            signal.signal_id = next_signal_id_++;
+            signal.timestamp_ns = market_data.timestamp_ns;
+            strncpy(signal.symbol, market_data.symbol, sizeof(signal.symbol) - 1);
+            signal.type = SignalType::ENTRY_LONG;
+            signal.strength = classifyStrength(momentum_zscore);
+            signal.price = market_data.mid_price;
+            signal.confidence = std::min(1.0, momentum_zscore / 5.0);
+
+            // Calculate targets
+            double volatility = calculateVolatility();
+            signal.target_price = market_data.mid_price * (1.0 + 2.0 * volatility);
+            signal.stop_loss_price = market_data.mid_price * (1.0 - volatility);
+
+            // Store features
+            signal.features["momentum"] = momentum;
+            signal.features["momentum_zscore"] = momentum_zscore;
+            signal.features["volume_ratio"] = volume_ratio;
+            signal.features["volatility"] = volatility;
+
+            signals.push_back(signal);
+        }
+
+        // Generate exit signals
+        if (portfolio.hasPosition(market_data.symbol) &&
+            std::abs(momentum_zscore) < params_.exit_threshold) {
+
+            TradingSignal signal;
+            signal.signal_id = next_signal_id_++;
+            signal.timestamp_ns = market_data.timestamp_ns;
+            strncpy(signal.symbol, market_data.symbol, sizeof(signal.symbol) - 1);
+            signal.type = SignalType::EXIT_LONG;
+            signal.price = market_data.mid_price;
+            signal.confidence = 0.7;
+
+            signals.push_back(signal);
+        }
+
+        return signals;
+    }
+
+    void onMarketData(const MarketData& data) override {
+        // Update internal state
+    }
+
+    void onFill(const Fill& fill) override {
+        // Track fills for signal evaluation
+    }
+
+    void setParameters(const std::unordered_map<std::string, double>& params) override {
+        if (params.count("lookback_period")) {
+            params_.lookback_period = static_cast<size_t>(params.at("lookback_period"));
+        }
+        if (params.count("entry_threshold")) {
+            params_.entry_threshold = params.at("entry_threshold");
+        }
+        if (params.count("exit_threshold")) {
+            params_.exit_threshold = params.at("exit_threshold");
+        }
+    }
+
+    std::string getName() const override {
+        return "MomentumSignalGenerator";
+    }
+
+    bool isWarmedUp() const override {
+        return price_history_.size() >= params_.lookback_period &&
+               volume_history_.size() >= params_.volume_ma_period;
+    }
+
+    size_t getWarmupPeriod() const override {
+        return std::max(params_.lookback_period, params_.volume_ma_period);
+    }
+
+private:
+    Parameters params_;
+    std::deque<double> price_history_;
+    std::deque<uint64_t> volume_history_;
+    std::atomic<uint64_t> next_signal_id_{1};
+
+    double calculateMomentum() const {
+        if (price_history_.empty()) return 0.0;
+
+        double current = price_history_.back();
+        double previous = price_history_.front();
+        return (current - previous) / previous;
+    }
+
+    double calculateZScore(double value) const {
+        // Calculate z-score of momentum
+        std::vector<double> momentums;
+        for (size_t i = 1; i < price_history_.size(); ++i) {
+            double mom = (price_history_[i] - price_history_[i-1]) / price_history_[i-1];
+            momentums.push_back(mom);
+        }
+
+        double mean = std::accumulate(momentums.begin(), momentums.end(), 0.0) /
+                     momentums.size();
+
+        double sq_sum = 0.0;
+        for (double mom : momentums) {
+            sq_sum += (mom - mean) * (mom - mean);
+        }
+        double std_dev = std::sqrt(sq_sum / momentums.size());
+
+        if (std_dev == 0) return 0.0;
+        return (value - mean) / std_dev;
+    }
+
+    double calculateVolumeRatio() const {
+        if (volume_history_.empty()) return 1.0;
+
+        uint64_t current_volume = volume_history_.back();
+        double avg_volume = std::accumulate(volume_history_.begin(),
+                                           volume_history_.end(), 0ULL) /
+                           static_cast<double>(volume_history_.size());
+
+        if (avg_volume == 0) return 1.0;
+        return current_volume / avg_volume;
+    }
+
+    double calculateVolatility() const {
+        if (price_history_.size() < 2) return 0.01;
+
+        std::vector<double> returns;
+        for (size_t i = 1; i < price_history_.size(); ++i) {
+            double ret = (price_history_[i] - price_history_[i-1]) / price_history_[i-1];
+            returns.push_back(ret);
+        }
+
+        double mean = std::accumulate(returns.begin(), returns.end(), 0.0) /
+                     returns.size();
+
+        double sq_sum = 0.0;
+        for (double ret : returns) {
+            sq_sum += (ret - mean) * (ret - mean);
+        }
+
+        return std::sqrt(sq_sum / returns.size());
+    }
+
+    SignalStrength classifyStrength(double zscore) const {
+        double abs_z = std::abs(zscore);
+        if (abs_z >= 3.0) return SignalStrength::VERY_STRONG;
+        if (abs_z >= 2.5) return SignalStrength::STRONG;
+        if (abs_z >= 2.0) return SignalStrength::MODERATE;
+        return SignalStrength::WEAK;
+    }
+};
+
+================================================================================
+3. SIGNAL GENERATION FRAMEWORK
+================================================================================
+
+3.1 SIGNAL MANAGER
+-------------------
+
+class SignalManager {
+public:
+    void registerGenerator(std::shared_ptr<ISignalGenerator> generator) {
+        generators_.push_back(generator);
+    }
+
+    std::vector<TradingSignal> generateAllSignals(
+        const MarketData& market_data,
+        const PortfolioState& portfolio) {
+
+        std::vector<TradingSignal> all_signals;
+
+        for (auto& generator : generators_) {
+            if (!generator->isWarmedUp()) {
+                generator->onMarketData(market_data);
+                continue;
+            }
+
+            auto signals = generator->generateSignals(market_data, portfolio);
+            all_signals.insert(all_signals.end(), signals.begin(), signals.end());
+        }
+
+        return all_signals;
+    }
+
+    void onMarketData(const MarketData& data) {
+        for (auto& generator : generators_) {
+            generator->onMarketData(data);
+        }
+    }
+
+    void onFill(const Fill& fill) {
+        for (auto& generator : generators_) {
+            generator->onFill(fill);
+        }
+    }
+
+private:
+    std::vector<std::shared_ptr<ISignalGenerator>> generators_;
+};
+
+3.2 SIGNAL COMBINER
+--------------------
+
+class SignalCombiner {
+public:
+    enum class CombineStrategy {
+        UNANIMOUS,      // All generators must agree
+        MAJORITY,       // Majority vote
+        WEIGHTED,       // Weighted by confidence
+        ANY             // Any signal triggers
+    };
+
+    SignalCombiner(CombineStrategy strategy = CombineStrategy::WEIGHTED)
+        : strategy_(strategy) {}
+
+    std::vector<TradingSignal> combineSignals(
+        const std::vector<TradingSignal>& signals) {
+
+        // Group signals by symbol and type
+        std::map<std::pair<std::string, SignalType>, std::vector<TradingSignal>> grouped;
+
+        for (const auto& signal : signals) {
+            auto key = std::make_pair(std::string(signal.symbol), signal.type);
+            grouped[key].push_back(signal);
+        }
+
+        // Combine each group
+        std::vector<TradingSignal> combined;
+        for (auto& [key, group] : grouped) {
+            if (auto signal = combineGroup(group)) {
+                combined.push_back(*signal);
+            }
+        }
+
+        return combined;
+    }
+
+private:
+    CombineStrategy strategy_;
+
+    std::optional<TradingSignal> combineGroup(
+        const std::vector<TradingSignal>& group) {
+
+        if (group.empty()) return std::nullopt;
+
+        switch (strategy_) {
+            case CombineStrategy::UNANIMOUS:
+                return combineUnanimous(group);
+
+            case CombineStrategy::MAJORITY:
+                return combineMajority(group);
+
+            case CombineStrategy::WEIGHTED:
+                return combineWeighted(group);
+
+            case CombineStrategy::ANY:
+                return group[0];  // Return first signal
+        }
+
+        return std::nullopt;
+    }
+
+    std::optional<TradingSignal> combineUnanimous(
+        const std::vector<TradingSignal>& group) {
+        // Require unanimous agreement
+        if (group.size() < 2) return std::nullopt;
+
+        TradingSignal combined = group[0];
+        double total_confidence = 0.0;
+
+        for (const auto& signal : group) {
+            total_confidence += signal.confidence;
+        }
+
+        combined.confidence = total_confidence / group.size();
+        return combined;
+    }
+
+    std::optional<TradingSignal> combineMajority(
+        const std::vector<TradingSignal>& group) {
+        // Require majority (>50%)
+        // Implementation similar to unanimous
+        return combineWeighted(group);
+    }
+
+    std::optional<TradingSignal> combineWeighted(
+        const std::vector<TradingSignal>& group) {
+
+        if (group.empty()) return std::nullopt;
+
+        TradingSignal combined = group[0];
+
+        // Weighted average of prices and targets
+        double total_weight = 0.0;
+        double weighted_price = 0.0;
+        double weighted_target = 0.0;
+        double weighted_stop = 0.0;
+        double total_confidence = 0.0;
+
+        for (const auto& signal : group) {
+            double weight = signal.confidence;
+            total_weight += weight;
+
+            weighted_price += signal.price * weight;
+            weighted_target += signal.target_price * weight;
+            weighted_stop += signal.stop_loss_price * weight;
+            total_confidence += signal.confidence;
+        }
+
+        if (total_weight > 0) {
+            combined.price = weighted_price / total_weight;
+            combined.target_price = weighted_target / total_weight;
+            combined.stop_loss_price = weighted_stop / total_weight;
+            combined.confidence = total_confidence / group.size();
+        }
+
+        return combined;
+    }
+};
+
+================================================================================
+4. SIGNAL VALIDATION METRICS
+================================================================================
+
+4.1 SIGNAL EVALUATOR
+---------------------
+
+class SignalEvaluator {
+public:
+    struct SignalPerformance {
+        uint64_t signal_id;
+        TradingSignal original_signal;
+
+        // Outcome
+        bool was_executed;
+        uint64_t execution_timestamp_ns;
+        double execution_price;
+
+        // P&L tracking
+        bool closed;
+        uint64_t close_timestamp_ns;
+        double close_price;
+        double realized_pnl;
+        double realized_pnl_bps;
+
+        // Performance metrics
+        double max_favorable_excursion;   // Best unrealized profit
+        double max_adverse_excursion;     // Worst unrealized loss
+        uint64_t duration_ns;
+
+        // Hit/miss
+        bool hit_target;
+        bool hit_stop;
+        bool profitable;
+
+        SignalPerformance()
+            : signal_id(0), was_executed(false), execution_timestamp_ns(0),
+              execution_price(0.0), closed(false), close_timestamp_ns(0),
+              close_price(0.0), realized_pnl(0.0), realized_pnl_bps(0.0),
+              max_favorable_excursion(0.0), max_adverse_excursion(0.0),
+              duration_ns(0), hit_target(false), hit_stop(false),
+              profitable(false) {}
+    };
+
+    void addSignal(const TradingSignal& signal) {
+        SignalPerformance perf;
+        perf.signal_id = signal.signal_id;
+        perf.original_signal = signal;
+        active_signals_[signal.signal_id] = perf;
+    }
+
+    void onExecution(uint64_t signal_id, uint64_t timestamp_ns,
+                    double execution_price) {
+        auto it = active_signals_.find(signal_id);
+        if (it != active_signals_.end()) {
+            it->second.was_executed = true;
+            it->second.execution_timestamp_ns = timestamp_ns;
+            it->second.execution_price = execution_price;
+        }
+    }
+
+    void onClose(uint64_t signal_id, uint64_t timestamp_ns,
+                double close_price) {
+        auto it = active_signals_.find(signal_id);
+        if (it != active_signals_.end() && it->second.was_executed) {
+            auto& perf = it->second;
+            perf.closed = true;
+            perf.close_timestamp_ns = timestamp_ns;
+            perf.close_price = close_price;
+            perf.duration_ns = timestamp_ns - perf.execution_timestamp_ns;
+
+            // Calculate P&L
+            if (perf.original_signal.type == SignalType::ENTRY_LONG) {
+                perf.realized_pnl = close_price - perf.execution_price;
+            } else {
+                perf.realized_pnl = perf.execution_price - close_price;
+            }
+
+            perf.realized_pnl_bps = (perf.realized_pnl / perf.execution_price) * 10000;
+            perf.profitable = perf.realized_pnl > 0;
+
+            // Check if targets hit
+            perf.hit_target = (perf.original_signal.type == SignalType::ENTRY_LONG &&
+                              close_price >= perf.original_signal.target_price) ||
+                             (perf.original_signal.type == SignalType::ENTRY_SHORT &&
+                              close_price <= perf.original_signal.target_price);
+
+            perf.hit_stop = (perf.original_signal.type == SignalType::ENTRY_LONG &&
+                            close_price <= perf.original_signal.stop_loss_price) ||
+                           (perf.original_signal.type == SignalType::ENTRY_SHORT &&
+                            close_price >= perf.original_signal.stop_loss_price);
+
+            // Move to completed
+            completed_signals_.push_back(perf);
+            active_signals_.erase(it);
+        }
+    }
+
+    void updateUnrealizedPnL(uint64_t signal_id, double current_price) {
+        auto it = active_signals_.find(signal_id);
+        if (it != active_signals_.end() && it->second.was_executed) {
+            auto& perf = it->second;
+
+            double unrealized_pnl;
+            if (perf.original_signal.type == SignalType::ENTRY_LONG) {
+                unrealized_pnl = current_price - perf.execution_price;
+            } else {
+                unrealized_pnl = perf.execution_price - current_price;
+            }
+
+            // Update MFE/MAE
+            if (unrealized_pnl > perf.max_favorable_excursion) {
+                perf.max_favorable_excursion = unrealized_pnl;
+            }
+            if (unrealized_pnl < perf.max_adverse_excursion) {
+                perf.max_adverse_excursion = unrealized_pnl;
+            }
+        }
+    }
+
+    struct AggregateStats {
+        size_t total_signals{0};
+        size_t executed_signals{0};
+        size_t closed_signals{0};
+
+        size_t profitable_signals{0};
+        size_t losing_signals{0};
+
+        double total_pnl{0.0};
+        double avg_pnl{0.0};
+        double avg_win{0.0};
+        double avg_loss{0.0};
+
+        double hit_rate{0.0};
+        double win_loss_ratio{0.0};
+
+        double avg_duration_ms{0.0};
+
+        size_t targets_hit{0};
+        size_t stops_hit{0};
+
+        double sharpe_ratio{0.0};
+        double sortino_ratio{0.0};
+        double max_drawdown{0.0};
+    };
+
+    AggregateStats calculateStats() const {
+        AggregateStats stats;
+
+        stats.total_signals = active_signals_.size() + completed_signals_.size();
+        stats.closed_signals = completed_signals_.size();
+
+        double total_win = 0.0;
+        double total_loss = 0.0;
+        std::vector<double> returns;
+
+        for (const auto& perf : completed_signals_) {
+            if (perf.was_executed) {
+                stats.executed_signals++;
+
+                stats.total_pnl += perf.realized_pnl;
+                returns.push_back(perf.realized_pnl_bps);
+
+                if (perf.profitable) {
+                    stats.profitable_signals++;
+                    total_win += perf.realized_pnl;
+                } else {
+                    stats.losing_signals++;
+                    total_loss += std::abs(perf.realized_pnl);
+                }
+
+                if (perf.hit_target) stats.targets_hit++;
+                if (perf.hit_stop) stats.stops_hit++;
+
+                stats.avg_duration_ms += perf.duration_ns / 1000000.0;
+            }
+        }
+
+        if (stats.closed_signals > 0) {
+            stats.avg_pnl = stats.total_pnl / stats.closed_signals;
+            stats.avg_duration_ms /= stats.closed_signals;
+        }
+
+        if (stats.profitable_signals > 0) {
+            stats.avg_win = total_win / stats.profitable_signals;
+        }
+
+        if (stats.losing_signals > 0) {
+            stats.avg_loss = total_loss / stats.losing_signals;
+        }
+
+        if (stats.executed_signals > 0) {
+            stats.hit_rate = static_cast<double>(stats.profitable_signals) /
+                           stats.executed_signals;
+        }
+
+        if (stats.avg_loss > 0) {
+            stats.win_loss_ratio = stats.avg_win / stats.avg_loss;
+        }
+
+        // Calculate Sharpe ratio
+        if (!returns.empty()) {
+            stats.sharpe_ratio = calculateSharpeRatio(returns);
+            stats.sortino_ratio = calculateSortinoRatio(returns);
+            stats.max_drawdown = calculateMaxDrawdown(returns);
+        }
+
+        return stats;
+    }
+
+private:
+    std::unordered_map<uint64_t, SignalPerformance> active_signals_;
+    std::vector<SignalPerformance> completed_signals_;
+
+    double calculateSharpeRatio(const std::vector<double>& returns) const {
+        if (returns.empty()) return 0.0;
+
+        double mean = std::accumulate(returns.begin(), returns.end(), 0.0) /
+                     returns.size();
+
+        double sq_sum = 0.0;
+        for (double ret : returns) {
+            sq_sum += (ret - mean) * (ret - mean);
+        }
+        double std_dev = std::sqrt(sq_sum / returns.size());
+
+        if (std_dev == 0) return 0.0;
+        return mean / std_dev * std::sqrt(252.0);  // Annualized
+    }
+
+    double calculateSortinoRatio(const std::vector<double>& returns) const {
+        if (returns.empty()) return 0.0;
+
+        double mean = std::accumulate(returns.begin(), returns.end(), 0.0) /
+                     returns.size();
+
+        double downside_sq_sum = 0.0;
+        size_t downside_count = 0;
+        for (double ret : returns) {
+            if (ret < 0) {
+                downside_sq_sum += ret * ret;
+                downside_count++;
+            }
+        }
+
+        if (downside_count == 0) return 0.0;
+        double downside_dev = std::sqrt(downside_sq_sum / downside_count);
+
+        if (downside_dev == 0) return 0.0;
+        return mean / downside_dev * std::sqrt(252.0);
+    }
+
+    double calculateMaxDrawdown(const std::vector<double>& returns) const {
+        if (returns.empty()) return 0.0;
+
+        double cumulative = 0.0;
+        double peak = 0.0;
+        double max_dd = 0.0;
+
+        for (double ret : returns) {
+            cumulative += ret;
+            peak = std::max(peak, cumulative);
+            double drawdown = peak - cumulative;
+            max_dd = std::max(max_dd, drawdown);
+        }
+
+        return max_dd;
+    }
+};
+
+================================================================================
+5. BACKTESTING SIGNAL PERFORMANCE
+================================================================================
+
+5.1 SIGNAL BACKTESTER
+----------------------
+
+class SignalBacktester {
+public:
+    struct BacktestConfig {
+        uint64_t start_time_ns;
+        uint64_t end_time_ns;
+        double initial_capital;
+        double position_size_pct;   // % of capital per position
+        bool use_stop_loss;
+        bool use_take_profit;
+        double commission_bps;
+    };
+
+    SignalBacktester(const BacktestConfig& config)
+        : config_(config) {}
+
+    void runBacktest(ISignalGenerator& generator,
+                    const std::vector<MarketData>& historical_data) {
+
+        evaluator_ = std::make_unique<SignalEvaluator>();
+        portfolio_.reset(config_.initial_capital);
+
+        for (const auto& data : historical_data) {
+            // Generate signals
+            auto signals = generator.generateSignals(data, portfolio_);
+
+            // Process signals
+            for (const auto& signal : signals) {
+                processSignal(signal, data);
+            }
+
+            // Update unrealized P&L
+            updateUnrealizedPnL(data);
+
+            // Update market data
+            generator.onMarketData(data);
+        }
+
+        // Close all open positions
+        closeAllPositions(historical_data.back());
+    }
+
+    const SignalEvaluator::AggregateStats& getStats() const {
+        return evaluator_->calculateStats();
+    }
+
+    const std::vector<SignalEvaluator::SignalPerformance>& getCompletedSignals() const {
+        return evaluator_->getCompletedSignals();
+    }
+
+private:
+    BacktestConfig config_;
+    std::unique_ptr<SignalEvaluator> evaluator_;
+    PortfolioState portfolio_;
+
+    void processSignal(const TradingSignal& signal, const MarketData& data) {
+        evaluator_->addSignal(signal);
+
+        if (signal.isEntry()) {
+            // Execute entry
+            double position_value = config_.initial_capital * config_.position_size_pct;
+            uint64_t quantity = static_cast<uint64_t>(position_value / signal.price);
+
+            if (quantity > 0) {
+                // Simulate execution
+                evaluator_->onExecution(signal.signal_id, data.timestamp_ns,
+                                       signal.price);
+
+                // Update portfolio
+                portfolio_.addPosition(signal.symbol, quantity, signal.price,
+                                      signal.type == SignalType::ENTRY_LONG);
+
+                // Apply commission
+                double commission = position_value * config_.commission_bps / 10000.0;
+                portfolio_.deductCash(commission);
+            }
+        } else if (signal.isExit()) {
+            // Execute exit
+            auto position = portfolio_.getPosition(signal.symbol);
+            if (position) {
+                evaluator_->onClose(signal.signal_id, data.timestamp_ns,
+                                   signal.price);
+
+                portfolio_.closePosition(signal.symbol, signal.price);
+
+                // Apply commission
+                double exit_value = position->quantity * signal.price;
+                double commission = exit_value * config_.commission_bps / 10000.0;
+                portfolio_.deductCash(commission);
+            }
+        }
+    }
+
+    void updateUnrealizedPnL(const MarketData& data) {
+        // Update all active positions
+        for (const auto& [signal_id, perf] : evaluator_->getActiveSignals()) {
+            if (std::string(perf.original_signal.symbol) == std::string(data.symbol)) {
+                evaluator_->updateUnrealizedPnL(signal_id, data.mid_price);
+            }
+        }
+    }
+
+    void closeAllPositions(const MarketData& final_data) {
+        // Implementation
+    }
+};
+
+================================================================================
+8. COMPLETE IMPLEMENTATION - USAGE EXAMPLE
+================================================================================
+
+#include "signal_testing.hpp"
+#include <iostream>
+
+int main() {
+    using namespace hft::simulation;
+
+    // Create signal generator
+    MomentumSignalGenerator::Parameters params;
+    params.lookback_period = 100;
+    params.entry_threshold = 2.0;
+    params.exit_threshold = 0.5;
+
+    auto generator = std::make_shared<MomentumSignalGenerator>(params);
+
+    // Configure backtest
+    SignalBacktester::BacktestConfig config;
+    config.start_time_ns = 1704110400000000000ULL;
+    config.end_time_ns = 1704196800000000000ULL;
+    config.initial_capital = 100000.0;
+    config.position_size_pct = 0.1;  // 10% per trade
+    config.use_stop_loss = true;
+    config.use_take_profit = true;
+    config.commission_bps = 3.0;
+
+    SignalBacktester backtester(config);
+
+    // Load historical data
+    std::vector<MarketData> historical_data;
+    // ... load data ...
+
+    // Run backtest
+    std::cout << "Running backtest..." << std::endl;
+    backtester.runBacktest(*generator, historical_data);
+
+    // Print results
+    const auto& stats = backtester.getStats();
+    std::cout << "\nBacktest Results:" << std::endl;
+    std::cout << "Total signals: " << stats.total_signals << std::endl;
+    std::cout << "Executed: " << stats.executed_signals << std::endl;
+    std::cout << "Closed: " << stats.closed_signals << std::endl;
+    std::cout << "Hit rate: " << (stats.hit_rate * 100) << "%" << std::endl;
+    std::cout << "Total P&L: $" << stats.total_pnl << std::endl;
+    std::cout << "Avg P&L: $" << stats.avg_pnl << std::endl;
+    std::cout << "Win/Loss ratio: " << stats.win_loss_ratio << std::endl;
+    std::cout << "Sharpe ratio: " << stats.sharpe_ratio << std::endl;
+    std::cout << "Max drawdown: " << stats.max_drawdown << " bps" << std::endl;
+
+    return 0;
+}
+
+================================================================================
+END OF DOCUMENT
+================================================================================

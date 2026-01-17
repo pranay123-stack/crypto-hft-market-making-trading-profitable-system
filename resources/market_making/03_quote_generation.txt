@@ -1,0 +1,1157 @@
+================================================================================
+QUOTE GENERATION FOR MARKET MAKING
+================================================================================
+
+File: 03_quote_generation.txt
+Purpose: Comprehensive guide to two-sided quote generation algorithms
+Topics: Spread calculation, size optimization, quote placement strategies
+Last Updated: 2025-11-26
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+
+1. Quote Generation Overview
+2. Two-Sided Quoting Mechanics
+3. Spread Calculation Algorithms
+4. Size Optimization
+5. Quote Placement Strategies
+6. Multi-Level Quoting
+7. Quote Update Strategies
+8. Latency-Aware Quoting
+9. Adverse Selection Protection
+10. Complete C++ Implementation
+
+================================================================================
+1. QUOTE GENERATION OVERVIEW
+================================================================================
+
+Quote generation is the core of market making: determining optimal bid and ask
+prices and sizes to post in the market. The goal is to maximize expected profit
+while managing inventory risk and adverse selection.
+
+QUOTE GENERATION OBJECTIVE:
+---------------------------
+
+max E[P&L] = E[Spread_Revenue] - E[Adverse_Selection_Cost] - E[Inventory_Cost]
+
+Subject to:
+- Price improvement vs. NBBO
+- Exchange minimum tick size
+- Position limits
+- Risk limits
+- Regulatory requirements
+
+QUOTE COMPONENTS:
+-----------------
+
+Complete Quote:
+{
+    Bid_Price,
+    Bid_Size,
+    Ask_Price,
+    Ask_Size,
+    Time_In_Force,
+    Order_Type
+}
+
+Typical Parameters:
+- Prices: Tick-aligned, near mid
+- Sizes: 100-1000 shares (adjustable)
+- Time_In_Force: GTC or IOC
+- Order_Type: Limit (occasionally hidden)
+
+QUOTE LIFECYCLE:
+----------------
+
+1. Generate → Calculate optimal bid/ask
+2. Validate → Check risk limits
+3. Submit → Send to exchange
+4. Monitor → Track fills and book changes
+5. Update → Adjust or cancel based on conditions
+6. Repeat → Continuous process
+
+Cycle Time: < 1 millisecond for HFT
+
+================================================================================
+2. TWO-SIDED QUOTING MECHANICS
+================================================================================
+
+SIMULTANEOUS BID-ASK POSTING:
+------------------------------
+
+Market makers post both sides simultaneously to:
+- Earn full spread if both fill
+- Maintain market neutrality
+- Provide continuous liquidity
+
+Example:
+Fair Value: $100.00
+Spread: $0.10
+
+Post:
+- Bid: $99.95 for 1000 shares
+- Ask: $100.05 for 1000 shares
+
+Possible Outcomes:
+1. Both fill → Profit = $100 (spread capture)
+2. Only bid fills → Long 1000 shares (inventory risk)
+3. Only ask fills → Short 1000 shares (inventory risk)
+4. Neither fills → No profit, no risk
+
+FILL PROBABILITY MODELS:
+-------------------------
+
+Probability of bid fill:
+P(bid_fill) = f(δ_bid, volume, volatility, order_imbalance)
+
+Simplified model:
+P(fill) = λ × exp(-κ × δ)
+
+Where:
+- λ = base fill rate
+- κ = sensitivity to distance from mid
+- δ = distance from fair value
+
+Example:
+λ = 0.5 (50% base rate at mid)
+κ = 10 (decay rate)
+δ_bid = 0.05 (5 cents from mid)
+
+P(bid_fill) = 0.5 × exp(-10 × 0.05) = 0.30 (30%)
+
+EXPECTED PROFIT PER QUOTE:
+--------------------------
+
+E[Profit] = P(bid_fill) × P(ask_fill | bid_fill) × Spread
+           - P(bid_fill) × (1 - P(ask_fill | bid_fill)) × InventoryCost
+           - P(ask_fill) × (1 - P(bid_fill | ask_fill)) × InventoryCost
+           - P(bid_fill) × AdverseSelectionCost
+           - P(ask_fill) × AdverseSelectionCost
+
+Simplified (assuming independence):
+E[Profit] = P(both) × Spread - P(one_side) × RiskCost
+
+OPTIMAL QUOTE DISTANCE:
+-----------------------
+
+Trade-off between fill probability and profit per fill:
+
+Revenue = P(fill) × (Spread/2)
+
+At mid: High P(fill), zero spread
+Far from mid: Low P(fill), high spread
+
+Optimal: δ* = argmax P(fill; δ) × δ
+
+C++ TWO-SIDED QUOTE STRUCTURE:
+-------------------------------
+
+struct Quote {
+    double bid_price;
+    int bid_size;
+    double ask_price;
+    int ask_size;
+    uint64_t timestamp;
+
+    // Calculate quoted spread
+    double getSpread() const {
+        return ask_price - bid_price;
+    }
+
+    // Calculate mid price
+    double getMid() const {
+        return (bid_price + ask_price) / 2.0;
+    }
+
+    // Validate quote
+    bool isValid() const {
+        return ask_price > bid_price &&
+               bid_size > 0 &&
+               ask_size > 0;
+    }
+};
+
+class QuoteGenerator {
+private:
+    double min_spread_;
+    int default_size_;
+    double tick_size_;
+
+public:
+    QuoteGenerator(double min_spread, int default_size, double tick_size)
+        : min_spread_(min_spread)
+        , default_size_(default_size)
+        , tick_size_(tick_size) {}
+
+    // Generate basic two-sided quote
+    Quote generateBasicQuote(double fair_value, double spread) const {
+        Quote q;
+
+        // Ensure minimum spread
+        spread = std::max(spread, min_spread_);
+
+        // Calculate raw prices
+        double half_spread = spread / 2.0;
+        double raw_bid = fair_value - half_spread;
+        double raw_ask = fair_value + half_spread;
+
+        // Align to tick size
+        q.bid_price = std::floor(raw_bid / tick_size_) * tick_size_;
+        q.ask_price = std::ceil(raw_ask / tick_size_) * tick_size_;
+
+        // Set sizes
+        q.bid_size = default_size_;
+        q.ask_size = default_size_;
+
+        // Timestamp
+        q.timestamp = getCurrentTimestamp();
+
+        return q;
+    }
+
+private:
+    uint64_t getCurrentTimestamp() const {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()
+        ).count();
+    }
+};
+
+================================================================================
+3. SPREAD CALCULATION ALGORITHMS
+================================================================================
+
+FIXED SPREAD:
+-------------
+
+Simplest approach: constant spread regardless of conditions
+
+Spread = CONSTANT
+
+Example: Always quote $0.02 spread
+
+Pros: Simple, predictable
+Cons: Doesn't adapt to market conditions
+
+VOLATILITY-ADJUSTED SPREAD:
+----------------------------
+
+Spread proportional to volatility:
+
+Spread = Base + β × σ
+
+Where:
+- Base = minimum spread (e.g., 1 tick)
+- β = volatility multiplier
+- σ = recent volatility
+
+Example:
+Base = $0.01
+β = 50
+σ = 0.02 (2% intraday vol)
+
+Spread = $0.01 + 50 × 0.02 = $1.01
+
+More realistic with normalization:
+Spread = Base × (1 + β × σ/σ_avg)
+
+INVENTORY-ADJUSTED SPREAD:
+---------------------------
+
+Widen spread when position is large:
+
+Spread = Base × (1 + α × |q|/q_max)
+
+Where:
+- α = inventory sensitivity
+- q = current position
+- q_max = maximum position
+
+Example:
+Position: 8000 / 10000
+α = 0.5
+Base = $0.02
+
+Spread = $0.02 × (1 + 0.5 × 0.8) = $0.028
+
+AVELLANEDA-STOIKOV SPREAD:
+--------------------------
+
+Theoretically optimal spread:
+
+δ⁺ + δ⁻ = γσ²(T-t) + (2/γ)ln(1 + γ/κ)
+
+Where:
+- γ = risk aversion (e.g., 0.1)
+- σ = volatility
+- T-t = time remaining
+- κ = order arrival rate
+
+Practical implementation:
+
+class AvellanedaStoikovSpread {
+private:
+    double gamma_;          // Risk aversion
+    double kappa_;          // Order arrival rate
+
+public:
+    AvellanedaStoikovSpread(double gamma, double kappa)
+        : gamma_(gamma), kappa_(kappa) {}
+
+    double calculateSpread(double volatility, double time_remaining) const {
+        double term1 = gamma_ * volatility * volatility * time_remaining;
+        double term2 = (2.0 / gamma_) * std::log(1.0 + gamma_ / kappa_);
+        return term1 + term2;
+    }
+
+    // Adjust spread based on inventory
+    double calculateAdjustedSpread(double volatility,
+                                   double time_remaining,
+                                   int position,
+                                   int max_position) const {
+        double base_spread = calculateSpread(volatility, time_remaining);
+
+        // Inventory adjustment
+        double position_ratio = static_cast<double>(std::abs(position)) /
+                               max_position;
+        double adjustment = 1.0 + position_ratio;
+
+        return base_spread * adjustment;
+    }
+};
+
+ORDER BOOK IMBALANCE SPREAD:
+----------------------------
+
+Adjust spread based on order book pressure:
+
+Imbalance = (Bid_Volume - Ask_Volume) / (Bid_Volume + Ask_Volume)
+
+Spread_Adjustment = β × Imbalance
+
+Where β controls sensitivity to imbalance
+
+If Imbalance > 0 (more buyers):
+- Widen ask (buyers willing to pay more)
+- Keep bid tight
+
+If Imbalance < 0 (more sellers):
+- Widen bid (sellers willing to accept less)
+- Keep ask tight
+
+ADAPTIVE SPREAD:
+----------------
+
+Combine multiple factors:
+
+Spread = Base × Vol_Factor × Inv_Factor × Imbalance_Factor × Competition_Factor
+
+class AdaptiveSpreadCalculator {
+private:
+    double base_spread_;
+    double vol_multiplier_;
+    double inv_multiplier_;
+    double imb_multiplier_;
+
+public:
+    AdaptiveSpreadCalculator(double base, double vol_mult,
+                            double inv_mult, double imb_mult)
+        : base_spread_(base)
+        , vol_multiplier_(vol_mult)
+        , inv_multiplier_(inv_mult)
+        , imb_multiplier_(imb_mult) {}
+
+    double calculateSpread(double volatility,
+                          double avg_volatility,
+                          int position,
+                          int max_position,
+                          double order_imbalance,
+                          double competitive_spread) const {
+        // Volatility factor
+        double vol_factor = 1.0;
+        if (avg_volatility > 0) {
+            vol_factor = 1.0 + vol_multiplier_ *
+                        (volatility - avg_volatility) / avg_volatility;
+        }
+        vol_factor = std::max(0.5, std::min(vol_factor, 2.0));
+
+        // Inventory factor
+        double pos_ratio = static_cast<double>(std::abs(position)) /
+                          max_position;
+        double inv_factor = 1.0 + inv_multiplier_ * pos_ratio;
+
+        // Imbalance factor (symmetry breaking)
+        double imb_factor = 1.0 + imb_multiplier_ * std::abs(order_imbalance);
+
+        // Competition factor
+        double comp_factor = 1.0;
+        if (competitive_spread > 0) {
+            // Try to match competition but maintain minimum edge
+            comp_factor = std::max(0.8, competitive_spread / base_spread_);
+        }
+
+        double spread = base_spread_ * vol_factor * inv_factor *
+                       imb_factor * comp_factor;
+
+        // Ensure minimum spread (at least 1 tick)
+        return std::max(spread, base_spread_ * 0.5);
+    }
+
+    // Calculate asymmetric spreads
+    struct AsymmetricSpread {
+        double bid_distance;
+        double ask_distance;
+    };
+
+    AsymmetricSpread calculateAsymmetricSpread(
+        double base_spread,
+        int position,
+        int max_position,
+        double order_imbalance) const {
+
+        AsymmetricSpread result;
+        double half_spread = base_spread / 2.0;
+
+        // Skew based on inventory
+        double inv_skew = 0.0;
+        if (max_position > 0) {
+            inv_skew = 0.3 * half_spread *
+                      static_cast<double>(position) / max_position;
+        }
+
+        // Skew based on order book imbalance
+        double imb_skew = 0.2 * half_spread * order_imbalance;
+
+        // Total skew
+        double total_skew = inv_skew + imb_skew;
+
+        result.bid_distance = half_spread + total_skew;
+        result.ask_distance = half_spread - total_skew;
+
+        // Ensure both sides are positive
+        result.bid_distance = std::max(0.0001, result.bid_distance);
+        result.ask_distance = std::max(0.0001, result.ask_distance);
+
+        return result;
+    }
+};
+
+MACHINE LEARNING SPREAD:
+------------------------
+
+Use ML model to predict optimal spread:
+
+Features:
+- Current volatility
+- Order book imbalance
+- Recent fill rates
+- Time of day
+- Current position
+- Recent trade intensity
+
+Model:
+Spread = ML_Model(features)
+
+Training objective:
+Maximize Sharpe ratio or total P&L
+
+================================================================================
+4. SIZE OPTIMIZATION
+================================================================================
+
+FIXED SIZE:
+-----------
+
+Simplest: Always quote same size
+
+Quote_Size = CONSTANT (e.g., 1000 shares)
+
+Pros: Simple, predictable capital usage
+Cons: Doesn't adapt to conditions
+
+POSITION-ADJUSTED SIZE:
+-----------------------
+
+Reduce size as position grows:
+
+Quote_Size = Base_Size × (1 - |q|/q_max)
+
+Example:
+Base: 1000
+Position: 6000 / 10000
+
+Quote_Size = 1000 × (1 - 0.6) = 400
+
+ADVERSE SELECTION-ADJUSTED SIZE:
+--------------------------------
+
+Reduce size when adverse selection risk is high:
+
+Quote_Size = Base_Size × (1 - Toxicity)
+
+Where Toxicity ∈ [0,1] measures informed flow
+
+KELLY CRITERION SIZE:
+---------------------
+
+Optimal bet sizing based on edge:
+
+f* = p/a - q/b
+
+Where:
+- p = probability of winning
+- q = 1 - p
+- a = amount lost if lose
+- b = amount won if win
+
+For market making:
+Size = Capital × f* × Confidence
+
+VOLATILITY-ADJUSTED SIZE:
+--------------------------
+
+Larger size in calm markets:
+
+Quote_Size = Base_Size × (σ_avg / σ_current)
+
+High volatility → Smaller size
+Low volatility → Larger size
+
+C++ SIZE OPTIMIZER:
+-------------------
+
+class QuoteSizeOptimizer {
+private:
+    int base_size_;
+    int min_size_;
+    int max_size_;
+
+public:
+    QuoteSizeOptimizer(int base_size, int min_size, int max_size)
+        : base_size_(base_size)
+        , min_size_(min_size)
+        , max_size_(max_size) {}
+
+    // Position-adjusted sizing
+    int calculatePositionAdjustedSize(int position,
+                                     int max_position) const {
+        if (max_position == 0) return base_size_;
+
+        double position_ratio = static_cast<double>(std::abs(position)) /
+                               max_position;
+
+        // Reduce size linearly with position
+        int size = static_cast<int>(base_size_ * (1.0 - position_ratio));
+
+        return std::clamp(size, min_size_, max_size_);
+    }
+
+    // Volatility-adjusted sizing
+    int calculateVolatilityAdjustedSize(double current_vol,
+                                       double avg_vol) const {
+        if (current_vol < 0.0001 || avg_vol < 0.0001) {
+            return base_size_;
+        }
+
+        // Inverse relationship: higher vol → smaller size
+        double vol_ratio = avg_vol / current_vol;
+        int size = static_cast<int>(base_size_ * vol_ratio);
+
+        return std::clamp(size, min_size_, max_size_);
+    }
+
+    // Adverse selection-adjusted sizing
+    int calculateToxicityAdjustedSize(double toxicity_score) const {
+        // toxicity_score in [0, 1]
+        double size_factor = 1.0 - 0.8 * toxicity_score;
+        int size = static_cast<int>(base_size_ * size_factor);
+
+        return std::clamp(size, min_size_, max_size_);
+    }
+
+    // Combined size optimization
+    int calculateOptimalSize(int position,
+                            int max_position,
+                            double current_vol,
+                            double avg_vol,
+                            double toxicity_score) const {
+        // Position component
+        double pos_factor = 1.0;
+        if (max_position > 0) {
+            double pos_ratio = static_cast<double>(std::abs(position)) /
+                              max_position;
+            pos_factor = 1.0 - 0.5 * pos_ratio;
+        }
+
+        // Volatility component
+        double vol_factor = 1.0;
+        if (current_vol > 0.0001 && avg_vol > 0.0001) {
+            vol_factor = std::sqrt(avg_vol / current_vol);
+            vol_factor = std::clamp(vol_factor, 0.5, 1.5);
+        }
+
+        // Toxicity component
+        double tox_factor = 1.0 - 0.6 * toxicity_score;
+
+        // Combined
+        double total_factor = pos_factor * vol_factor * tox_factor;
+        int size = static_cast<int>(base_size_ * total_factor);
+
+        return std::clamp(size, min_size_, max_size_);
+    }
+
+    // Asymmetric sizing based on position
+    struct AsymmetricSize {
+        int bid_size;
+        int ask_size;
+    };
+
+    AsymmetricSize calculateAsymmetricSizes(int position,
+                                           int max_position) const {
+        AsymmetricSize result;
+
+        if (position > 0) {
+            // Long position: larger ask size to sell
+            result.ask_size = base_size_;
+            result.bid_size = std::max(min_size_, base_size_ / 2);
+        } else if (position < 0) {
+            // Short position: larger bid size to buy
+            result.bid_size = base_size_;
+            result.ask_size = std::max(min_size_, base_size_ / 2);
+        } else {
+            // Neutral: equal sizes
+            result.bid_size = base_size_;
+            result.ask_size = base_size_;
+        }
+
+        return result;
+    }
+};
+
+================================================================================
+5. QUOTE PLACEMENT STRATEGIES
+================================================================================
+
+AT-THE-TOUCH QUOTING:
+---------------------
+
+Post at current best bid/ask (join queue):
+
+Bid = Current_Best_Bid
+Ask = Current_Best_Ask
+
+Pros:
++ Highest fill probability
++ Earn full spread if inside
+
+Cons:
+- Back of queue (low priority)
+- Susceptible to being picked off
+- High adverse selection
+
+INSIDE-THE-TOUCH QUOTING:
+--------------------------
+
+Post inside current best (penny jump):
+
+Bid = Current_Best_Bid + tick
+Ask = Current_Best_Ask - tick
+
+Pros:
++ First in queue (price-time priority)
++ Higher fill probability than passive
+
+Cons:
+- Others may jump you
+- Reduced spread capture
+- May trigger quote-matching race
+
+MID-POINT QUOTING:
+------------------
+
+Post at or near mid price:
+
+Bid = Mid - δ
+Ask = Mid + δ
+
+Where δ is small (e.g., 0.5 ticks if sub-penny allowed)
+
+Pros:
++ Maximum spread capture if both fill
++ Good for rebate capture
+
+Cons:
+- Lower fill probability
+- Requires sub-penny pricing
+
+PASSIVE QUOTING:
+----------------
+
+Post away from touch (provide depth):
+
+Bid = Current_Best_Bid - n_ticks × tick
+Ask = Current_Best_Ask + n_ticks × tick
+
+Pros:
++ Lower adverse selection
++ Earn wider spread
++ Safer queue position
+
+Cons:
+- Much lower fill probability
+- Capital tied up longer
+
+ADAPTIVE PLACEMENT:
+-------------------
+
+Adjust placement based on conditions:
+
+class QuotePlacementStrategy {
+public:
+    enum class Strategy {
+        AT_TOUCH,
+        INSIDE_TOUCH,
+        MID_POINT,
+        PASSIVE,
+        ADAPTIVE
+    };
+
+private:
+    Strategy strategy_;
+    double tick_size_;
+
+public:
+    QuotePlacementStrategy(Strategy strategy, double tick_size)
+        : strategy_(strategy), tick_size_(tick_size) {}
+
+    struct PlacementResult {
+        double bid_price;
+        double ask_price;
+        int bid_queue_position;  // estimated
+        int ask_queue_position;  // estimated
+    };
+
+    PlacementResult calculatePlacement(
+        double fair_value,
+        double best_bid,
+        double best_ask,
+        double spread_width,
+        int position,
+        int max_position) const {
+
+        PlacementResult result;
+
+        switch (strategy_) {
+            case Strategy::AT_TOUCH:
+                result.bid_price = best_bid;
+                result.ask_price = best_ask;
+                result.bid_queue_position = 1000;  // back of queue
+                result.ask_queue_position = 1000;
+                break;
+
+            case Strategy::INSIDE_TOUCH:
+                result.bid_price = best_bid + tick_size_;
+                result.ask_price = best_ask - tick_size_;
+                result.bid_queue_position = 0;  // front of queue
+                result.ask_queue_position = 0;
+                break;
+
+            case Strategy::MID_POINT:
+                result.bid_price = fair_value - spread_width / 2.0;
+                result.ask_price = fair_value + spread_width / 2.0;
+                result.bid_queue_position = 500;
+                result.ask_queue_position = 500;
+                break;
+
+            case Strategy::PASSIVE: {
+                int ticks_away = 2;
+                result.bid_price = best_bid - ticks_away * tick_size_;
+                result.ask_price = best_ask + ticks_away * tick_size_;
+                result.bid_queue_position = 0;
+                result.ask_queue_position = 0;
+                break;
+            }
+
+            case Strategy::ADAPTIVE:
+                result = calculateAdaptivePlacement(
+                    fair_value, best_bid, best_ask, spread_width,
+                    position, max_position
+                );
+                break;
+        }
+
+        return result;
+    }
+
+private:
+    PlacementResult calculateAdaptivePlacement(
+        double fair_value,
+        double best_bid,
+        double best_ask,
+        double spread_width,
+        int position,
+        int max_position) const {
+
+        PlacementResult result;
+
+        // Calculate aggressiveness based on position
+        double pos_ratio = static_cast<double>(std::abs(position)) /
+                          max_position;
+
+        // Small position: passive
+        // Large position: aggressive
+
+        if (position > max_position * 0.7) {
+            // Large long position: aggressive on ask
+            result.ask_price = best_ask - tick_size_;  // inside
+            result.bid_price = best_bid - tick_size_;  // passive
+        } else if (position < -max_position * 0.7) {
+            // Large short position: aggressive on bid
+            result.bid_price = best_bid + tick_size_;  // inside
+            result.ask_price = best_ask + tick_size_;  // passive
+        } else {
+            // Normal position: at-the-touch
+            result.bid_price = best_bid;
+            result.ask_price = best_ask;
+        }
+
+        result.bid_queue_position = 100;
+        result.ask_queue_position = 100;
+
+        return result;
+    }
+};
+
+================================================================================
+6. MULTI-LEVEL QUOTING
+================================================================================
+
+Instead of single bid/ask, post multiple price levels:
+
+Level 1: Best_Bid / Best_Ask (aggressive)
+Level 2: Best_Bid - 1 tick / Best_Ask + 1 tick
+Level 3: Best_Bid - 2 ticks / Best_Ask + 2 ticks
+...
+
+BENEFITS:
+---------
++ Capture fills at multiple price levels
++ Increase total fill volume
++ Provide market depth
++ Better inventory control
+
+SIZING STRATEGY:
+----------------
+
+Larger sizes at better prices:
+
+Size_i = Base_Size × decay^i
+
+Example with decay=0.8:
+Level 1: 1000 shares
+Level 2: 800 shares
+Level 3: 640 shares
+
+C++ MULTI-LEVEL QUOTER:
+-----------------------
+
+class MultiLevelQuoter {
+private:
+    int num_levels_;
+    double tick_size_;
+    int base_size_;
+    double size_decay_;
+
+public:
+    struct PriceLevel {
+        double price;
+        int size;
+    };
+
+    struct MultiLevelQuote {
+        std::vector<PriceLevel> bids;
+        std::vector<PriceLevel> asks;
+    };
+
+    MultiLevelQuoter(int num_levels, double tick_size,
+                     int base_size, double size_decay)
+        : num_levels_(num_levels)
+        , tick_size_(tick_size)
+        , base_size_(base_size)
+        , size_decay_(size_decay) {}
+
+    MultiLevelQuote generateMultiLevelQuote(
+        double fair_value,
+        double best_bid,
+        double best_ask,
+        int position,
+        int max_position) const {
+
+        MultiLevelQuote quote;
+
+        // Generate bid levels
+        for (int i = 0; i < num_levels_; ++i) {
+            PriceLevel level;
+            level.price = best_bid - i * tick_size_;
+            level.size = static_cast<int>(
+                base_size_ * std::pow(size_decay_, i)
+            );
+
+            // Adjust for inventory
+            if (position > 0) {
+                level.size = static_cast<int>(
+                    level.size * (1.0 - 0.5 * position / max_position)
+                );
+            }
+
+            quote.bids.push_back(level);
+        }
+
+        // Generate ask levels
+        for (int i = 0; i < num_levels_; ++i) {
+            PriceLevel level;
+            level.price = best_ask + i * tick_size_;
+            level.size = static_cast<int>(
+                base_size_ * std::pow(size_decay_, i)
+            );
+
+            // Adjust for inventory
+            if (position < 0) {
+                level.size = static_cast<int>(
+                    level.size * (1.0 - 0.5 * std::abs(position) / max_position)
+                );
+            }
+
+            quote.asks.push_back(level);
+        }
+
+        return quote;
+    }
+};
+
+================================================================================
+7. QUOTE UPDATE STRATEGIES
+================================================================================
+
+CONTINUOUS UPDATING:
+--------------------
+
+Update quotes on every market data change:
+
+On OrderBook Update:
+1. Recalculate fair value
+2. Recalculate optimal spread
+3. Generate new quotes
+4. Cancel old quotes
+5. Submit new quotes
+
+Pros: Most responsive
+Cons: High message rate, exchange fees
+
+THRESHOLD-BASED UPDATING:
+--------------------------
+
+Update only when significant change:
+
+if |NewFairValue - OldFairValue| > threshold:
+    Update quotes
+
+Typical threshold: 0.5-1.0 ticks
+
+PERIODIC UPDATING:
+------------------
+
+Update at fixed intervals:
+
+Every N milliseconds:
+    Update quotes
+
+Typical: N = 100-1000 ms
+
+TIME-WEIGHTED UPDATING:
+-----------------------
+
+Update based on quote age:
+
+Age = CurrentTime - QuoteSubmitTime
+
+if Age > MaxAge:
+    Update quotes
+
+Typical MaxAge: 1-5 seconds
+
+C++ QUOTE UPDATE MANAGER:
+-------------------------
+
+class QuoteUpdateManager {
+private:
+    double fair_value_threshold_;
+    uint64_t max_quote_age_ns_;
+    uint64_t min_update_interval_ns_;
+    uint64_t last_update_time_;
+    double last_fair_value_;
+
+public:
+    QuoteUpdateManager(double fv_threshold,
+                      uint64_t max_age_ms,
+                      uint64_t min_interval_ms)
+        : fair_value_threshold_(fv_threshold)
+        , max_quote_age_ns_(max_age_ms * 1'000'000)
+        , min_update_interval_ns_(min_interval_ms * 1'000'000)
+        , last_update_time_(0)
+        , last_fair_value_(0.0) {}
+
+    bool shouldUpdate(double current_fair_value,
+                     uint64_t quote_submit_time,
+                     uint64_t current_time) const {
+        // Check minimum interval
+        if (current_time - last_update_time_ < min_update_interval_ns_) {
+            return false;
+        }
+
+        // Check fair value change
+        if (std::abs(current_fair_value - last_fair_value_) >
+            fair_value_threshold_) {
+            return true;
+        }
+
+        // Check quote age
+        uint64_t quote_age = current_time - quote_submit_time;
+        if (quote_age > max_quote_age_ns_) {
+            return true;
+        }
+
+        return false;
+    }
+
+    void recordUpdate(double fair_value, uint64_t timestamp) {
+        last_fair_value_ = fair_value;
+        last_update_time_ = timestamp;
+    }
+};
+
+================================================================================
+8. COMPLETE QUOTE GENERATION SYSTEM
+================================================================================
+
+class ComprehensiveQuoteGenerator {
+private:
+    // Components
+    AdaptiveSpreadCalculator spread_calc_;
+    QuoteSizeOptimizer size_optimizer_;
+    QuotePlacementStrategy placement_;
+    QuoteUpdateManager update_manager_;
+
+    // Configuration
+    double tick_size_;
+    int max_position_;
+
+public:
+    ComprehensiveQuoteGenerator(/* parameters */) {
+        // Initialize components
+    }
+
+    Quote generateOptimalQuote(
+        const MarketData& market,
+        const PositionState& position,
+        const RiskLimits& limits) {
+
+        // 1. Calculate fair value
+        double fair_value = calculateFairValue(market);
+
+        // 2. Calculate optimal spread
+        double spread = spread_calc_.calculateSpread(
+            market.volatility,
+            market.avg_volatility,
+            position.current,
+            max_position_,
+            market.order_imbalance,
+            market.competitive_spread
+        );
+
+        // 3. Calculate optimal sizes
+        auto sizes = size_optimizer_.calculateAsymmetricSizes(
+            position.current,
+            max_position_
+        );
+
+        // 4. Determine placement
+        auto placement = placement_.calculatePlacement(
+            fair_value,
+            market.best_bid,
+            market.best_ask,
+            spread,
+            position.current,
+            max_position_
+        );
+
+        // 5. Construct quote
+        Quote quote;
+        quote.bid_price = alignToTick(placement.bid_price);
+        quote.ask_price = alignToTick(placement.ask_price);
+        quote.bid_size = sizes.bid_size;
+        quote.ask_size = sizes.ask_size;
+        quote.timestamp = getCurrentTimestamp();
+
+        // 6. Validate
+        if (!validateQuote(quote, limits)) {
+            return Quote{};  // Return empty quote
+        }
+
+        return quote;
+    }
+
+private:
+    double alignToTick(double price) const {
+        return std::round(price / tick_size_) * tick_size_;
+    }
+
+    bool validateQuote(const Quote& quote,
+                      const RiskLimits& limits) const {
+        // Check spread
+        if (quote.getSpread() < tick_size_) return false;
+
+        // Check prices are valid
+        if (quote.bid_price <= 0 || quote.ask_price <= 0) return false;
+
+        // Check sizes
+        if (quote.bid_size <= 0 || quote.ask_size <= 0) return false;
+
+        // Check position limits
+        // ... additional validation
+
+        return true;
+    }
+
+    double calculateFairValue(const MarketData& market) const {
+        // Microprice with multiple levels
+        return (market.best_bid * market.ask_size +
+                market.best_ask * market.bid_size) /
+               (market.bid_size + market.ask_size);
+    }
+};
+
+================================================================================
+PERFORMANCE SUMMARY
+================================================================================
+
+Key Metrics for Quote Generation:
+- Quote Generation Latency: < 5 microseconds
+- Quote Update Rate: 100-1000 Hz
+- Fill Rate: 70-90%
+- Spread Capture: 65-80%
+- Adverse Selection Ratio: 45-55%
+
+Best Practices:
+1. Use volatility-adjusted spreads
+2. Implement position-aware sizing
+3. Update quotes on significant changes only
+4. Validate all quotes before submission
+5. Monitor fill rates and adjust parameters
+
+Next: Read 04_adverse_selection.txt for informed trader detection.
+
+================================================================================
+END OF QUOTE GENERATION
+================================================================================

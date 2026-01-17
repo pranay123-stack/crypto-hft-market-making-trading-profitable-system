@@ -1,0 +1,929 @@
+================================================================================
+DISASTER RECOVERY - NETWORK FAILOVER
+High-Frequency Trading System
+Multi-Path Redundancy | Sub-Second Failover
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Network Architecture Overview
+2. BGP-Based Failover
+3. VRRP/HSRP for Gateway Redundancy
+4. Load Balancer Redundancy
+5. DNS Failover
+6. Multi-Homed Connectivity
+7. Network Monitoring & Detection
+8. Failover Testing Procedures
+9. Network Recovery Procedures
+10. Troubleshooting Guide
+
+================================================================================
+1. NETWORK ARCHITECTURE OVERVIEW
+================================================================================
+
+1.1 MULTI-LAYER NETWORK REDUNDANCY
+-----------------------------------
+
+┌──────────────────────────────────────────────────────────────────────┐
+│                    NETWORK REDUNDANCY ARCHITECTURE                   │
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  Layer 7: Application Load Balancing                                │
+│  ┌────────────────────────────────────────────────────────────┐    │
+│  │  HAProxy Primary (Active) ◄──VRRP──► HAProxy Standby      │    │
+│  │  VIP: 10.0.1.100          │          │                      │    │
+│  └────────────────────────────────────────────────────────────┘    │
+│                              │                                       │
+│  Layer 4: Firewall Redundancy                                       │
+│  ┌────────────────────────────────────────────────────────────┐    │
+│  │  Firewall-1 (Active) ◄──stateful sync──► Firewall-2        │    │
+│  └────────────────────────────────────────────────────────────┘    │
+│                              │                                       │
+│  Layer 3: Router Redundancy (BGP)                                   │
+│  ┌────────────────────────────────────────────────────────────┐    │
+│  │  Router-1 (AS 65001)        Router-2 (AS 65001)            │    │
+│  │      │                            │                          │    │
+│  │      ▼                            ▼                          │    │
+│  │  ISP-A (Primary)            ISP-B (Backup)                  │    │
+│  │  10Gbps                      10Gbps                          │    │
+│  └────────────────────────────────────────────────────────────┘    │
+│                                                                      │
+│  Layer 2: Switch Redundancy (MLAG)                                  │
+│  ┌────────────────────────────────────────────────────────────┐    │
+│  │  Core Switch-1  ◄──MLAG/VPC──►  Core Switch-2              │    │
+│  │       │                              │                       │    │
+│  │       └──────────┬──────────────────┘                       │    │
+│  │                  │                                           │    │
+│  │          ┌───────┴───────┐                                  │    │
+│  │      Server-1         Server-2                              │    │
+│  │      (Dual NIC)       (Dual NIC)                            │    │
+│  └────────────────────────────────────────────────────────────┘    │
+│                                                                      │
+│  Layer 1: Physical Redundancy                                       │
+│  ┌────────────────────────────────────────────────────────────┐    │
+│  │  - Dual Power Supplies per device                           │    │
+│  │  - Dual fiber paths (geographically diverse)                │    │
+│  │  - Multiple ISP connections                                 │    │
+│  │  - Redundant WAN links                                      │    │
+│  └────────────────────────────────────────────────────────────┘    │
+└──────────────────────────────────────────────────────────────────────┘
+
+1.2 NETWORK SLA TARGETS
+------------------------
+
+┌────────────────────┬──────────────┬────────────┬───────────────┐
+│ Component          │ Availability │ Failover   │ Detection     │
+├────────────────────┼──────────────┼────────────┼───────────────┤
+│ Core Switches      │ 99.999%      │ <1s        │ <1s           │
+│ Edge Routers       │ 99.999%      │ <30s       │ <10s          │
+│ Firewalls          │ 99.99%       │ <5s        │ <5s           │
+│ Load Balancers     │ 99.995%      │ <1s        │ <2s           │
+│ WAN Links          │ 99.95%       │ <30s       │ <10s          │
+│ Internet Uplinks   │ 99.9%        │ <60s       │ <30s          │
+└────────────────────┴──────────────┴────────────┴───────────────┘
+
+================================================================================
+2. BGP-BASED FAILOVER
+================================================================================
+
+2.1 BGP CONFIGURATION
+---------------------
+
+Multi-Homed BGP Setup:
+
+Primary Router (Router-1):
+```
+router bgp 65001
+ bgp router-id 10.0.1.1
+ bgp log-neighbor-changes
+ 
+ ! Neighbor configurations
+ neighbor 203.0.113.1 remote-as 65100  ! ISP-A
+ neighbor 203.0.113.2 remote-as 65200  ! ISP-B
+ neighbor 10.0.1.2 remote-as 65001     ! iBGP to Router-2
+ 
+ ! Address family configuration
+ address-family ipv4
+  network 10.0.1.0 mask 255.255.255.0
+  network 10.0.2.0 mask 255.255.255.0
+  
+  ! Prefer ISP-A (Primary)
+  neighbor 203.0.113.1 route-map PREFER-ISP-A in
+  neighbor 203.0.113.1 route-map SET-LOCAL-PREF out
+  
+  ! ISP-B as backup
+  neighbor 203.0.113.2 route-map BACKUP-ISP-B in
+  
+  ! iBGP
+  neighbor 10.0.1.2 next-hop-self
+  neighbor 10.0.1.2 send-community both
+ exit-address-family
+!
+! Route maps for traffic engineering
+route-map PREFER-ISP-A permit 10
+ set local-preference 200
+!
+route-map BACKUP-ISP-B permit 10
+ set local-preference 100
+!
+route-map SET-LOCAL-PREF permit 10
+ set local-preference 150
+```
+
+Backup Router (Router-2):
+```
+router bgp 65001
+ bgp router-id 10.0.1.2
+ bgp log-neighbor-changes
+ 
+ neighbor 203.0.113.3 remote-as 65100  ! ISP-A (secondary)
+ neighbor 203.0.113.4 remote-as 65200  ! ISP-B (secondary)
+ neighbor 10.0.1.1 remote-as 65001     ! iBGP to Router-1
+ 
+ address-family ipv4
+  network 10.0.1.0 mask 255.255.255.0
+  network 10.0.2.0 mask 255.255.255.0
+  
+  neighbor 203.0.113.3 route-map BACKUP-PATH in
+  neighbor 203.0.113.4 route-map BACKUP-PATH in
+  
+  neighbor 10.0.1.1 next-hop-self
+ exit-address-family
+!
+route-map BACKUP-PATH permit 10
+ set local-preference 50  ! Lower preference than Router-1
+```
+
+2.2 BGP MONITORING
+------------------
+
+BGP Monitoring Script: /opt/hft/scripts/monitor_bgp.sh
+
+```bash
+#!/bin/bash
+# Monitor BGP Sessions and Route Availability
+
+LOG_FILE="/var/log/hft/bgp_monitor.log"
+
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a $LOG_FILE
+}
+
+check_bgp_sessions() {
+    log "=== BGP Session Check ==="
+    
+    # Check BGP neighbors
+    vtysh -c "show ip bgp summary" | tee -a $LOG_FILE
+    
+    # Count established sessions
+    ESTABLISHED=$(vtysh -c "show ip bgp summary" | grep -c "Established")
+    EXPECTED=4  # 2 ISPs x 2 routers
+    
+    if [ $ESTABLISHED -lt $EXPECTED ]; then
+        log "WARNING: Only $ESTABLISHED/$EXPECTED BGP sessions established"
+        /opt/hft/scripts/send_alert.sh "WARNING" "BGP session count low: $ESTABLISHED/$EXPECTED"
+        return 1
+    fi
+    
+    log "BGP sessions healthy: $ESTABLISHED/$EXPECTED"
+    return 0
+}
+
+check_route_availability() {
+    log "=== Route Availability Check ==="
+    
+    # Check if we're receiving default route
+    DEFAULT_ROUTES=$(vtysh -c "show ip bgp 0.0.0.0/0" | grep -c "^*>")
+    
+    if [ $DEFAULT_ROUTES -eq 0 ]; then
+        log "CRITICAL: No default route available!"
+        /opt/hft/scripts/send_alert.sh "CRITICAL" "No default route in BGP table"
+        return 1
+    fi
+    
+    log "Default route available: $DEFAULT_ROUTES path(s)"
+    
+    # Check specific important routes
+    IMPORTANT_PREFIXES=(
+        "198.51.100.0/24"  # Exchange network
+        "203.0.113.0/24"   # Partner network
+    )
+    
+    for prefix in "${IMPORTANT_PREFIXES[@]}"; do
+        if vtysh -c "show ip bgp $prefix" | grep -q "^*>"; then
+            log "Route $prefix: Available"
+        else
+            log "WARNING: Route $prefix not available"
+            /opt/hft/scripts/send_alert.sh "WARNING" "BGP route missing: $prefix"
+        fi
+    done
+    
+    return 0
+}
+
+check_bgp_flapping() {
+    log "=== BGP Flapping Detection ==="
+    
+    # Check for recent BGP flaps (state changes)
+    FLAP_COUNT=$(grep "BGP.*state changed" /var/log/frr/frr.log | \
+        grep "$(date +%Y-%m-%d)" | wc -l)
+    
+    if [ $FLAP_COUNT -gt 10 ]; then
+        log "WARNING: High BGP flap count today: $FLAP_COUNT"
+        /opt/hft/scripts/send_alert.sh "WARNING" "BGP flapping detected: $FLAP_COUNT flaps"
+        return 1
+    fi
+    
+    log "BGP stability: $FLAP_COUNT flaps today"
+    return 0
+}
+
+# Main execution
+main() {
+    check_bgp_sessions
+    check_route_availability
+    check_bgp_flapping
+}
+
+# Run continuously
+while true; do
+    main
+    sleep 60  # Check every minute
+done
+```
+
+2.3 BGP FAILOVER TESTING
+-------------------------
+
+BGP Failover Test Script: /opt/hft/scripts/test_bgp_failover.sh
+
+```bash
+#!/bin/bash
+# Test BGP Failover
+
+echo "=== BGP FAILOVER TEST ==="
+
+# 1. Record current state
+echo "[1/5] Recording current BGP state..."
+vtysh -c "show ip bgp summary" > /tmp/bgp_before.txt
+ACTIVE_PATH=$(vtysh -c "show ip bgp 0.0.0.0/0" | grep "^*>" | awk '{print $3}')
+echo "Current active path: $ACTIVE_PATH"
+
+# 2. Shutdown primary ISP session
+read -p "Shutdown primary ISP BGP session? (yes/no) " CONFIRM
+if [[ $CONFIRM != "yes" ]]; then
+    echo "Test cancelled"
+    exit 0
+fi
+
+START_TIME=$(date +%s)
+
+echo "[2/5] Shutting down primary BGP session..."
+vtysh -c "configure terminal" -c "router bgp 65001" -c "neighbor 203.0.113.1 shutdown"
+
+# 3. Monitor convergence
+echo "[3/5] Monitoring BGP convergence..."
+sleep 5
+
+CONVERGED=false
+for i in {1..30}; do
+    NEW_PATH=$(vtysh -c "show ip bgp 0.0.0.0/0" | grep "^*>" | awk '{print $3}')
+    
+    if [ "$NEW_PATH" != "$ACTIVE_PATH" ] && [ -n "$NEW_PATH" ]; then
+        echo "Converged to new path: $NEW_PATH"
+        CONVERGED=true
+        break
+    fi
+    
+    echo "Waiting for convergence... ($i/30)"
+    sleep 1
+done
+
+END_TIME=$(date +%s)
+FAILOVER_TIME=$((END_TIME - START_TIME))
+
+if [ "$CONVERGED" = false ]; then
+    echo "ERROR: BGP did not converge within 30 seconds!"
+    exit 1
+fi
+
+echo "BGP failover completed in ${FAILOVER_TIME} seconds"
+
+# 4. Validate connectivity
+echo "[4/5] Validating connectivity..."
+if ping -c 5 8.8.8.8 > /dev/null 2>&1; then
+    echo "✓ Internet connectivity verified"
+else
+    echo "✗ Internet connectivity FAILED"
+fi
+
+# 5. Restore primary session
+echo "[5/5] Restoring primary BGP session..."
+vtysh -c "configure terminal" -c "router bgp 65001" -c "no neighbor 203.0.113.1 shutdown"
+
+sleep 10
+
+echo "=== TEST COMPLETE ==="
+echo "Failover Time: ${FAILOVER_TIME} seconds"
+echo "Target: <30 seconds"
+
+if [ $FAILOVER_TIME -le 30 ]; then
+    echo "Status: PASSED"
+else
+    echo "Status: FAILED (exceeded target)"
+fi
+```
+
+================================================================================
+3. VRRP FOR GATEWAY REDUNDANCY
+================================================================================
+
+3.1 VRRP CONFIGURATION
+----------------------
+
+Keepalived Configuration - Master:
+
+/etc/keepalived/keepalived.conf (Router-1):
+```
+global_defs {
+    router_id HFT_RTR1
+    enable_script_security
+    script_user root
+}
+
+vrrp_script check_network {
+    script "/opt/hft/scripts/check_network_health.sh"
+    interval 2
+    timeout 3
+    rise 2
+    fall 3
+    weight -20
+}
+
+vrrp_instance VI_GATEWAY {
+    state MASTER
+    interface eth0
+    virtual_router_id 51
+    priority 100
+    advert_int 1
+    
+    authentication {
+        auth_type PASS
+        auth_pass SecureVRRPKey2025
+    }
+    
+    virtual_ipaddress {
+        10.0.1.1/24 dev eth0 label eth0:1
+    }
+    
+    track_script {
+        check_network
+    }
+    
+    notify_master "/opt/hft/scripts/vrrp_become_master.sh GATEWAY"
+    notify_backup "/opt/hft/scripts/vrrp_become_backup.sh GATEWAY"
+    notify_fault "/opt/hft/scripts/vrrp_fault.sh GATEWAY"
+}
+
+# Additional VRRP instance for trading subnet
+vrrp_instance VI_TRADING {
+    state MASTER
+    interface eth1
+    virtual_router_id 52
+    priority 100
+    advert_int 1
+    
+    authentication {
+        auth_type PASS
+        auth_pass TradingVRRPKey2025
+    }
+    
+    virtual_ipaddress {
+        192.168.100.1/24 dev eth1 label eth1:1
+    }
+    
+    track_script {
+        check_network
+    }
+}
+```
+
+Keepalived Configuration - Backup:
+
+/etc/keepalived/keepalived.conf (Router-2):
+```
+global_defs {
+    router_id HFT_RTR2
+}
+
+vrrp_script check_network {
+    script "/opt/hft/scripts/check_network_health.sh"
+    interval 2
+    timeout 3
+    rise 2
+    fall 3
+    weight -20
+}
+
+vrrp_instance VI_GATEWAY {
+    state BACKUP
+    interface eth0
+    virtual_router_id 51
+    priority 90  # Lower than master
+    advert_int 1
+    
+    authentication {
+        auth_type PASS
+        auth_pass SecureVRRPKey2025
+    }
+    
+    virtual_ipaddress {
+        10.0.1.1/24 dev eth0 label eth0:1
+    }
+    
+    track_script {
+        check_network
+    }
+    
+    notify_master "/opt/hft/scripts/vrrp_become_master.sh GATEWAY"
+    notify_backup "/opt/hft/scripts/vrrp_become_backup.sh GATEWAY"
+    notify_fault "/opt/hft/scripts/vrrp_fault.sh GATEWAY"
+}
+```
+
+3.2 VRRP HEALTH CHECK
+---------------------
+
+Script: /opt/hft/scripts/check_network_health.sh
+
+```bash
+#!/bin/bash
+# Network Health Check for VRRP
+
+# Check 1: Can we ping upstream gateway?
+if ! ping -c 1 -W 1 10.0.0.1 > /dev/null 2>&1; then
+    echo "Upstream gateway unreachable"
+    exit 1
+fi
+
+# Check 2: Can we reach the internet?
+if ! ping -c 1 -W 2 8.8.8.8 > /dev/null 2>&1; then
+    echo "Internet unreachable"
+    exit 1
+fi
+
+# Check 3: Are our BGP sessions up?
+BGP_UP=$(vtysh -c "show ip bgp summary" 2>/dev/null | grep -c "Established")
+if [ $BGP_UP -lt 2 ]; then
+    echo "Insufficient BGP sessions: $BGP_UP"
+    exit 1
+fi
+
+# Check 4: Check local interface status
+INTERFACE="eth0"
+if ! ip link show $INTERFACE | grep -q "state UP"; then
+    echo "Interface $INTERFACE is down"
+    exit 1
+fi
+
+# All checks passed
+exit 0
+```
+
+================================================================================
+4. LOAD BALANCER REDUNDANCY
+================================================================================
+
+4.1 HAPROXY HIGH AVAILABILITY
+------------------------------
+
+HAProxy Master Configuration: /etc/haproxy/haproxy.cfg
+
+```
+global
+    log 127.0.0.1 local2
+    maxconn 100000
+    user haproxy
+    group haproxy
+    daemon
+    
+    # Enable stats socket for runtime API
+    stats socket /var/run/haproxy.sock mode 600 level admin
+    stats timeout 30s
+
+defaults
+    log     global
+    mode    tcp
+    option  tcplog
+    option  dontlognull
+    timeout connect 5s
+    timeout client  30s
+    timeout server  30s
+    retries 3
+    
+frontend trading_frontend
+    bind *:5555
+    default_backend trading_servers
+    
+    # Enable connection tracking
+    stick-table type ip size 100k expire 30m
+    stick on src
+
+backend trading_servers
+    balance leastconn
+    option tcp-check
+    
+    # Health check
+    tcp-check connect
+    tcp-check send "PING\r\n"
+    tcp-check expect string "PONG"
+    
+    server trade1 10.0.2.10:5555 check inter 2s rise 2 fall 3
+    server trade2 10.0.2.11:5555 check inter 2s rise 2 fall 3
+    server trade3 10.0.2.12:5555 check inter 2s rise 2 fall 3
+    server trade4 10.0.2.13:5555 check inter 2s rise 2 fall 3 backup
+
+listen stats
+    bind *:8404
+    stats enable
+    stats uri /stats
+    stats refresh 30s
+    stats admin if TRUE
+```
+
+HAProxy Failover with Keepalived:
+
+/etc/keepalived/keepalived.conf:
+```
+vrrp_script check_haproxy {
+    script "killall -0 haproxy"
+    interval 2
+    weight 20
+}
+
+vrrp_instance VI_HAPROXY {
+    state MASTER
+    interface eth0
+    virtual_router_id 53
+    priority 101
+    advert_int 1
+    
+    virtual_ipaddress {
+        10.0.1.100/24
+    }
+    
+    track_script {
+        check_haproxy
+    }
+}
+```
+
+4.2 LOAD BALANCER FAILOVER TEST
+---------------------------------
+
+Script: /opt/hft/scripts/test_lb_failover.sh
+
+```bash
+#!/bin/bash
+# Test Load Balancer Failover
+
+echo "=== LOAD BALANCER FAILOVER TEST ==="
+
+# 1. Verify current master
+echo "[1/4] Identifying current LB master..."
+MASTER=$(ip addr show | grep "10.0.1.100" | wc -l)
+
+if [ $MASTER -eq 1 ]; then
+    echo "This node is MASTER"
+    CURRENT_ROLE="MASTER"
+else
+    echo "This node is BACKUP"
+    CURRENT_ROLE="BACKUP"
+fi
+
+# 2. Start monitoring from client
+echo "[2/4] Starting connection monitoring..."
+(
+    while true; do
+        curl -s http://10.0.1.100:8404/stats > /dev/null
+        if [ $? -eq 0 ]; then
+            echo "$(date +%H:%M:%S) - LB Accessible"
+        else
+            echo "$(date +%H:%M:%S) - LB UNREACHABLE"
+        fi
+        sleep 1
+    done
+) &
+MONITOR_PID=$!
+
+sleep 3
+
+# 3. Simulate failover
+if [ "$CURRENT_ROLE" == "MASTER" ]; then
+    echo "[3/4] Simulating master failure..."
+    START=$(date +%s)
+    
+    systemctl stop haproxy
+    sleep 5
+    
+    # Check if backup took over
+    VIP_ACTIVE=$(ssh backup-lb "ip addr show | grep '10.0.1.100' | wc -l")
+    
+    END=$(date +%s)
+    FAILOVER_TIME=$((END - START))
+    
+    if [ $VIP_ACTIVE -eq 1 ]; then
+        echo "✓ Backup took over VIP in ${FAILOVER_TIME}s"
+    else
+        echo "✗ Backup did NOT take over VIP"
+    fi
+    
+    # Restore
+    systemctl start haproxy
+    
+else
+    echo "Cannot simulate failover from BACKUP node"
+fi
+
+# 4. Stop monitoring
+kill $MONITOR_PID 2>/dev/null
+
+echo "[4/4] Test complete"
+```
+
+================================================================================
+5. DNS FAILOVER
+================================================================================
+
+5.1 DNS-BASED FAILOVER CONFIGURATION
+--------------------------------------
+
+BIND9 Configuration with Health Checks:
+
+/etc/bind/named.conf:
+```
+zone "trading.hft.local" {
+    type master;
+    file "/etc/bind/zones/db.trading.hft.local";
+    allow-update { none; };
+    also-notify { 10.0.1.2; };  # Secondary DNS
+};
+```
+
+Zone File with Multiple A Records:
+
+/etc/bind/zones/db.trading.hft.local:
+```
+$TTL 30  ; Low TTL for fast failover
+@       IN      SOA     ns1.hft.local. admin.hft.local. (
+                        2025011501  ; Serial
+                        3600        ; Refresh
+                        1800        ; Retry
+                        604800      ; Expire
+                        30 )        ; Minimum TTL
+
+; Name servers
+        IN      NS      ns1.hft.local.
+        IN      NS      ns2.hft.local.
+
+; A Records with failover
+trading IN      A       10.0.1.10    ; Primary
+        IN      A       10.0.1.11    ; Secondary (returned if primary down)
+
+; Round-robin for load distribution
+api     IN      A       10.0.1.20
+        IN      A       10.0.1.21
+        IN      A       10.0.1.22
+
+; Specific services
+db-primary      IN      A       10.0.1.40
+db-standby      IN      A       10.0.1.41
+```
+
+5.2 DNS HEALTH MONITORING
+---------------------------
+
+Script: /opt/hft/scripts/dns_health_monitor.sh
+
+```bash
+#!/bin/bash
+# DNS Health Monitoring and Dynamic Updates
+
+ZONE_FILE="/etc/bind/zones/db.trading.hft.local"
+HOSTS=("trading" "api" "db-primary")
+
+check_host_health() {
+    HOST=$1
+    IP=$2
+    
+    # Check if host is responding
+    if ping -c 3 -W 2 $IP > /dev/null 2>&1; then
+        # Check application health
+        if curl -sf --max-time 2 http://$IP:8080/health > /dev/null 2>&1; then
+            return 0  # Healthy
+        fi
+    fi
+    
+    return 1  # Unhealthy
+}
+
+update_dns_record() {
+    HOSTNAME=$1
+    OLD_IP=$2
+    NEW_IP=$3
+    
+    echo "Updating DNS: $HOSTNAME from $OLD_IP to $NEW_IP"
+    
+    # Update zone file
+    sed -i "s/$OLD_IP/$NEW_IP/" $ZONE_FILE
+    
+    # Increment serial
+    SERIAL=$(grep "Serial" $ZONE_FILE | awk '{print $1}')
+    NEW_SERIAL=$((SERIAL + 1))
+    sed -i "s/$SERIAL/$NEW_SERIAL/" $ZONE_FILE
+    
+    # Reload BIND
+    rndc reload trading.hft.local
+    
+    # Send alert
+    /opt/hft/scripts/send_alert.sh "WARNING" \
+        "DNS updated: $HOSTNAME now points to $NEW_IP (was $OLD_IP)"
+}
+
+# Main monitoring loop
+while true; do
+    for host in "${HOSTS[@]}"; do
+        PRIMARY_IP=$(dig +short $host.hft.local @localhost | head -1)
+        
+        if [ -z "$PRIMARY_IP" ]; then
+            echo "WARNING: No IP for $host"
+            continue
+        fi
+        
+        if ! check_host_health $host $PRIMARY_IP; then
+            echo "ALERT: $host ($PRIMARY_IP) is unhealthy"
+            
+            # Get secondary IP
+            SECONDARY_IP=$(dig +short $host.hft.local @localhost | tail -1)
+            
+            if [ "$PRIMARY_IP" != "$SECONDARY_IP" ]; then
+                # Promote secondary
+                update_dns_record $host $PRIMARY_IP $SECONDARY_IP
+            else
+                echo "ERROR: No healthy secondary for $host"
+                /opt/hft/scripts/send_alert.sh "CRITICAL" \
+                    "No healthy instances for $host"
+            fi
+        fi
+    done
+    
+    sleep 30  # Check every 30 seconds
+done
+```
+
+================================================================================
+6. NETWORK RECOVERY PROCEDURES
+================================================================================
+
+6.1 NETWORK OUTAGE RECOVERY RUNBOOK
+-------------------------------------
+
+Procedure: NET-RECOVERY-001
+
+Step 1: Identify Scope (2 minutes)
+```bash
+# Check all network interfaces
+ip link show
+
+# Check routing table
+ip route show
+
+# Check BGP status
+vtysh -c "show ip bgp summary"
+
+# Check VRRP status
+ip addr show | grep "inet.*scope global"
+
+# Test connectivity
+ping -c 5 8.8.8.8
+ping -c 5 10.0.1.1
+```
+
+Step 2: Isolate Problem (3 minutes)
+```bash
+# Check physical layer
+ethtool eth0
+
+# Check for errors
+ip -s link show eth0
+
+# Check switch connectivity
+for switch in switch1 switch2; do
+    ping -c 3 $switch
+done
+
+# Check firewall rules
+iptables -L -n -v
+```
+
+Step 3: Implement Fix (5 minutes)
+```bash
+# Common fixes:
+
+# Restart network interface
+ifdown eth0 && ifup eth0
+
+# Restart BGP
+systemctl restart frr
+
+# Restart VRRP
+systemctl restart keepalived
+
+# Clear ARP cache
+ip neigh flush all
+
+# Reset switch port (if accessible)
+ssh switch1 "interface eth1/1; shutdown; no shutdown"
+```
+
+Step 4: Validate Recovery (3 minutes)
+```bash
+# Run validation script
+/opt/hft/scripts/validate_network_recovery.sh
+```
+
+6.2 NETWORK VALIDATION SCRIPT
+-------------------------------
+
+Script: /opt/hft/scripts/validate_network_recovery.sh
+
+```bash
+#!/bin/bash
+# Validate Network Recovery
+
+echo "=== NETWORK RECOVERY VALIDATION ==="
+
+TESTS_PASSED=0
+TESTS_FAILED=0
+
+validate_test() {
+    TEST_NAME=$1
+    shift
+    TEST_COMMAND="$@"
+    
+    echo -n "Testing $TEST_NAME... "
+    
+    if eval $TEST_COMMAND > /dev/null 2>&1; then
+        echo "PASSED"
+        ((TESTS_PASSED++))
+    else
+        echo "FAILED"
+        ((TESTS_FAILED++))
+    fi
+}
+
+# Interface Tests
+validate_test "eth0 up" "ip link show eth0 | grep -q 'state UP'"
+validate_test "eth1 up" "ip link show eth1 | grep -q 'state UP'"
+
+# Routing Tests
+validate_test "Default route" "ip route show | grep -q 'default via'"
+validate_test "Local routes" "ip route show | grep -q '10.0.1.0/24'"
+
+# BGP Tests
+validate_test "BGP sessions" "vtysh -c 'show ip bgp summary' | grep -q 'Established'"
+validate_test "BGP routes" "vtysh -c 'show ip bgp' | grep -q '^*>'"
+
+# VRRP Tests
+validate_test "VRRP VIP" "ip addr show | grep -q '10.0.1.1'"
+
+# Connectivity Tests
+validate_test "Ping gateway" "ping -c 3 -W 2 10.0.0.1"
+validate_test "Ping DNS" "ping -c 3 -W 2 8.8.8.8"
+validate_test "Ping exchange" "ping -c 3 -W 2 198.51.100.1"
+
+# DNS Tests
+validate_test "DNS resolution" "dig +short trading.hft.local | grep -q '[0-9]'"
+
+# Application Tests
+validate_test "Trading engine" "curl -sf --max-time 2 http://localhost:8080/health"
+validate_test "Load balancer" "curl -sf --max-time 2 http://10.0.1.100:8404/stats"
+
+# Summary
+echo ""
+echo "=== VALIDATION SUMMARY ==="
+echo "Tests Passed: $TESTS_PASSED"
+echo "Tests Failed: $TESTS_FAILED"
+
+if [ $TESTS_FAILED -eq 0 ]; then
+    echo "Status: ALL TESTS PASSED"
+    exit 0
+else
+    echo "Status: SOME TESTS FAILED"
+    exit 1
+fi
+```
+
+================================================================================
+END OF DOCUMENT
+================================================================================

@@ -1,0 +1,904 @@
+================================================================================
+DOCKER CONTAINERIZATION FOR HFT SYSTEMS
+================================================================================
+Complete Docker configuration for high-frequency trading systems with
+multi-stage builds, optimization, and production-ready setups.
+
+Last Updated: 2025-11-25
+================================================================================
+
+TABLE OF CONTENTS
+================================================================================
+1. Production Dockerfile (Multi-Stage)
+2. Development Dockerfile
+3. Docker Compose Configuration
+4. Build Optimization Techniques
+5. Runtime Configuration
+6. Security Hardening
+7. Image Size Optimization
+8. Health Checks and Monitoring
+9. Network and Resource Management
+
+================================================================================
+1. PRODUCTION DOCKERFILE (MULTI-STAGE BUILD)
+================================================================================
+
+# docker/Dockerfile.production
+# Multi-stage build for HFT trading engine with optimal image size
+ARG BASE_IMAGE=ubuntu:22.04
+ARG BUILD_TYPE=Release
+
+# ============================================================================
+# Stage 1: Build Environment Setup
+# ============================================================================
+FROM ${BASE_IMAGE} as builder-base
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV CMAKE_VERSION=3.27.0
+ENV CONAN_VERSION=2.0.13
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    g++-13 \
+    gcc-13 \
+    cmake \
+    ninja-build \
+    git \
+    wget \
+    curl \
+    ca-certificates \
+    python3 \
+    python3-pip \
+    pkg-config \
+    ccache \
+    && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 100 \
+    && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-13 100 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install CMake
+RUN wget -qO- "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz" | \
+    tar --strip-components=1 -xz -C /usr/local
+
+# Install Conan
+RUN pip3 install --no-cache-dir conan==${CONAN_VERSION}
+
+# Setup Conan profile
+RUN conan profile detect --force && \
+    conan profile show default
+
+# ============================================================================
+# Stage 2: Dependency Building
+# ============================================================================
+FROM builder-base as dependencies
+
+WORKDIR /build
+
+# Copy dependency files
+COPY conanfile.py conanfile.txt CMakeLists.txt ./
+COPY cmake/ ./cmake/
+
+# Install and build dependencies
+ARG BUILD_TYPE
+RUN conan install . \
+    --build=missing \
+    --settings build_type=${BUILD_TYPE} \
+    --settings compiler.cppstd=20 \
+    --settings compiler.libcxx=libstdc++11 \
+    --output-folder=/build/conan
+
+# ============================================================================
+# Stage 3: Application Building
+# ============================================================================
+FROM dependencies as builder
+
+WORKDIR /build
+
+# Copy source code
+COPY src/ ./src/
+COPY include/ ./include/
+COPY tests/ ./tests/
+COPY benchmarks/ ./benchmarks/
+
+# Configure and build
+ARG BUILD_TYPE
+RUN cmake -B build -G Ninja \
+    -DCMAKE_BUILD_TYPE=${BUILD_TYPE} \
+    -DCMAKE_TOOLCHAIN_FILE=/build/conan/conan_toolchain.cmake \
+    -DCMAKE_CXX_COMPILER=g++-13 \
+    -DCMAKE_C_COMPILER=gcc-13 \
+    -DCMAKE_CXX_FLAGS="-O3 -march=native -mtune=native -flto" \
+    -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
+    -DENABLE_TESTING=OFF \
+    -DENABLE_BENCHMARKS=OFF \
+    && cmake --build build --config ${BUILD_TYPE} -j $(nproc)
+
+# Strip binaries for smaller size
+RUN find build/bin -type f -executable -exec strip --strip-unneeded {} \;
+
+# ============================================================================
+# Stage 4: Runtime Image
+# ============================================================================
+FROM ${BASE_IMAGE} as runtime
+
+LABEL maintainer="devops@hft-trading.example.com"
+LABEL description="HFT Trading Engine - Production Runtime"
+LABEL version="1.0.0"
+
+# Install only runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libstdc++6 \
+    libgomp1 \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN groupadd -r hftuser && \
+    useradd -r -g hftuser -u 1000 -s /bin/bash -m hftuser
+
+# Create application directories
+RUN mkdir -p /app/bin /app/config /app/logs /app/data && \
+    chown -R hftuser:hftuser /app
+
+WORKDIR /app
+
+# Copy built binaries from builder stage
+COPY --from=builder --chown=hftuser:hftuser /build/build/bin/* ./bin/
+
+# Copy runtime libraries
+COPY --from=builder --chown=hftuser:hftuser /build/conan/lib/*.so* /usr/local/lib/
+
+# Update library cache
+RUN ldconfig
+
+# Copy configuration files
+COPY --chown=hftuser:hftuser config/ ./config/
+COPY --chown=hftuser:hftuser scripts/docker-entrypoint.sh ./
+
+# Make entrypoint executable
+RUN chmod +x docker-entrypoint.sh
+
+# Switch to non-root user
+USER hftuser
+
+# Expose ports
+EXPOSE 8080 8443 9090
+
+# Health check
+HEALTHCHECK --interval=10s --timeout=3s --start-period=30s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
+
+# Set environment variables
+ENV PATH="/app/bin:${PATH}" \
+    LD_LIBRARY_PATH="/usr/local/lib:${LD_LIBRARY_PATH}" \
+    HFT_CONFIG_PATH="/app/config" \
+    HFT_LOG_PATH="/app/logs" \
+    HFT_DATA_PATH="/app/data"
+
+# Volumes for persistent data
+VOLUME ["/app/logs", "/app/data"]
+
+ENTRYPOINT ["./docker-entrypoint.sh"]
+CMD ["trading-engine", "--config", "/app/config/production.yaml"]
+
+# ============================================================================
+# Stage 5: Debug Image (Optional)
+# ============================================================================
+FROM runtime as debug
+
+USER root
+
+# Install debugging tools
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gdb \
+    valgrind \
+    strace \
+    ltrace \
+    perf-tools-unstable \
+    && rm -rf /var/lib/apt/lists/*
+
+USER hftuser
+
+CMD ["gdb", "./bin/trading-engine"]
+
+================================================================================
+2. DEVELOPMENT DOCKERFILE
+================================================================================
+
+# docker/Dockerfile.development
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install development tools
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    g++-13 \
+    gcc-13 \
+    cmake \
+    ninja-build \
+    git \
+    gdb \
+    valgrind \
+    clang-15 \
+    clang-tidy-15 \
+    clang-format-15 \
+    cppcheck \
+    ccache \
+    python3 \
+    python3-pip \
+    vim \
+    htop \
+    curl \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Conan and other Python tools
+RUN pip3 install --no-cache-dir \
+    conan==2.0.13 \
+    cmake-format \
+    cpplint \
+    lizard
+
+# Setup compiler alternatives
+RUN update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 100 && \
+    update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-13 100 && \
+    update-alternatives --install /usr/bin/clang clang /usr/bin/clang-15 100 && \
+    update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-15 100
+
+# Create development user
+RUN useradd -m -s /bin/bash developer && \
+    echo "developer ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+
+USER developer
+WORKDIR /workspace
+
+# Configure Git
+RUN git config --global user.name "Developer" && \
+    git config --global user.email "dev@hft-trading.example.com" && \
+    git config --global core.editor vim
+
+# Setup Conan profile
+RUN conan profile detect --force
+
+# Install development Conan packages
+RUN conan install --requires=gtest/1.14.0 --build=missing && \
+    conan install --requires=benchmark/1.8.3 --build=missing && \
+    conan install --requires=catch2/3.5.0 --build=missing
+
+CMD ["/bin/bash"]
+
+================================================================================
+3. DOCKER COMPOSE CONFIGURATION
+================================================================================
+
+# docker-compose.yml
+version: '3.8'
+
+services:
+  # HFT Trading Engine
+  trading-engine:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.production
+      args:
+        BUILD_TYPE: Release
+    image: hft-trading-engine:latest
+    container_name: hft-trading-engine
+    hostname: trading-engine
+    restart: unless-stopped
+    networks:
+      - hft-network
+    ports:
+      - "8080:8080"   # REST API
+      - "8443:8443"   # Secure WebSocket
+      - "9090:9090"   # Metrics
+    volumes:
+      - ./config:/app/config:ro
+      - trading-logs:/app/logs
+      - trading-data:/app/data
+    environment:
+      - HFT_ENV=production
+      - HFT_LOG_LEVEL=info
+      - HFT_THREAD_COUNT=8
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 8G
+        reservations:
+          cpus: '2'
+          memory: 4G
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  # Redis for caching and pub/sub
+  redis:
+    image: redis:7-alpine
+    container_name: hft-redis
+    restart: unless-stopped
+    networks:
+      - hft-network
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes --maxmemory 2gb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  # PostgreSQL for persistent storage
+  postgres:
+    image: postgres:15-alpine
+    container_name: hft-postgres
+    restart: unless-stopped
+    networks:
+      - hft-network
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_DB=hft_trading
+      - POSTGRES_USER=hftuser
+      - POSTGRES_PASSWORD_FILE=/run/secrets/db_password
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    secrets:
+      - db_password
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hftuser"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Prometheus for metrics
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: hft-prometheus
+    restart: unless-stopped
+    networks:
+      - hft-network
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+
+  # Grafana for visualization
+  grafana:
+    image: grafana/grafana:latest
+    container_name: hft-grafana
+    restart: unless-stopped
+    networks:
+      - hft-network
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD_FILE=/run/secrets/grafana_password
+      - GF_INSTALL_PLUGINS=redis-datasource
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    secrets:
+      - grafana_password
+    depends_on:
+      - prometheus
+
+  # Nginx reverse proxy
+  nginx:
+    image: nginx:alpine
+    container_name: hft-nginx
+    restart: unless-stopped
+    networks:
+      - hft-network
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - nginx-logs:/var/log/nginx
+    depends_on:
+      - trading-engine
+
+networks:
+  hft-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+volumes:
+  trading-logs:
+  trading-data:
+  redis-data:
+  postgres-data:
+  prometheus-data:
+  grafana-data:
+  nginx-logs:
+
+secrets:
+  db_password:
+    file: ./secrets/db_password.txt
+  grafana_password:
+    file: ./secrets/grafana_password.txt
+
+# docker-compose.override.yml (for development)
+version: '3.8'
+
+services:
+  trading-engine:
+    build:
+      dockerfile: docker/Dockerfile.development
+      args:
+        BUILD_TYPE: Debug
+    volumes:
+      - .:/workspace
+      - build-cache:/workspace/build
+    command: /bin/bash
+    stdin_open: true
+    tty: true
+    cap_add:
+      - SYS_PTRACE  # For debugging
+    security_opt:
+      - seccomp:unconfined
+
+volumes:
+  build-cache:
+
+================================================================================
+4. BUILD OPTIMIZATION TECHNIQUES
+================================================================================
+
+# .dockerignore
+# Exclude unnecessary files from build context
+.git
+.github
+.vscode
+.idea
+*.md
+docs/
+tests/
+benchmarks/
+build/
+*.o
+*.so
+*.a
+.cache/
+.conan/
+*.log
+.env
+docker-compose.override.yml
+
+# Docker Build Script with Advanced Caching
+# scripts/docker-build.sh
+#!/bin/bash
+
+set -e
+
+IMAGE_NAME="hft-trading-engine"
+REGISTRY="registry.example.com"
+VERSION=$(git describe --tags --always --dirty)
+BUILD_TYPE="${BUILD_TYPE:-Release}"
+
+# Enable BuildKit for advanced caching
+export DOCKER_BUILDKIT=1
+
+# Build with cache from registry
+docker build \
+    --file docker/Dockerfile.production \
+    --build-arg BUILD_TYPE=${BUILD_TYPE} \
+    --build-arg BUILDKIT_INLINE_CACHE=1 \
+    --cache-from ${REGISTRY}/${IMAGE_NAME}:cache \
+    --tag ${REGISTRY}/${IMAGE_NAME}:${VERSION} \
+    --tag ${REGISTRY}/${IMAGE_NAME}:latest \
+    .
+
+# Push to registry
+docker push ${REGISTRY}/${IMAGE_NAME}:${VERSION}
+docker push ${REGISTRY}/${IMAGE_NAME}:latest
+
+# Tag as cache
+docker tag ${REGISTRY}/${IMAGE_NAME}:${VERSION} ${REGISTRY}/${IMAGE_NAME}:cache
+docker push ${REGISTRY}/${IMAGE_NAME}:cache
+
+echo "Build completed: ${REGISTRY}/${IMAGE_NAME}:${VERSION}"
+
+# Multi-Platform Build Script
+# scripts/docker-build-multiplatform.sh
+#!/bin/bash
+
+set -e
+
+docker buildx create --name hft-builder --use || true
+docker buildx inspect hft-builder --bootstrap
+
+docker buildx build \
+    --platform linux/amd64,linux/arm64 \
+    --file docker/Dockerfile.production \
+    --tag registry.example.com/hft-trading-engine:multi \
+    --push \
+    .
+
+================================================================================
+5. RUNTIME CONFIGURATION
+================================================================================
+
+# scripts/docker-entrypoint.sh
+#!/bin/bash
+set -e
+
+# Environment validation
+if [ -z "$HFT_ENV" ]; then
+    echo "ERROR: HFT_ENV not set"
+    exit 1
+fi
+
+# CPU affinity for low latency
+if [ -n "$CPU_AFFINITY" ]; then
+    echo "Setting CPU affinity to: $CPU_AFFINITY"
+    taskset -c $CPU_AFFINITY "$@"
+else
+    exec "$@"
+fi
+
+# Huge pages configuration (if available)
+if [ -w /sys/kernel/mm/hugepages ]; then
+    echo "Configuring huge pages..."
+    echo 128 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+fi
+
+# Network tuning
+if [ "$NETWORK_TUNING" = "true" ]; then
+    echo "Applying network tuning..."
+    # These would require privileged mode
+    # ethtool -C eth0 rx-usecs 0 tx-usecs 0
+    # ethtool -G eth0 rx 4096 tx 4096
+fi
+
+# Start application
+exec "$@"
+
+# Runtime Configuration File
+# config/docker-runtime.yaml
+runtime:
+  cpu_affinity: "0-3"
+  thread_priority: high
+  huge_pages: true
+  numa_node: 0
+
+network:
+  tcp_nodelay: true
+  so_reuseaddr: true
+  so_reuseport: true
+  buffer_size: 2097152
+
+memory:
+  heap_size: "4G"
+  stack_size: "10M"
+  mlockall: true
+
+logging:
+  level: info
+  format: json
+  output: /app/logs/trading-engine.log
+  rotation:
+    max_size: 100M
+    max_files: 10
+
+metrics:
+  enabled: true
+  port: 9090
+  interval: 1s
+
+================================================================================
+6. SECURITY HARDENING
+================================================================================
+
+# Dockerfile security best practices applied:
+# 1. Non-root user execution
+# 2. Minimal base image
+# 3. Multi-stage builds to reduce attack surface
+# 4. No unnecessary privileges
+# 5. Read-only root filesystem (where possible)
+# 6. Secrets via environment or mounted files
+# 7. Regular security scanning
+
+# docker/Dockerfile.hardened
+FROM ubuntu:22.04 as hardened-runtime
+
+# Install security updates only
+RUN apt-get update && \
+    apt-get upgrade -y && \
+    apt-get install -y --no-install-recommends \
+        libstdc++6 \
+        ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# Create restricted user
+RUN groupadd -r -g 1000 hftuser && \
+    useradd -r -g hftuser -u 1000 -s /sbin/nologin hftuser
+
+WORKDIR /app
+
+# Copy only necessary files
+COPY --from=builder --chown=hftuser:hftuser /build/build/bin/trading-engine ./
+COPY --chown=hftuser:hftuser config/ ./config/
+
+# Set file permissions
+RUN chmod 500 trading-engine && \
+    chmod 400 config/*
+
+USER hftuser
+
+# Read-only root filesystem
+# Mount /tmp and /app/logs as tmpfs
+VOLUME ["/tmp", "/app/logs"]
+
+# Drop all capabilities and add only required ones
+# (Set in docker-compose or k8s manifest)
+
+CMD ["./trading-engine"]
+
+# Security scanning integration
+# scripts/scan-image.sh
+#!/bin/bash
+
+IMAGE=$1
+
+echo "Scanning ${IMAGE} for vulnerabilities..."
+
+# Trivy scan
+trivy image --severity HIGH,CRITICAL --exit-code 1 ${IMAGE}
+
+# Grype scan
+grype ${IMAGE} --fail-on critical
+
+# Docker Scout scan
+docker scout cves ${IMAGE}
+
+echo "Security scan completed"
+
+================================================================================
+7. IMAGE SIZE OPTIMIZATION
+================================================================================
+
+# Optimization Techniques Applied:
+# 1. Multi-stage builds - Remove build tools from final image
+# 2. .dockerignore - Reduce build context size
+# 3. Minimal base images - Use Alpine or distroless where possible
+# 4. Layer optimization - Combine RUN commands
+# 5. Strip binaries - Remove debug symbols
+# 6. Dependency cleanup - Remove package manager cache
+
+# Ultra-minimal runtime with distroless
+# docker/Dockerfile.distroless
+FROM gcc:13 as builder
+# ... (build stages) ...
+
+FROM gcr.io/distroless/cc-debian12
+
+COPY --from=builder /build/build/bin/trading-engine /app/
+COPY --from=builder /build/conan/lib/*.so* /usr/local/lib/
+
+WORKDIR /app
+CMD ["./trading-engine"]
+
+# Image size comparison script
+# scripts/compare-image-sizes.sh
+#!/bin/bash
+
+echo "Image Size Comparison:"
+echo "======================"
+
+docker images | grep hft-trading-engine | awk '{print $1":"$2 "\t" $7 $8}'
+
+# Expected results:
+# ubuntu-based:    ~200MB
+# alpine-based:    ~100MB
+# distroless:      ~50MB
+
+================================================================================
+8. HEALTH CHECKS AND MONITORING
+================================================================================
+
+# Advanced health check script
+# scripts/health-check.sh
+#!/bin/bash
+
+set -e
+
+# Check HTTP endpoint
+if ! curl -f -s http://localhost:8080/health > /dev/null; then
+    echo "Health endpoint failed"
+    exit 1
+fi
+
+# Check process responsiveness
+if ! pgrep -x trading-engine > /dev/null; then
+    echo "Trading engine process not found"
+    exit 1
+fi
+
+# Check memory usage
+MEMORY_PERCENT=$(ps aux | grep trading-engine | grep -v grep | awk '{print $4}')
+if (( $(echo "$MEMORY_PERCENT > 90" | bc -l) )); then
+    echo "Memory usage too high: ${MEMORY_PERCENT}%"
+    exit 1
+fi
+
+# Check latency metrics
+LATENCY=$(curl -s http://localhost:9090/metrics | grep latency_p99 | awk '{print $2}')
+if (( $(echo "$LATENCY > 1000" | bc -l) )); then
+    echo "P99 latency too high: ${LATENCY}us"
+    exit 1
+fi
+
+echo "All health checks passed"
+exit 0
+
+# Prometheus metrics endpoint configuration
+# config/prometheus.yml
+global:
+  scrape_interval: 1s
+  evaluation_interval: 1s
+
+scrape_configs:
+  - job_name: 'hft-trading-engine'
+    static_configs:
+      - targets: ['trading-engine:9090']
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: 'latency.*'
+        action: keep
+
+================================================================================
+9. NETWORK AND RESOURCE MANAGEMENT
+================================================================================
+
+# Advanced networking configuration
+# docker-compose.network-optimized.yml
+version: '3.8'
+
+services:
+  trading-engine:
+    image: hft-trading-engine:latest
+    network_mode: host  # For lowest latency
+    # OR use macvlan for dedicated network interface
+    # networks:
+    #   trading-net:
+    #     ipv4_address: 172.20.0.10
+
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 8G
+          pids: 100
+        reservations:
+          cpus: '4'
+          memory: 8G
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+    sysctls:
+      - net.core.somaxconn=4096
+      - net.ipv4.tcp_max_syn_backlog=8192
+      - net.ipv4.tcp_tw_reuse=1
+      - net.core.rmem_max=16777216
+      - net.core.wmem_max=16777216
+
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+      memlock:
+        soft: -1
+        hard: -1
+
+networks:
+  trading-net:
+    driver: macvlan
+    driver_opts:
+      parent: eth0
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+          gateway: 172.20.0.1
+
+# CPU pinning and NUMA configuration
+# scripts/run-with-numa.sh
+#!/bin/bash
+
+NUMA_NODE=0
+CPU_CORES="0-3"
+
+docker run -d \
+    --name hft-trading-engine \
+    --cpuset-cpus=${CPU_CORES} \
+    --cpuset-mems=${NUMA_NODE} \
+    --cpu-rt-runtime=950000 \
+    --ulimit rtprio=99 \
+    --cap-add=SYS_NICE \
+    hft-trading-engine:latest
+
+# Resource monitoring
+# scripts/monitor-container.sh
+#!/bin/bash
+
+CONTAINER_NAME="hft-trading-engine"
+
+while true; do
+    echo "=== $(date) ==="
+    docker stats ${CONTAINER_NAME} --no-stream
+
+    # CPU per core
+    docker exec ${CONTAINER_NAME} top -bn1 | grep trading-engine
+
+    # Network stats
+    docker exec ${CONTAINER_NAME} cat /proc/net/dev | grep eth0
+
+    sleep 5
+done
+
+================================================================================
+DOCKER BEST PRACTICES FOR HFT SYSTEMS
+================================================================================
+
+1. IMAGE OPTIMIZATION
+   - Use multi-stage builds to minimize runtime image size
+   - Strip debug symbols from binaries (unless debugging)
+   - Use .dockerignore to reduce build context
+   - Leverage BuildKit caching for faster builds
+
+2. RUNTIME PERFORMANCE
+   - Use host networking or macvlan for lowest latency
+   - Pin containers to specific CPU cores
+   - Configure NUMA awareness
+   - Use huge pages for memory management
+   - Disable swap
+
+3. SECURITY
+   - Run as non-root user
+   - Use read-only filesystems where possible
+   - Scan images for vulnerabilities
+   - Manage secrets properly (never in images)
+   - Minimal base images
+
+4. MONITORING
+   - Implement comprehensive health checks
+   - Export metrics in Prometheus format
+   - Monitor resource usage continuously
+   - Set up alerting for anomalies
+
+5. DEPLOYMENT
+   - Use specific image tags, not 'latest'
+   - Implement graceful shutdown handling
+   - Configure proper restart policies
+   - Test in staging before production
+
+================================================================================
+END OF DOCKER CONTAINERIZATION GUIDE
+================================================================================

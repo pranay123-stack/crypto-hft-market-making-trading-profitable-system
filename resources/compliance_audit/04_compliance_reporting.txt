@@ -1,0 +1,849 @@
+================================================================================
+COMPLIANCE REPORTING FRAMEWORK
+Regulatory Report Generation and Submission
+High-Frequency Trading System
+================================================================================
+
+OVERVIEW
+--------
+Comprehensive compliance reporting system for generating, validating, and
+submitting regulatory reports to various authorities including SEC, FINRA,
+FCA, MiFID II competent authorities, and other global regulators.
+
+================================================================================
+SECTION 1: REGULATORY REPORTING REQUIREMENTS
+================================================================================
+
+1.1 UNITED STATES REPORTING OBLIGATIONS
+----------------------------------------
+
+SEC/FINRA Reports:
+
+Report Name                    | Frequency      | Deadline       | Recipients
+-------------------------------|----------------|----------------|-------------
+CAT (Consolidated Audit Trail) | Real-time      | T+0            | CAT NMS Plan
+OATS (Order Audit Trail System)| Real-time      | T+0            | FINRA
+Blue Sheets                    | On demand      | As requested   | SEC
+Large Trader Reports (13H)     | Quarterly      | 45 days        | SEC
+Form SHO (Short Interest)      | Semi-monthly   | T+2            | FINRA/Exchanges
+Regulation SHO Closeout        | Daily          | T+1            | Clearinghouse
+Rule 606 (Order Routing)       | Quarterly      | 30 days        | Public disclosure
+Rule 605 (Execution Quality)   | Monthly        | 30 days        | Public disclosure
+Form X-17A-5 (Financial)       | Monthly/Annual | 17-45 days     | SEC
+
+
+1.2 EUROPEAN UNION REPORTING OBLIGATIONS
+-----------------------------------------
+
+MiFID II/MiFIR Reports:
+
+Report Name                    | Frequency      | Deadline       | Recipients
+-------------------------------|----------------|----------------|-------------
+Transaction Reports (RTS 22)   | T+1            | 09:00 CET      | NCA via ARM
+Reference Data (RTS 23)        | Continuous     | Real-time      | FIRDS
+Instrument Reference Data      | T+1            | Before trading | Trading venues
+Position Reports (Commodities) | Daily          | T+1            | NCA
+Trading Venue Transparency     | Real-time      | Continuous     | ESMA/Public
+Best Execution Reports         | Annual         | Apr 30         | Clients
+
+
+EMIR (Derivatives) Reports:
+
+Report Name                    | Frequency      | Deadline       | Recipients
+-------------------------------|----------------|----------------|-------------
+Trade Reports                  | T+1            | EOD            | Trade Repository
+Valuation Reports             | Daily          | T+1            | Trade Repository
+Portfolio Reconciliation      | Daily-Annual   | Varies         | Counterparties
+Lifecycle Events              | Real-time      | Immediate      | Trade Repository
+
+
+1.3 ASIA-PACIFIC REPORTING OBLIGATIONS
+---------------------------------------
+
+Hong Kong SFC:
+
+Report Name                    | Frequency      | Deadline       | Recipients
+-------------------------------|----------------|----------------|-------------
+Short Position Reporting       | Weekly         | Friday         | SFC
+Large Position Reporting       | Daily          | Next day       | SFC
+Algorithmic Trading Reports    | Annual         | Varies         | SFC
+
+
+Singapore MAS:
+
+Report Name                    | Frequency      | Deadline       | Recipients
+-------------------------------|----------------|----------------|-------------
+Securities Borrowing/Lending   | Monthly        | 7 business days| MAS
+Trade Reporting               | T+1            | 09:00 SGT      | MAS
+
+
+================================================================================
+SECTION 2: CAT REPORTING IMPLEMENTATION
+================================================================================
+
+2.1 CAT REPORTING SCHEMA
+-------------------------
+
+struct CATReport {
+    // Report Header
+    char cat_reporter_id[10];             // IMID
+    char submission_number[20];
+    char reporting_date[10];              // YYYYMMDD
+    uint32_t record_count;
+
+    // Customer Account Information
+    struct AccountInfo {
+        char firm_designated_id[40];      // FDID
+        char large_trader_id[13];         // LTID (if applicable)
+        char account_holder_type;         // 1=Individual, 2=Joint, etc.
+        char customer_type;               // E=Employee, C=Customer
+        char account_effective_date[10];
+        bool affiliate_flag;
+    };
+
+    // Order Events
+    struct OrderEvent {
+        char firm_designated_id[40];
+        char cat_order_id[40];             // Unique CAT order ID
+        char prior_cat_order_id[40];       // Linked prior order
+        char parent_cat_order_id[40];      // Parent order
+
+        char event_timestamp[21];          // YYYYMMDDHHMMSSnnnnnn (microseconds)
+        char manual_flag;                  // true/false
+        char electronic_timestamp_type[2]; // 01=Gateway, 02=FIX, etc.
+
+        char symbol[16];
+        char security_type[3];             // EQS, OPT, etc.
+        char put_call;                     // P, C, or blank
+        char strike_price[16];
+        char expiration_date[10];
+
+        char event_type[10];               // MEOR, MEON, MEOC, etc.
+        char side;                         // B=Buy, SS=Short Sell, etc.
+        int64_t order_quantity;
+        double price;
+        char order_type[3];                // MKT, LMT, STP
+        char time_in_force[3];             // DAY, GTC, IOC, FOK
+
+        char trading_session[3];           // REG, PRE, POST
+        char destination[20];              // Routing destination
+        char routing_party_role[2];        // 52=Clearing Firm, etc.
+
+        char affiliates_list[200];         // Comma-separated IMIDs
+
+        // Order handling
+        char handling_instructions[3];     // ALG, MAN, etc.
+        char session_id[40];
+        char algo_id[40];
+
+        // Cancel/replace
+        char cancel_replace_orig_order_id[40];
+
+        // Execution
+        char execution_id[40];
+        int64_t executed_quantity;
+        double execution_price;
+        char capacity;                     // P=Principal, A=Agent, M=Mixed
+        char contra_party_type[2];
+
+        // Fees
+        double liquidity_fee;
+        char fee_type;                     // R=Rebate, F=Fee
+
+        // Identifiers
+        char exchange_order_id[40];
+        char marketplace_trade_id[40];
+    };
+
+    std::vector<AccountInfo> accounts;
+    std::vector<OrderEvent> order_events;
+};
+
+
+2.2 CAT REPORTER IMPLEMENTATION
+--------------------------------
+
+class CATReporter {
+public:
+    CATReporter(const std::string& imid, const std::string& cat_endpoint)
+        : cat_reporter_id_(imid)
+        , cat_endpoint_(cat_endpoint)
+    {
+        reporting_thread_ = std::thread(&CATReporter::ReportingLoop, this);
+    }
+
+    void ReportOrderEvent(const Order& order, const std::string& event_type) {
+        CATReport::OrderEvent cat_event{};
+
+        // Generate CAT Order ID (persistent across lifecycle)
+        if (order.cat_order_id.empty()) {
+            GenerateCATOrderID(order, cat_event.cat_order_id);
+        } else {
+            strcpy(cat_event.cat_order_id, order.cat_order_id.c_str());
+        }
+
+        // Link to prior order if modification
+        if (!order.prior_order_id.empty()) {
+            strcpy(cat_event.prior_cat_order_id,
+                   order.prior_cat_order_id.c_str());
+        }
+
+        // Link to parent if child order
+        if (!order.parent_order_id.empty()) {
+            strcpy(cat_event.parent_cat_order_id,
+                   order.parent_cat_order_id.c_str());
+        }
+
+        // Timestamp with microsecond precision
+        FormatCATTimestamp(order.gateway_timestamp_ns, cat_event.event_timestamp);
+        cat_event.manual_flag = 'f';  // false (electronic)
+        strcpy(cat_event.electronic_timestamp_type, "01");  // Gateway
+
+        // Security information
+        strcpy(cat_event.symbol, order.symbol.c_str());
+        strcpy(cat_event.security_type, GetSecurityType(order.symbol).c_str());
+
+        // Event details
+        strcpy(cat_event.event_type, event_type.c_str());
+        cat_event.side = MapOrderSide(order.side);
+        cat_event.order_quantity = order.quantity;
+        cat_event.price = order.limit_price;
+        strcpy(cat_event.order_type, order.type.c_str());
+        strcpy(cat_event.time_in_force, order.tif.c_str());
+
+        // Routing information
+        strcpy(cat_event.destination, order.destination.c_str());
+
+        // Handling instructions
+        strcpy(cat_event.handling_instructions, "ALG");  // Algorithmic
+        strcpy(cat_event.algo_id, order.algo_id.c_str());
+
+        // Account linkage
+        strcpy(cat_event.firm_designated_id, order.fdid.c_str());
+
+        // Queue for submission
+        EnqueueCATEvent(cat_event);
+    }
+
+    void ReportExecution(const Execution& exec, const Order& order) {
+        CATReport::OrderEvent cat_event{};
+
+        strcpy(cat_event.cat_order_id, order.cat_order_id.c_str());
+        strcpy(cat_event.event_type, "MEFL");  // Member Execution - Full
+
+        FormatCATTimestamp(exec.execution_time_ns, cat_event.event_timestamp);
+
+        strcpy(cat_event.symbol, order.symbol.c_str());
+        cat_event.executed_quantity = exec.quantity;
+        cat_event.execution_price = exec.price;
+        cat_event.capacity = 'P';  // Principal
+
+        // Execution identifiers
+        strcpy(cat_event.execution_id, exec.id.c_str());
+        strcpy(cat_event.marketplace_trade_id, exec.exchange_trade_id.c_str());
+
+        // Fees
+        cat_event.liquidity_fee = exec.liquidity_fee;
+        cat_event.fee_type = exec.liquidity_flag == 'A' ? 'R' : 'F';
+
+        EnqueueCATEvent(cat_event);
+    }
+
+private:
+    void ReportingLoop() {
+        std::vector<CATReport::OrderEvent> batch;
+        batch.reserve(10000);
+
+        while (running_) {
+            // Collect events for batch submission
+            CATReport::OrderEvent event;
+            while (batch.size() < 10000 &&
+                   event_queue_.try_dequeue(event)) {
+                batch.push_back(event);
+            }
+
+            if (!batch.empty()) {
+                // Submit batch to CAT
+                SubmitCATBatch(batch);
+                batch.clear();
+            }
+
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+    }
+
+    void SubmitCATBatch(const std::vector<CATReport::OrderEvent>& events) {
+        CATReport report{};
+        strcpy(report.cat_reporter_id, cat_reporter_id_.c_str());
+        strcpy(report.reporting_date, GetCurrentDateYYYYMMDD().c_str());
+        report.record_count = events.size();
+        report.order_events = events;
+
+        // Generate CAT submission file (pipe-delimited format)
+        std::string submission_data = FormatCATSubmission(report);
+
+        // Submit via SFTP
+        if (SubmitViaSFTP(cat_endpoint_, submission_data)) {
+            LOG_INFO("CAT report submitted: " << events.size() << " events");
+        } else {
+            LOG_ERROR("CAT submission failed");
+            // Queue for retry
+            for (const auto& event : events) {
+                retry_queue_.enqueue(event);
+            }
+        }
+    }
+
+    std::string FormatCATSubmission(const CATReport& report) {
+        std::stringstream ss;
+
+        // File header
+        ss << "HDR|" << report.cat_reporter_id << "|"
+           << report.reporting_date << "|"
+           << report.record_count << "\n";
+
+        // Order events
+        for (const auto& event : report.order_events) {
+            ss << event.event_type << "|"
+               << event.firm_designated_id << "|"
+               << event.cat_order_id << "|"
+               << event.event_timestamp << "|"
+               << event.symbol << "|"
+               << event.side << "|"
+               << event.order_quantity << "|"
+               << event.price << "|"
+               << event.order_type << "|"
+               << event.time_in_force << "|"
+               << event.destination << "|"
+               << event.handling_instructions << "|"
+               << event.algo_id << "\n";
+        }
+
+        // File trailer
+        ss << "TRL|" << report.record_count << "\n";
+
+        return ss.str();
+    }
+
+    void GenerateCATOrderID(const Order& order, char* cat_order_id) {
+        // Format: IMID + YYYYMMDD + Sequence
+        std::stringstream ss;
+        ss << cat_reporter_id_
+           << GetCurrentDateYYYYMMDD()
+           << std::setfill('0') << std::setw(10)
+           << cat_sequence_.fetch_add(1);
+        strcpy(cat_order_id, ss.str().c_str());
+    }
+
+    std::string cat_reporter_id_;
+    std::string cat_endpoint_;
+    std::atomic<uint64_t> cat_sequence_{0};
+    moodycamel::ConcurrentQueue<CATReport::OrderEvent> event_queue_;
+    moodycamel::ConcurrentQueue<CATReport::OrderEvent> retry_queue_;
+    std::thread reporting_thread_;
+    std::atomic<bool> running_{true};
+};
+
+
+================================================================================
+SECTION 3: MIFID II TRANSACTION REPORTING
+================================================================================
+
+3.1 TRANSACTION REPORTING SYSTEM
+---------------------------------
+
+class MiFIDIITransactionReportingSystem {
+public:
+    MiFIDIITransactionReportingSystem(const std::string& lei,
+                                     const std::string& arm_endpoint)
+        : firm_lei_(lei)
+        , arm_endpoint_(arm_endpoint)
+    {
+        reporting_thread_ = std::thread(
+            &MiFIDIITransactionReportingSystem::ReportingLoop, this);
+    }
+
+    void GenerateTransactionReport(const Execution& exec, const Order& order) {
+        // MiFID II transaction report (ISO 20022 XML format)
+        std::stringstream xml;
+
+        xml << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
+        xml << "<Document xmlns=\"urn:iso:std:iso:20022:tech:xsd:auth.031.001.01\">\n";
+        xml << "  <FinInstrmRptgTxRpt>\n";
+        xml << "    <Tx>\n";
+
+        // Transaction identification
+        xml << "      <New>\n";
+        xml << "        <TxId>" << exec.exchange_trade_id << "</TxId>\n";
+        xml << "        <ExctgPty>" << firm_lei_ << "</ExctgPty>\n";
+        xml << "        <InvstmtPtyInd>true</InvstmtPtyInd>\n";
+        xml << "        <SubmitgPty>" << firm_lei_ << "</SubmitgPty>\n";
+
+        // Buyer information
+        xml << "        <Buyr>\n";
+        xml << "          <AcctOwnr>\n";
+        xml << "            <Id>\n";
+        if (order.side == 'B') {
+            xml << "              <LEI>" << firm_lei_ << "</LEI>\n";
+        } else {
+            xml << "              <LEI>" << exec.counterparty_lei << "</LEI>\n";
+        }
+        xml << "            </Id>\n";
+        xml << "            <CtryOfBrnch>" << GetCountryCode() << "</CtryOfBrnch>\n";
+        xml << "          </AcctOwnr>\n";
+        xml << "          <DcsnMakr>\n";
+        xml << "            <Algo>" << order.algo_id << "</Algo>\n";
+        xml << "          </DcsnMakr>\n";
+        xml << "        </Buyr>\n";
+
+        // Seller information
+        xml << "        <Sellr>\n";
+        xml << "          <AcctOwnr>\n";
+        xml << "            <Id>\n";
+        if (order.side == 'S') {
+            xml << "              <LEI>" << firm_lei_ << "</LEI>\n";
+        } else {
+            xml << "              <LEI>" << exec.counterparty_lei << "</LEI>\n";
+        }
+        xml << "            </Id>\n";
+        xml << "          </AcctOwnr>\n";
+        xml << "        </Sellr>\n";
+
+        // Transaction details
+        xml << "        <TradDt>" << FormatISO8601Date(exec.execution_time_ns)
+            << "</TradDt>\n";
+        xml << "        <TradgCpcty>DEAL</TradgCpcty>\n";  // Deal on own account
+
+        // Quantity
+        xml << "        <Qty>\n";
+        xml << "          <Qty>" << exec.quantity << "</Qty>\n";
+        xml << "        </Qty>\n";
+
+        // Price
+        xml << "        <Pric>\n";
+        xml << "          <Pric>" << std::fixed << std::setprecision(6)
+            << exec.price << "</Pric>\n";
+        xml << "          <Ccy>" << GetCurrency(order.symbol) << "</Ccy>\n";
+        xml << "        </Pric>\n";
+
+        // Net amount
+        double net_amount = exec.quantity * exec.price;
+        xml << "        <NetAmt>" << std::fixed << std::setprecision(2)
+            << net_amount << "</NetAmt>\n";
+
+        // Trading venue
+        xml << "        <TradgVn>\n";
+        xml << "          <MktIdCd>" << GetMICCode(exec.exchange) << "</MktIdCd>\n";
+        xml << "        </TradgVn>\n";
+
+        // Instrument
+        xml << "        <FinInstrm>\n";
+        xml << "          <Id>\n";
+        xml << "            <ISIN>" << GetISIN(order.symbol) << "</ISIN>\n";
+        xml << "          </Id>\n";
+        xml << "        </FinInstrm>\n";
+
+        // Investment decision
+        xml << "        <InvstmtDcsnPrsn>\n";
+        xml << "          <Algo>" << order.algo_id << "</Algo>\n";
+        xml << "        </InvstmtDcsnPrsn>\n";
+
+        // Execution decision
+        xml << "        <ExctgPrsn>\n";
+        xml << "          <Algo>" << order.execution_algo_id << "</Algo>\n";
+        xml << "        </ExctgPrsn>\n";
+
+        xml << "      </New>\n";
+        xml << "    </Tx>\n";
+        xml << "  </FinInstrmRptgTxRpt>\n";
+        xml << "</Document>\n";
+
+        // Submit to ARM (Approved Reporting Mechanism)
+        SubmitToARM(xml.str());
+    }
+
+private:
+    void SubmitToARM(const std::string& xml_report) {
+        // Submit to ARM via secure connection
+        HTTPSClient client(arm_endpoint_);
+        auto response = client.Post("/transaction-reports", xml_report,
+                                   {{"Content-Type", "application/xml"}});
+
+        if (response.status_code == 200) {
+            LOG_INFO("MiFID II transaction report submitted successfully");
+        } else {
+            LOG_ERROR("MiFID II report submission failed: "
+                     << response.status_code);
+            // Queue for retry
+            retry_queue_.enqueue(xml_report);
+        }
+    }
+
+    void ReportingLoop() {
+        while (running_) {
+            // Process retry queue
+            std::string retry_report;
+            if (retry_queue_.try_dequeue(retry_report)) {
+                SubmitToARM(retry_report);
+            }
+
+            std::this_thread::sleep_for(std::chrono::seconds(10));
+        }
+    }
+
+    std::string firm_lei_;
+    std::string arm_endpoint_;
+    moodycamel::ConcurrentQueue<std::string> retry_queue_;
+    std::thread reporting_thread_;
+    std::atomic<bool> running_{true};
+};
+
+
+================================================================================
+SECTION 4: RULE 606 ORDER ROUTING DISCLOSURE
+================================================================================
+
+4.1 QUARTERLY ORDER ROUTING REPORT
+-----------------------------------
+
+class Rule606ReportGenerator {
+public:
+    struct OrderRoutingStatistics {
+        std::string venue_name;
+        std::string venue_mic_code;
+
+        // Market orders
+        uint64_t market_orders_count;
+        double market_orders_share_percentage;
+
+        // Marketable limit orders
+        uint64_t marketable_limit_orders_count;
+        double marketable_limit_orders_share_percentage;
+
+        // Non-marketable limit orders
+        uint64_t non_marketable_limit_orders_count;
+        double non_marketable_limit_orders_share_percentage;
+
+        // Other orders
+        uint64_t other_orders_count;
+        double other_orders_share_percentage;
+
+        // Payment for order flow
+        double net_payment_per_hundred_shares_market;
+        double net_payment_per_hundred_shares_marketable_limit;
+        double net_payment_per_hundred_shares_non_marketable_limit;
+        double net_payment_per_hundred_shares_other;
+    };
+
+    std::string GenerateQuarterlyReport(int year, int quarter) {
+        auto [start_date, end_date] = GetQuarterDates(year, quarter);
+
+        // Collect routing statistics
+        std::vector<OrderRoutingStatistics> stats =
+            CollectRoutingStatistics(start_date, end_date);
+
+        // Generate report in JSON format (required by Rule 606)
+        json report;
+        report["reportingPeriod"]["year"] = year;
+        report["reportingPeriod"]["quarter"] = quarter;
+        report["reportingFirm"] = firm_name_;
+        report["reportingDate"] = GetCurrentDateISO8601();
+
+        // Securities groupings (S&P 500, non-S&P 500, options)
+        json securities_groups = json::array();
+
+        // S&P 500 Stocks
+        json sp500_group;
+        sp500_group["securitiesType"] = "S&P 500 Stocks";
+        sp500_group["venues"] = json::array();
+
+        for (const auto& venue_stats : stats) {
+            json venue;
+            venue["venueName"] = venue_stats.venue_name;
+            venue["venueMIC"] = venue_stats.venue_mic_code;
+
+            venue["marketOrders"]["ordersCount"] =
+                venue_stats.market_orders_count;
+            venue["marketOrders"]["sharePercentage"] =
+                venue_stats.market_orders_share_percentage;
+
+            venue["marketableLimit Orders"]["ordersCount"] =
+                venue_stats.marketable_limit_orders_count;
+            venue["marketableLimitOrders"]["sharePercentage"] =
+                venue_stats.marketable_limit_orders_share_percentage;
+
+            venue["nonMarketableLimitOrders"]["ordersCount"] =
+                venue_stats.non_marketable_limit_orders_count;
+            venue["nonMarketableLimitOrders"]["sharePercentage"] =
+                venue_stats.non_marketable_limit_orders_share_percentage;
+
+            venue["otherOrders"]["ordersCount"] =
+                venue_stats.other_orders_count;
+            venue["otherOrders"]["sharePercentage"] =
+                venue_stats.other_orders_share_percentage;
+
+            sp500_group["venues"].push_back(venue);
+        }
+
+        securities_groups.push_back(sp500_group);
+        report["securitiesGroups"] = securities_groups;
+
+        // Convert to formatted JSON string
+        return report.dump(2);
+    }
+
+    void PublishReport(const std::string& report_json) {
+        // Publish to firm's public website
+        PublishToWebsite(report_json);
+
+        // Submit to SEC's EDGAR system
+        SubmitToEDGAR(report_json);
+
+        LOG_INFO("Rule 606 report published");
+    }
+
+private:
+    std::vector<OrderRoutingStatistics> CollectRoutingStatistics(
+        const std::string& start_date,
+        const std::string& end_date) {
+
+        std::vector<OrderRoutingStatistics> stats;
+
+        // Query order routing database
+        auto orders = QueryOrdersByDateRange(start_date, end_date);
+
+        // Group by venue and order type
+        std::map<std::string, OrderRoutingStatistics> venue_map;
+
+        for (const auto& order : orders) {
+            auto& venue_stats = venue_map[order.destination];
+
+            if (venue_stats.venue_name.empty()) {
+                venue_stats.venue_name = GetVenueName(order.destination);
+                venue_stats.venue_mic_code = order.destination;
+            }
+
+            // Classify order type
+            if (order.type == "MKT") {
+                venue_stats.market_orders_count++;
+            } else if (IsMarketableLimit(order)) {
+                venue_stats.marketable_limit_orders_count++;
+            } else if (order.type == "LMT") {
+                venue_stats.non_marketable_limit_orders_count++;
+            } else {
+                venue_stats.other_orders_count++;
+            }
+        }
+
+        // Calculate percentages
+        uint64_t total_orders = orders.size();
+        for (auto& [venue, venue_stats] : venue_map) {
+            venue_stats.market_orders_share_percentage =
+                (100.0 * venue_stats.market_orders_count) / total_orders;
+            venue_stats.marketable_limit_orders_share_percentage =
+                (100.0 * venue_stats.marketable_limit_orders_count) / total_orders;
+            venue_stats.non_marketable_limit_orders_share_percentage =
+                (100.0 * venue_stats.non_marketable_limit_orders_count) / total_orders;
+            venue_stats.other_orders_share_percentage =
+                (100.0 * venue_stats.other_orders_count) / total_orders;
+
+            stats.push_back(venue_stats);
+        }
+
+        return stats;
+    }
+
+    std::string firm_name_;
+};
+
+
+================================================================================
+SECTION 5: LARGE TRADER REPORTING (13H)
+================================================================================
+
+5.1 FORM 13H IMPLEMENTATION
+----------------------------
+
+class Form13HReporter {
+public:
+    struct LargeTraderIdentification {
+        char ltid[13];                     // Large Trader ID
+        char firm_name[100];
+        char business_address[200];
+        char contact_name[100];
+        char contact_phone[20];
+        char contact_email[100];
+
+        std::vector<std::string> executing_brokers;  // LEIs
+        std::vector<std::string> trading_accounts;
+    };
+
+    struct LargeTraderActivity {
+        char ltid[13];
+        char reporting_date[10];           // YYYY-MM-DD
+
+        struct SecurityActivity {
+            char symbol[16];
+            char isin[12];
+            int64_t aggregate_transactions;
+            int64_t aggregate_shares;
+            int64_t fair_market_value_usd;
+        };
+
+        std::vector<SecurityActivity> securities;
+    };
+
+    // Initial Form 13H filing
+    void FileInitialForm13H(const LargeTraderIdentification& ltid_info) {
+        // Generate Form 13H XML
+        std::stringstream xml;
+
+        xml << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
+        xml << "<form13H xmlns=\"http://www.sec.gov/edgar/form13h\">\n";
+        xml << "  <formType>13H-INITIAL</formType>\n";
+        xml << "  <filerInfo>\n";
+        xml << "    <ltid>" << ltid_info.ltid << "</ltid>\n";
+        xml << "    <firmName>" << ltid_info.firm_name << "</firmName>\n";
+        xml << "    <businessAddress>" << ltid_info.business_address
+            << "</businessAddress>\n";
+        xml << "    <contactName>" << ltid_info.contact_name << "</contactName>\n";
+        xml << "    <contactPhone>" << ltid_info.contact_phone << "</contactPhone>\n";
+        xml << "    <contactEmail>" << ltid_info.contact_email << "</contactEmail>\n";
+        xml << "  </filerInfo>\n";
+        xml << "  <executingBrokers>\n";
+        for (const auto& broker : ltid_info.executing_brokers) {
+            xml << "    <broker>" << broker << "</broker>\n";
+        }
+        xml << "  </executingBrokers>\n";
+        xml << "</form13H>\n";
+
+        // Submit to SEC EDGAR
+        SubmitToEDGAR(xml.str());
+
+        LOG_INFO("Form 13H (Initial) filed for LTID: " << ltid_info.ltid);
+    }
+
+    // Quarterly reporting
+    void FileQuarterlyActivity(const LargeTraderActivity& activity) {
+        std::stringstream xml;
+
+        xml << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
+        xml << "<form13H xmlns=\"http://www.sec.gov/edgar/form13h\">\n";
+        xml << "  <formType>13H-Q</formType>\n";
+        xml << "  <ltid>" << activity.ltid << "</ltid>\n";
+        xml << "  <reportingDate>" << activity.reporting_date
+            << "</reportingDate>\n";
+        xml << "  <activities>\n";
+
+        for (const auto& sec : activity.securities) {
+            xml << "    <security>\n";
+            xml << "      <symbol>" << sec.symbol << "</symbol>\n";
+            xml << "      <isin>" << sec.isin << "</isin>\n";
+            xml << "      <transactions>" << sec.aggregate_transactions
+                << "</transactions>\n";
+            xml << "      <shares>" << sec.aggregate_shares << "</shares>\n";
+            xml << "      <marketValue>" << sec.fair_market_value_usd
+                << "</marketValue>\n";
+            xml << "    </security>\n";
+        }
+
+        xml << "  </activities>\n";
+        xml << "</form13H>\n";
+
+        SubmitToEDGAR(xml.str());
+
+        LOG_INFO("Form 13H (Quarterly) filed for LTID: " << activity.ltid);
+    }
+};
+
+
+================================================================================
+SECTION 6: AUTOMATED REPORT GENERATION
+================================================================================
+
+6.1 REPORT SCHEDULER
+---------------------
+
+class ComplianceReportScheduler {
+public:
+    struct ReportSchedule {
+        std::string report_name;
+        std::string report_type;
+        std::chrono::hours frequency;
+        std::function<void()> generator_function;
+        std::chrono::system_clock::time_point next_run_time;
+        bool enabled;
+    };
+
+    ComplianceReportScheduler() {
+        InitializeSchedules();
+        scheduler_thread_ = std::thread(
+            &ComplianceReportScheduler::SchedulerLoop, this);
+    }
+
+private:
+    void InitializeSchedules() {
+        // Daily reports
+        schedules_.push_back(ReportSchedule{
+            .report_name = "Daily Trade Summary",
+            .report_type = "INTERNAL",
+            .frequency = std::chrono::hours(24),
+            .generator_function = [this]() { GenerateDailyTradeSummary(); },
+            .next_run_time = GetNextBusinessDayEOD(),
+            .enabled = true
+        });
+
+        // Monthly Rule 605
+        schedules_.push_back(ReportSchedule{
+            .report_name = "Rule 605 Execution Quality",
+            .report_type = "SEC",
+            .frequency = std::chrono::hours(24 * 30),
+            .generator_function = [this]() { GenerateRule605Report(); },
+            .next_run_time = GetNextMonthEnd(),
+            .enabled = true
+        });
+
+        // Quarterly Rule 606
+        schedules_.push_back(ReportSchedule{
+            .report_name = "Rule 606 Order Routing",
+            .report_type = "SEC",
+            .frequency = std::chrono::hours(24 * 90),
+            .generator_function = [this]() { GenerateRule606Report(); },
+            .next_run_time = GetNextQuarterEnd(),
+            .enabled = true
+        });
+    }
+
+    void SchedulerLoop() {
+        while (running_) {
+            auto now = std::chrono::system_clock::now();
+
+            for (auto& schedule : schedules_) {
+                if (schedule.enabled && now >= schedule.next_run_time) {
+                    LOG_INFO("Running scheduled report: " << schedule.report_name);
+
+                    try {
+                        schedule.generator_function();
+                        LOG_INFO("Report completed: " << schedule.report_name);
+                    } catch (const std::exception& e) {
+                        LOG_ERROR("Report generation failed: "
+                                 << schedule.report_name << " - " << e.what());
+                    }
+
+                    // Schedule next run
+                    schedule.next_run_time = now + schedule.frequency;
+                }
+            }
+
+            std::this_thread::sleep_for(std::chrono::minutes(10));
+        }
+    }
+
+    std::vector<ReportSchedule> schedules_;
+    std::thread scheduler_thread_;
+    std::atomic<bool> running_{true};
+};
+
+================================================================================
+END OF DOCUMENT
+================================================================================

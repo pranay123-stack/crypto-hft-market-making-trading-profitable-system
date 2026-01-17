@@ -1,0 +1,934 @@
+SLA/SLO MONITORING FOR HFT SYSTEMS
+===================================
+
+TABLE OF CONTENTS
+-----------------
+1. Overview & SLI/SLO/SLA Framework
+2. Service Level Indicators (SLIs)
+3. Service Level Objectives (SLOs)
+4. Service Level Agreements (SLAs)
+5. Error Budget Management
+6. SLO Tracking & Reporting
+7. Burn Rate Alerts
+8. Multi-Window Multi-Burn-Rate Alerts
+9. SLO Dashboard Implementation
+10. Production SLO Examples
+11. Incident Response Integration
+
+============================================
+1. OVERVIEW & SLI/SLO/SLA FRAMEWORK
+============================================
+
+SLI/SLO/SLA Hierarchy:
+----------------------
+┌────────────────────────────────────────────────────────────┐
+│                           SLA                               │
+│   (Contractual agreement with consequences)                │
+│   Example: 99.9% uptime or refund                          │
+└────────────────────┬───────────────────────────────────────┘
+                     │
+┌────────────────────▼───────────────────────────────────────┐
+│                           SLO                               │
+│   (Internal target - tighter than SLA)                     │
+│   Example: 99.95% successful order placements             │
+└────────────────────┬───────────────────────────────────────┘
+                     │
+┌────────────────────▼───────────────────────────────────────┐
+│                           SLI                               │
+│   (Quantitative measure of service level)                  │
+│   Example: successful_orders / total_orders                │
+└─────────────────────────────────────────────────────────────┘
+
+Key Concepts:
+-------------
+SLI (Service Level Indicator):
+  - Quantitative measurement of service behavior
+  - Examples: latency, availability, throughput, error rate
+
+SLO (Service Level Objective):
+  - Target value or range for an SLI
+  - Defines acceptable performance
+  - Internal goal, not customer-facing
+
+SLA (Service Level Agreement):
+  - Contractual commitment to customers
+  - Includes consequences for violations
+  - Typically looser than SLOs
+
+Error Budget:
+  - Amount of unreliability allowed within SLO
+  - 1 - SLO = error budget
+  - Example: 99.9% SLO = 0.1% error budget = 43.2 min/month
+
+Burn Rate:
+  - How fast error budget is being consumed
+  - Used for alert thresholds
+  - High burn rate = imminent SLO violation
+
+============================================
+2. SERVICE LEVEL INDICATORS (SLIs)
+============================================
+
+SLI Categories for HFT:
+-----------------------
+
+1. AVAILABILITY SLIs
+   - System uptime
+   - Exchange connectivity uptime
+   - Service availability
+
+2. LATENCY SLIs
+   - Order placement latency (p50, p95, p99)
+   - Market data latency
+   - Fill notification latency
+
+3. QUALITY SLIs
+   - Order success rate
+   - Fill rate
+   - Data accuracy
+
+4. FRESHNESS SLIs
+   - Market data freshness
+   - Position data freshness
+
+C++ SLI Tracker Implementation:
+--------------------------------
+#include <atomic>
+#include <chrono>
+#include <deque>
+#include <mutex>
+#include <cmath>
+
+class SLI {
+public:
+    struct Measurement {
+        uint64_t timestamp_ms;
+        bool good;  // true if meets SLO, false otherwise
+        double value;  // actual measurement value
+    };
+
+private:
+    std::string name_;
+    std::deque<Measurement> measurements_;
+    mutable std::mutex mutex_;
+
+    // Rolling window configuration
+    std::chrono::seconds window_duration_;
+    size_t max_measurements_;
+
+    // Aggregated stats
+    std::atomic<uint64_t> total_good_{0};
+    std::atomic<uint64_t> total_bad_{0};
+
+public:
+    SLI(const std::string& name,
+        std::chrono::seconds window_duration = std::chrono::seconds(3600),
+        size_t max_measurements = 100000)
+        : name_(name),
+          window_duration_(window_duration),
+          max_measurements_(max_measurements) {}
+
+    void record(bool good, double value = 0.0) {
+        auto now = std::chrono::system_clock::now();
+        auto timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now.time_since_epoch()).count();
+
+        Measurement m{timestamp_ms, good, value};
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+
+            measurements_.push_back(m);
+
+            // Trim old measurements
+            trimOldMeasurements();
+
+            // Trim by size
+            while (measurements_.size() > max_measurements_) {
+                measurements_.pop_front();
+            }
+        }
+
+        if (good) {
+            total_good_.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            total_bad_.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    // Calculate SLI over time window
+    double calculateSLI(std::chrono::seconds window) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        if (measurements_.empty()) {
+            return 0.0;
+        }
+
+        auto now = std::chrono::system_clock::now();
+        auto cutoff_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now.time_since_epoch() - window).count();
+
+        uint64_t good_count = 0;
+        uint64_t total_count = 0;
+
+        for (const auto& m : measurements_) {
+            if (m.timestamp_ms >= cutoff_ms) {
+                total_count++;
+                if (m.good) {
+                    good_count++;
+                }
+            }
+        }
+
+        return total_count > 0 ?
+            static_cast<double>(good_count) / total_count * 100.0 : 0.0;
+    }
+
+    // Calculate lifetime SLI
+    double getLifetimeSLI() const {
+        uint64_t good = total_good_.load(std::memory_order_acquire);
+        uint64_t bad = total_bad_.load(std::memory_order_acquire);
+        uint64_t total = good + bad;
+
+        return total > 0 ?
+            static_cast<double>(good) / total * 100.0 : 0.0;
+    }
+
+    // Get percentile latency
+    double getPercentile(double percentile,
+                        std::chrono::seconds window) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        if (measurements_.empty()) {
+            return 0.0;
+        }
+
+        auto now = std::chrono::system_clock::now();
+        auto cutoff_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now.time_since_epoch() - window).count();
+
+        std::vector<double> values;
+        for (const auto& m : measurements_) {
+            if (m.timestamp_ms >= cutoff_ms) {
+                values.push_back(m.value);
+            }
+        }
+
+        if (values.empty()) {
+            return 0.0;
+        }
+
+        std::sort(values.begin(), values.end());
+
+        size_t index = static_cast<size_t>(
+            std::ceil(values.size() * percentile / 100.0) - 1);
+
+        return values[std::min(index, values.size() - 1)];
+    }
+
+    const std::string& getName() const { return name_; }
+
+private:
+    void trimOldMeasurements() {
+        auto now = std::chrono::system_clock::now();
+        auto cutoff_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now.time_since_epoch() - window_duration_).count();
+
+        while (!measurements_.empty() &&
+               measurements_.front().timestamp_ms < cutoff_ms) {
+            measurements_.pop_front();
+        }
+    }
+};
+
+SLI Registry:
+-------------
+class SLIRegistry {
+private:
+    static std::map<std::string, std::shared_ptr<SLI>> slis_;
+    static std::mutex mutex_;
+
+public:
+    static std::shared_ptr<SLI> registerSLI(
+        const std::string& name,
+        std::chrono::seconds window = std::chrono::seconds(3600)) {
+
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        auto it = slis_.find(name);
+        if (it != slis_.end()) {
+            return it->second;
+        }
+
+        auto sli = std::make_shared<SLI>(name, window);
+        slis_[name] = sli;
+
+        return sli;
+    }
+
+    static std::shared_ptr<SLI> getSLI(const std::string& name) {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        auto it = slis_.find(name);
+        if (it != slis_.end()) {
+            return it->second;
+        }
+
+        return nullptr;
+    }
+
+    static std::map<std::string, std::shared_ptr<SLI>> getAllSLIs() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return slis_;
+    }
+};
+
+std::map<std::string, std::shared_ptr<SLI>> SLIRegistry::slis_;
+std::mutex SLIRegistry::mutex_;
+
+============================================
+3. SERVICE LEVEL OBJECTIVES (SLOs)
+============================================
+
+SLO Definition:
+---------------
+class SLO {
+public:
+    enum class Type {
+        AVAILABILITY,      // Percentage of successful requests
+        LATENCY,          // Percentage below latency threshold
+        THROUGHPUT,       // Minimum requests/second
+        QUALITY           // Percentage meeting quality criteria
+    };
+
+    struct Target {
+        double value;           // Target percentage (e.g., 99.9)
+        std::chrono::seconds window;  // Time window (e.g., 30 days)
+    };
+
+private:
+    std::string name_;
+    Type type_;
+    std::shared_ptr<SLI> sli_;
+    Target target_;
+
+    // For latency SLOs
+    double latency_threshold_ms_;
+
+public:
+    SLO(const std::string& name,
+        Type type,
+        std::shared_ptr<SLI> sli,
+        Target target,
+        double latency_threshold_ms = 0.0)
+        : name_(name),
+          type_(type),
+          sli_(sli),
+          target_(target),
+          latency_threshold_ms_(latency_threshold_ms) {}
+
+    struct Status {
+        std::string name;
+        double current_sli;
+        double target_slo;
+        double error_budget_remaining;  // Percentage
+        double error_budget_consumed;   // Percentage
+        bool meeting_slo;
+        std::chrono::system_clock::time_point timestamp;
+    };
+
+    Status getStatus() const {
+        Status status;
+        status.name = name_;
+        status.target_slo = target_.value;
+
+        if (type_ == Type::LATENCY) {
+            // For latency: SLI is percentage of requests below threshold
+            status.current_sli = sli_->calculateSLI(target_.window);
+        } else {
+            // For availability/quality: SLI is success rate
+            status.current_sli = sli_->calculateSLI(target_.window);
+        }
+
+        status.meeting_slo = status.current_sli >= status.target_slo;
+
+        // Calculate error budget
+        double error_budget_total = 100.0 - status.target_slo;
+        double current_error = 100.0 - status.current_sli;
+
+        status.error_budget_consumed =
+            error_budget_total > 0 ?
+            (current_error / error_budget_total) * 100.0 : 0.0;
+
+        status.error_budget_remaining = 100.0 - status.error_budget_consumed;
+
+        status.timestamp = std::chrono::system_clock::now();
+
+        return status;
+    }
+
+    const std::string& getName() const { return name_; }
+    Type getType() const { return type_; }
+    const Target& getTarget() const { return target_; }
+
+    // Calculate burn rate (how fast we're consuming error budget)
+    double calculateBurnRate(std::chrono::seconds short_window,
+                            std::chrono::seconds long_window) const {
+        double short_sli = sli_->calculateSLI(short_window);
+        double long_sli = sli_->calculateSLI(long_window);
+
+        double short_error = 100.0 - short_sli;
+        double long_error = 100.0 - long_sli;
+
+        // Burn rate = short-term error / long-term error
+        return long_error > 0 ? short_error / long_error : 0.0;
+    }
+};
+
+SLO Manager:
+------------
+class SLOManager {
+private:
+    std::map<std::string, std::shared_ptr<SLO>> slos_;
+    std::mutex mutex_;
+
+public:
+    void registerSLO(std::shared_ptr<SLO> slo) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        slos_[slo->getName()] = slo;
+    }
+
+    std::shared_ptr<SLO> getSLO(const std::string& name) {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        auto it = slos_.find(name);
+        if (it != slos_.end()) {
+            return it->second;
+        }
+
+        return nullptr;
+    }
+
+    std::vector<SLO::Status> getAllStatus() {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        std::vector<SLO::Status> statuses;
+        for (const auto& [name, slo] : slos_) {
+            statuses.push_back(slo->getStatus());
+        }
+
+        return statuses;
+    }
+
+    nlohmann::json getSLOReport() {
+        auto statuses = getAllStatus();
+
+        nlohmann::json report = nlohmann::json::array();
+
+        for (const auto& status : statuses) {
+            auto timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                status.timestamp.time_since_epoch()).count();
+
+            report.push_back({
+                {"name", status.name},
+                {"current_sli", status.current_sli},
+                {"target_slo", status.target_slo},
+                {"error_budget_remaining", status.error_budget_remaining},
+                {"error_budget_consumed", status.error_budget_consumed},
+                {"meeting_slo", status.meeting_slo},
+                {"timestamp", timestamp_ms}
+            });
+        }
+
+        return report;
+    }
+
+    // Check if any SLO is being violated
+    bool hasViolations() {
+        auto statuses = getAllStatus();
+
+        for (const auto& status : statuses) {
+            if (!status.meeting_slo) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+};
+
+============================================
+4. ERROR BUDGET MANAGEMENT
+============================================
+
+Error Budget Tracker:
+---------------------
+class ErrorBudgetTracker {
+private:
+    std::string name_;
+    double slo_target_;  // e.g., 99.9
+    std::chrono::seconds window_;
+
+    std::shared_ptr<SLI> sli_;
+
+public:
+    ErrorBudgetTracker(const std::string& name,
+                      double slo_target,
+                      std::chrono::seconds window,
+                      std::shared_ptr<SLI> sli)
+        : name_(name),
+          slo_target_(slo_target),
+          window_(window),
+          sli_(sli) {}
+
+    struct BudgetStatus {
+        double total_budget_percentage;    // e.g., 0.1% for 99.9% SLO
+        double remaining_budget_percentage;
+        double consumed_budget_percentage;
+        uint64_t total_budget_minutes;     // For 30-day window
+        uint64_t remaining_budget_minutes;
+        uint64_t consumed_budget_minutes;
+        double consumption_rate;           // Percentage per hour
+    };
+
+    BudgetStatus getStatus() const {
+        BudgetStatus status;
+
+        // Total error budget
+        status.total_budget_percentage = 100.0 - slo_target_;
+
+        // Current SLI
+        double current_sli = sli_->calculateSLI(window_);
+
+        // Current error rate
+        double current_error = 100.0 - current_sli;
+
+        // Consumed budget
+        status.consumed_budget_percentage =
+            std::min(current_error, status.total_budget_percentage);
+
+        // Remaining budget
+        status.remaining_budget_percentage =
+            status.total_budget_percentage - status.consumed_budget_percentage;
+
+        // Convert to time
+        uint64_t window_minutes = window_.count() / 60;
+
+        status.total_budget_minutes =
+            static_cast<uint64_t>(window_minutes * status.total_budget_percentage / 100.0);
+
+        status.consumed_budget_minutes =
+            static_cast<uint64_t>(window_minutes * status.consumed_budget_percentage / 100.0);
+
+        status.remaining_budget_minutes =
+            status.total_budget_minutes - status.consumed_budget_minutes;
+
+        // Consumption rate (extrapolate to per-hour)
+        double short_window_error = 100.0 - sli_->calculateSLI(std::chrono::seconds(3600));
+        status.consumption_rate = short_window_error;
+
+        return status;
+    }
+
+    void printStatus() const {
+        auto status = getStatus();
+
+        std::cout << "Error Budget Status for " << name_ << ":\n"
+                  << "  Total Budget: " << status.total_budget_percentage << "% ("
+                  << status.total_budget_minutes << " minutes)\n"
+                  << "  Consumed: " << status.consumed_budget_percentage << "% ("
+                  << status.consumed_budget_minutes << " minutes)\n"
+                  << "  Remaining: " << status.remaining_budget_percentage << "% ("
+                  << status.remaining_budget_minutes << " minutes)\n"
+                  << "  Consumption Rate: " << status.consumption_rate << "%/hour\n";
+    }
+
+    // Predict when budget will be exhausted
+    std::chrono::seconds predictExhaustion() const {
+        auto status = getStatus();
+
+        if (status.consumption_rate <= 0) {
+            return std::chrono::seconds::max();  // Never
+        }
+
+        // Hours until exhaustion
+        double hours = status.remaining_budget_percentage / status.consumption_rate;
+
+        return std::chrono::seconds(static_cast<uint64_t>(hours * 3600));
+    }
+};
+
+============================================
+5. BURN RATE ALERTS
+============================================
+
+Multi-Window Burn Rate Alerting:
+---------------------------------
+class BurnRateAlert {
+public:
+    struct Window {
+        std::chrono::seconds duration;
+        double burn_rate_threshold;
+        double error_budget_consumed_threshold;
+    };
+
+private:
+    std::string name_;
+    std::shared_ptr<SLO> slo_;
+    std::vector<Window> windows_;
+
+    std::function<void(const std::string&, const std::string&)> alert_callback_;
+
+public:
+    BurnRateAlert(const std::string& name,
+                  std::shared_ptr<SLO> slo)
+        : name_(name), slo_(slo) {
+
+        // Default multi-window configuration
+        // Based on Google SRE book recommendations
+        windows_ = {
+            // Short window: 1 hour, consume 2% of 30-day budget
+            {std::chrono::hours(1), 14.4, 2.0},
+
+            // Medium window: 6 hours, consume 5% of 30-day budget
+            {std::chrono::hours(6), 6.0, 5.0}
+        };
+    }
+
+    void setWindows(const std::vector<Window>& windows) {
+        windows_ = windows;
+    }
+
+    void setAlertCallback(
+        std::function<void(const std::string&, const std::string&)> callback) {
+        alert_callback_ = callback;
+    }
+
+    void check() {
+        auto status = slo_->getStatus();
+
+        for (const auto& window : windows_) {
+            // Calculate burn rate for this window
+            double burn_rate = slo_->calculateBurnRate(
+                window.duration,
+                slo_->getTarget().window
+            );
+
+            // Check if burn rate exceeds threshold
+            if (burn_rate > window.burn_rate_threshold) {
+                // Also check error budget consumption
+                if (status.error_budget_consumed >= window.error_budget_consumed_threshold) {
+                    fireAlert(window, burn_rate, status.error_budget_consumed);
+                }
+            }
+        }
+    }
+
+private:
+    void fireAlert(const Window& window,
+                   double actual_burn_rate,
+                   double actual_budget_consumed) {
+        std::ostringstream message;
+        message << "Burn rate alert for " << name_ << ": "
+                << "Window: " << window.duration.count() / 3600 << "h, "
+                << "Burn rate: " << actual_burn_rate << "x "
+                << "(threshold: " << window.burn_rate_threshold << "x), "
+                << "Budget consumed: " << actual_budget_consumed << "% "
+                << "(threshold: " << window.error_budget_consumed_threshold << "%)";
+
+        if (alert_callback_) {
+            alert_callback_(name_, message.str());
+        } else {
+            std::cerr << message.str() << "\n";
+        }
+    }
+};
+
+============================================
+6. PRODUCTION SLO EXAMPLES FOR HFT
+============================================
+
+HFT SLO Configuration:
+----------------------
+class HFTSLOConfiguration {
+public:
+    static void setupSLOs(SLOManager& slo_manager) {
+        // 1. Order Placement Availability SLO
+        // Target: 99.95% of orders successfully placed
+        auto order_placement_sli = SLIRegistry::registerSLI(
+            "order_placement",
+            std::chrono::seconds(30 * 24 * 3600)  // 30 days
+        );
+
+        auto order_placement_slo = std::make_shared<SLO>(
+            "order_placement_availability",
+            SLO::Type::AVAILABILITY,
+            order_placement_sli,
+            SLO::Target{99.95, std::chrono::seconds(30 * 24 * 3600)}
+        );
+
+        slo_manager.registerSLO(order_placement_slo);
+
+        // 2. Order Latency SLO
+        // Target: 99% of orders placed within 5ms
+        auto order_latency_sli = SLIRegistry::registerSLI(
+            "order_latency",
+            std::chrono::seconds(30 * 24 * 3600)
+        );
+
+        auto order_latency_slo = std::make_shared<SLO>(
+            "order_latency_5ms",
+            SLO::Type::LATENCY,
+            order_latency_sli,
+            SLO::Target{99.0, std::chrono::seconds(30 * 24 * 3600)},
+            5000.0  // 5ms threshold in microseconds
+        );
+
+        slo_manager.registerSLO(order_latency_slo);
+
+        // 3. Market Data Latency SLO
+        // Target: 99.9% of market data updates processed within 1ms
+        auto market_data_latency_sli = SLIRegistry::registerSLI(
+            "market_data_latency",
+            std::chrono::seconds(30 * 24 * 3600)
+        );
+
+        auto market_data_latency_slo = std::make_shared<SLO>(
+            "market_data_latency_1ms",
+            SLO::Type::LATENCY,
+            market_data_latency_sli,
+            SLO::Target{99.9, std::chrono::seconds(30 * 24 * 3600)},
+            1000.0  // 1ms threshold in microseconds
+        );
+
+        slo_manager.registerSLO(market_data_latency_slo);
+
+        // 4. Fill Rate SLO
+        // Target: 70% of orders get filled
+        auto fill_rate_sli = SLIRegistry::registerSLI(
+            "fill_rate",
+            std::chrono::seconds(24 * 3600)  // Daily
+        );
+
+        auto fill_rate_slo = std::make_shared<SLO>(
+            "fill_rate",
+            SLO::Type::QUALITY,
+            fill_rate_sli,
+            SLO::Target{70.0, std::chrono::seconds(24 * 3600)}
+        );
+
+        slo_manager.registerSLO(fill_rate_slo);
+
+        // 5. Exchange Connectivity SLO
+        // Target: 99.99% uptime
+        auto exchange_uptime_sli = SLIRegistry::registerSLI(
+            "exchange_uptime",
+            std::chrono::seconds(30 * 24 * 3600)
+        );
+
+        auto exchange_uptime_slo = std::make_shared<SLO>(
+            "exchange_connectivity",
+            SLO::Type::AVAILABILITY,
+            exchange_uptime_sli,
+            SLO::Target{99.99, std::chrono::seconds(30 * 24 * 3600)}
+        );
+
+        slo_manager.registerSLO(exchange_uptime_slo);
+    }
+};
+
+Usage in Trading Engine:
+-------------------------
+class TradingEngineWithSLOs {
+private:
+    SLOManager slo_manager_;
+
+    std::shared_ptr<SLI> order_placement_sli_;
+    std::shared_ptr<SLI> order_latency_sli_;
+    std::shared_ptr<SLI> fill_rate_sli_;
+
+    std::shared_ptr<BurnRateAlert> order_placement_alert_;
+
+public:
+    TradingEngineWithSLOs() {
+        // Setup SLOs
+        HFTSLOConfiguration::setupSLOs(slo_manager_);
+
+        // Get SLI references
+        order_placement_sli_ = SLIRegistry::getSLI("order_placement");
+        order_latency_sli_ = SLIRegistry::getSLI("order_latency");
+        fill_rate_sli_ = SLIRegistry::getSLI("fill_rate");
+
+        // Setup burn rate alerts
+        auto order_slo = slo_manager_.getSLO("order_placement_availability");
+        order_placement_alert_ = std::make_shared<BurnRateAlert>(
+            "order_placement", order_slo);
+
+        order_placement_alert_->setAlertCallback(
+            [](const std::string& name, const std::string& message) {
+                std::cerr << "BURN RATE ALERT: " << message << "\n";
+                // Send to AlertManager, PagerDuty, etc.
+            }
+        );
+
+        // Start periodic alert checks
+        startAlertMonitoring();
+    }
+
+    void submitOrder(const Order& order) {
+        auto start = std::chrono::high_resolution_clock::now();
+
+        bool success = false;
+        try {
+            success = sendOrderToExchange(order);
+        } catch (...) {
+            success = false;
+        }
+
+        auto end = std::chrono::high_resolution_clock::now();
+        auto latency_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            end - start).count();
+
+        // Record availability SLI
+        order_placement_sli_->record(success);
+
+        // Record latency SLI (good if < 5ms)
+        bool latency_good = latency_us < 5000;
+        order_latency_sli_->record(latency_good, latency_us);
+    }
+
+    void onOrderFill(const Fill& fill) {
+        // Record fill
+        fill_rate_sli_->record(true);
+    }
+
+    void onOrderExpired(const Order& order) {
+        // Order expired without fill
+        fill_rate_sli_->record(false);
+    }
+
+    void printSLOReport() {
+        auto report = slo_manager_.getSLOReport();
+        std::cout << report.dump(2) << "\n";
+    }
+
+private:
+    void startAlertMonitoring() {
+        std::thread([this]() {
+            while (true) {
+                std::this_thread::sleep_for(std::chrono::minutes(1));
+
+                // Check burn rates
+                order_placement_alert_->check();
+
+                // Check for SLO violations
+                if (slo_manager_.hasViolations()) {
+                    std::cerr << "WARNING: SLO violations detected!\n";
+                    printSLOReport();
+                }
+            }
+        }).detach();
+    }
+
+    bool sendOrderToExchange(const Order& order) {
+        // Implementation
+        return true;
+    }
+};
+
+Prometheus Recording Rules for SLOs:
+-------------------------------------
+# slo_rules.yml
+groups:
+  - name: slo_recording_rules
+    interval: 30s
+    rules:
+      # Order placement SLI
+      - record: sli:order_placement:success_rate:30d
+        expr: |
+          sum(rate(hft_orders_success_total[30d]))
+          /
+          sum(rate(hft_orders_total[30d]))
+
+      # Order latency SLI
+      - record: sli:order_latency:good_ratio:30d
+        expr: |
+          sum(rate(hft_order_latency_bucket{le="5000"}[30d]))
+          /
+          sum(rate(hft_order_latency_count[30d]))
+
+      # Error budget remaining
+      - record: slo:order_placement:error_budget_remaining:percentage
+        expr: |
+          (1 - ((1 - sli:order_placement:success_rate:30d) / (1 - 0.9995)))
+          * 100
+
+      # Burn rate (1 hour window)
+      - record: slo:order_placement:burn_rate:1h
+        expr: |
+          (1 - sum(rate(hft_orders_success_total[1h])) /
+               sum(rate(hft_orders_total[1h])))
+          /
+          (1 - 0.9995)
+
+SLO Dashboard JSON:
+-------------------
+{
+  "dashboard": {
+    "title": "SLO Dashboard",
+    "panels": [
+      {
+        "id": 1,
+        "title": "Error Budget Remaining",
+        "type": "gauge",
+        "targets": [
+          {
+            "expr": "slo:order_placement:error_budget_remaining:percentage"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "thresholds": {
+              "steps": [
+                {"value": 0, "color": "red"},
+                {"value": 20, "color": "yellow"},
+                {"value": 50, "color": "green"}
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "title": "Burn Rate (1h window)",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "slo:order_placement:burn_rate:1h"
+          }
+        ],
+        "thresholds": [
+          {"value": 14.4, "colorMode": "critical"}
+        ]
+      }
+    ]
+  }
+}
+
+Production Deployment:
+----------------------
+#!/bin/bash
+
+# Deploy SLO monitoring
+
+# Load recording rules
+kubectl create configmap prometheus-slo-rules \
+  --from-file=slo_rules.yml \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+# Reload Prometheus
+kubectl exec -it prometheus-0 -- \
+  curl -X POST http://localhost:9090/-/reload
+
+echo "SLO monitoring deployed"

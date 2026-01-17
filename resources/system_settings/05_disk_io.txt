@@ -1,0 +1,982 @@
+================================================================================
+DISK I/O OPTIMIZATION FOR HFT SYSTEMS
+================================================================================
+
+OVERVIEW:
+While HFT systems primarily operate in memory, disk I/O optimization is
+critical for logging, persistent storage, and system stability. This document
+covers I/O schedulers, mount options, SSD optimization, and file systems.
+
+TARGET METRICS:
+- Log Write Latency: < 1 millisecond (P99)
+- Sequential Write: > 3 GB/s (NVMe SSD)
+- Random Read IOPS: > 500,000 (NVMe SSD)
+- Fsync Latency: < 100 microseconds
+- I/O Wait: < 1% CPU time
+
+================================================================================
+1. I/O SCHEDULER SELECTION
+================================================================================
+
+CONCEPT:
+I/O schedulers determine how disk requests are ordered and dispatched.
+For SSDs/NVMe, simpler schedulers provide lower latency.
+
+AVAILABLE SCHEDULERS:
+- noop/none: No scheduling (RECOMMENDED for NVMe)
+- deadline: Deadline-based (RECOMMENDED for SATA SSDs)
+- cfq: Completely Fair Queuing (DEFAULT, avoid for HFT)
+- bfq: Budget Fair Queuing (throughput-oriented, avoid)
+- kyber: Adaptive scheduler (modern alternative)
+- mq-deadline: Multi-queue deadline (for multi-queue devices)
+
+CHECK CURRENT SCHEDULER:
+----------------------------------------
+# For traditional block devices (sdX)
+cat /sys/block/sda/queue/scheduler
+# Output: noop deadline [cfq]  # [brackets] show active
+
+# For NVMe devices (nvmeXnY)
+cat /sys/block/nvme0n1/queue/scheduler
+# Output: [none] mq-deadline kyber bfq
+
+# List all block devices and schedulers
+for dev in /sys/block/sd*/queue/scheduler; do
+    echo "$dev: $(cat $dev)"
+done
+----------------------------------------
+
+SET I/O SCHEDULER:
+
+NVME DEVICES (USE "NONE"):
+----------------------------------------
+# NVMe has internal scheduling, kernel scheduler adds overhead
+echo none > /sys/block/nvme0n1/queue/scheduler
+
+# Verify
+cat /sys/block/nvme0n1/queue/scheduler
+# Should show: [none] mq-deadline kyber
+----------------------------------------
+
+SATA SSD (USE "DEADLINE" OR "NOOP"):
+----------------------------------------
+# Deadline provides good balance for SATA SSDs
+echo deadline > /sys/block/sda/queue/scheduler
+
+# Or noop for absolute minimal overhead
+echo noop > /sys/block/sda/queue/scheduler
+
+# Verify
+cat /sys/block/sda/queue/scheduler
+----------------------------------------
+
+PERSISTENT CONFIGURATION:
+----------------------------------------
+# Method 1: udev rules (RECOMMENDED)
+cat > /etc/udev/rules.d/60-ioschedulers.rules << EOF
+# Set none scheduler for NVMe devices
+ACTION=="add|change", KERNEL=="nvme[0-9]n[0-9]", ATTR{queue/scheduler}="none"
+
+# Set deadline for SATA SSDs
+ACTION=="add|change", KERNEL=="sd[a-z]", ATTR{queue/rotational}=="0", ATTR{queue/scheduler}="deadline"
+
+# Keep cfq for HDDs (if any)
+ACTION=="add|change", KERNEL=="sd[a-z]", ATTR{queue/rotational}=="1", ATTR{queue/scheduler}="cfq"
+EOF
+
+# Reload udev rules
+udevadm control --reload-rules
+udevadm trigger --type=devices --action=change
+
+# Method 2: Kernel boot parameter
+# Edit /etc/default/grub
+GRUB_CMDLINE_LINUX="elevator=deadline"  # For SATA
+GRUB_CMDLINE_LINUX="elevator=noop"      # Alternative
+
+update-grub && reboot
+
+# Method 3: systemd service
+cat > /etc/systemd/system/set-io-scheduler.service << EOF
+[Unit]
+Description=Set I/O Scheduler
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'echo none > /sys/block/nvme0n1/queue/scheduler'
+ExecStart=/bin/sh -c 'echo deadline > /sys/block/sda/queue/scheduler'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl enable set-io-scheduler.service
+systemctl start set-io-scheduler.service
+----------------------------------------
+
+================================================================================
+2. I/O SCHEDULER TUNING
+================================================================================
+
+DEADLINE SCHEDULER PARAMETERS:
+----------------------------------------
+# View current settings
+cat /sys/block/sda/queue/iosched/read_expire
+cat /sys/block/sda/queue/iosched/write_expire
+cat /sys/block/sda/queue/iosched/fifo_batch
+
+# Tune for low latency
+# Read deadline (milliseconds) - default: 500
+echo 50 > /sys/block/sda/queue/iosched/read_expire
+
+# Write deadline (milliseconds) - default: 5000
+echo 500 > /sys/block/sda/queue/iosched/write_expire
+
+# Batch size (number of requests) - default: 16
+echo 8 > /sys/block/sda/queue/iosched/fifo_batch
+
+# Disable front merging (reduce latency variance)
+echo 1 > /sys/block/sda/queue/iosched/front_merges
+----------------------------------------
+
+MQ-DEADLINE PARAMETERS:
+----------------------------------------
+# For multi-queue deadline (modern kernel)
+cat /sys/block/nvme0n1/queue/iosched/read_expire
+cat /sys/block/nvme0n1/queue/iosched/write_expire
+
+# Reduce latency
+echo 50 > /sys/block/nvme0n1/queue/iosched/read_expire
+echo 500 > /sys/block/nvme0n1/queue/iosched/write_expire
+----------------------------------------
+
+QUEUE DEPTH TUNING:
+----------------------------------------
+# View current queue depth
+cat /sys/block/nvme0n1/queue/nr_requests
+
+# For NVMe, large queue depth is beneficial (default: 1024-2048)
+# For low-latency logging, reduce queue depth
+echo 512 > /sys/block/nvme0n1/queue/nr_requests
+
+# SATA SSD queue depth (default: 128)
+echo 64 > /sys/block/sda/queue/nr_requests
+
+# Too small = underutilized bandwidth
+# Too large = increased latency
+# Balance based on workload
+----------------------------------------
+
+READ-AHEAD TUNING:
+----------------------------------------
+# Check current read-ahead (KB)
+blockdev --getra /dev/nvme0n1
+
+# For trading logs (sequential writes, minimal reads)
+# Reduce read-ahead to save memory
+blockdev --setra 128 /dev/nvme0n1  # 128 * 512 bytes = 64KB
+
+# For databases or data replay (sequential reads)
+# Increase read-ahead
+blockdev --setra 8192 /dev/nvme0n1  # 8192 * 512 bytes = 4MB
+
+# Make persistent (add to rc.local or systemd)
+echo "blockdev --setra 128 /dev/nvme0n1" >> /etc/rc.local
+----------------------------------------
+
+MAX SECTORS:
+----------------------------------------
+# Maximum size of a single I/O request (KB)
+cat /sys/block/nvme0n1/queue/max_sectors_kb
+
+# For NVMe, default is often optimal (512-1024)
+# Can increase for sequential workloads
+echo 1024 > /sys/block/nvme0n1/queue/max_sectors_kb
+
+# For minimal latency (smaller requests)
+echo 256 > /sys/block/nvme0n1/queue/max_sectors_kb
+----------------------------------------
+
+================================================================================
+3. FILE SYSTEM SELECTION AND FORMATTING
+================================================================================
+
+RECOMMENDED FILE SYSTEMS FOR HFT:
+1. XFS: Best for high-performance logging, large files
+2. ext4: General purpose, excellent performance, widely tested
+3. F2FS: Flash-optimized, good for SSDs (less mature)
+4. Btrfs: Avoid (COW overhead, unpredictable latency)
+
+XFS (RECOMMENDED FOR LOGS):
+----------------------------------------
+# Install XFS tools
+apt-get install xfsprogs
+
+# Format with optimal settings for SSDs
+mkfs.xfs -f -d agcount=8 -l size=128m -n size=8192 /dev/nvme0n1p1
+
+# Options explained:
+# -d agcount=8: Allocation groups (match CPU cores for parallelism)
+# -l size=128m: Large log size for better performance
+# -n size=8192: Directory block size (8KB)
+
+# For large files (trading archives)
+mkfs.xfs -f -d agcount=8 -l size=256m -i size=2048 /dev/nvme0n1p2
+# -i size=2048: Larger inode size for more attributes
+
+# Mount XFS (see mount options section)
+mount -o noatime,nodiratime,logbsize=256k,largeio,inode64 \
+    /dev/nvme0n1p1 /var/log/trading
+----------------------------------------
+
+EXT4:
+----------------------------------------
+# Format with optimal settings
+mkfs.ext4 -F -E stride=128,stripe-width=128 \
+    -O ^has_journal,extent,huge_file,flex_bg,dir_nlink,extra_isize,64bit \
+    /dev/nvme0n1p1
+
+# Options explained:
+# ^has_journal: Disable journal for maximum performance (risky!)
+# extent: Use extent-based allocation (better for large files)
+# huge_file: Support for very large files
+# flex_bg: Flexible block groups
+# dir_nlink: Unlimited subdirectories
+# 64bit: 64-bit file system support
+
+# With journal (recommended for most cases)
+mkfs.ext4 -F -E stride=128,stripe-width=128 \
+    -O extent,huge_file,flex_bg,uninit_bg,dir_nlink,extra_isize,64bit \
+    /dev/nvme0n1p1
+
+# Tune after creation
+tune2fs -O ^has_journal /dev/nvme0n1p1  # Remove journal (optional)
+tune2fs -o journal_data_writeback /dev/nvme0n1p1  # Async journal
+
+# Mount ext4 (see mount options section)
+mount -o noatime,nodiratime,data=writeback,barrier=0 \
+    /dev/nvme0n1p1 /var/log/trading
+----------------------------------------
+
+F2FS (FLASH-OPTIMIZED):
+----------------------------------------
+# Install F2FS tools
+apt-get install f2fs-tools
+
+# Format for flash storage
+mkfs.f2fs -f -O extra_attr,inode_checksum,sb_checksum,compression \
+    /dev/nvme0n1p1
+
+# Mount F2FS
+mount -o noatime,nodiratime,inline_data,flush_merge \
+    /dev/nvme0n1p1 /var/log/trading
+----------------------------------------
+
+FILE SYSTEM BENCHMARKING:
+----------------------------------------
+# FIO benchmark (flexible I/O tester)
+apt-get install fio
+
+# Random write test (simulate logging)
+fio --name=randwrite --ioengine=libaio --iodepth=16 \
+    --rw=randwrite --bs=4k --direct=1 --size=1G \
+    --numjobs=4 --runtime=60 --group_reporting \
+    --filename=/mnt/test/fio_test
+
+# Sequential write test
+fio --name=seqwrite --ioengine=libaio --iodepth=32 \
+    --rw=write --bs=1m --direct=1 --size=4G \
+    --numjobs=1 --runtime=60 --group_reporting \
+    --filename=/mnt/test/fio_test
+
+# Fsync latency test (critical for trading logs)
+fio --name=fsync --ioengine=sync --iodepth=1 \
+    --rw=write --bs=4k --direct=0 --fsync=1 \
+    --size=100M --numjobs=1 --runtime=60 \
+    --group_reporting --filename=/mnt/test/fio_test
+
+# Target fsync latency: < 100 microseconds on NVMe
+----------------------------------------
+
+================================================================================
+4. MOUNT OPTIONS OPTIMIZATION
+================================================================================
+
+CRITICAL MOUNT OPTIONS:
+
+NOATIME AND NODIRATIME:
+----------------------------------------
+# Disable access time updates (major performance gain)
+# Every read would otherwise require a metadata write
+
+# Add to /etc/fstab
+UUID=xxx /var/log/trading xfs noatime,nodiratime 0 0
+
+# Or use relatime (updates atime only if older than mtime)
+UUID=xxx /var/log/trading xfs relatime 0 0
+
+# Test impact:
+# Without noatime: ~30% performance loss on read-heavy workloads
+# With noatime: No atime overhead
+----------------------------------------
+
+COMPREHENSIVE MOUNT OPTIONS:
+
+XFS:
+----------------------------------------
+# High-performance XFS mount options
+cat >> /etc/fstab << EOF
+# Trading logs on NVMe
+UUID=xxx /var/log/trading xfs noatime,nodiratime,logbsize=256k,largeio,inode64,swalloc,nobarrier 0 0
+
+# Trading data on NVMe
+UUID=yyy /data/trading xfs noatime,nodiratime,logbsize=256k,largeio,inode64,swalloc,nobarrier 0 0
+EOF
+
+# Options explained:
+# noatime: Don't update access time
+# nodiratime: Don't update directory access time
+# logbsize=256k: Large log buffer (improves metadata performance)
+# largeio: Prefer larger I/O (better for sequential)
+# inode64: Allow inodes beyond 2TB boundary
+# swalloc: Allocate space for delayed writes
+# nobarrier: Disable write barriers (assumes battery-backed cache)
+
+# Mount
+mount -a
+
+# WARNING: nobarrier assumes your storage has battery-backed cache
+# Without it, risk of data loss on power failure
+----------------------------------------
+
+EXT4:
+----------------------------------------
+cat >> /etc/fstab << EOF
+# Trading logs on NVMe
+UUID=xxx /var/log/trading ext4 noatime,nodiratime,data=writeback,barrier=0,journal_async_commit,delalloc,noauto_da_alloc 0 0
+
+# Trading data on NVMe
+UUID=yyy /data/trading ext4 noatime,nodiratime,data=writeback,barrier=0,commit=60 0 0
+EOF
+
+# Options explained:
+# data=writeback: Don't order data writes (fastest, less safe)
+# barrier=0: Disable write barriers (battery-backed cache only)
+# journal_async_commit: Async journal commits
+# delalloc: Delayed allocation (better layout)
+# noauto_da_alloc: Disable auto-allocation on rename
+# commit=60: Commit interval in seconds (default: 5)
+
+mount -a
+----------------------------------------
+
+DISCARD/TRIM:
+----------------------------------------
+# Enable automatic TRIM for SSDs
+
+# Continuous TRIM (mount option)
+# NOT RECOMMENDED for performance (adds latency)
+UUID=xxx /data/trading xfs noatime,discard 0 0
+
+# Periodic TRIM (RECOMMENDED)
+# Enable fstrim.timer (systemd)
+systemctl enable fstrim.timer
+systemctl start fstrim.timer
+
+# Verify timer
+systemctl status fstrim.timer
+
+# Manual TRIM
+fstrim -v /data/trading
+
+# Check TRIM support
+lsblk --discard
+# DISC-GRAN and DISC-MAX should be non-zero
+
+# Or for specific device
+hdparm -I /dev/nvme0n1 | grep TRIM
+# Should show: "Data Set Management TRIM supported"
+----------------------------------------
+
+TMPFS FOR TEMPORARY DATA:
+----------------------------------------
+# Mount tmpfs (RAM filesystem) for ultra-fast temporary storage
+cat >> /etc/fstab << EOF
+# Temporary trading data in RAM
+tmpfs /tmp/trading tmpfs noatime,size=16G,mode=1777 0 0
+EOF
+
+mount -a
+
+# Use for:
+# - Intra-day temporary files
+# - Lock files
+# - IPC files
+# - Session data
+
+# WARNING: Data is lost on reboot or power loss
+----------------------------------------
+
+================================================================================
+5. SSD-SPECIFIC OPTIMIZATIONS
+================================================================================
+
+SSD VERIFICATION:
+----------------------------------------
+# Check if device is SSD
+cat /sys/block/nvme0n1/queue/rotational
+# 0 = SSD, 1 = HDD
+
+# Check SSD information
+smartctl -a /dev/nvme0n1
+
+# NVMe-specific info
+nvme list
+nvme smart-log /dev/nvme0n1
+----------------------------------------
+
+ENABLE NCQ (NATIVE COMMAND QUEUING):
+----------------------------------------
+# Check NCQ depth
+cat /sys/block/sda/device/queue_depth
+
+# For SATA SSDs, NCQ should be enabled (default on modern systems)
+# Verify in dmesg
+dmesg | grep -i ncq
+
+# Should show: "ata1.00: NCQ enabled, depth 32"
+----------------------------------------
+
+OVER-PROVISIONING:
+----------------------------------------
+# Reserve space on SSD for wear leveling and garbage collection
+# Improves performance and longevity
+
+# Method 1: Don't partition full capacity
+# Leave 10-20% unpartitioned
+
+# Method 2: Use hdparm (if supported)
+hdparm --set-sector-count 1831348785 --please-destroy-my-drive /dev/sda
+# Reduces reported capacity by 10%
+
+# Method 3: Vendor tools
+# Use Samsung Magician, Intel SSD Toolbox, etc.
+----------------------------------------
+
+SSD POWER MANAGEMENT:
+----------------------------------------
+# Disable aggressive power management for SSDs
+cat /sys/class/scsi_host/host*/link_power_management_policy
+
+# Set to maximum performance
+echo max_performance > /sys/class/scsi_host/host*/link_power_management_policy
+
+# For NVMe, disable APST (Autonomous Power State Transition)
+echo 0 > /sys/module/nvme_core/parameters/default_ps_max_latency_us
+
+# Make persistent
+cat > /etc/udev/rules.d/60-ssd-power.rules << EOF
+ACTION=="add|change", SUBSYSTEM=="scsi_host", KERNEL=="host*", \
+    ATTR{link_power_management_policy}="max_performance"
+EOF
+
+# Kernel parameter
+# Edit /etc/default/grub
+GRUB_CMDLINE_LINUX="nvme_core.default_ps_max_latency_us=0"
+----------------------------------------
+
+SSD FIRMWARE UPDATES:
+----------------------------------------
+# Keep firmware up to date for performance and reliability
+
+# Check current firmware version
+nvme id-ctrl /dev/nvme0n1 | grep fr
+# Or
+smartctl -a /dev/nvme0n1 | grep "Firmware Version"
+
+# Update firmware (NVMe)
+# Download from vendor, then:
+nvme fw-download /dev/nvme0n1 --fw=firmware.bin
+nvme fw-activate /dev/nvme0n1 --slot=0 --action=2
+
+# For SATA SSDs, use vendor tools
+----------------------------------------
+
+================================================================================
+6. WRITE CACHE CONFIGURATION
+================================================================================
+
+VOLATILE WRITE CACHE:
+----------------------------------------
+# Check write cache status
+hdparm -W /dev/sda
+# write-caching =  1 (on)
+
+# Enable write cache (default on most SSDs)
+hdparm -W1 /dev/sda
+
+# Disable write cache (safer but slower)
+hdparm -W0 /dev/sda
+
+# For NVMe
+nvme get-feature /dev/nvme0n1 -f 0x06  # Volatile write cache feature
+
+# Enable volatile write cache (NVMe)
+nvme set-feature /dev/nvme0n1 -f 0x06 -v 1
+----------------------------------------
+
+BATTERY-BACKED WRITE CACHE:
+----------------------------------------
+# If using RAID controller with BBU
+# Enable write-back caching
+
+# MegaRAID example
+megacli -LDSetProp WB -Lall -aALL
+
+# Check cache policy
+megacli -LDInfo -Lall -aALL | grep "Current Cache Policy"
+
+# With BBU, safe to use aggressive caching and nobarrier
+----------------------------------------
+
+FSYNC BEHAVIOR:
+----------------------------------------
+# Test fsync latency
+time bash -c 'dd if=/dev/zero of=/mnt/test/file bs=1M count=100 && sync'
+
+# Application-level fsync control (C++)
+#include <unistd.h>
+#include <fcntl.h>
+
+void write_log_with_fsync(const char* filename, const char* data, size_t size) {
+    int fd = open(filename, O_WRONLY | O_APPEND | O_CREAT, 0644);
+    write(fd, data, size);
+
+    // Explicit fsync (ensure durability)
+    fsync(fd);  // Wait for write to complete
+
+    close(fd);
+}
+
+// For lower latency, batch writes
+void write_log_batched(const char* filename, const char** data, int count) {
+    int fd = open(filename, O_WRONLY | O_APPEND | O_CREAT, 0644);
+
+    // Write all data
+    for (int i = 0; i < count; i++) {
+        write(fd, data[i], strlen(data[i]));
+    }
+
+    // Single fsync for all writes
+    fsync(fd);
+
+    close(fd);
+}
+
+// For even lower latency, use O_DIRECT (bypass page cache)
+void write_log_direct(const char* filename, const char* data, size_t size) {
+    // Data must be aligned for O_DIRECT
+    int fd = open(filename, O_WRONLY | O_APPEND | O_CREAT | O_DIRECT, 0644);
+
+    // Align buffer
+    void* aligned_buf;
+    posix_memalign(&aligned_buf, 4096, size);
+    memcpy(aligned_buf, data, size);
+
+    write(fd, aligned_buf, size);
+    free(aligned_buf);
+    close(fd);
+}
+----------------------------------------
+
+================================================================================
+7. I/O MONITORING AND DIAGNOSTICS
+================================================================================
+
+IOSTAT - I/O STATISTICS:
+----------------------------------------
+# Install sysstat
+apt-get install sysstat
+
+# Monitor I/O stats (1 second interval)
+iostat -x 1
+
+# Key metrics:
+# %util: Device utilization (should be < 80% on average)
+# await: Average wait time (should be < 1ms on NVMe)
+# r_await: Read wait time
+# w_await: Write wait time
+# svctm: Service time (deprecated metric)
+
+# Sample output for NVMe:
+# Device  r/s    w/s   rMB/s   wMB/s  await  %util
+# nvme0n1 100    500   10.0    50.0   0.5    30.0
+
+# Target NVMe await: < 1ms
+# Target SATA SSD await: < 5ms
+----------------------------------------
+
+IOTOP - TOP FOR I/O:
+----------------------------------------
+# Install iotop
+apt-get install iotop
+
+# Monitor processes by I/O
+iotop -o  # Only show processes with I/O
+
+# Batch mode for logging
+iotop -b -n 10 > iotop.log
+
+# Find I/O intensive processes
+iotop -qqq -P -o -k
+----------------------------------------
+
+BLKTRACE - DETAILED I/O TRACING:
+----------------------------------------
+# Install blktrace
+apt-get install blktrace
+
+# Trace I/O for device
+blktrace -d /dev/nvme0n1 -o nvme_trace
+
+# Stop with Ctrl+C, then analyze
+blkparse nvme0n1.blktrace.* > trace.txt
+
+# Statistics
+btt -i nvme0n1.blktrace.*
+
+# Visualize with seekwatcher
+seekwatcher -t nvme0n1.blktrace.* -o trace.png
+----------------------------------------
+
+DISK LATENCY MONITORING:
+----------------------------------------
+# BPF tools (bcc-tools)
+apt-get install bpfcc-tools
+
+# Block I/O latency histogram
+/usr/share/bcc/tools/biolatency -D 10
+
+# Target P99 latency:
+# NVMe: < 100 microseconds
+# SATA SSD: < 1 millisecond
+
+# Trace slow I/O
+/usr/share/bcc/tools/biosnoop | awk '$7 > 10000'  # > 10ms
+
+# File system latency
+/usr/share/bcc/tools/ext4dist -m 10  # or xfsdist
+----------------------------------------
+
+SMARTCTL - DISK HEALTH:
+----------------------------------------
+# Install smartmontools
+apt-get install smartmontools
+
+# Check disk health
+smartctl -H /dev/nvme0n1
+# Should show: PASSED
+
+# Detailed SMART data
+smartctl -a /dev/nvme0n1
+
+# Key metrics to monitor:
+# - Critical Warning (should be 0)
+# - Temperature
+# - Available Spare (should be > 10%)
+# - Percentage Used (wear level)
+# - Power Cycles
+# - Power On Hours
+# - Unsafe Shutdowns
+# - Media Errors
+
+# Monitor over time
+smartctl -A /dev/nvme0n1 | grep -E "Temperature|Percentage_Used"
+
+# Set up SMART monitoring
+systemctl enable smartd
+systemctl start smartd
+
+# Configure alerting in /etc/smartd.conf
+----------------------------------------
+
+FIO - COMPREHENSIVE BENCHMARK:
+----------------------------------------
+# Latency-focused test suite
+cat > hft_disk_bench.fio << EOF
+[global]
+ioengine=libaio
+direct=1
+size=1G
+runtime=60
+time_based
+group_reporting
+
+[randread]
+bs=4k
+iodepth=1
+rw=randread
+numjobs=1
+filename=/mnt/test/randread
+
+[randwrite]
+bs=4k
+iodepth=1
+rw=randwrite
+numjobs=1
+filename=/mnt/test/randwrite
+
+[fsync]
+bs=4k
+iodepth=1
+rw=write
+fsync=1
+numjobs=1
+filename=/mnt/test/fsync
+EOF
+
+fio hft_disk_bench.fio
+
+# Analyze results (focus on P99.99 latency)
+# NVMe targets:
+# Random read 4K: < 100 us
+# Random write 4K: < 50 us
+# Fsync: < 100 us
+----------------------------------------
+
+================================================================================
+8. ASYNCHRONOUS I/O (AIO)
+================================================================================
+
+LINUX AIO:
+----------------------------------------
+// High-performance async I/O
+#include <libaio.h>
+#include <sys/eventfd.h>
+
+class AsyncLogger {
+private:
+    io_context_t ctx;
+    int max_events = 128;
+
+public:
+    AsyncLogger() {
+        memset(&ctx, 0, sizeof(ctx));
+        if (io_setup(max_events, &ctx) < 0) {
+            perror("io_setup failed");
+        }
+    }
+
+    ~AsyncLogger() {
+        io_destroy(ctx);
+    }
+
+    void submit_write(int fd, void* buf, size_t size, off_t offset) {
+        struct iocb cb;
+        struct iocb* cbs[1];
+
+        // Prepare I/O control block
+        io_prep_pwrite(&cb, fd, buf, size, offset);
+        cb.data = buf;  // User data
+
+        cbs[0] = &cb;
+
+        // Submit
+        if (io_submit(ctx, 1, cbs) != 1) {
+            perror("io_submit failed");
+        }
+    }
+
+    int complete_writes() {
+        struct io_event events[max_events];
+        struct timespec timeout = {0, 0};  // Non-blocking
+
+        // Reap completions
+        int n = io_getevents(ctx, 0, max_events, events, &timeout);
+
+        for (int i = 0; i < n; i++) {
+            // Process completion
+            void* buf = events[i].data;
+            // Free buffer or return to pool
+        }
+
+        return n;
+    }
+};
+
+// Usage
+AsyncLogger logger;
+void* buf = allocate_buffer();
+logger.submit_write(fd, buf, size, offset);
+// ... do other work ...
+logger.complete_writes();  // Check for completions
+----------------------------------------
+
+IO_URING (MODERN ALTERNATIVE):
+----------------------------------------
+// io_uring: More efficient than AIO
+#include <liburing.h>
+
+class IOUringLogger {
+private:
+    struct io_uring ring;
+
+public:
+    IOUringLogger(int queue_depth = 128) {
+        if (io_uring_queue_init(queue_depth, &ring, 0) < 0) {
+            perror("io_uring_queue_init failed");
+        }
+    }
+
+    ~IOUringLogger() {
+        io_uring_queue_exit(&ring);
+    }
+
+    void submit_write(int fd, void* buf, size_t size, off_t offset) {
+        struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+
+        io_uring_prep_write(sqe, fd, buf, size, offset);
+        io_uring_sqe_set_data(sqe, buf);
+
+        io_uring_submit(&ring);
+    }
+
+    int complete_writes() {
+        struct io_uring_cqe *cqe;
+        int count = 0;
+
+        // Non-blocking completion check
+        while (io_uring_peek_cqe(&ring, &cqe) == 0) {
+            void* buf = io_uring_cqe_get_data(cqe);
+            // Process completion
+
+            io_uring_cqe_seen(&ring, cqe);
+            count++;
+        }
+
+        return count;
+    }
+};
+----------------------------------------
+
+================================================================================
+9. LOG FILE MANAGEMENT
+================================================================================
+
+LOG ROTATION:
+----------------------------------------
+# Configure logrotate for trading logs
+cat > /etc/logrotate.d/trading << EOF
+/var/log/trading/*.log {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0644 trading trading
+    postrotate
+        killall -HUP trading_engine
+    endscript
+}
+EOF
+
+# Test rotation
+logrotate -f /etc/logrotate.d/trading
+
+# Or use time-based filenames in application
+# trading_20250125_093000.log
+----------------------------------------
+
+SEPARATE LOG PARTITIONS:
+----------------------------------------
+# Isolate trading logs from OS
+# Prevents log filling from affecting system
+
+# Create separate partition/filesystem for logs
+mkfs.xfs /dev/nvme0n1p3
+mount /dev/nvme0n1p3 /var/log/trading
+
+# Set quota if needed
+xfs_quota -x -c 'limit bsoft=100g bhard=110g -d' /var/log/trading
+
+# Monitor disk usage
+df -h /var/log/trading
+
+# Alert on high usage
+cat > /usr/local/bin/check_log_disk.sh << 'EOF'
+#!/bin/bash
+USAGE=$(df /var/log/trading | tail -1 | awk '{print $5}' | sed 's/%//')
+if [ $USAGE -gt 80 ]; then
+    echo "Log disk usage: $USAGE%" | mail -s "Log Disk Alert" ops@company.com
+fi
+EOF
+
+chmod +x /usr/local/bin/check_log_disk.sh
+echo "*/5 * * * * /usr/local/bin/check_log_disk.sh" | crontab -
+----------------------------------------
+
+================================================================================
+10. DISK I/O CHECKLIST
+================================================================================
+
+VALIDATION:
+----------------------------------------
+#!/bin/bash
+echo "=== Disk I/O Configuration Validation ==="
+
+echo -e "\nI/O Schedulers:"
+for dev in /sys/block/{sd,nvme}*/queue/scheduler; do
+    [ -f "$dev" ] && echo "$dev: $(cat $dev)"
+done
+
+echo -e "\nMount Options:"
+mount | grep -E "xfs|ext4"
+
+echo -e "\nSSD Detection:"
+for dev in /sys/block/{sd,nvme}*/queue/rotational; do
+    [ -f "$dev" ] && echo "$dev: $(cat $dev)"
+done
+
+echo -e "\nTRIM Support:"
+lsblk --discard | grep -v "0B"
+
+echo -e "\nRead-ahead:"
+for dev in /dev/{sd,nvme}*; do
+    [ -b "$dev" ] && echo "$dev: $(blockdev --getra $dev)"
+done
+
+echo -e "\nDisk Performance Test (fsync):"
+fio --name=fsync --ioengine=sync --rw=write --bs=4k --size=10M \
+    --fsync=1 --directory=/var/log/trading --runtime=10 \
+    --time_based --group_reporting | grep -E "lat|IOPS"
+----------------------------------------
+
+CHECKLIST:
+----------------------------------------
+[ ] I/O scheduler optimized (none for NVMe, deadline for SATA SSD)
+[ ] File system chosen (XFS or ext4)
+[ ] Mount options optimized (noatime, writeback, etc.)
+[ ] TRIM enabled (fstrim.timer)
+[ ] Write cache configured
+[ ] SSD power management disabled
+[ ] Separate partition for logs
+[ ] Log rotation configured
+[ ] Disk monitoring enabled (smartd)
+[ ] Fsync latency < 100 us (NVMe)
+[ ] I/O wait < 1% CPU time
+[ ] No I/O errors in dmesg
+[ ] Configuration persistent across reboots
+
+TARGET METRICS (NVMe):
+- Random read (4K, QD1): < 100 us
+- Random write (4K, QD1): < 50 us
+- Fsync latency: < 100 us
+- Sequential read: > 3 GB/s
+- Sequential write: > 2 GB/s
+----------------------------------------
+
+================================================================================
+END OF DOCUMENT
+================================================================================

@@ -1,0 +1,590 @@
+================================================================================
+                    LOAD BALANCING FOR HFT SYSTEMS
+                    HAProxy, Nginx, and Custom Solutions
+================================================================================
+
+TABLE OF CONTENTS
+================================================================================
+1. Load Balancing in HFT
+2. HAProxy Implementation
+3. Nginx Configuration
+4. Custom Load Balancer
+5. DNS Round-Robin
+6. Client-Side Load Balancing
+7. Best Practices
+
+================================================================================
+1. LOAD BALANCING IN HFT
+================================================================================
+
+Load balancing distributes traffic across multiple instances for scalability,
+availability, and performance.
+
+WHEN TO USE LOAD BALANCING IN HFT:
+✓ Non-critical HTTP APIs (admin, monitoring)
+✓ Market data feed distribution (multiple consumers)
+✓ Order Management System (active-active)
+✓ Risk management services
+✓ Reporting and analytics
+
+WHEN NOT TO USE:
+✗ Critical path trading operations (adds latency)
+✗ Ultra-low latency requirements (< 100 μs)
+✗ Services requiring session affinity
+✗ Single point is sufficient
+
+LOAD BALANCING STRATEGIES:
+
+Round Robin: Request 1->A, 2->B, 3->C, 4->A...
+Least Connections: Route to server with fewest connections
+IP Hash: Same client always routes to same server
+Weighted: Distribute based on server capacity
+
+================================================================================
+2. HAPROXY IMPLEMENTATION
+================================================================================
+
+HAPROXY ARCHITECTURE:
+
+             Internet/Clients
+                   │
+            ┌──────▼──────┐
+            │   HAProxy   │
+            │ Load Balancer│
+            └──────┬──────┘
+                   │
+      ┌────────────┼────────────┐
+      │            │            │
+┌─────▼────┐ ┌────▼─────┐ ┌───▼──────┐
+│Backend 1 │ │Backend 2 │ │Backend 3 │
+│(healthy) │ │(healthy) │ │(unhealthy│
+└──────────┘ └──────────┘ └──────────┘
+
+HAPROXY CONFIGURATION:
+
+# /etc/haproxy/haproxy.cfg
+
+global
+    maxconn 50000
+    log /dev/log local0
+    user haproxy
+    group haproxy
+    daemon
+    tune.bufsize 32768
+    tune.maxrewrite 1024
+
+defaults
+    log     global
+    mode    http
+    option  httplog
+    option  dontlognull
+    timeout connect 5000ms
+    timeout client  50000ms
+    timeout server  50000ms
+
+# Frontend for trading API
+frontend trading_api
+    bind *:8080
+    mode http
+    default_backend trading_servers
+
+    # ACLs for routing
+    acl is_order path_beg /api/order
+    acl is_position path_beg /api/position
+    use_backend order_servers if is_order
+    use_backend position_servers if is_position
+
+# Backend for trading servers
+backend trading_servers
+    mode http
+    balance roundrobin
+
+    option httpchk GET /health
+    http-check expect status 200
+
+    server trade1 192.168.1.10:8080 check inter 2s rise 2 fall 3
+    server trade2 192.168.1.11:8080 check inter 2s rise 2 fall 3
+    server trade3 192.168.1.12:8080 check inter 2s rise 2 fall 3
+
+# Backend for order servers
+backend order_servers
+    mode http
+    balance leastconn
+
+    option httpchk GET /health
+
+    server order1 192.168.1.20:8080 check inter 2s
+    server order2 192.168.1.21:8080 check inter 2s
+
+# Backend for position servers
+backend position_servers
+    mode http
+    balance source  # Session affinity
+
+    option httpchk GET /health
+
+    server pos1 192.168.1.30:8080 check inter 2s
+    server pos2 192.168.1.31:8080 check inter 2s
+
+# Stats page
+listen stats
+    bind *:9000
+    stats enable
+    stats uri /stats
+    stats refresh 5s
+    stats auth admin:password
+
+TCP MODE (for non-HTTP services):
+
+# Frontend for ZeroMQ gateway
+frontend zmq_gateway
+    bind *:5555
+    mode tcp
+    default_backend zmq_servers
+
+backend zmq_servers
+    mode tcp
+    balance roundrobin
+
+    option tcp-check
+
+    server zmq1 192.168.1.40:5555 check inter 2s
+    server zmq2 192.168.1.41:5555 check inter 2s
+
+================================================================================
+3. NGINX CONFIGURATION
+================================================================================
+
+NGINX AS LOAD BALANCER:
+
+# /etc/nginx/nginx.conf
+
+http {
+    # Upstream for trading API
+    upstream trading_backend {
+        least_conn;  # Least connections
+
+        server 192.168.1.10:8080 max_fails=3 fail_timeout=30s;
+        server 192.168.1.11:8080 max_fails=3 fail_timeout=30s;
+        server 192.168.1.12:8080 max_fails=3 fail_timeout=30s;
+
+        keepalive 32;  # Connection pooling
+    }
+
+    # Upstream for order service
+    upstream order_backend {
+        ip_hash;  # Session affinity
+
+        server 192.168.1.20:8080;
+        server 192.168.1.21:8080;
+    }
+
+    # Server block
+    server {
+        listen 80;
+        server_name trading-api.example.com;
+
+        # Health check endpoint
+        location /health {
+            access_log off;
+            return 200 "OK";
+        }
+
+        # Proxy to trading backend
+        location /api/ {
+            proxy_pass http://trading_backend;
+
+            # Headers
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+
+            # Timeouts
+            proxy_connect_timeout 5s;
+            proxy_send_timeout 10s;
+            proxy_read_timeout 10s;
+
+            # Buffering (disable for low latency)
+            proxy_buffering off;
+
+            # Keep-alive
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+        }
+
+        # Order service (session affinity)
+        location /api/order/ {
+            proxy_pass http://order_backend;
+
+            proxy_set_header Host $host;
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+        }
+    }
+
+    # Monitoring
+    server {
+        listen 9000;
+        server_name localhost;
+
+        location /nginx_status {
+            stub_status on;
+            access_log off;
+        }
+    }
+}
+
+NGINX TCP LOAD BALANCING:
+
+stream {
+    upstream redis_cluster {
+        least_conn;
+
+        server 192.168.1.50:6379 max_fails=3 fail_timeout=10s;
+        server 192.168.1.51:6379 max_fails=3 fail_timeout=10s;
+        server 192.168.1.52:6379 max_fails=3 fail_timeout=10s;
+    }
+
+    server {
+        listen 6379;
+        proxy_pass redis_cluster;
+        proxy_connect_timeout 1s;
+    }
+}
+
+================================================================================
+4. CUSTOM LOAD BALANCER
+================================================================================
+
+C++ CUSTOM LOAD BALANCER:
+
+#include <vector>
+#include <string>
+#include <atomic>
+#include <chrono>
+
+class LoadBalancer {
+public:
+    struct Backend {
+        std::string address;
+        int port;
+        std::atomic<bool> healthy{true};
+        std::atomic<int> active_connections{0};
+        std::chrono::steady_clock::time_point last_health_check;
+    };
+
+    enum class Strategy {
+        ROUND_ROBIN,
+        LEAST_CONNECTIONS,
+        RANDOM,
+        WEIGHTED_ROUND_ROBIN
+    };
+
+private:
+    std::vector<Backend> backends_;
+    std::atomic<size_t> round_robin_index_{0};
+    Strategy strategy_;
+
+public:
+    LoadBalancer(Strategy strategy = Strategy::ROUND_ROBIN)
+        : strategy_(strategy) {}
+
+    void addBackend(const std::string& address, int port) {
+        Backend backend;
+        backend.address = address;
+        backend.port = port;
+        backend.healthy = true;
+        backend.active_connections = 0;
+        backends_.push_back(backend);
+    }
+
+    // Get next backend based on strategy
+    Backend* getNextBackend() {
+        switch (strategy_) {
+            case Strategy::ROUND_ROBIN:
+                return roundRobin();
+            case Strategy::LEAST_CONNECTIONS:
+                return leastConnections();
+            case Strategy::RANDOM:
+                return random();
+            default:
+                return roundRobin();
+        }
+    }
+
+private:
+    Backend* roundRobin() {
+        size_t start_idx = round_robin_index_.fetch_add(1) % backends_.size();
+
+        for (size_t i = 0; i < backends_.size(); ++i) {
+            size_t idx = (start_idx + i) % backends_.size();
+
+            if (backends_[idx].healthy) {
+                return &backends_[idx];
+            }
+        }
+
+        return nullptr;  // No healthy backends
+    }
+
+    Backend* leastConnections() {
+        Backend* selected = nullptr;
+        int min_connections = INT_MAX;
+
+        for (auto& backend : backends_) {
+            if (!backend.healthy) continue;
+
+            int connections = backend.active_connections.load();
+            if (connections < min_connections) {
+                min_connections = connections;
+                selected = &backend;
+            }
+        }
+
+        return selected;
+    }
+
+    Backend* random() {
+        std::vector<Backend*> healthy;
+
+        for (auto& backend : backends_) {
+            if (backend.healthy) {
+                healthy.push_back(&backend);
+            }
+        }
+
+        if (healthy.empty()) {
+            return nullptr;
+        }
+
+        size_t idx = rand() % healthy.size();
+        return healthy[idx];
+    }
+
+public:
+    // Health checking
+    void healthCheck() {
+        for (auto& backend : backends_) {
+            bool healthy = checkBackendHealth(backend.address, backend.port);
+            backend.healthy = healthy;
+            backend.last_health_check = std::chrono::steady_clock::now();
+        }
+    }
+
+private:
+    bool checkBackendHealth(const std::string& address, int port) {
+        // Implement health check (HTTP GET /health, TCP connect, etc.)
+        // For example, TCP connect check:
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) return false;
+
+        struct sockaddr_in server_addr;
+        server_addr.sin_family = AF_INET;
+        server_addr.sin_port = htons(port);
+        inet_pton(AF_INET, address.c_str(), &server_addr.sin_addr);
+
+        struct timeval timeout;
+        timeout.tv_sec = 1;
+        timeout.tv_usec = 0;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+        int result = connect(sock, (struct sockaddr*)&server_addr,
+                           sizeof(server_addr));
+
+        close(sock);
+
+        return result == 0;
+    }
+};
+
+// USAGE:
+
+LoadBalancer lb(LoadBalancer::Strategy::LEAST_CONNECTIONS);
+
+lb.addBackend("192.168.1.10", 8080);
+lb.addBackend("192.168.1.11", 8080);
+lb.addBackend("192.168.1.12", 8080);
+
+// Health check loop
+std::thread health_checker([&lb]() {
+    while (true) {
+        lb.healthCheck();
+        std::this_thread::sleep_for(std::chrono::seconds(10));
+    }
+});
+
+// Get backend for request
+auto* backend = lb.getNextBackend();
+if (backend) {
+    backend->active_connections++;
+
+    // Make request to backend
+    makeRequest(backend->address, backend->port);
+
+    backend->active_connections--;
+}
+
+================================================================================
+5. DNS ROUND-ROBIN
+================================================================================
+
+Simplest load balancing using DNS with multiple A records.
+
+DNS CONFIGURATION:
+
+; Zone file
+trading-api.example.com.    IN  A    192.168.1.10
+trading-api.example.com.    IN  A    192.168.1.11
+trading-api.example.com.    IN  A    192.168.1.12
+
+ADVANTAGES:
++ Simple to implement
++ No single point of failure
++ Works with any protocol
+
+DISADVANTAGES:
+- No health checking
+- Caching issues (TTL)
+- Uneven distribution
+
+For HFT: Not recommended due to lack of health checking and control.
+
+================================================================================
+6. CLIENT-SIDE LOAD BALANCING
+================================================================================
+
+Client-Side Load Balancing (like Ribbon, implemented in C++):
+
+class ClientSideLoadBalancer {
+    std::vector<std::string> servers_;
+    std::atomic<size_t> index_{0};
+
+public:
+    ClientSideLoadBalancer(const std::vector<std::string>& servers)
+        : servers_(servers) {}
+
+    // Get next server
+    std::string getServer() {
+        size_t idx = index_.fetch_add(1) % servers_.size();
+        return servers_[idx];
+    }
+
+    // Update server list (from service discovery)
+    void updateServers(const std::vector<std::string>& servers) {
+        servers_ = servers;
+        index_ = 0;
+    }
+};
+
+// Integration with Consul
+class DynamicLoadBalancer {
+    ConsulClient consul_;
+    ClientSideLoadBalancer lb_;
+    std::string service_name_;
+
+public:
+    DynamicLoadBalancer(const std::string& service_name)
+        : consul_("localhost", 8500)
+        , lb_({})
+        , service_name_(service_name) {
+
+        // Initial discovery
+        updateServerList();
+
+        // Periodic update
+        std::thread([this]() {
+            while (true) {
+                updateServerList();
+                std::this_thread::sleep_for(std::chrono::seconds(30));
+            }
+        }).detach();
+    }
+
+    std::string getServer() {
+        return lb_.getServer();
+    }
+
+private:
+    void updateServerList() {
+        auto instances = consul_.discoverService(service_name_);
+
+        std::vector<std::string> servers;
+        for (const auto& inst : instances) {
+            servers.push_back(inst.address + ":" + std::to_string(inst.port));
+        }
+
+        lb_.updateServers(servers);
+    }
+};
+
+// Usage
+DynamicLoadBalancer lb("order-service");
+
+std::string server = lb.getServer();
+makeRequest(server);
+
+================================================================================
+7. BEST PRACTICES
+================================================================================
+
+CONFIGURATION GUIDELINES:
+
+✓ Enable health checks (every 5-10 seconds)
+✓ Set appropriate timeouts (connect: 5s, read: 30s)
+✓ Use connection pooling/keep-alive
+✓ Monitor backend latency and error rates
+✓ Implement circuit breakers
+✓ Use least connections for varying request times
+✓ Use IP hash for session affinity
+✓ Deploy load balancers in HA pairs
+✓ Monitor load balancer itself
+
+DON'T:
+
+✗ Put load balancer on critical trading path
+✗ Use DNS round-robin alone in production
+✗ Forget to tune timeouts
+✗ Ignore failed health checks
+✗ Over-complicate (use simple strategies)
+✗ Single load balancer (SPOF)
+
+PERFORMANCE TUNING:
+
+HAProxy:
+maxconn 50000
+tune.bufsize 32768
+nbproc 2  # Multiple processes
+
+Nginx:
+worker_processes auto;
+worker_connections 10000;
+keepalive_requests 1000;
+
+MONITORING:
+
+HAProxy Stats:
+http://haproxy:9000/stats
+
+Nginx Status:
+http://nginx:9000/nginx_status
+
+Key Metrics:
+- Request rate
+- Error rate
+- Backend latency (p50, p99)
+- Connection count
+- Health check failures
+
+LATENCY IMPACT:
+
+No Load Balancer: API latency = 10ms
+With HAProxy: API latency = 10.5ms (+0.5ms overhead)
+With Nginx: API latency = 10.3ms (+0.3ms overhead)
+
+For HFT:
+Critical path (< 100μs): NO load balancer
+Non-critical (> 10ms): OK to use load balancer
+
+================================================================================
+END OF LOAD BALANCING
+================================================================================

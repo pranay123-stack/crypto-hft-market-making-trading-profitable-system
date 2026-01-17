@@ -1,0 +1,1327 @@
+================================================================================
+                    HFT MEMORY DEBUGGING GUIDE
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Theory and Common Memory Issues in HFT
+2. Memory Debugging Tools
+3. Memory Leak Detection
+4. Memory Corruption Detection
+5. Allocation Performance Issues
+6. Step-by-Step Debugging Workflows
+7. Real HFT C++ Code Examples
+8. Debugging Commands and Interpretation
+9. Solutions and Fixes
+10. Best Practices for HFT Memory Management
+
+================================================================================
+1. THEORY AND COMMON MEMORY ISSUES IN HFT
+================================================================================
+
+OVERVIEW
+--------
+Memory issues in HFT systems can cause:
+- Unpredictable latency spikes (GC-like pauses)
+- Gradual performance degradation
+- Sudden crashes in production
+- Data corruption leading to incorrect trades
+- System instability under high load
+
+CRITICAL MEMORY ISSUES IN HFT
+------------------------------
+
+A) Memory Leaks
+   - Gradual memory exhaustion
+   - Increased allocation pressure
+   - Page faults and cache pollution
+   - OOM killer intervention
+
+B) Memory Corruption
+   - Buffer overflows
+   - Use-after-free bugs
+   - Double-free errors
+   - Stack corruption
+   - Heap metadata corruption
+
+C) Allocation Performance
+   - Excessive allocations in hot path
+   - Memory fragmentation
+   - Lock contention in allocator
+   - TLB misses
+   - Page faults
+
+D) Memory Alignment Issues
+   - Unaligned access penalties
+   - False sharing
+   - Cache line splits
+   - SIMD operation failures
+
+E) Memory Ordering
+   - Cache coherency issues
+   - Non-temporal stores
+   - Write combining effects
+
+================================================================================
+2. MEMORY DEBUGGING TOOLS
+================================================================================
+
+ESSENTIAL MEMORY DEBUGGING TOOLS
+---------------------------------
+
+1. VALGRIND MEMCHECK
+   Purpose: Comprehensive memory error detection
+   Command: valgrind --tool=memcheck --leak-check=full ./trading_engine
+
+   Detects:
+   - Memory leaks
+   - Use of uninitialized memory
+   - Use-after-free
+   - Double-free
+   - Invalid free
+   - Memory access violations
+
+   Pros:
+   - No code modification needed
+   - Very accurate
+   - Detailed error reports
+
+   Cons:
+   - Extreme slowdown (10-50x)
+   - Not for production use
+   - Large memory overhead
+
+2. ADDRESS SANITIZER (ASan)
+   Purpose: Fast memory error detection
+   Compile: g++ -g -fsanitize=address -fno-omit-frame-pointer program.cpp
+
+   Detects:
+   - Heap/stack/global buffer overflows
+   - Use-after-free
+   - Use-after-return
+   - Double-free
+   - Memory leaks
+
+   Pros:
+   - Much faster than Valgrind (2-5x slowdown)
+   - Excellent accuracy
+   - Stack traces at allocation/deallocation
+
+   Cons:
+   - Requires recompilation
+   - 2-3x memory overhead
+   - Cannot combine with TSan
+
+3. MEMORY SANITIZER (MSan)
+   Purpose: Uninitialized memory detector
+   Compile: clang++ -g -fsanitize=memory -fno-omit-frame-pointer program.cpp
+
+   Detects:
+   - Use of uninitialized memory
+   - Reading uninitialized padding bytes
+
+4. LEAK SANITIZER (LSan)
+   Purpose: Standalone leak detector
+   Included with ASan or standalone:
+   Compile: g++ -g -fsanitize=leak program.cpp
+
+5. HEAP PROFILERS
+   - Google TCMalloc heap profiler
+   - jemalloc profiling
+   - Valgrind Massif
+   - heaptrack
+
+6. CUSTOM INSTRUMENTATION
+   - Override new/delete operators
+   - Custom allocator wrappers
+   - Memory tracking libraries
+
+7. HARDWARE TOOLS
+   - Intel VTune Memory Access Analysis
+   - perf mem for memory profiling
+   - Intel PMU counters
+
+================================================================================
+3. MEMORY LEAK DETECTION
+================================================================================
+
+TYPES OF MEMORY LEAKS IN HFT
+-----------------------------
+
+A) DIRECT LEAK
+   Memory allocated but never freed
+
+B) INDIRECT LEAK
+   Memory reachable only through leaked memory
+
+C) STILL REACHABLE
+   Memory still pointed to at exit (may be intentional)
+
+D) DEFINITELY LOST
+   No pointers to memory block
+
+E) POSSIBLY LOST
+   Only interior pointers exist
+
+VALGRIND LEAK DETECTION
+------------------------
+
+Command:
+valgrind --tool=memcheck \
+         --leak-check=full \
+         --show-leak-kinds=all \
+         --track-origins=yes \
+         --verbose \
+         --log-file=valgrind-mem.log \
+         ./trading_engine
+
+Output Interpretation:
+```
+==12345== LEAK SUMMARY:
+==12345==    definitely lost: 4,096 bytes in 1 blocks
+==12345==    indirectly lost: 8,192 bytes in 2 blocks
+==12345==      possibly lost: 0 bytes in 0 blocks
+==12345==    still reachable: 16,384 bytes in 4 blocks
+==12345==         suppressed: 0 bytes in 0 blocks
+
+==12345== 4,096 bytes in 1 blocks are definitely lost in loss record 1 of 5
+==12345==    at 0x4C2E0EF: operator new(unsigned long) (in vgpreload_memcheck)
+==12345==    by 0x400B23: OrderManager::allocate_buffer() (order_manager.cpp:45)
+==12345==    by 0x400C56: OrderManager::initialize() (order_manager.cpp:78)
+==12345==    by 0x400D12: main (main.cpp:23)
+```
+
+Analysis:
+- definitely lost: 4,096 bytes leaked at order_manager.cpp:45
+- Must fix this leak
+- Check if delete[] is missing
+
+ADDRESS SANITIZER LEAK DETECTION
+---------------------------------
+
+Compile:
+g++ -g -fsanitize=address -fno-omit-frame-pointer order_manager.cpp -o order_mgr
+
+Run:
+ASAN_OPTIONS=detect_leaks=1 ./order_mgr
+
+Output:
+```
+=================================================================
+==12345==ERROR: LeakSanitizer: detected memory leaks
+
+Direct leak of 4096 byte(s) in 1 object(s) allocated from:
+    #0 0x7f1234 in operator new(unsigned long) (/usr/lib/x86_64-linux-gnu/libasan.so.4+0xe0e80)
+    #1 0x401234 in OrderManager::allocate_buffer() order_manager.cpp:45
+    #2 0x401456 in OrderManager::initialize() order_manager.cpp:78
+    #3 0x401567 in main main.cpp:23
+
+SUMMARY: AddressSanitizer: 4096 byte(s) leaked in 1 allocation(s).
+```
+
+CUSTOM LEAK DETECTOR
+--------------------
+
+```cpp
+#include <unordered_map>
+#include <mutex>
+#include <cstdlib>
+
+class MemoryTracker {
+    struct AllocationInfo {
+        size_t size;
+        const char* file;
+        int line;
+    };
+
+    std::unordered_map<void*, AllocationInfo> allocations;
+    std::mutex mtx;
+    size_t total_allocated = 0;
+    size_t peak_allocated = 0;
+
+public:
+    static MemoryTracker& instance() {
+        static MemoryTracker tracker;
+        return tracker;
+    }
+
+    void record_allocation(void* ptr, size_t size, const char* file, int line) {
+        std::lock_guard<std::mutex> lock(mtx);
+        allocations[ptr] = {size, file, line};
+        total_allocated += size;
+        if (total_allocated > peak_allocated) {
+            peak_allocated = total_allocated;
+        }
+    }
+
+    void record_deallocation(void* ptr) {
+        std::lock_guard<std::mutex> lock(mtx);
+        auto it = allocations.find(ptr);
+        if (it != allocations.end()) {
+            total_allocated -= it->second.size;
+            allocations.erase(it);
+        }
+    }
+
+    void dump_leaks() {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (!allocations.empty()) {
+            std::cerr << "MEMORY LEAKS DETECTED:\n";
+            for (const auto& [ptr, info] : allocations) {
+                std::cerr << "  " << info.size << " bytes leaked at "
+                          << info.file << ":" << info.line << "\n";
+            }
+        }
+        std::cerr << "Peak memory usage: " << peak_allocated << " bytes\n";
+    }
+};
+
+#ifdef DEBUG_MEMORY
+void* operator new(size_t size, const char* file, int line) {
+    void* ptr = std::malloc(size);
+    MemoryTracker::instance().record_allocation(ptr, size, file, line);
+    return ptr;
+}
+
+void operator delete(void* ptr) noexcept {
+    MemoryTracker::instance().record_deallocation(ptr);
+    std::free(ptr);
+}
+
+#define new new(__FILE__, __LINE__)
+#endif
+```
+
+================================================================================
+4. MEMORY CORRUPTION DETECTION
+================================================================================
+
+COMMON CORRUPTION PATTERNS IN HFT
+----------------------------------
+
+A) BUFFER OVERFLOW
+```cpp
+// BUGGY CODE
+char symbol[8];
+strcpy(symbol, "AAPL.NASDAQ");  // Overflow! Only 8 bytes available
+```
+
+B) USE-AFTER-FREE
+```cpp
+// BUGGY CODE
+Order* order = new Order();
+delete order;
+order->update_status(FILLED);  // Use after free!
+```
+
+C) DOUBLE-FREE
+```cpp
+// BUGGY CODE
+delete order;
+delete order;  // Double free!
+```
+
+D) STACK CORRUPTION
+```cpp
+// BUGGY CODE
+void process() {
+    int buffer[10];
+    buffer[15] = 42;  // Stack corruption!
+}
+```
+
+ADDRESS SANITIZER DETECTION
+----------------------------
+
+Example 1: Heap Buffer Overflow Detection
+
+Code:
+```cpp
+void process_orders() {
+    int* orders = new int[100];
+    orders[100] = 12345;  // One past the end!
+    delete[] orders;
+}
+```
+
+Compile and Run:
+g++ -g -fsanitize=address -O1 -fno-omit-frame-pointer overflow.cpp -o overflow
+./overflow
+
+Output:
+```
+=================================================================
+==12345==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x614000000190
+WRITE of size 4 at 0x614000000190 thread T0
+    #0 0x401234 in process_orders() overflow.cpp:3
+    #1 0x401345 in main overflow.cpp:8
+
+0x614000000190 is located 0 bytes to the right of 400-byte region
+allocated by thread T0 here:
+    #0 0x7f1234 in operator new[](unsigned long)
+    #1 0x401200 in process_orders() overflow.cpp:2
+
+SUMMARY: AddressSanitizer: heap-buffer-overflow overflow.cpp:3
+```
+
+Example 2: Use-After-Free Detection
+
+Code:
+```cpp
+struct Order {
+    int order_id;
+    void print() { std::cout << order_id << "\n"; }
+};
+
+void buggy_function() {
+    Order* order = new Order{12345};
+    delete order;
+    order->print();  // Use after free!
+}
+```
+
+ASan Output:
+```
+=================================================================
+==12345==ERROR: AddressSanitizer: heap-use-after-free on address 0x603000000010
+READ of size 4 at 0x603000000010 thread T0
+    #0 0x401567 in Order::print() order.cpp:5
+    #1 0x401678 in buggy_function() order.cpp:11
+
+freed by thread T0 here:
+    #0 0x7f1234 in operator delete(void*)
+    #1 0x401650 in buggy_function() order.cpp:10
+
+previously allocated by thread T0 here:
+    #0 0x7f5678 in operator new(unsigned long)
+    #1 0x401620 in buggy_function() order.cpp:9
+
+SUMMARY: AddressSanitizer: heap-use-after-free order.cpp:5
+```
+
+VALGRIND CORRUPTION DETECTION
+------------------------------
+
+Command:
+valgrind --tool=memcheck \
+         --track-origins=yes \
+         --read-var-info=yes \
+         ./trading_engine
+
+Example Output:
+```
+==12345== Invalid write of size 4
+==12345==    at 0x401234: process_orders (overflow.cpp:3)
+==12345==    by 0x401345: main (main.cpp:8)
+==12345==  Address 0x5204190 is 0 bytes after a block of size 400 alloc'd
+==12345==    at 0x4C2E0EF: operator new[](unsigned long)
+==12345==    by 0x401200: process_orders (overflow.cpp:2)
+```
+
+STACK PROTECTION
+----------------
+
+Enable stack canaries:
+g++ -g -fstack-protector-strong program.cpp
+
+Detection example:
+```
+*** stack smashing detected ***: ./program terminated
+Aborted (core dumped)
+```
+
+GDB Analysis:
+```
+(gdb) bt
+#0  __GI_raise (sig=sig@entry=6) at ../sysdeps/unix/sysv/linux/raise.c:51
+#1  __GI_abort () at abort.c:79
+#2  __fortify_fail (msg=0x7ffff7b8e680 "stack smashing detected")
+#3  __stack_chk_fail ()
+#4  process_buffer () at buffer.cpp:45
+```
+
+================================================================================
+5. ALLOCATION PERFORMANCE ISSUES
+================================================================================
+
+IDENTIFYING ALLOCATION BOTTLENECKS
+-----------------------------------
+
+1. PERF MEMORY PROFILING
+
+Record allocations:
+perf record -e syscalls:sys_enter_brk,syscalls:sys_enter_mmap -g ./trading_engine
+
+Analyze:
+perf report --stdio
+
+Output shows:
+- Most frequent allocation call sites
+- Stack traces leading to allocations
+- Time spent in allocator
+
+2. VALGRIND MASSIF (HEAP PROFILER)
+
+Command:
+valgrind --tool=massif --massif-out-file=massif.out ./trading_engine
+
+Visualize:
+ms_print massif.out
+
+Output:
+```
+    MB
+19.71^                                                                       #
+     |                                                                       #
+     |                                                                   @   #
+     |                                                               @   @   #
+     |                                                           @   @   @   #
+     |                                                       :   @   @   @   #
+     |                                                   @   :   @   @   @   #
+   0 +----------------------------------------------------------------------->Mi
+     0                                                                   250.0
+
+Number of snapshots: 50
+Peak memory: 19.71 MB
+
+Detailed snapshot 45 (peak):
+  n1: 19,710,000 (heap allocation functions) malloc/new/new[], --alloc-fns, etc.
+   n1: 15,000,000 in OrderBook::resize_buffers (orderbook.cpp:234)
+   n1: 3,500,000 in MarketDataHandler::allocate_cache (market_data.cpp:112)
+```
+
+3. TCMALLOC HEAP PROFILER
+
+Link with tcmalloc:
+g++ -g program.cpp -o program -ltcmalloc
+
+Run with profiling:
+HEAPPROFILE=/tmp/heap.prof ./program
+
+Analyze:
+pprof --text ./program /tmp/heap.prof.0001.heap
+
+COMMON ALLOCATION PROBLEMS IN HFT
+----------------------------------
+
+Problem 1: Allocations in Hot Path
+```cpp
+// BUGGY - Allocates on every tick!
+void on_market_data(const Quote& quote) {
+    std::string symbol = quote.get_symbol();  // Allocation!
+    auto* book = new OrderBook();  // Allocation!
+    // ... process ...
+    delete book;
+}
+```
+
+Problem 2: String Allocations
+```cpp
+// BUGGY - Many small string allocations
+std::string build_message() {
+    std::string msg = "Order ";  // Allocation
+    msg += std::to_string(order_id);  // Allocation
+    msg += " for ";  // Reallocation
+    msg += symbol;  // Reallocation
+    return msg;
+}
+```
+
+Problem 3: Container Growth
+```cpp
+// BUGGY - Vector reallocations
+std::vector<Order> orders;  // Default capacity = 0
+for (int i = 0; i < 10000; ++i) {
+    orders.push_back(Order{i});  // Multiple reallocations!
+}
+```
+
+Problem 4: Shared Pointer Overhead
+```cpp
+// BUGGY - Atomic reference counting overhead
+void process_orders(const std::vector<std::shared_ptr<Order>>& orders) {
+    for (const auto& order : orders) {  // Atomic inc/dec on each iteration!
+        // ... process ...
+    }
+}
+```
+
+================================================================================
+6. STEP-BY-STEP DEBUGGING WORKFLOWS
+================================================================================
+
+WORKFLOW 1: INVESTIGATING MEMORY LEAK
+--------------------------------------
+
+Step 1: Confirm Leak Exists
+```bash
+# Monitor memory usage over time
+ps aux | grep trading_engine
+# Or
+top -p <pid>
+# Or
+pmap -x <pid>
+```
+
+Step 2: Run with ASan
+```bash
+g++ -g -fsanitize=address -fno-omit-frame-pointer trading.cpp -o trading
+ASAN_OPTIONS=detect_leaks=1:log_path=asan.log ./trading
+```
+
+Step 3: Analyze ASan Output
+- Identify leak location from stack trace
+- Check if delete/free is missing
+- Look for early returns that skip cleanup
+
+Step 4: Verify Fix
+```bash
+# Recompile and run
+ASAN_OPTIONS=detect_leaks=1 ./trading
+# Should show: LeakSanitizer: No leaks detected
+```
+
+WORKFLOW 2: DEBUGGING CRASH (USE-AFTER-FREE)
+---------------------------------------------
+
+Step 1: Reproduce with Core Dump
+```bash
+ulimit -c unlimited
+./trading_engine
+# After crash
+gdb ./trading_engine core
+```
+
+Step 2: Analyze Core Dump
+```gdb
+(gdb) bt
+(gdb) frame 0
+(gdb) print this
+(gdb) print *this  # May show garbage if use-after-free
+```
+
+Step 3: Run with ASan
+```bash
+g++ -g -fsanitize=address -fno-omit-frame-pointer trading.cpp -o trading
+./trading
+```
+
+Step 4: Examine ASan Report
+- Locate use-after-free line
+- Check freed location
+- Verify allocation location
+- Analyze lifetime mismatch
+
+Step 5: Fix and Verify
+- Extend object lifetime
+- Use smart pointers
+- Implement proper ownership
+- Re-run with ASan to confirm fix
+
+WORKFLOW 3: PERFORMANCE REGRESSION DUE TO ALLOCATIONS
+------------------------------------------------------
+
+Step 1: Profile with perf
+```bash
+perf record -g --call-graph=dwarf -F 999 ./trading_engine
+perf report --stdio --no-children | grep -A 5 "malloc\|operator new"
+```
+
+Step 2: Identify Hot Allocation Sites
+Look for:
+- High percentage in malloc/new
+- Frequent call sites
+- Unexpected allocations
+
+Step 3: Heap Profile with Massif
+```bash
+valgrind --tool=massif --massif-out-file=massif.out ./trading_engine
+ms_print massif.out > massif_report.txt
+```
+
+Step 4: Analyze Allocations
+- Find peak memory usage
+- Identify allocation hotspots
+- Check for temporary allocations
+
+Step 5: Optimize
+- Pre-allocate buffers
+- Use object pools
+- Eliminate temporary objects
+- Use custom allocators
+
+Step 6: Verify Improvement
+```bash
+perf stat -e cpu-cycles,instructions,cache-misses,page-faults ./trading_engine_old
+perf stat -e cpu-cycles,instructions,cache-misses,page-faults ./trading_engine_new
+```
+
+WORKFLOW 4: DEBUGGING INTERMITTENT CORRUPTION
+----------------------------------------------
+
+Step 1: Enable All Sanitizers
+```bash
+# Try ASan first
+g++ -g -fsanitize=address -fno-omit-frame-pointer program.cpp
+./program
+
+# If no detection, try MSan (requires full rebuild)
+clang++ -g -fsanitize=memory -fno-omit-frame-pointer program.cpp
+./program
+```
+
+Step 2: Add Watchpoints in GDB
+```gdb
+(gdb) watch -l variable_address
+(gdb) continue
+# Breaks when variable is modified
+```
+
+Step 3: Enable Guard Pages
+```cpp
+#include <sys/mman.h>
+
+void* allocate_with_guard(size_t size) {
+    size_t page_size = sysconf(_SC_PAGESIZE);
+    size_t total = size + 2 * page_size;
+
+    void* mem = mmap(nullptr, total, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+    // Guard pages before and after
+    mprotect(mem, page_size, PROT_NONE);
+    mprotect((char*)mem + page_size + size, page_size, PROT_NONE);
+
+    return (char*)mem + page_size;
+}
+```
+
+Step 4: Stress Test
+Run program repeatedly or with threads to increase likelihood of corruption
+
+================================================================================
+7. REAL HFT C++ CODE EXAMPLES
+================================================================================
+
+EXAMPLE 1: CUSTOM MEMORY POOL FOR ORDER OBJECTS
+------------------------------------------------
+
+```cpp
+#include <array>
+#include <cstdint>
+#include <new>
+
+template<typename T, size_t PoolSize>
+class ObjectPool {
+    struct FreeNode {
+        FreeNode* next;
+    };
+
+    alignas(alignof(T)) std::array<uint8_t, sizeof(T) * PoolSize> storage;
+    FreeNode* free_list = nullptr;
+    size_t allocated_count = 0;
+
+public:
+    ObjectPool() {
+        // Initialize free list
+        for (size_t i = 0; i < PoolSize; ++i) {
+            auto* node = reinterpret_cast<FreeNode*>(&storage[i * sizeof(T)]);
+            node->next = free_list;
+            free_list = node;
+        }
+    }
+
+    template<typename... Args>
+    T* allocate(Args&&... args) {
+        if (free_list == nullptr) {
+            return nullptr;  // Pool exhausted
+        }
+
+        // Remove from free list
+        void* mem = free_list;
+        free_list = free_list->next;
+        allocated_count++;
+
+        // Construct object
+        return new (mem) T(std::forward<Args>(args)...);
+    }
+
+    void deallocate(T* ptr) {
+        if (ptr == nullptr) return;
+
+        // Destroy object
+        ptr->~T();
+
+        // Add to free list
+        auto* node = reinterpret_cast<FreeNode*>(ptr);
+        node->next = free_list;
+        free_list = node;
+        allocated_count--;
+    }
+
+    size_t available() const {
+        return PoolSize - allocated_count;
+    }
+
+    bool owns(const T* ptr) const {
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(ptr);
+        return p >= storage.data() && p < storage.data() + storage.size();
+    }
+};
+
+// Usage in HFT system
+struct Order {
+    uint64_t order_id;
+    char symbol[8];
+    double price;
+    uint32_t quantity;
+};
+
+ObjectPool<Order, 10000> order_pool;  // Pre-allocated pool
+
+void submit_order(uint64_t id, const char* sym, double px, uint32_t qty) {
+    Order* order = order_pool.allocate();
+    if (order) {
+        order->order_id = id;
+        strncpy(order->symbol, sym, 7);
+        order->symbol[7] = '\0';
+        order->price = px;
+        order->quantity = qty;
+
+        // ... submit order ...
+
+        // When done
+        order_pool.deallocate(order);
+    }
+}
+```
+
+EXAMPLE 2: ARENA ALLOCATOR FOR TEMPORARY OBJECTS
+-------------------------------------------------
+
+```cpp
+#include <cstdint>
+#include <cstdlib>
+#include <new>
+
+class ArenaAllocator {
+    uint8_t* buffer;
+    size_t buffer_size;
+    size_t offset = 0;
+
+public:
+    ArenaAllocator(size_t size) : buffer_size(size) {
+        buffer = static_cast<uint8_t*>(std::aligned_alloc(64, size));
+    }
+
+    ~ArenaAllocator() {
+        std::free(buffer);
+    }
+
+    void* allocate(size_t size, size_t alignment = alignof(std::max_align_t)) {
+        // Align offset
+        size_t aligned_offset = (offset + alignment - 1) & ~(alignment - 1);
+
+        if (aligned_offset + size > buffer_size) {
+            return nullptr;  // Arena full
+        }
+
+        void* ptr = buffer + aligned_offset;
+        offset = aligned_offset + size;
+        return ptr;
+    }
+
+    void reset() {
+        offset = 0;  // Bulk deallocation
+    }
+
+    size_t used() const { return offset; }
+    size_t available() const { return buffer_size - offset; }
+};
+
+// Usage: Per-message processing arena
+class MessageProcessor {
+    ArenaAllocator arena{1024 * 1024};  // 1MB arena
+
+public:
+    void process_market_data(const uint8_t* data, size_t len) {
+        // Use arena for temporary allocations
+        auto* parsed = arena.allocate(sizeof(ParsedData));
+        // ... process ...
+
+        // Reset arena after processing (bulk deallocation)
+        arena.reset();
+    }
+};
+```
+
+EXAMPLE 3: SMART POINTER WRAPPER WITH ALLOCATION TRACKING
+----------------------------------------------------------
+
+```cpp
+#include <memory>
+#include <atomic>
+
+class AllocationTracker {
+    std::atomic<size_t> allocation_count{0};
+    std::atomic<size_t> deallocation_count{0};
+    std::atomic<size_t> bytes_allocated{0};
+
+public:
+    static AllocationTracker& instance() {
+        static AllocationTracker tracker;
+        return tracker;
+    }
+
+    void record_allocation(size_t bytes) {
+        allocation_count.fetch_add(1, std::memory_order_relaxed);
+        bytes_allocated.fetch_add(bytes, std::memory_order_relaxed);
+    }
+
+    void record_deallocation(size_t bytes) {
+        deallocation_count.fetch_add(1, std::memory_order_relaxed);
+        bytes_allocated.fetch_sub(bytes, std::memory_order_relaxed);
+    }
+
+    void print_stats() {
+        std::cout << "Allocations: " << allocation_count.load() << "\n"
+                  << "Deallocations: " << deallocation_count.load() << "\n"
+                  << "Current bytes: " << bytes_allocated.load() << "\n";
+    }
+};
+
+template<typename T>
+struct TrackedDeleter {
+    void operator()(T* ptr) {
+        AllocationTracker::instance().record_deallocation(sizeof(T));
+        delete ptr;
+    }
+};
+
+template<typename T, typename... Args>
+std::unique_ptr<T, TrackedDeleter<T>> make_tracked_unique(Args&&... args) {
+    AllocationTracker::instance().record_allocation(sizeof(T));
+    return std::unique_ptr<T, TrackedDeleter<T>>(new T(std::forward<Args>(args)...));
+}
+```
+
+EXAMPLE 4: LOCK-FREE FIXED-SIZE BUFFER (NO ALLOCATIONS)
+--------------------------------------------------------
+
+```cpp
+#include <array>
+#include <atomic>
+#include <optional>
+
+template<typename T, size_t Capacity>
+class LockFreeRingBuffer {
+    static_assert((Capacity & (Capacity - 1)) == 0, "Capacity must be power of 2");
+
+    std::array<T, Capacity> buffer;
+    alignas(64) std::atomic<size_t> write_pos{0};
+    alignas(64) std::atomic<size_t> read_pos{0};
+
+public:
+    bool try_push(const T& item) {
+        size_t current_write = write_pos.load(std::memory_order_relaxed);
+        size_t next_write = (current_write + 1) & (Capacity - 1);
+
+        if (next_write == read_pos.load(std::memory_order_acquire)) {
+            return false;  // Full
+        }
+
+        buffer[current_write] = item;
+        write_pos.store(next_write, std::memory_order_release);
+        return true;
+    }
+
+    std::optional<T> try_pop() {
+        size_t current_read = read_pos.load(std::memory_order_relaxed);
+
+        if (current_read == write_pos.load(std::memory_order_acquire)) {
+            return std::nullopt;  // Empty
+        }
+
+        T item = buffer[current_read];
+        read_pos.store((current_read + 1) & (Capacity - 1), std::memory_order_release);
+        return item;
+    }
+
+    size_t size() const {
+        size_t w = write_pos.load(std::memory_order_acquire);
+        size_t r = read_pos.load(std::memory_order_acquire);
+        return (w - r) & (Capacity - 1);
+    }
+
+    bool empty() const {
+        return read_pos.load(std::memory_order_acquire) ==
+               write_pos.load(std::memory_order_acquire);
+    }
+};
+
+// No heap allocations at all!
+LockFreeRingBuffer<Quote, 65536> market_data_buffer;
+```
+
+EXAMPLE 5: MEMORY-MAPPED FILE FOR LARGE DATA STRUCTURES
+--------------------------------------------------------
+
+```cpp
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <cstring>
+
+class MemoryMappedFile {
+    void* mapped_memory = nullptr;
+    size_t file_size = 0;
+    int fd = -1;
+
+public:
+    MemoryMappedFile(const char* path, size_t size) : file_size(size) {
+        fd = open(path, O_RDWR | O_CREAT, 0666);
+        if (fd == -1) return;
+
+        // Set file size
+        if (ftruncate(fd, size) == -1) {
+            close(fd);
+            return;
+        }
+
+        // Map file into memory
+        mapped_memory = mmap(nullptr, size, PROT_READ | PROT_WRITE,
+                            MAP_SHARED, fd, 0);
+
+        if (mapped_memory == MAP_FAILED) {
+            mapped_memory = nullptr;
+            close(fd);
+        }
+    }
+
+    ~MemoryMappedFile() {
+        if (mapped_memory) {
+            munmap(mapped_memory, file_size);
+        }
+        if (fd != -1) {
+            close(fd);
+        }
+    }
+
+    void* data() { return mapped_memory; }
+    size_t size() const { return file_size; }
+
+    void sync() {
+        if (mapped_memory) {
+            msync(mapped_memory, file_size, MS_SYNC);
+        }
+    }
+};
+
+// Usage: Persistent order book state
+struct OrderBookState {
+    uint64_t sequence;
+    // ... other state ...
+};
+
+MemoryMappedFile state_file("/tmp/orderbook.state", sizeof(OrderBookState));
+auto* state = static_cast<OrderBookState*>(state_file.data());
+// Access state directly, no allocations
+state->sequence++;
+state_file.sync();  // Persist to disk
+```
+
+================================================================================
+8. DEBUGGING COMMANDS AND INTERPRETATION
+================================================================================
+
+VALGRIND MEMCHECK COMMANDS
+---------------------------
+
+Basic leak check:
+valgrind --leak-check=full ./program
+
+Detailed leak check with origins:
+valgrind --leak-check=full --show-leak-kinds=all --track-origins=yes ./program
+
+Suppress known issues:
+valgrind --suppressions=mysupp.supp --leak-check=full ./program
+
+ASAN ENVIRONMENT VARIABLES
+---------------------------
+
+Enable leak detection:
+ASAN_OPTIONS=detect_leaks=1 ./program
+
+Disable leak detection:
+ASAN_OPTIONS=detect_leaks=0 ./program
+
+Custom options:
+ASAN_OPTIONS=detect_leaks=1:log_path=asan.log:verbosity=1 ./program
+
+Halt on error:
+ASAN_OPTIONS=halt_on_error=1 ./program
+
+GDB MEMORY COMMANDS
+-------------------
+
+Watch memory address:
+(gdb) watch *(int*)0x7fffffffe000
+(gdb) watch variable
+
+Hardware watchpoint:
+(gdb) watch -l *0x7fffffffe000
+
+Display memory:
+(gdb) x/16xb 0x7fffffffe000  # 16 bytes in hex
+(gdb) x/4xw 0x7fffffffe000   # 4 words in hex
+(gdb) x/s 0x7fffffffe000     # As string
+
+Find memory pattern:
+(gdb) find 0x7fff00000000, 0x7fffffffffff, 0x12345678
+
+PERF MEMORY PROFILING
+----------------------
+
+Profile memory access:
+perf mem record ./program
+perf mem report
+
+Profile page faults:
+perf record -e page-faults ./program
+perf report
+
+Profile cache misses:
+perf record -e cache-misses ./program
+perf report
+
+PMAP ANALYSIS
+-------------
+
+View memory mappings:
+pmap -x <pid>
+
+Output interpretation:
+```
+Address           Kbytes     RSS   Dirty Mode  Mapping
+0000000000400000    4096    4096       0 r-x-- trading_engine
+0000000000800000      64      64      64 rw--- trading_engine
+00007f1234000000   65536   32768   16384 rw--- anon          # Heap
+```
+
+================================================================================
+9. SOLUTIONS AND FIXES
+================================================================================
+
+SOLUTION 1: FIX MEMORY LEAK IN ORDER MANAGER
+---------------------------------------------
+
+BEFORE (BUGGY):
+```cpp
+class OrderManager {
+    std::vector<Order*> orders;
+
+    void add_order(int id) {
+        orders.push_back(new Order{id});  // Leaked!
+    }
+};
+```
+
+AFTER (FIXED - Smart Pointers):
+```cpp
+class OrderManager {
+    std::vector<std::unique_ptr<Order>> orders;
+
+    void add_order(int id) {
+        orders.push_back(std::make_unique<Order>(id));  // Automatic cleanup
+    }
+};
+```
+
+AFTER (FIXED - Object Pool):
+```cpp
+class OrderManager {
+    ObjectPool<Order, 10000> pool;
+    std::vector<Order*> orders;
+
+    void add_order(int id) {
+        Order* order = pool.allocate(id);
+        orders.push_back(order);
+    }
+
+    void remove_order(size_t index) {
+        pool.deallocate(orders[index]);
+        orders.erase(orders.begin() + index);
+    }
+};
+```
+
+SOLUTION 2: FIX USE-AFTER-FREE IN CALLBACK
+-------------------------------------------
+
+BEFORE (BUGGY):
+```cpp
+class Strategy {
+    OrderBook* book;
+
+    void on_quote(const Quote& q) {
+        delete book;
+        book = new OrderBook();
+        // ... later ...
+        book->update(q);  // May use old deleted book if callback re-enters
+    }
+};
+```
+
+AFTER (FIXED):
+```cpp
+class Strategy {
+    std::unique_ptr<OrderBook> book;
+
+    void on_quote(const Quote& q) {
+        auto new_book = std::make_unique<OrderBook>();
+        // ... initialize new_book ...
+        book = std::move(new_book);  // Atomic swap, old book deleted safely
+        book->update(q);
+    }
+};
+```
+
+SOLUTION 3: ELIMINATE ALLOCATION IN HOT PATH
+---------------------------------------------
+
+BEFORE (SLOW):
+```cpp
+void process_tick(const Quote& quote) {
+    std::string msg = "Received quote for " + std::string(quote.symbol);
+    log(msg);  // String allocation on every tick!
+}
+```
+
+AFTER (FAST):
+```cpp
+void process_tick(const Quote& quote) {
+    char msg[128];
+    snprintf(msg, sizeof(msg), "Received quote for %s", quote.symbol);
+    log(msg);  // No allocation
+}
+```
+
+SOLUTION 4: FIX BUFFER OVERFLOW
+--------------------------------
+
+BEFORE (BUGGY):
+```cpp
+void copy_symbol(const char* src, char* dst) {
+    strcpy(dst, src);  // No bounds checking!
+}
+```
+
+AFTER (FIXED):
+```cpp
+void copy_symbol(const char* src, char* dst, size_t dst_size) {
+    strncpy(dst, src, dst_size - 1);
+    dst[dst_size - 1] = '\0';  // Ensure null termination
+}
+
+// Or better:
+#include <cstring>
+void copy_symbol(const char* src, char (&dst)[8]) {
+    std::strncpy(dst, src, sizeof(dst) - 1);
+    dst[sizeof(dst) - 1] = '\0';
+}
+```
+
+SOLUTION 5: FIX MEMORY FRAGMENTATION
+-------------------------------------
+
+BEFORE (FRAGMENTED):
+```cpp
+// Many small allocations
+std::vector<std::unique_ptr<Order>> orders;
+for (int i = 0; i < 10000; ++i) {
+    orders.push_back(std::make_unique<Order>());  // 10000 separate allocations
+}
+```
+
+AFTER (CONTIGUOUS):
+```cpp
+// Single allocation
+std::vector<Order> orders;
+orders.reserve(10000);  // Pre-allocate
+for (int i = 0; i < 10000; ++i) {
+    orders.emplace_back();  // Construct in-place
+}
+```
+
+================================================================================
+10. BEST PRACTICES FOR HFT MEMORY MANAGEMENT
+================================================================================
+
+1. PRE-ALLOCATE EVERYTHING POSSIBLE
+   ```cpp
+   // At initialization
+   std::vector<Order> orders;
+   orders.reserve(100000);  // Reserve maximum expected size
+
+   std::string buffer;
+   buffer.reserve(4096);  // Reuse buffer
+   ```
+
+2. USE OBJECT POOLS FOR FREQUENTLY ALLOCATED TYPES
+   - Orders
+   - Market data updates
+   - Messages
+   - Temporary buffers
+
+3. AVOID ALLOCATIONS IN HOT PATH
+   - Use stack buffers
+   - Reuse pre-allocated buffers
+   - Use placement new if necessary
+
+4. USE CUSTOM ALLOCATORS
+   ```cpp
+   std::vector<Order, ArenaAllocator<Order>> orders;
+   ```
+
+5. MONITOR MEMORY USAGE IN PRODUCTION
+   ```cpp
+   void check_memory() {
+       struct rusage usage;
+       getrusage(RUSAGE_SELF, &usage);
+       if (usage.ru_maxrss > MEMORY_THRESHOLD) {
+           log_warning("High memory usage");
+       }
+   }
+   ```
+
+6. ENABLE SANITIZERS IN DEVELOPMENT
+   - Always build with ASan in testing
+   - Run comprehensive test suites
+   - Stress test with sanitizers
+
+7. USE SMART POINTERS, BUT WISELY
+   - unique_ptr for ownership
+   - Avoid shared_ptr in hot path (atomic overhead)
+   - Raw pointers OK for non-owning references
+
+8. ALIGN CRITICAL DATA STRUCTURES
+   ```cpp
+   struct alignas(64) CriticalData {
+       // ... members ...
+   };
+   ```
+
+9. USE MEMORY-MAPPED FILES FOR LARGE STATE
+   - Faster than file I/O
+   - Automatic paging
+   - Shared memory between processes
+
+10. REGULAR MEMORY AUDITS
+    - Weekly Valgrind runs
+    - Continuous monitoring of RSS
+    - Track allocation patterns
+    - Review memory-sensitive code changes
+
+================================================================================
+END OF MEMORY DEBUGGING GUIDE
+================================================================================

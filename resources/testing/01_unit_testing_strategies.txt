@@ -1,0 +1,942 @@
+================================================================================
+UNIT TESTING STRATEGIES FOR HFT SYSTEMS
+Google Test & Catch2 Framework Implementation
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Testing Framework Setup
+2. Google Test Implementation
+3. Catch2 Implementation
+4. Test Fixtures and Utilities
+5. Mock Objects for HFT Components
+6. Parameterized Tests
+7. Test Coverage Requirements
+8. Continuous Integration
+9. Best Practices
+
+================================================================================
+1. TESTING FRAMEWORK SETUP
+================================================================================
+
+1.1 Google Test Setup (CMakeLists.txt)
+---------------------------------------
+cmake_minimum_required(VERSION 3.14)
+project(HFT_UnitTests)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Fetch Google Test
+include(FetchContent)
+FetchContent_Declare(
+  googletest
+  GIT_REPOSITORY https://github.com/google/googletest.git
+  GIT_TAG        release-1.12.1
+)
+FetchContent_MakeAvailable(googletest)
+
+# Enable testing
+enable_testing()
+
+# Add test executable
+add_executable(hft_tests
+    tests/order_manager_test.cpp
+    tests/market_data_test.cpp
+    tests/risk_manager_test.cpp
+    tests/strategy_test.cpp
+    tests/matching_engine_test.cpp
+    src/order_manager.cpp
+    src/market_data.cpp
+    src/risk_manager.cpp
+    src/strategy.cpp
+)
+
+target_link_libraries(hft_tests
+    GTest::gtest_main
+    GTest::gmock_main
+    pthread
+)
+
+include(GoogleTest)
+gtest_discover_tests(hft_tests)
+
+# Code coverage
+option(CODE_COVERAGE "Enable coverage reporting" OFF)
+if(CODE_COVERAGE)
+    target_compile_options(hft_tests PRIVATE --coverage)
+    target_link_options(hft_tests PRIVATE --coverage)
+endif()
+
+
+1.2 Catch2 Setup Alternative
+-----------------------------
+cmake_minimum_required(VERSION 3.14)
+project(HFT_Catch2Tests)
+
+set(CMAKE_CXX_STANDARD 20)
+
+FetchContent_Declare(
+  Catch2
+  GIT_REPOSITORY https://github.com/catchorg/Catch2.git
+  GIT_TAG        v3.4.0
+)
+FetchContent_MakeAvailable(Catch2)
+
+add_executable(hft_catch_tests
+    tests/catch2_main.cpp
+    tests/order_test.cpp
+    tests/pricing_test.cpp
+)
+
+target_link_libraries(hft_catch_tests PRIVATE Catch2::Catch2WithMain)
+
+include(CTest)
+include(Catch)
+catch_discover_tests(hft_catch_tests)
+
+
+1.3 Directory Structure
+-----------------------
+HFT_system/
+├── tests/
+│   ├── unit/
+│   │   ├── order_manager_test.cpp
+│   │   ├── market_data_test.cpp
+│   │   ├── risk_manager_test.cpp
+│   │   ├── strategy_test.cpp
+│   │   └── matching_engine_test.cpp
+│   ├── fixtures/
+│   │   ├── test_fixtures.h
+│   │   └── mock_objects.h
+│   └── test_data/
+│       ├── market_data_samples.csv
+│       └── order_scenarios.json
+├── src/
+└── CMakeLists.txt
+
+
+================================================================================
+2. GOOGLE TEST IMPLEMENTATION
+================================================================================
+
+2.1 Order Manager Unit Tests
+-----------------------------
+// tests/unit/order_manager_test.cpp
+#include <gtest/gtest.h>
+#include <gmock/gmock.h>
+#include "order_manager.h"
+#include "mock_exchange_interface.h"
+#include <chrono>
+#include <memory>
+
+using namespace std::chrono;
+using ::testing::Return;
+using ::testing::_;
+using ::testing::AtLeast;
+
+namespace hft {
+namespace testing {
+
+class OrderManagerTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        mock_exchange_ = std::make_shared<MockExchangeInterface>();
+        order_manager_ = std::make_unique<OrderManager>(mock_exchange_);
+
+        // Set up common test data
+        test_order_.order_id = 12345;
+        test_order_.symbol = "AAPL";
+        test_order_.side = OrderSide::BUY;
+        test_order_.price = 150.25;
+        test_order_.quantity = 100;
+        test_order_.order_type = OrderType::LIMIT;
+        test_order_.timestamp = system_clock::now();
+    }
+
+    void TearDown() override {
+        order_manager_.reset();
+        mock_exchange_.reset();
+    }
+
+    std::shared_ptr<MockExchangeInterface> mock_exchange_;
+    std::unique_ptr<OrderManager> order_manager_;
+    Order test_order_;
+};
+
+// Test: Order submission success
+TEST_F(OrderManagerTest, SubmitOrderSuccess) {
+    EXPECT_CALL(*mock_exchange_, sendOrder(_))
+        .Times(1)
+        .WillOnce(Return(true));
+
+    auto start = high_resolution_clock::now();
+    bool result = order_manager_->submitOrder(test_order_);
+    auto end = high_resolution_clock::now();
+
+    EXPECT_TRUE(result);
+    EXPECT_EQ(order_manager_->getPendingOrderCount(), 1);
+
+    // Latency check: submission should complete in < 10 microseconds
+    auto latency = duration_cast<microseconds>(end - start).count();
+    EXPECT_LT(latency, 10) << "Order submission took " << latency << " us";
+}
+
+// Test: Order validation
+TEST_F(OrderManagerTest, OrderValidation) {
+    // Invalid price
+    Order invalid_order = test_order_;
+    invalid_order.price = -10.0;
+
+    EXPECT_FALSE(order_manager_->submitOrder(invalid_order));
+    EXPECT_EQ(order_manager_->getLastError(), "Invalid price");
+
+    // Invalid quantity
+    invalid_order = test_order_;
+    invalid_order.quantity = 0;
+
+    EXPECT_FALSE(order_manager_->submitOrder(invalid_order));
+    EXPECT_EQ(order_manager_->getLastError(), "Invalid quantity");
+
+    // Empty symbol
+    invalid_order = test_order_;
+    invalid_order.symbol = "";
+
+    EXPECT_FALSE(order_manager_->submitOrder(invalid_order));
+    EXPECT_EQ(order_manager_->getLastError(), "Invalid symbol");
+}
+
+// Test: Order cancellation
+TEST_F(OrderManagerTest, CancelOrder) {
+    EXPECT_CALL(*mock_exchange_, sendOrder(_))
+        .WillOnce(Return(true));
+    EXPECT_CALL(*mock_exchange_, cancelOrder(test_order_.order_id))
+        .WillOnce(Return(true));
+
+    order_manager_->submitOrder(test_order_);
+
+    auto start = high_resolution_clock::now();
+    bool result = order_manager_->cancelOrder(test_order_.order_id);
+    auto end = high_resolution_clock::now();
+
+    EXPECT_TRUE(result);
+    EXPECT_EQ(order_manager_->getPendingOrderCount(), 0);
+
+    // Cancel latency should be < 5 microseconds
+    auto latency = duration_cast<microseconds>(end - start).count();
+    EXPECT_LT(latency, 5) << "Order cancellation took " << latency << " us";
+}
+
+// Test: Order modification
+TEST_F(OrderManagerTest, ModifyOrder) {
+    EXPECT_CALL(*mock_exchange_, sendOrder(_))
+        .WillOnce(Return(true));
+    EXPECT_CALL(*mock_exchange_, modifyOrder(_, _, _))
+        .WillOnce(Return(true));
+
+    order_manager_->submitOrder(test_order_);
+
+    double new_price = 151.00;
+    int new_quantity = 150;
+
+    bool result = order_manager_->modifyOrder(
+        test_order_.order_id, new_price, new_quantity
+    );
+
+    EXPECT_TRUE(result);
+
+    Order* updated = order_manager_->getOrder(test_order_.order_id);
+    ASSERT_NE(updated, nullptr);
+    EXPECT_DOUBLE_EQ(updated->price, new_price);
+    EXPECT_EQ(updated->quantity, new_quantity);
+}
+
+// Test: Order fill handling
+TEST_F(OrderManagerTest, HandleOrderFill) {
+    EXPECT_CALL(*mock_exchange_, sendOrder(_))
+        .WillOnce(Return(true));
+
+    order_manager_->submitOrder(test_order_);
+
+    // Simulate partial fill
+    FillReport fill;
+    fill.order_id = test_order_.order_id;
+    fill.filled_quantity = 50;
+    fill.fill_price = 150.25;
+    fill.timestamp = system_clock::now();
+
+    order_manager_->handleFill(fill);
+
+    Order* order = order_manager_->getOrder(test_order_.order_id);
+    ASSERT_NE(order, nullptr);
+    EXPECT_EQ(order->filled_quantity, 50);
+    EXPECT_EQ(order->remaining_quantity, 50);
+    EXPECT_EQ(order->status, OrderStatus::PARTIALLY_FILLED);
+
+    // Complete fill
+    fill.filled_quantity = 50;
+    order_manager_->handleFill(fill);
+
+    order = order_manager_->getOrder(test_order_.order_id);
+    EXPECT_EQ(order->status, OrderStatus::FILLED);
+    EXPECT_EQ(order->filled_quantity, 100);
+}
+
+// Test: Concurrent order submissions
+TEST_F(OrderManagerTest, ConcurrentOrderSubmission) {
+    const int num_orders = 1000;
+    std::vector<std::thread> threads;
+    std::atomic<int> success_count{0};
+
+    EXPECT_CALL(*mock_exchange_, sendOrder(_))
+        .Times(AtLeast(num_orders))
+        .WillRepeatedly(Return(true));
+
+    auto submit_orders = [&](int thread_id, int count) {
+        for (int i = 0; i < count; ++i) {
+            Order order = test_order_;
+            order.order_id = thread_id * 10000 + i;
+            if (order_manager_->submitOrder(order)) {
+                success_count++;
+            }
+        }
+    };
+
+    // Launch 10 threads, each submitting 100 orders
+    for (int i = 0; i < 10; ++i) {
+        threads.emplace_back(submit_orders, i, num_orders / 10);
+    }
+
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    EXPECT_EQ(success_count.load(), num_orders);
+    EXPECT_EQ(order_manager_->getPendingOrderCount(), num_orders);
+}
+
+
+2.2 Market Data Handler Tests
+------------------------------
+// tests/unit/market_data_test.cpp
+#include <gtest/gtest.h>
+#include "market_data_handler.h"
+#include <random>
+
+class MarketDataHandlerTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        handler_ = std::make_unique<MarketDataHandler>();
+
+        // Initialize test market data
+        test_quote_.symbol = "AAPL";
+        test_quote_.bid_price = 150.00;
+        test_quote_.ask_price = 150.05;
+        test_quote_.bid_size = 1000;
+        test_quote_.ask_size = 800;
+        test_quote_.timestamp = system_clock::now();
+    }
+
+    std::unique_ptr<MarketDataHandler> handler_;
+    Quote test_quote_;
+};
+
+TEST_F(MarketDataHandlerTest, QuoteUpdate) {
+    auto callback_called = false;
+    Quote received_quote;
+
+    handler_->subscribeToQuotes("AAPL",
+        [&](const Quote& quote) {
+            callback_called = true;
+            received_quote = quote;
+        }
+    );
+
+    handler_->onQuoteUpdate(test_quote_);
+
+    EXPECT_TRUE(callback_called);
+    EXPECT_EQ(received_quote.symbol, "AAPL");
+    EXPECT_DOUBLE_EQ(received_quote.bid_price, 150.00);
+    EXPECT_DOUBLE_EQ(received_quote.ask_price, 150.05);
+}
+
+TEST_F(MarketDataHandlerTest, OrderBookConstruction) {
+    // Add multiple price levels
+    for (int i = 0; i < 10; ++i) {
+        Quote quote;
+        quote.symbol = "AAPL";
+        quote.bid_price = 150.00 - (i * 0.01);
+        quote.ask_price = 150.05 + (i * 0.01);
+        quote.bid_size = 100 * (i + 1);
+        quote.ask_size = 100 * (i + 1);
+
+        handler_->onQuoteUpdate(quote);
+    }
+
+    auto order_book = handler_->getOrderBook("AAPL");
+    ASSERT_NE(order_book, nullptr);
+
+    EXPECT_EQ(order_book->getBidLevels().size(), 10);
+    EXPECT_EQ(order_book->getAskLevels().size(), 10);
+
+    // Check best bid/ask
+    EXPECT_DOUBLE_EQ(order_book->getBestBid(), 150.00);
+    EXPECT_DOUBLE_EQ(order_book->getBestAsk(), 150.05);
+    EXPECT_DOUBLE_EQ(order_book->getSpread(), 0.05);
+}
+
+TEST_F(MarketDataHandlerTest, TradeUpdate) {
+    Trade trade;
+    trade.symbol = "AAPL";
+    trade.price = 150.10;
+    trade.size = 500;
+    trade.timestamp = system_clock::now();
+    trade.aggressor = TradeSide::BUY;
+
+    auto callback_called = false;
+    handler_->subscribeToTrades("AAPL",
+        [&](const Trade& t) {
+            callback_called = true;
+            EXPECT_DOUBLE_EQ(t.price, 150.10);
+            EXPECT_EQ(t.size, 500);
+        }
+    );
+
+    handler_->onTradeUpdate(trade);
+    EXPECT_TRUE(callback_called);
+}
+
+TEST_F(MarketDataHandlerTest, LatencyMeasurement) {
+    const int num_updates = 10000;
+    std::vector<long long> latencies;
+
+    handler_->subscribeToQuotes("AAPL",
+        [&](const Quote& quote) {
+            auto now = high_resolution_clock::now();
+            auto latency = duration_cast<nanoseconds>(
+                now - quote.timestamp
+            ).count();
+            latencies.push_back(latency);
+        }
+    );
+
+    for (int i = 0; i < num_updates; ++i) {
+        test_quote_.timestamp = high_resolution_clock::now();
+        handler_->onQuoteUpdate(test_quote_);
+    }
+
+    // Calculate statistics
+    double avg_latency = std::accumulate(
+        latencies.begin(), latencies.end(), 0.0
+    ) / latencies.size();
+
+    std::sort(latencies.begin(), latencies.end());
+    long long p50 = latencies[latencies.size() / 2];
+    long long p99 = latencies[latencies.size() * 99 / 100];
+
+    EXPECT_LT(avg_latency, 1000) << "Average latency: " << avg_latency << " ns";
+    EXPECT_LT(p99, 5000) << "P99 latency: " << p99 << " ns";
+}
+
+
+2.3 Risk Manager Tests
+----------------------
+// tests/unit/risk_manager_test.cpp
+#include <gtest/gtest.h>
+#include "risk_manager.h"
+
+class RiskManagerTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        RiskLimits limits;
+        limits.max_position_size = 10000;
+        limits.max_order_value = 1000000.0;
+        limits.max_daily_loss = 50000.0;
+        limits.max_concentration = 0.25;  // 25%
+
+        risk_manager_ = std::make_unique<RiskManager>(limits);
+    }
+
+    std::unique_ptr<RiskManager> risk_manager_;
+};
+
+TEST_F(RiskManagerTest, PositionLimitCheck) {
+    Position position;
+    position.symbol = "AAPL";
+    position.quantity = 5000;
+    position.average_price = 150.00;
+
+    // Within limit
+    EXPECT_TRUE(risk_manager_->checkPositionLimit(position));
+
+    // Exceed limit
+    position.quantity = 15000;
+    EXPECT_FALSE(risk_manager_->checkPositionLimit(position));
+}
+
+TEST_F(RiskManagerTest, OrderValueCheck) {
+    Order order;
+    order.symbol = "AAPL";
+    order.price = 150.00;
+    order.quantity = 5000;  // Value: 750,000
+
+    EXPECT_TRUE(risk_manager_->checkOrderValue(order));
+
+    order.quantity = 10000;  // Value: 1,500,000
+    EXPECT_FALSE(risk_manager_->checkOrderValue(order));
+}
+
+TEST_F(RiskManagerTest, DailyLossLimit) {
+    // Simulate some losses
+    risk_manager_->recordPnL(-20000.0);
+    EXPECT_TRUE(risk_manager_->checkDailyLoss());
+
+    risk_manager_->recordPnL(-35000.0);
+    EXPECT_FALSE(risk_manager_->checkDailyLoss());
+
+    // Test reset after day rollover
+    risk_manager_->resetDailyMetrics();
+    EXPECT_TRUE(risk_manager_->checkDailyLoss());
+}
+
+TEST_F(RiskManagerTest, ConcentrationLimit) {
+    // Set portfolio value
+    risk_manager_->updatePortfolioValue(1000000.0);
+
+    Position position;
+    position.symbol = "AAPL";
+    position.quantity = 1000;
+    position.average_price = 150.00;  // Value: 150,000 (15%)
+
+    EXPECT_TRUE(risk_manager_->checkConcentration(position));
+
+    position.quantity = 2000;  // Value: 300,000 (30%)
+    EXPECT_FALSE(risk_manager_->checkConcentration(position));
+}
+
+TEST_F(RiskManagerTest, PreTradeRiskCheck) {
+    Order order;
+    order.symbol = "AAPL";
+    order.price = 150.00;
+    order.quantity = 1000;
+    order.side = OrderSide::BUY;
+
+    Position current_position;
+    current_position.symbol = "AAPL";
+    current_position.quantity = 2000;
+    current_position.average_price = 149.00;
+
+    auto result = risk_manager_->performPreTradeCheck(order, current_position);
+
+    EXPECT_TRUE(result.approved);
+    EXPECT_TRUE(result.warnings.empty());
+    EXPECT_TRUE(result.violations.empty());
+}
+
+
+================================================================================
+3. CATCH2 IMPLEMENTATION
+================================================================================
+
+3.1 Catch2 Test Examples
+-------------------------
+// tests/catch2_tests.cpp
+#define CATCH_CONFIG_MAIN
+#include <catch2/catch_test_macros.hpp>
+#include <catch2/benchmark/catch_benchmark.hpp>
+#include <catch2/matchers/catch_matchers_floating_point.hpp>
+#include "order_book.h"
+
+using Catch::Matchers::WithinRel;
+
+TEST_CASE("OrderBook operations", "[orderbook]") {
+    OrderBook book("AAPL");
+
+    SECTION("Add bid orders") {
+        book.addBid(150.00, 100);
+        book.addBid(149.95, 200);
+        book.addBid(149.90, 150);
+
+        REQUIRE(book.getBestBid() == 150.00);
+        REQUIRE(book.getBidDepth() == 3);
+        REQUIRE(book.getTotalBidVolume() == 450);
+    }
+
+    SECTION("Add ask orders") {
+        book.addAsk(150.10, 100);
+        book.addAsk(150.15, 200);
+        book.addAsk(150.20, 150);
+
+        REQUIRE(book.getBestAsk() == 150.10);
+        REQUIRE(book.getAskDepth() == 3);
+        REQUIRE(book.getTotalAskVolume() == 450);
+    }
+
+    SECTION("Spread calculation") {
+        book.addBid(150.00, 100);
+        book.addAsk(150.10, 100);
+
+        REQUIRE_THAT(book.getSpread(), WithinRel(0.10, 0.001));
+        REQUIRE_THAT(book.getMidPrice(), WithinRel(150.05, 0.001));
+    }
+
+    SECTION("Order matching") {
+        book.addBid(150.00, 100);
+        book.addAsk(150.10, 100);
+
+        // Market buy should match ask
+        auto matches = book.matchMarketOrder(OrderSide::BUY, 50);
+
+        REQUIRE(matches.size() == 1);
+        REQUIRE(matches[0].price == 150.10);
+        REQUIRE(matches[0].quantity == 50);
+        REQUIRE(book.getTotalAskVolume() == 50);
+    }
+}
+
+TEST_CASE("VWAP calculation", "[pricing]") {
+    VWAPCalculator calc;
+
+    calc.addTrade(150.00, 100);
+    calc.addTrade(150.10, 200);
+    calc.addTrade(149.90, 150);
+
+    double vwap = calc.getVWAP();
+
+    // VWAP = (150*100 + 150.10*200 + 149.90*150) / 450
+    double expected = 150.0111;
+
+    REQUIRE_THAT(vwap, WithinRel(expected, 0.0001));
+}
+
+BENCHMARK("Order book updates") {
+    OrderBook book("AAPL");
+    return book.addBid(150.00, 100);
+};
+
+BENCHMARK("VWAP calculation with 1000 trades") {
+    VWAPCalculator calc;
+    for (int i = 0; i < 1000; ++i) {
+        calc.addTrade(150.0 + (i % 10) * 0.01, 100);
+    }
+    return calc.getVWAP();
+};
+
+
+================================================================================
+4. TEST FIXTURES AND UTILITIES
+================================================================================
+
+4.1 Common Test Fixtures
+-------------------------
+// tests/fixtures/test_fixtures.h
+#ifndef TEST_FIXTURES_H
+#define TEST_FIXTURES_H
+
+#include <gtest/gtest.h>
+#include <memory>
+#include <vector>
+#include "market_data_handler.h"
+#include "order_manager.h"
+
+class HFTTestFixture : public ::testing::Test {
+protected:
+    void SetUp() override {
+        setupMarketData();
+        setupOrders();
+        setupPositions();
+    }
+
+    void TearDown() override {
+        market_data_.reset();
+        order_manager_.reset();
+        positions_.clear();
+    }
+
+    void setupMarketData() {
+        market_data_ = std::make_unique<MarketDataHandler>();
+
+        // Add sample quotes
+        for (const auto& symbol : symbols_) {
+            Quote quote;
+            quote.symbol = symbol;
+            quote.bid_price = 150.00;
+            quote.ask_price = 150.05;
+            quote.bid_size = 1000;
+            quote.ask_size = 1000;
+            quote.timestamp = system_clock::now();
+
+            quotes_.push_back(quote);
+        }
+    }
+
+    void setupOrders() {
+        order_manager_ = std::make_unique<OrderManager>();
+
+        Order order;
+        order.symbol = "AAPL";
+        order.side = OrderSide::BUY;
+        order.price = 150.00;
+        order.quantity = 100;
+        order.order_type = OrderType::LIMIT;
+
+        test_orders_.push_back(order);
+    }
+
+    void setupPositions() {
+        Position pos;
+        pos.symbol = "AAPL";
+        pos.quantity = 1000;
+        pos.average_price = 149.50;
+
+        positions_.push_back(pos);
+    }
+
+    std::unique_ptr<MarketDataHandler> market_data_;
+    std::unique_ptr<OrderManager> order_manager_;
+    std::vector<Quote> quotes_;
+    std::vector<Order> test_orders_;
+    std::vector<Position> positions_;
+    std::vector<std::string> symbols_ = {"AAPL", "GOOGL", "MSFT"};
+};
+
+#endif // TEST_FIXTURES_H
+
+
+4.2 Mock Objects
+----------------
+// tests/fixtures/mock_objects.h
+#ifndef MOCK_OBJECTS_H
+#define MOCK_OBJECTS_H
+
+#include <gmock/gmock.h>
+#include "exchange_interface.h"
+#include "market_data_feed.h"
+
+class MockExchangeInterface : public ExchangeInterface {
+public:
+    MOCK_METHOD(bool, sendOrder, (const Order& order), (override));
+    MOCK_METHOD(bool, cancelOrder, (uint64_t order_id), (override));
+    MOCK_METHOD(bool, modifyOrder, (uint64_t order_id, double price, int quantity), (override));
+    MOCK_METHOD(OrderStatus, getOrderStatus, (uint64_t order_id), (override));
+    MOCK_METHOD(std::vector<Fill>, getFills, (uint64_t order_id), (override));
+};
+
+class MockMarketDataFeed : public MarketDataFeed {
+public:
+    MOCK_METHOD(void, subscribe, (const std::string& symbol), (override));
+    MOCK_METHOD(void, unsubscribe, (const std::string& symbol), (override));
+    MOCK_METHOD(Quote, getLastQuote, (const std::string& symbol), (override));
+    MOCK_METHOD(bool, isConnected, (), (const, override));
+};
+
+class MockRiskManager : public RiskManager {
+public:
+    MOCK_METHOD(bool, checkOrder, (const Order& order), (override));
+    MOCK_METHOD(bool, checkPosition, (const Position& position), (override));
+    MOCK_METHOD(void, updatePosition, (const Fill& fill), (override));
+    MOCK_METHOD(double, getAvailableCapital, (), (const, override));
+};
+
+#endif // MOCK_OBJECTS_H
+
+
+================================================================================
+5. PARAMETERIZED TESTS
+================================================================================
+
+5.1 Data-Driven Tests
+----------------------
+// Parameterized test for multiple order scenarios
+class OrderValidationTest : public ::testing::TestWithParam<
+    std::tuple<double, int, OrderSide, bool>
+> {
+protected:
+    OrderManager order_manager_;
+};
+
+TEST_P(OrderValidationTest, ValidateOrders) {
+    auto [price, quantity, side, expected_valid] = GetParam();
+
+    Order order;
+    order.symbol = "AAPL";
+    order.price = price;
+    order.quantity = quantity;
+    order.side = side;
+    order.order_type = OrderType::LIMIT;
+
+    bool is_valid = order_manager_.validateOrder(order);
+    EXPECT_EQ(is_valid, expected_valid);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    OrderScenarios,
+    OrderValidationTest,
+    ::testing::Values(
+        std::make_tuple(150.00, 100, OrderSide::BUY, true),
+        std::make_tuple(-10.00, 100, OrderSide::BUY, false),
+        std::make_tuple(150.00, -50, OrderSide::BUY, false),
+        std::make_tuple(150.00, 0, OrderSide::BUY, false),
+        std::make_tuple(0.01, 1000000, OrderSide::SELL, true)
+    )
+);
+
+
+================================================================================
+6. TEST COVERAGE REQUIREMENTS
+================================================================================
+
+6.1 Coverage Configuration
+---------------------------
+# .codecov.yml
+coverage:
+  precision: 2
+  round: down
+  range: "70...100"
+
+  status:
+    project:
+      default:
+        target: 85%
+        threshold: 1%
+    patch:
+      default:
+        target: 90%
+
+  ignore:
+    - "tests/*"
+    - "third_party/*"
+
+# Critical components requiring 95%+ coverage
+critical_components:
+  - src/order_manager.cpp
+  - src/risk_manager.cpp
+  - src/matching_engine.cpp
+
+
+6.2 Coverage Report Generation
+-------------------------------
+#!/bin/bash
+# generate_coverage.sh
+
+# Build with coverage flags
+cmake -DCODE_COVERAGE=ON -DCMAKE_BUILD_TYPE=Debug ..
+make
+
+# Run tests
+./hft_tests
+
+# Generate coverage report
+lcov --capture --directory . --output-file coverage.info
+lcov --remove coverage.info '/usr/*' --output-file coverage.info
+lcov --remove coverage.info '*/tests/*' --output-file coverage.info
+
+# Generate HTML report
+genhtml coverage.info --output-directory coverage_html
+
+# Display summary
+lcov --list coverage.info
+
+echo "Coverage report generated in coverage_html/"
+
+
+================================================================================
+7. CONTINUOUS INTEGRATION
+================================================================================
+
+7.1 GitHub Actions Workflow
+----------------------------
+# .github/workflows/tests.yml
+name: Unit Tests
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake g++ lcov
+
+    - name: Build
+      run: |
+        mkdir build && cd build
+        cmake -DCODE_COVERAGE=ON ..
+        make -j$(nproc)
+
+    - name: Run tests
+      run: |
+        cd build
+        ./hft_tests --gtest_output=xml:test_results.xml
+
+    - name: Generate coverage
+      run: |
+        cd build
+        lcov --capture --directory . --output-file coverage.info
+        lcov --remove coverage.info '/usr/*' '*/tests/*' --output-file coverage.info
+
+    - name: Upload coverage
+      uses: codecov/codecov-action@v3
+      with:
+        files: ./build/coverage.info
+        fail_ci_if_error: true
+
+    - name: Publish test results
+      uses: EnricoMi/publish-unit-test-result-action@v2
+      if: always()
+      with:
+        files: build/test_results.xml
+
+
+================================================================================
+8. BEST PRACTICES FOR HFT UNIT TESTING
+================================================================================
+
+1. Test Isolation
+   - Each test should be independent
+   - Use fixtures for setup/teardown
+   - Avoid shared state between tests
+
+2. Performance Testing
+   - Measure execution time for critical paths
+   - Set latency thresholds
+   - Use ASSERT/EXPECT_LT for timing checks
+
+3. Mock External Dependencies
+   - Mock exchange connections
+   - Mock market data feeds
+   - Use dependency injection
+
+4. Edge Cases
+   - Test boundary conditions
+   - Test error handling
+   - Test race conditions
+
+5. Deterministic Tests
+   - Avoid random data unless seeded
+   - Use fixed timestamps for reproducibility
+   - Control thread scheduling in concurrent tests
+
+6. Fast Execution
+   - Keep unit tests under 1ms each
+   - Use mocks to avoid I/O
+   - Parallelize test execution
+
+7. Clear Assertions
+   - One logical assertion per test
+   - Descriptive failure messages
+   - Use appropriate matchers
+
+8. Continuous Monitoring
+   - Track test execution time trends
+   - Monitor flaky tests
+   - Maintain high coverage (>85%)
+
+================================================================================
+END OF UNIT TESTING STRATEGIES
+================================================================================

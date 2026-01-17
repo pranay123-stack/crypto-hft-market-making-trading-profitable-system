@@ -1,0 +1,938 @@
+================================================================================
+CPU OPTIMIZATION FOR HIGH-FREQUENCY TRADING
+CPU Pinning, Core Isolation, Frequency Scaling, and Power Management
+================================================================================
+
+INTRODUCTION
+================================================================================
+
+CPU optimization is one of the most cost-effective performance improvements
+for HFT systems. Unlike hardware upgrades, these are software configurations
+that can reduce latency by 20-50% with zero capital investment.
+
+KEY OPTIMIZATIONS:
+- CPU pinning (thread affinity)
+- Core isolation (isolcpus)
+- Frequency scaling (disable turbo boost, set governor)
+- Power states (C-states, P-states)
+- NUMA awareness
+- Cache optimization
+- Interrupt steering
+
+TYPICAL IMPROVEMENTS:
+- Latency reduction: 20-50%
+- Jitter reduction: 80-95%
+- Consistency: Much more predictable timing
+
+Cost: $0 (configuration only)
+Implementation time: 1-2 weeks
+
+CPU ARCHITECTURE BASICS
+================================================================================
+
+MODERN CPU STRUCTURE
+--------------------
+
+Typical server CPU (e.g., Intel Xeon, AMD EPYC):
+
+- Multiple cores: 8-64 cores per CPU
+- Hyperthreading (HT): 2 logical CPUs per core
+- Cache hierarchy:
+  - L1: 32-64 KB per core (fastest, < 1 ns)
+  - L2: 256KB-1MB per core (fast, 3-10 ns)
+  - L3: 10-50 MB shared (slower, 20-50 ns)
+- NUMA nodes: Multiple memory controllers
+- Frequency: Base 2-3 GHz, Turbo 3-5 GHz
+
+LATENCY HIERARCHY
+-----------------
+
+Access Type              | Latency
+-------------------------|------------
+L1 cache hit             | 0.5-1 ns
+L2 cache hit             | 3-10 ns
+L3 cache hit             | 20-50 ns
+Local NUMA memory        | 80-120 ns
+Remote NUMA memory       | 150-300 ns
+Context switch           | 1-5 us
+Thread wake-up           | 10-50 us
+
+SOURCES OF LATENCY AND JITTER
+==============================
+
+1. CONTEXT SWITCHES
+   - OS switches between threads/processes
+   - Save/restore CPU registers
+   - TLB flush
+   - Cache pollution
+   - Latency: 1-5 microseconds
+   - Highly variable
+
+2. INTERRUPTS
+   - Hardware interrupts (network, disk, timer)
+   - Software interrupts
+   - Interrupt handler execution
+   - Latency: 1-10 microseconds
+   - Unpredictable timing
+
+3. CPU FREQUENCY CHANGES
+   - Turbo boost (frequency scaling up/down)
+   - Power management (P-states)
+   - Takes 10-100 microseconds to change frequency
+   - Performance variability
+
+4. CPU SLEEP STATES (C-STATES)
+   - CPU enters low-power mode when idle
+   - Exit latency: 1-100 microseconds
+   - Unpredictable wake-up time
+
+5. CACHE MISSES
+   - Data not in L1/L2/L3
+   - Fetch from memory
+   - Latency: 80-300 nanoseconds
+   - Frequent in unoptimized code
+
+6. NUMA ACCESS
+   - Access memory on remote NUMA node
+   - 2-3x slower than local
+   - Latency: 150-300 nanoseconds
+
+7. OTHER PROCESSES
+   - Competing for CPU time
+   - Cache eviction
+   - Resource contention
+   - Variable impact
+
+CPU PINNING (THREAD AFFINITY)
+================================================================================
+
+CONCEPT
+-------
+
+CPU pinning (affinity) binds a thread to specific CPU cores, preventing the
+OS scheduler from moving it between cores.
+
+Benefits:
+- No migration overhead
+- Better cache utilization
+- Predictable performance
+- Lower latency
+
+Without pinning:
+- Thread migrates between cores
+- L1/L2 cache invalidated
+- TLB flush
+- Latency spike: 1-5 microseconds
+
+IMPLEMENTATION IN LINUX
+------------------------
+
+1. USING taskset COMMAND
+
+```bash
+# Run process on cores 2-5
+taskset -c 2-5 ./hft_app
+
+# Check current affinity
+taskset -p PID
+
+# Set affinity of running process
+taskset -pc 2-5 PID
+```
+
+2. USING PTHREAD (IN CODE)
+
+```c
+#include <pthread.h>
+#include <sched.h>
+
+void set_thread_affinity(int core) {
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(core, &cpuset);
+
+    pthread_t thread = pthread_self();
+    int result = pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset);
+    if (result != 0) {
+        perror("pthread_setaffinity_np");
+    }
+}
+
+// In thread function:
+void* trading_thread(void* arg) {
+    set_thread_affinity(2);  // Pin to core 2
+
+    // Trading logic...
+    while (1) {
+        process_market_data();
+        execute_strategy();
+        send_orders();
+    }
+}
+```
+
+3. USING CGROUPS (FOR MULTIPLE PROCESSES)
+
+```bash
+# Create cgroup
+mkdir /sys/fs/cgroup/cpuset/hft
+
+# Assign cores 2-5
+echo 2-5 > /sys/fs/cgroup/cpuset/hft/cpuset.cpus
+
+# Assign NUMA node 0
+echo 0 > /sys/fs/cgroup/cpuset/hft/cpuset.mems
+
+# Move processes to cgroup
+echo PID > /sys/fs/cgroup/cpuset/hft/tasks
+```
+
+BEST PRACTICES
+--------------
+
+1. PIN CRITICAL THREADS
+   - Market data handler: Core 2
+   - Strategy engine: Core 3
+   - Order entry: Core 4
+   - Risk checks: Core 5
+   - Non-critical (logging, etc.): Cores 6-7
+
+2. AVOID CORE 0
+   - OS typically uses core 0 for system tasks
+   - Higher interrupt load
+   - More context switches
+   - Leave for OS
+
+3. ONE THREAD PER CORE
+   - Don't oversubscribe
+   - Avoid multiple critical threads on same core
+   - Use hyperthreading carefully (see below)
+
+4. RESPECT NUMA BOUNDARIES
+   - Pin to cores in same NUMA node
+   - Access local memory only
+   - Avoid cross-NUMA communication
+
+CORE ISOLATION (isolcpus)
+================================================================================
+
+CONCEPT
+-------
+
+Core isolation removes CPU cores from the Linux scheduler, dedicating them
+entirely to specific applications. No other processes will run on isolated cores.
+
+Benefits:
+- Zero context switches (except your app)
+- No competition for CPU
+- No cache pollution from other processes
+- Lowest jitter possible
+
+CONFIGURATION
+-------------
+
+1. KERNEL BOOT PARAMETER
+
+Edit /etc/default/grub:
+
+```bash
+GRUB_CMDLINE_LINUX="isolcpus=2-7 nohz_full=2-7 rcu_nocbs=2-7"
+```
+
+Parameters:
+- isolcpus=2-7: Isolate cores 2-7 from scheduler
+- nohz_full=2-7: Disable timer tick on these cores
+- rcu_nocbs=2-7: Move RCU callbacks off these cores
+
+Update grub and reboot:
+```bash
+sudo update-grub
+sudo reboot
+```
+
+2. VERIFY ISOLATION
+
+```bash
+# Check isolated cores
+cat /sys/devices/system/cpu/isolated
+
+# Check CPU list for scheduler
+cat /sys/devices/system/cpu/present
+
+# Monitor per-core usage
+mpstat -P ALL 1
+```
+
+3. RUN ON ISOLATED CORES
+
+```bash
+# Pin to isolated core
+taskset -c 2 ./hft_app
+```
+
+RESULT:
+- Core 2 shows 100% usage (your app)
+- No other processes on core 2
+- Minimal interrupts
+- Lowest latency and jitter
+
+EXAMPLE CONFIGURATION
+---------------------
+
+Server: 16-core (32 hyperthreads)
+
+Allocation:
+- Cores 0-1: OS and system tasks
+- Cores 2-9: Isolated for HFT (8 cores)
+- Cores 10-15: Other applications
+
+HFT component mapping:
+- Core 2: Market data RX
+- Core 3: Market data parsing
+- Core 4: Strategy execution
+- Core 5: Order preparation
+- Core 6: Order TX
+- Core 7: Risk checks
+- Core 8: Monitoring
+- Core 9: Spare
+
+TURBO BOOST AND FREQUENCY SCALING
+================================================================================
+
+TURBO BOOST OVERVIEW
+--------------------
+
+Intel Turbo Boost (AMD: Precision Boost) allows CPUs to exceed base frequency
+when thermal and power limits permit.
+
+Example:
+- Base frequency: 2.4 GHz
+- Max turbo: 4.0 GHz
+
+Problem for HFT:
+- Frequency changes cause latency (10-100 microseconds to ramp up/down)
+- Inconsistent performance (sometimes fast, sometimes slow)
+- Thermal throttling (unpredictable)
+- Higher jitter
+
+DISABLE TURBO BOOST FOR CONSISTENCY
+------------------------------------
+
+Most HFT systems disable turbo boost for consistent latency.
+
+1. IN BIOS
+   - Boot into BIOS/UEFI
+   - Find "Turbo Boost" or "Turbo Mode" setting
+   - Disable
+   - Save and reboot
+
+2. AT RUNTIME (INTEL)
+
+```bash
+# Check turbo status
+cat /sys/devices/system/cpu/intel_pstate/no_turbo
+
+# 0 = turbo enabled, 1 = turbo disabled
+
+# Disable turbo
+echo 1 | sudo tee /sys/devices/system/cpu/intel_pstate/no_turbo
+
+# Verify
+cat /proc/cpuinfo | grep MHz
+```
+
+3. AT RUNTIME (AMD)
+
+```bash
+# AMD uses cpufreq subsystem
+# Set governor to performance (see next section)
+```
+
+TRADE-OFF:
+- Lose peak performance (lower max frequency)
+- Gain consistency (stable frequency)
+- For HFT, consistency > peak
+
+EXCEPTION:
+- If your app is rarely active (sporadic trading), turbo boost may be acceptable
+- For continuous market making, disable it
+
+CPU FREQUENCY GOVERNOR
+----------------------
+
+Linux CPU frequency governor controls how CPU frequency changes.
+
+Governors:
+- performance: Always max frequency (usually base, not turbo)
+- powersave: Always min frequency
+- ondemand: Scale based on load (default)
+- conservative: Scale gradually
+- userspace: User-controlled
+- schedutil: Scheduler-based (newer kernels)
+
+FOR HFT: Use "performance" governor
+
+CONFIGURATION
+-------------
+
+1. CHECK CURRENT GOVERNOR
+
+```bash
+cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+```
+
+2. SET TO PERFORMANCE
+
+```bash
+# For all cores
+echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+
+# For specific core
+echo performance | sudo tee /sys/devices/system/cpu/cpu2/cpufreq/scaling_governor
+```
+
+3. MAKE PERSISTENT
+
+Create /etc/rc.local:
+
+```bash
+#!/bin/bash
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+exit 0
+```
+
+Or use cpufrequtils:
+
+```bash
+sudo apt-get install cpufrequtils
+echo 'GOVERNOR="performance"' | sudo tee /etc/default/cpufrequtils
+sudo systemctl restart cpufrequtils
+```
+
+RESULT:
+- CPU stays at base frequency
+- No scaling delays
+- Consistent performance
+- Slightly higher power consumption (acceptable trade-off)
+
+POWER STATES (C-STATES AND P-STATES)
+================================================================================
+
+C-STATES (IDLE STATES)
+----------------------
+
+When CPU is idle, it enters low-power C-states:
+
+- C0: Active (executing instructions)
+- C1: Halt (basic idle, exit latency ~1 us)
+- C1E: Enhanced halt (exit latency ~10 us)
+- C3: Deep sleep (exit latency ~50 us)
+- C6: Deeper sleep (exit latency ~100 us)
+
+Problem: Exit latency adds jitter when CPU wakes up
+
+FOR HFT: Disable deep C-states
+
+DISABLE C-STATES
+----------------
+
+1. IN BIOS
+   - Find "C-states" or "CPU power management"
+   - Enable C1 only, disable C1E, C3, C6
+   - OR disable all C-states (CPU always in C0)
+
+2. AT RUNTIME
+
+```bash
+# Check current C-states
+cpupower idle-info
+
+# Disable C-states beyond C1
+cpupower idle-set -D 1
+
+# Or use kernel parameter (in /etc/default/grub):
+GRUB_CMDLINE_LINUX="intel_idle.max_cstate=1"
+# AMD:
+GRUB_CMDLINE_LINUX="processor.max_cstate=1"
+```
+
+TRADE-OFF:
+- Higher power consumption (CPU never truly idle)
+- Better latency (no wake-up delay)
+- For HFT, accept higher power for lower latency
+
+P-STATES (FREQUENCY/VOLTAGE STATES)
+------------------------------------
+
+P-states control CPU frequency and voltage. Related to frequency governor.
+
+FOR HFT:
+- Disable P-state transitions
+- Use performance governor (fixed frequency)
+- Consistent performance
+
+Configuration: (covered in frequency scaling section above)
+
+NUMA OPTIMIZATION
+================================================================================
+
+NUMA (NON-UNIFORM MEMORY ACCESS)
+---------------------------------
+
+Modern servers have multiple CPUs, each with its own memory controller.
+
+Example: 2-socket server
+- Socket 0: Cores 0-15, Memory 0-64GB (NUMA node 0)
+- Socket 1: Cores 16-31, Memory 64-128GB (NUMA node 1)
+
+Access times:
+- Local memory (same NUMA node): 80-120 ns
+- Remote memory (different node): 150-300 ns
+
+Remote access is 2-3x slower!
+
+CHECK NUMA TOPOLOGY
+-------------------
+
+```bash
+# Show NUMA nodes
+numactl --hardware
+
+Output:
+available: 2 nodes (0-1)
+node 0 cpus: 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+node 0 size: 65536 MB
+node 0 free: 45000 MB
+node 1 cpus: 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31
+node 1 size: 65536 MB
+node 1 free: 50000 MB
+
+node distances:
+node   0   1
+  0:  10  21
+  1:  21  10
+
+Distance 10 = local, 21 = remote (higher = slower)
+
+# Check which NUMA node a NIC is on
+cat /sys/class/net/eth0/device/numa_node
+```
+
+NUMA-AWARE ALLOCATION
+---------------------
+
+1. BIND TO NUMA NODE
+
+```bash
+# Run on node 0 (cores + memory)
+numactl --cpunodebind=0 --membind=0 ./hft_app
+
+# Interleave memory across nodes (for large allocations)
+numactl --interleave=all ./hft_app
+```
+
+2. IN CODE (C/C++)
+
+```c
+#include <numa.h>
+
+int main() {
+    // Check if NUMA is available
+    if (numa_available() < 0) {
+        printf("NUMA not available\n");
+        return 1;
+    }
+
+    // Bind to NUMA node 0
+    numa_run_on_node(0);
+    numa_set_preferred(0);
+
+    // Allocate memory on node 0
+    void* buffer = numa_alloc_onnode(1024*1024, 0);
+
+    // ... use buffer ...
+
+    numa_free(buffer, 1024*1024);
+}
+
+Compile: gcc -o app app.c -lnuma
+```
+
+BEST PRACTICES
+--------------
+
+1. ALIGN CPU AND MEMORY
+   - If thread runs on node 0, allocate memory on node 0
+   - Avoid cross-NUMA access
+
+2. ALIGN NIC AND CPU
+   - Check which NUMA node NIC is on
+   - Run network threads on that node
+   - Allocate packet buffers on that node
+
+3. EXAMPLE HFT SETUP
+
+Server: 2-socket, NUMA nodes 0 and 1
+NIC: On NUMA node 0
+
+Configuration:
+- Market data thread: Node 0 cores
+- Market data buffers: Node 0 memory
+- Strategy thread: Node 0 cores (shares L3 cache)
+- Order buffers: Node 0 memory
+
+- Analytics threads: Node 1 (non-critical)
+- Database: Node 1
+
+Result: All critical path on single NUMA node, no remote access
+
+INTERRUPT STEERING
+================================================================================
+
+NETWORK INTERRUPTS
+------------------
+
+Network packets generate interrupts. By default, interrupts may go to any core.
+
+Problem:
+- Interrupts on core running trading logic cause latency spikes
+- Context switch to interrupt handler
+- Cache pollution
+- 1-10 microsecond delay
+
+Solution: Steer interrupts to non-critical cores
+
+CONFIGURATION
+-------------
+
+1. CHECK INTERRUPT AFFINITY
+
+```bash
+# Show IRQ numbers for network device
+cat /proc/interrupts | grep eth0
+
+# Show affinity for IRQ 100
+cat /proc/irq/100/smp_affinity
+```
+
+smp_affinity is a bitmask:
+- 0x0001 = CPU 0
+- 0x0002 = CPU 1
+- 0x0004 = CPU 2
+- 0x00ff = CPUs 0-7
+
+2. SET INTERRUPT AFFINITY
+
+```bash
+# Steer IRQ 100 to CPU 1
+echo 2 | sudo tee /proc/irq/100/smp_affinity
+
+# Or use irqbalance daemon with exclusions
+```
+
+3. DISABLE irqbalance (RECOMMENDED FOR HFT)
+
+irqbalance automatically distributes interrupts, undoing manual settings.
+
+```bash
+sudo systemctl stop irqbalance
+sudo systemctl disable irqbalance
+```
+
+4. MANUAL STEERING STRATEGY
+
+- Core 0-1: System + all interrupts
+- Core 2-7: Isolated, no interrupts, HFT threads
+
+Example script:
+
+```bash
+#!/bin/bash
+# Steer all network IRQs to cores 0-1
+
+for irq in $(grep eth0 /proc/interrupts | cut -d: -f1); do
+    echo 3 > /proc/irq/$irq/smp_affinity  # 3 = binary 11 = CPUs 0-1
+done
+```
+
+RECEIVE SIDE SCALING (RSS)
+---------------------------
+
+RSS distributes incoming packets across multiple RX queues and cores.
+
+Configuration:
+
+```bash
+# Check number of RX queues
+ethtool -l eth0
+
+# Set to 4 queues
+ethtool -L eth0 rx 4
+
+# Check queue to CPU mapping
+ethtool -x eth0
+
+# Manually set affinity for each queue
+echo 4 > /proc/irq/100/smp_affinity   # Queue 0 -> CPU 2
+echo 8 > /proc/irq/101/smp_affinity   # Queue 1 -> CPU 3
+...
+```
+
+For HFT with dedicated cores:
+- Use fewer RX queues (1-2)
+- Steer to dedicated cores
+- Simpler than multi-queue
+
+CACHE OPTIMIZATION
+================================================================================
+
+CACHE LINE SIZE: 64 bytes (typical)
+
+FALSE SHARING
+-------------
+
+Problem: Multiple threads accessing different variables in same cache line
+- CPU invalidates entire cache line
+- Performance penalty
+
+Example:
+
+```c
+// BAD: False sharing
+struct Data {
+    int thread1_counter;  // Same cache line
+    int thread2_counter;  // Same cache line
+};
+
+// GOOD: Padding to separate cache lines
+struct Data {
+    int thread1_counter;
+    char padding[60];     // Pad to 64 bytes
+    int thread2_counter;
+    char padding2[60];
+};
+
+// Or use alignas (C++11)
+struct Data {
+    alignas(64) int thread1_counter;
+    alignas(64) int thread2_counter;
+};
+```
+
+DATA ALIGNMENT
+--------------
+
+Align data structures to cache line boundaries:
+
+```c
+struct __attribute__((aligned(64))) MarketData {
+    double price;
+    int quantity;
+    timestamp_t time;
+    // ...
+};
+```
+
+Benefits:
+- Reduced cache misses
+- Better prefetching
+- Lower latency
+
+PREFETCHING
+-----------
+
+Manually prefetch data that will be accessed soon:
+
+```c
+#include <xmmintrin.h>  // SSE intrinsics
+
+// Prefetch data into L1 cache
+_mm_prefetch((const char*)&next_order, _MM_HINT_T0);
+
+// Then process current order
+process_order(&current_order);
+
+// By the time we get to next_order, it's in cache
+process_order(&next_order);
+```
+
+COMPREHENSIVE EXAMPLE CONFIGURATION
+================================================================================
+
+Example: 16-core HFT server
+
+/etc/default/grub:
+```
+GRUB_CMDLINE_LINUX="isolcpus=2-9 nohz_full=2-9 rcu_nocbs=2-9 intel_idle.max_cstate=1 intel_pstate=disable processor.max_cstate=1"
+```
+
+/etc/rc.local:
+```bash
+#!/bin/bash
+
+# Disable turbo
+echo 1 > /sys/devices/system/cpu/intel_pstate/no_turbo
+
+# Set performance governor
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+
+# Disable irqbalance
+systemctl stop irqbalance
+
+# Steer interrupts to cores 0-1
+for irq in $(grep eth0 /proc/interrupts | cut -d: -f1); do
+    echo 3 > /proc/irq/$irq/smp_affinity
+done
+
+# Disable NMI watchdog (generates interrupts)
+echo 0 > /proc/sys/kernel/nmi_watchdog
+
+# Set huge pages
+echo 1024 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+
+exit 0
+```
+
+HFT application launch:
+```bash
+#!/bin/bash
+
+# Check NUMA node for NIC
+NIC_NODE=$(cat /sys/class/net/eth0/device/numa_node)
+
+# Launch with NUMA binding and core affinity
+numactl --cpunodebind=$NIC_NODE --membind=$NIC_NODE \
+    taskset -c 2-9 \
+    ./hft_app --config hft.conf
+```
+
+In application code:
+```c
+// Pin specific threads
+void* md_thread(void* arg) {
+    set_thread_affinity(2);  // Market data on core 2
+    // ... process market data
+}
+
+void* strategy_thread(void* arg) {
+    set_thread_affinity(3);  // Strategy on core 3
+    // ... execute strategy
+}
+
+void* order_thread(void* arg) {
+    set_thread_affinity(4);  // Orders on core 4
+    // ... send orders
+}
+```
+
+MONITORING AND VALIDATION
+================================================================================
+
+TOOLS
+-----
+
+1. PERF (Linux performance analyzer)
+
+```bash
+# Monitor context switches
+perf stat -e context-switches ./hft_app
+
+# Monitor cache misses
+perf stat -e cache-misses ./hft_app
+
+# Record and analyze
+perf record -e cycles ./hft_app
+perf report
+```
+
+2. MPSTAT (per-core CPU usage)
+
+```bash
+# Update every 1 second
+mpstat -P ALL 1
+
+Output:
+02:00:00 PM  CPU    %usr   %sys  %idle
+02:00:01 PM    0    5.00   3.00  92.00
+02:00:01 PM    1    4.00   2.00  94.00
+02:00:01 PM    2  100.00   0.00   0.00  <- HFT thread, 100% busy
+02:00:01 PM    3  100.00   0.00   0.00  <- HFT thread, 100% busy
+...
+```
+
+3. TURBOSTAT (CPU frequency monitoring)
+
+```bash
+turbostat --interval 1
+
+Shows:
+- Current frequency per core
+- C-state residency
+- Power consumption
+```
+
+4. NUMASTAT (NUMA statistics)
+
+```bash
+numastat -p PID
+
+Shows:
+- Local vs remote memory access
+- NUMA hits/misses
+```
+
+EXPECTED RESULTS AFTER OPTIMIZATION
+====================================
+
+Before optimization:
+- Latency p50: 10 microseconds
+- Latency p99: 50 microseconds
+- Latency p99.9: 200 microseconds
+- Jitter (p99-p50): 40 microseconds
+
+After optimization:
+- Latency p50: 5 microseconds
+- Latency p99: 8 microseconds
+- Latency p99.9: 15 microseconds
+- Jitter (p99-p50): 3 microseconds
+
+Improvements:
+- 50% reduction in median latency
+- 84% reduction in p99 latency
+- 92.5% reduction in p99.9 latency
+- 92.5% reduction in jitter
+
+Real-world example: Market making firm
+- Before: 15us average, 80us p99
+- After: 8us average, 12us p99
+- Impact: Captured 30% more profitable quotes
+- ROI: Infinite (no cost, pure configuration)
+
+CONCLUSION
+================================================================================
+
+CPU optimization is the highest ROI optimization for HFT systems:
+
+COST: $0 (pure configuration)
+EFFORT: 1-2 weeks to implement and test
+BENEFIT: 20-50% latency reduction, 80-95% jitter reduction
+
+KEY TECHNIQUES:
+1. Core isolation (isolcpus) - Most impactful
+2. CPU pinning - Essential
+3. Disable turbo boost - Consistency
+4. Performance governor - Max frequency
+5. Disable deep C-states - Lower wake-up latency
+6. NUMA awareness - Avoid remote memory
+7. Interrupt steering - Protect critical cores
+
+RECOMMENDED APPROACH:
+1. Week 1: Baseline measurement, implement core isolation and pinning
+2. Week 2: Frequency/power optimization, NUMA tuning, validation
+3. Monitor continuously, iterate
+
+Every HFT system should implement these optimizations. No excuse not to -
+zero cost and massive benefit.
+
+Document version: 1.0
+Last updated: 2025-01-15

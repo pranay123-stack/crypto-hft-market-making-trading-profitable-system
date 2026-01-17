@@ -1,0 +1,1645 @@
+================================================================================
+                    TICK DATA LIFECYCLE MANAGEMENT
+                    Hot/Warm/Cold Storage Tiering for HFT
+================================================================================
+
+Table of Contents:
+1. Data Lifecycle Overview
+2. Hot Storage Tier
+3. Warm Storage Tier
+4. Cold Storage Tier
+5. Data Migration Policies
+6. Retention Policies
+7. Data Archival Strategies
+8. Disaster Recovery
+
+================================================================================
+SECTION 1: DATA LIFECYCLE OVERVIEW
+================================================================================
+
+1.1 Tiered Storage Architecture
+-------------------------------
+
+Storage Tier Characteristics:
+┌─────────────────┬──────────────┬──────────────┬──────────────┬─────────────┐
+│ Tier            │ Latency      │ Cost/GB/Mo   │ Retention    │ Access      │
+├─────────────────┼──────────────┼──────────────┼──────────────┼─────────────┤
+│ HOT (NVMe SSD)  │ < 100 µs     │ $0.20-0.50   │ 1-7 days     │ Real-time   │
+│ WARM (SSD)      │ < 1 ms       │ $0.08-0.15   │ 7-90 days    │ Interactive │
+│ COLD (HDD)      │ < 10 ms      │ $0.02-0.05   │ 90-365 days  │ Batch       │
+│ ARCHIVE (S3)    │ < 1 min      │ $0.004-0.01  │ 1-7 years    │ Rare        │
+│ GLACIER         │ 3-12 hours   │ $0.001       │ 7+ years     │ Compliance  │
+└─────────────────┴──────────────┴──────────────┴──────────────┴─────────────┘
+
+Data Flow Through Tiers:
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                                                                             │
+│  Live Feed ──► HOT ──► WARM ──► COLD ──► ARCHIVE ──► GLACIER               │
+│                │        │        │         │           │                    │
+│            Real-time  Analysis  Research  Compliance  Legal Hold           │
+│            Trading    Backtest  ML Train  Audit       Regulatory           │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+1.2 Data Classification
+-----------------------
+
+```cpp
+// data_classification.hpp - Data Tier Classification
+#pragma once
+
+#include <chrono>
+#include <cstdint>
+
+namespace hft {
+namespace lifecycle {
+
+enum class DataTier {
+    HOT,      // Actively traded, recent data
+    WARM,     // Frequently accessed historical
+    COLD,     // Infrequently accessed
+    ARCHIVE,  // Long-term storage
+    GLACIER   // Compliance/legal hold
+};
+
+enum class DataPriority {
+    CRITICAL,   // Must never be lost
+    HIGH,       // Important for operations
+    MEDIUM,     // Standard business data
+    LOW         // Can be regenerated
+};
+
+struct DataClassification {
+    DataTier tier;
+    DataPriority priority;
+    uint32_t retention_days;
+    bool compliance_required;
+    bool encryption_required;
+
+    static DataClassification forTickData() {
+        return {
+            DataTier::HOT,
+            DataPriority::HIGH,
+            365 * 7,  // 7 years for regulatory
+            true,
+            true
+        };
+    }
+
+    static DataClassification forAggregatedData() {
+        return {
+            DataTier::WARM,
+            DataPriority::MEDIUM,
+            365 * 10,  // 10 years
+            true,
+            false
+        };
+    }
+};
+
+// Age-based tier determination
+DataTier determineDataTier(
+    std::chrono::system_clock::time_point data_time,
+    std::chrono::system_clock::time_point now = std::chrono::system_clock::now()
+) {
+    auto age = std::chrono::duration_cast<std::chrono::hours>(now - data_time);
+
+    if (age < std::chrono::hours(24 * 7)) {
+        return DataTier::HOT;
+    } else if (age < std::chrono::hours(24 * 90)) {
+        return DataTier::WARM;
+    } else if (age < std::chrono::hours(24 * 365)) {
+        return DataTier::COLD;
+    } else if (age < std::chrono::hours(24 * 365 * 5)) {
+        return DataTier::ARCHIVE;
+    } else {
+        return DataTier::GLACIER;
+    }
+}
+
+} // namespace lifecycle
+} // namespace hft
+```
+
+================================================================================
+SECTION 2: HOT STORAGE TIER
+================================================================================
+
+2.1 Hot Storage Configuration
+-----------------------------
+
+Hot Tier Specifications:
+- Storage Type: NVMe SSD (PCIe 4.0/5.0)
+- IOPS: 500,000+ random read
+- Throughput: 5+ GB/s sequential
+- Latency: < 100 µs P99
+- Capacity: 1-10 TB typical
+- Replication: Synchronous (2-3 copies)
+
+```cpp
+// hot_storage.hpp - Hot Storage Tier Management
+#pragma once
+
+#include <memory>
+#include <string>
+#include <vector>
+#include <unordered_map>
+#include <shared_mutex>
+
+namespace hft {
+namespace storage {
+
+struct HotStorageConfig {
+    std::string base_path = "/nvme/hot";
+    size_t max_size_bytes = 1024ULL * 1024 * 1024 * 1024;  // 1 TB
+    size_t partition_size_bytes = 1024ULL * 1024 * 1024;    // 1 GB
+    uint32_t max_age_hours = 168;  // 7 days
+    bool enable_compression = false;  // No compression for speed
+    uint32_t replication_factor = 2;
+};
+
+class HotStorageManager {
+public:
+    explicit HotStorageManager(const HotStorageConfig& config)
+        : config_(config) {
+        initializeStorage();
+    }
+
+    // Write tick to hot storage (optimized for speed)
+    bool writeTick(uint32_t symbol_id, const Tick& tick) {
+        auto& partition = getActivePartition(symbol_id);
+        return partition.write(tick);
+    }
+
+    // Batch write for efficiency
+    bool writeBatch(uint32_t symbol_id, const std::vector<Tick>& ticks) {
+        auto& partition = getActivePartition(symbol_id);
+        return partition.writeBatch(ticks);
+    }
+
+    // Read recent ticks (hot path - must be fast)
+    std::vector<Tick> readRecent(uint32_t symbol_id, size_t count) {
+        std::shared_lock lock(mutex_);
+
+        auto it = symbol_partitions_.find(symbol_id);
+        if (it == symbol_partitions_.end()) {
+            return {};
+        }
+
+        return it->second->readRecent(count);
+    }
+
+    // Read time range
+    std::vector<Tick> readTimeRange(
+        uint32_t symbol_id,
+        uint64_t start_ns,
+        uint64_t end_ns
+    ) {
+        std::shared_lock lock(mutex_);
+
+        auto it = symbol_partitions_.find(symbol_id);
+        if (it == symbol_partitions_.end()) {
+            return {};
+        }
+
+        return it->second->readTimeRange(start_ns, end_ns);
+    }
+
+    // Check if data needs migration to warm tier
+    std::vector<std::string> getPartitionsForMigration() {
+        std::vector<std::string> to_migrate;
+
+        auto now = std::chrono::system_clock::now();
+        auto cutoff = now - std::chrono::hours(config_.max_age_hours);
+
+        std::shared_lock lock(mutex_);
+        for (const auto& [symbol_id, partition] : symbol_partitions_) {
+            if (partition->getOldestTimestamp() < cutoff) {
+                to_migrate.push_back(partition->getPath());
+            }
+        }
+
+        return to_migrate;
+    }
+
+    // Storage statistics
+    struct StorageStats {
+        size_t total_bytes;
+        size_t used_bytes;
+        size_t partition_count;
+        size_t symbol_count;
+        uint64_t oldest_data_timestamp;
+        uint64_t newest_data_timestamp;
+    };
+
+    StorageStats getStats() const {
+        std::shared_lock lock(mutex_);
+        StorageStats stats{};
+        stats.symbol_count = symbol_partitions_.size();
+        // ... calculate other stats
+        return stats;
+    }
+
+private:
+    class HotPartition {
+    public:
+        explicit HotPartition(const std::string& path, size_t max_size)
+            : path_(path), max_size_(max_size) {
+            // Memory-map the partition file
+            initMmap();
+        }
+
+        bool write(const Tick& tick) {
+            if (current_offset_ + sizeof(Tick) > max_size_) {
+                return false;  // Partition full
+            }
+
+            std::memcpy(data_ + current_offset_, &tick, sizeof(Tick));
+            current_offset_ += sizeof(Tick);
+            tick_count_++;
+
+            updateStats(tick);
+            return true;
+        }
+
+        bool writeBatch(const std::vector<Tick>& ticks) {
+            size_t batch_size = ticks.size() * sizeof(Tick);
+            if (current_offset_ + batch_size > max_size_) {
+                return false;
+            }
+
+            std::memcpy(data_ + current_offset_, ticks.data(), batch_size);
+            current_offset_ += batch_size;
+            tick_count_ += ticks.size();
+
+            for (const auto& tick : ticks) {
+                updateStats(tick);
+            }
+            return true;
+        }
+
+        std::vector<Tick> readRecent(size_t count) {
+            std::vector<Tick> result;
+            size_t actual_count = std::min(count, tick_count_);
+            result.resize(actual_count);
+
+            size_t start_offset = current_offset_ - actual_count * sizeof(Tick);
+            std::memcpy(result.data(), data_ + start_offset, actual_count * sizeof(Tick));
+
+            return result;
+        }
+
+        std::vector<Tick> readTimeRange(uint64_t start_ns, uint64_t end_ns) {
+            std::vector<Tick> result;
+
+            // Binary search for start position
+            size_t start_idx = binarySearchByTime(start_ns);
+
+            const Tick* ticks = reinterpret_cast<const Tick*>(data_);
+            for (size_t i = start_idx; i < tick_count_; ++i) {
+                if (ticks[i].timestamp > end_ns) break;
+                if (ticks[i].timestamp >= start_ns) {
+                    result.push_back(ticks[i]);
+                }
+            }
+
+            return result;
+        }
+
+        std::chrono::system_clock::time_point getOldestTimestamp() const {
+            return std::chrono::system_clock::time_point(
+                std::chrono::nanoseconds(oldest_timestamp_));
+        }
+
+        const std::string& getPath() const { return path_; }
+
+    private:
+        void initMmap() {
+            // Implementation: mmap the partition file
+        }
+
+        void updateStats(const Tick& tick) {
+            if (oldest_timestamp_ == 0 || tick.timestamp < oldest_timestamp_) {
+                oldest_timestamp_ = tick.timestamp;
+            }
+            if (tick.timestamp > newest_timestamp_) {
+                newest_timestamp_ = tick.timestamp;
+            }
+        }
+
+        size_t binarySearchByTime(uint64_t target_ns) {
+            const Tick* ticks = reinterpret_cast<const Tick*>(data_);
+            size_t left = 0, right = tick_count_;
+
+            while (left < right) {
+                size_t mid = left + (right - left) / 2;
+                if (ticks[mid].timestamp < target_ns) {
+                    left = mid + 1;
+                } else {
+                    right = mid;
+                }
+            }
+
+            return left;
+        }
+
+        std::string path_;
+        size_t max_size_;
+        char* data_ = nullptr;
+        size_t current_offset_ = 0;
+        size_t tick_count_ = 0;
+        uint64_t oldest_timestamp_ = 0;
+        uint64_t newest_timestamp_ = 0;
+    };
+
+    void initializeStorage() {
+        // Create storage directories
+        std::filesystem::create_directories(config_.base_path);
+    }
+
+    HotPartition& getActivePartition(uint32_t symbol_id) {
+        std::unique_lock lock(mutex_);
+
+        auto it = symbol_partitions_.find(symbol_id);
+        if (it == symbol_partitions_.end()) {
+            std::string path = config_.base_path + "/symbol_" +
+                              std::to_string(symbol_id) + ".hot";
+            auto partition = std::make_unique<HotPartition>(
+                path, config_.partition_size_bytes);
+            it = symbol_partitions_.emplace(symbol_id, std::move(partition)).first;
+        }
+
+        return *it->second;
+    }
+
+    HotStorageConfig config_;
+    mutable std::shared_mutex mutex_;
+    std::unordered_map<uint32_t, std::unique_ptr<HotPartition>> symbol_partitions_;
+};
+
+} // namespace storage
+} // namespace hft
+```
+
+================================================================================
+SECTION 3: WARM STORAGE TIER
+================================================================================
+
+3.1 Warm Storage Configuration
+------------------------------
+
+Warm Tier Specifications:
+- Storage Type: SATA SSD or Fast HDD (RAID 10)
+- IOPS: 50,000+ random read
+- Throughput: 500+ MB/s sequential
+- Latency: < 1 ms P99
+- Capacity: 10-100 TB typical
+- Compression: LZ4 (fast decompression)
+
+```cpp
+// warm_storage.hpp - Warm Storage Tier Management
+#pragma once
+
+#include <filesystem>
+#include <queue>
+
+namespace hft {
+namespace storage {
+
+struct WarmStorageConfig {
+    std::string base_path = "/ssd/warm";
+    size_t max_size_bytes = 50ULL * 1024 * 1024 * 1024 * 1024;  // 50 TB
+    uint32_t retention_days = 90;
+    bool enable_compression = true;
+    std::string compression_algorithm = "lz4";
+    uint32_t partition_days = 1;  // One partition per day
+};
+
+class WarmStorageManager {
+public:
+    explicit WarmStorageManager(const WarmStorageConfig& config)
+        : config_(config) {
+        initializeStorage();
+        loadPartitionIndex();
+    }
+
+    // Ingest data from hot tier
+    bool ingestFromHot(const std::string& hot_partition_path) {
+        // Read hot partition
+        std::vector<Tick> ticks = readHotPartition(hot_partition_path);
+
+        if (ticks.empty()) {
+            return false;
+        }
+
+        // Group by date
+        auto grouped = groupByDate(ticks);
+
+        // Write to warm partitions with compression
+        for (auto& [date, date_ticks] : grouped) {
+            writeWarmPartition(date, date_ticks);
+        }
+
+        return true;
+    }
+
+    // Read data from warm tier
+    std::vector<Tick> readTimeRange(
+        uint32_t symbol_id,
+        uint64_t start_ns,
+        uint64_t end_ns
+    ) {
+        std::vector<Tick> result;
+
+        // Find relevant partitions
+        auto partitions = findPartitionsInRange(start_ns, end_ns);
+
+        for (const auto& partition : partitions) {
+            auto ticks = readPartition(partition, symbol_id, start_ns, end_ns);
+            result.insert(result.end(), ticks.begin(), ticks.end());
+        }
+
+        return result;
+    }
+
+    // Get partitions ready for cold migration
+    std::vector<std::string> getPartitionsForColdMigration() {
+        std::vector<std::string> to_migrate;
+
+        auto cutoff = std::chrono::system_clock::now() -
+                     std::chrono::hours(config_.retention_days * 24);
+
+        for (const auto& entry : std::filesystem::directory_iterator(config_.base_path)) {
+            if (entry.is_directory()) {
+                auto partition_date = parsePartitionDate(entry.path().filename());
+                if (partition_date < cutoff) {
+                    to_migrate.push_back(entry.path().string());
+                }
+            }
+        }
+
+        return to_migrate;
+    }
+
+private:
+    std::vector<Tick> readHotPartition(const std::string& path) {
+        // Implementation: read and decompress if needed
+        std::vector<Tick> ticks;
+        return ticks;
+    }
+
+    std::map<std::string, std::vector<Tick>> groupByDate(const std::vector<Tick>& ticks) {
+        std::map<std::string, std::vector<Tick>> grouped;
+
+        for (const auto& tick : ticks) {
+            std::string date = timestampToDate(tick.timestamp);
+            grouped[date].push_back(tick);
+        }
+
+        return grouped;
+    }
+
+    void writeWarmPartition(const std::string& date, std::vector<Tick>& ticks) {
+        std::string partition_path = config_.base_path + "/" + date;
+        std::filesystem::create_directories(partition_path);
+
+        // Sort by symbol for efficient querying
+        std::sort(ticks.begin(), ticks.end(), [](const Tick& a, const Tick& b) {
+            return a.symbol_id < b.symbol_id ||
+                   (a.symbol_id == b.symbol_id && a.timestamp < b.timestamp);
+        });
+
+        // Write with compression
+        if (config_.enable_compression) {
+            writeCompressed(partition_path + "/ticks.lz4", ticks);
+        } else {
+            writeRaw(partition_path + "/ticks.bin", ticks);
+        }
+
+        // Write index
+        writePartitionIndex(partition_path, ticks);
+    }
+
+    void writeCompressed(const std::string& path, const std::vector<Tick>& ticks) {
+        // LZ4 compression implementation
+    }
+
+    void writeRaw(const std::string& path, const std::vector<Tick>& ticks) {
+        // Direct binary write
+    }
+
+    void writePartitionIndex(const std::string& path, const std::vector<Tick>& ticks) {
+        // Write symbol offsets and time ranges
+    }
+
+    std::vector<std::string> findPartitionsInRange(uint64_t start_ns, uint64_t end_ns) {
+        std::vector<std::string> partitions;
+        // Implementation
+        return partitions;
+    }
+
+    std::vector<Tick> readPartition(
+        const std::string& partition,
+        uint32_t symbol_id,
+        uint64_t start_ns,
+        uint64_t end_ns
+    ) {
+        std::vector<Tick> ticks;
+        // Implementation
+        return ticks;
+    }
+
+    std::string timestampToDate(uint64_t timestamp_ns) {
+        time_t seconds = timestamp_ns / 1000000000ULL;
+        struct tm tm_info;
+        gmtime_r(&seconds, &tm_info);
+        char buffer[11];
+        strftime(buffer, 11, "%Y-%m-%d", &tm_info);
+        return std::string(buffer);
+    }
+
+    std::chrono::system_clock::time_point parsePartitionDate(const std::string& name) {
+        std::tm tm = {};
+        std::istringstream ss(name);
+        ss >> std::get_time(&tm, "%Y-%m-%d");
+        return std::chrono::system_clock::from_time_t(std::mktime(&tm));
+    }
+
+    void initializeStorage() {
+        std::filesystem::create_directories(config_.base_path);
+    }
+
+    void loadPartitionIndex() {
+        // Load existing partition metadata
+    }
+
+    WarmStorageConfig config_;
+    std::map<std::string, std::string> partition_index_;
+};
+
+} // namespace storage
+} // namespace hft
+```
+
+================================================================================
+SECTION 4: COLD STORAGE TIER
+================================================================================
+
+4.1 Cold Storage Configuration
+------------------------------
+
+Cold Tier Specifications:
+- Storage Type: HDD (High-capacity, 7200 RPM)
+- IOPS: 100-200 random read
+- Throughput: 200+ MB/s sequential
+- Latency: < 10 ms P99
+- Capacity: 100+ TB
+- Compression: ZSTD (high ratio)
+
+```cpp
+// cold_storage.hpp - Cold Storage Tier Management
+#pragma once
+
+namespace hft {
+namespace storage {
+
+struct ColdStorageConfig {
+    std::string base_path = "/hdd/cold";
+    size_t max_size_bytes = 500ULL * 1024 * 1024 * 1024 * 1024;  // 500 TB
+    uint32_t retention_days = 365;
+    std::string compression_algorithm = "zstd";
+    int compression_level = 15;  // High compression
+    uint32_t partition_days = 7;  // Weekly partitions
+    bool enable_columnar_format = true;  // Better compression
+};
+
+class ColdStorageManager {
+public:
+    explicit ColdStorageManager(const ColdStorageConfig& config)
+        : config_(config) {}
+
+    // Ingest from warm tier with high compression
+    bool ingestFromWarm(const std::string& warm_partition_path) {
+        std::vector<Tick> ticks = readWarmPartition(warm_partition_path);
+
+        if (ticks.empty()) {
+            return false;
+        }
+
+        // Convert to columnar format for better compression
+        auto columnar = convertToColumnar(ticks);
+
+        // Write with high compression
+        std::string date = extractDate(warm_partition_path);
+        writeColumnarCompressed(date, columnar);
+
+        return true;
+    }
+
+    // Read from cold tier (batch access)
+    std::vector<Tick> readTimeRange(
+        uint32_t symbol_id,
+        uint64_t start_ns,
+        uint64_t end_ns
+    ) {
+        std::vector<Tick> result;
+
+        auto partitions = findPartitionsInRange(start_ns, end_ns);
+
+        for (const auto& partition : partitions) {
+            auto ticks = readColumnarPartition(partition, symbol_id, start_ns, end_ns);
+            result.insert(result.end(), ticks.begin(), ticks.end());
+        }
+
+        return result;
+    }
+
+private:
+    struct ColumnarData {
+        std::vector<uint64_t> timestamps;
+        std::vector<int64_t> prices;
+        std::vector<uint64_t> quantities;
+        std::vector<uint32_t> symbol_ids;
+        std::vector<uint8_t> flags;
+    };
+
+    ColumnarData convertToColumnar(const std::vector<Tick>& ticks) {
+        ColumnarData data;
+        data.timestamps.reserve(ticks.size());
+        data.prices.reserve(ticks.size());
+        data.quantities.reserve(ticks.size());
+        data.symbol_ids.reserve(ticks.size());
+        data.flags.reserve(ticks.size());
+
+        for (const auto& tick : ticks) {
+            data.timestamps.push_back(tick.timestamp);
+            data.prices.push_back(tick.price);
+            data.quantities.push_back(tick.quantity);
+            data.symbol_ids.push_back(tick.symbol_id);
+            data.flags.push_back(tick.flags);
+        }
+
+        return data;
+    }
+
+    void writeColumnarCompressed(const std::string& date, const ColumnarData& data) {
+        std::string partition_path = config_.base_path + "/" + date;
+        std::filesystem::create_directories(partition_path);
+
+        // Each column in separate file for maximum compression
+        compressAndWrite(partition_path + "/timestamps.zst",
+                        data.timestamps.data(),
+                        data.timestamps.size() * sizeof(uint64_t));
+
+        compressAndWrite(partition_path + "/prices.zst",
+                        data.prices.data(),
+                        data.prices.size() * sizeof(int64_t));
+
+        compressAndWrite(partition_path + "/quantities.zst",
+                        data.quantities.data(),
+                        data.quantities.size() * sizeof(uint64_t));
+
+        compressAndWrite(partition_path + "/symbol_ids.zst",
+                        data.symbol_ids.data(),
+                        data.symbol_ids.size() * sizeof(uint32_t));
+
+        compressAndWrite(partition_path + "/flags.zst",
+                        data.flags.data(),
+                        data.flags.size() * sizeof(uint8_t));
+
+        // Write metadata
+        writeMetadata(partition_path, data.timestamps.size());
+    }
+
+    void compressAndWrite(const std::string& path, const void* data, size_t size) {
+        // ZSTD high compression
+        size_t compressed_bound = ZSTD_compressBound(size);
+        std::vector<char> compressed(compressed_bound);
+
+        size_t compressed_size = ZSTD_compress(
+            compressed.data(), compressed_bound,
+            data, size,
+            config_.compression_level
+        );
+
+        // Write to file
+        std::ofstream file(path, std::ios::binary);
+        file.write(compressed.data(), compressed_size);
+    }
+
+    std::vector<Tick> readWarmPartition(const std::string& path) {
+        std::vector<Tick> ticks;
+        return ticks;
+    }
+
+    std::vector<std::string> findPartitionsInRange(uint64_t start_ns, uint64_t end_ns) {
+        std::vector<std::string> partitions;
+        return partitions;
+    }
+
+    std::vector<Tick> readColumnarPartition(
+        const std::string& partition,
+        uint32_t symbol_id,
+        uint64_t start_ns,
+        uint64_t end_ns
+    ) {
+        std::vector<Tick> ticks;
+        return ticks;
+    }
+
+    std::string extractDate(const std::string& path) {
+        return "";
+    }
+
+    void writeMetadata(const std::string& path, size_t tick_count) {
+        // Write partition metadata
+    }
+
+    ColdStorageConfig config_;
+};
+
+} // namespace storage
+} // namespace hft
+```
+
+================================================================================
+SECTION 5: DATA MIGRATION POLICIES
+================================================================================
+
+5.1 Migration Policy Engine
+---------------------------
+
+```cpp
+// migration_policy.hpp - Data Migration Policy Engine
+#pragma once
+
+#include <functional>
+#include <chrono>
+
+namespace hft {
+namespace lifecycle {
+
+enum class MigrationTrigger {
+    AGE_BASED,        // Data age exceeds threshold
+    SIZE_BASED,       // Storage tier full
+    ACCESS_BASED,     // Low access frequency
+    SCHEDULED,        // Time-based schedule
+    MANUAL            // Operator triggered
+};
+
+struct MigrationRule {
+    std::string name;
+    DataTier source_tier;
+    DataTier target_tier;
+    MigrationTrigger trigger;
+
+    // Conditions
+    uint32_t age_hours = 0;
+    uint64_t size_threshold_bytes = 0;
+    uint32_t access_count_threshold = 0;
+    std::string schedule_cron;
+
+    // Actions
+    bool compress_on_migrate = true;
+    bool delete_source = true;
+    bool verify_after_migrate = true;
+
+    // Priority (lower = higher priority)
+    int priority = 100;
+};
+
+class MigrationPolicyEngine {
+public:
+    void addRule(const MigrationRule& rule) {
+        rules_.push_back(rule);
+        std::sort(rules_.begin(), rules_.end(),
+            [](const MigrationRule& a, const MigrationRule& b) {
+                return a.priority < b.priority;
+            });
+    }
+
+    std::vector<MigrationTask> evaluateRules(
+        const StorageMetrics& hot_metrics,
+        const StorageMetrics& warm_metrics,
+        const StorageMetrics& cold_metrics
+    ) {
+        std::vector<MigrationTask> tasks;
+
+        for (const auto& rule : rules_) {
+            if (shouldTriggerRule(rule, hot_metrics, warm_metrics, cold_metrics)) {
+                auto candidates = findMigrationCandidates(rule);
+                for (const auto& candidate : candidates) {
+                    tasks.push_back(createMigrationTask(rule, candidate));
+                }
+            }
+        }
+
+        return tasks;
+    }
+
+    // Default policies
+    static std::vector<MigrationRule> getDefaultPolicies() {
+        return {
+            // Hot to Warm after 7 days
+            MigrationRule{
+                "hot_to_warm_age",
+                DataTier::HOT,
+                DataTier::WARM,
+                MigrationTrigger::AGE_BASED,
+                168,  // 7 days in hours
+                0, 0, "",
+                true, true, true,
+                10
+            },
+
+            // Hot to Warm when 80% full
+            MigrationRule{
+                "hot_to_warm_size",
+                DataTier::HOT,
+                DataTier::WARM,
+                MigrationTrigger::SIZE_BASED,
+                0,
+                800ULL * 1024 * 1024 * 1024,  // 800 GB threshold
+                0, "",
+                true, true, true,
+                5  // Higher priority
+            },
+
+            // Warm to Cold after 90 days
+            MigrationRule{
+                "warm_to_cold_age",
+                DataTier::WARM,
+                DataTier::COLD,
+                MigrationTrigger::AGE_BASED,
+                2160,  // 90 days
+                0, 0, "",
+                true, true, true,
+                20
+            },
+
+            // Cold to Archive after 1 year
+            MigrationRule{
+                "cold_to_archive_age",
+                DataTier::COLD,
+                DataTier::ARCHIVE,
+                MigrationTrigger::AGE_BASED,
+                8760,  // 365 days
+                0, 0, "",
+                true, true, true,
+                30
+            },
+
+            // Daily maintenance job
+            MigrationRule{
+                "daily_cleanup",
+                DataTier::HOT,
+                DataTier::WARM,
+                MigrationTrigger::SCHEDULED,
+                0, 0, 0,
+                "0 2 * * *",  // 2 AM daily
+                true, true, true,
+                100
+            }
+        };
+    }
+
+private:
+    struct MigrationTask {
+        std::string source_path;
+        std::string target_path;
+        DataTier source_tier;
+        DataTier target_tier;
+        MigrationRule rule;
+        size_t estimated_size;
+    };
+
+    struct StorageMetrics {
+        size_t total_bytes;
+        size_t used_bytes;
+        std::map<std::string, uint64_t> partition_ages;
+        std::map<std::string, uint32_t> partition_access_counts;
+    };
+
+    bool shouldTriggerRule(
+        const MigrationRule& rule,
+        const StorageMetrics& hot,
+        const StorageMetrics& warm,
+        const StorageMetrics& cold
+    ) {
+        switch (rule.trigger) {
+            case MigrationTrigger::SIZE_BASED: {
+                const auto& metrics = getMetricsForTier(rule.source_tier, hot, warm, cold);
+                return metrics.used_bytes >= rule.size_threshold_bytes;
+            }
+            case MigrationTrigger::AGE_BASED:
+            case MigrationTrigger::ACCESS_BASED:
+                return true;  // Always evaluate candidates
+            case MigrationTrigger::SCHEDULED:
+                return isScheduledNow(rule.schedule_cron);
+            default:
+                return false;
+        }
+    }
+
+    std::vector<std::string> findMigrationCandidates(const MigrationRule& rule) {
+        std::vector<std::string> candidates;
+        // Implementation based on rule type
+        return candidates;
+    }
+
+    MigrationTask createMigrationTask(const MigrationRule& rule, const std::string& path) {
+        MigrationTask task;
+        task.source_path = path;
+        task.rule = rule;
+        return task;
+    }
+
+    const StorageMetrics& getMetricsForTier(
+        DataTier tier,
+        const StorageMetrics& hot,
+        const StorageMetrics& warm,
+        const StorageMetrics& cold
+    ) {
+        switch (tier) {
+            case DataTier::HOT: return hot;
+            case DataTier::WARM: return warm;
+            default: return cold;
+        }
+    }
+
+    bool isScheduledNow(const std::string& cron) {
+        // Cron expression evaluation
+        return false;
+    }
+
+    std::vector<MigrationRule> rules_;
+};
+
+} // namespace lifecycle
+} // namespace hft
+```
+
+5.2 Migration Executor
+----------------------
+
+```cpp
+// migration_executor.hpp - Async Migration Execution
+#pragma once
+
+#include <thread>
+#include <queue>
+#include <atomic>
+
+namespace hft {
+namespace lifecycle {
+
+class MigrationExecutor {
+public:
+    MigrationExecutor(size_t worker_threads = 2)
+        : stop_(false) {
+        for (size_t i = 0; i < worker_threads; ++i) {
+            workers_.emplace_back(&MigrationExecutor::workerLoop, this);
+        }
+    }
+
+    ~MigrationExecutor() {
+        stop_ = true;
+        queue_cv_.notify_all();
+        for (auto& worker : workers_) {
+            if (worker.joinable()) worker.join();
+        }
+    }
+
+    void submitMigration(MigrationTask task) {
+        {
+            std::lock_guard lock(queue_mutex_);
+            pending_tasks_.push(std::move(task));
+        }
+        queue_cv_.notify_one();
+    }
+
+    struct MigrationStats {
+        uint64_t tasks_completed;
+        uint64_t tasks_failed;
+        uint64_t bytes_migrated;
+        uint64_t current_queue_depth;
+    };
+
+    MigrationStats getStats() const {
+        std::lock_guard lock(queue_mutex_);
+        return {
+            tasks_completed_.load(),
+            tasks_failed_.load(),
+            bytes_migrated_.load(),
+            pending_tasks_.size()
+        };
+    }
+
+private:
+    void workerLoop() {
+        while (!stop_) {
+            MigrationTask task;
+
+            {
+                std::unique_lock lock(queue_mutex_);
+                queue_cv_.wait(lock, [this] {
+                    return stop_ || !pending_tasks_.empty();
+                });
+
+                if (stop_ && pending_tasks_.empty()) return;
+
+                task = std::move(pending_tasks_.front());
+                pending_tasks_.pop();
+            }
+
+            executeMigration(task);
+        }
+    }
+
+    void executeMigration(const MigrationTask& task) {
+        try {
+            // 1. Read source data
+            auto data = readSourceData(task);
+
+            // 2. Transform/compress if needed
+            if (task.rule.compress_on_migrate) {
+                data = compressData(data, task.target_tier);
+            }
+
+            // 3. Write to target
+            writeTargetData(task, data);
+
+            // 4. Verify if required
+            if (task.rule.verify_after_migrate) {
+                if (!verifyMigration(task)) {
+                    throw std::runtime_error("Verification failed");
+                }
+            }
+
+            // 5. Delete source if required
+            if (task.rule.delete_source) {
+                deleteSource(task);
+            }
+
+            tasks_completed_++;
+            bytes_migrated_ += task.estimated_size;
+
+        } catch (const std::exception& e) {
+            tasks_failed_++;
+            logMigrationError(task, e.what());
+        }
+    }
+
+    std::vector<char> readSourceData(const MigrationTask& task) {
+        std::vector<char> data;
+        return data;
+    }
+
+    std::vector<char> compressData(const std::vector<char>& data, DataTier target) {
+        // Choose compression based on target tier
+        return data;
+    }
+
+    void writeTargetData(const MigrationTask& task, const std::vector<char>& data) {
+        // Write to target path
+    }
+
+    bool verifyMigration(const MigrationTask& task) {
+        // Verify checksums match
+        return true;
+    }
+
+    void deleteSource(const MigrationTask& task) {
+        std::filesystem::remove_all(task.source_path);
+    }
+
+    void logMigrationError(const MigrationTask& task, const std::string& error) {
+        // Log error for monitoring
+    }
+
+    std::atomic<bool> stop_;
+    std::vector<std::thread> workers_;
+
+    mutable std::mutex queue_mutex_;
+    std::condition_variable queue_cv_;
+    std::queue<MigrationTask> pending_tasks_;
+
+    std::atomic<uint64_t> tasks_completed_{0};
+    std::atomic<uint64_t> tasks_failed_{0};
+    std::atomic<uint64_t> bytes_migrated_{0};
+};
+
+} // namespace lifecycle
+} // namespace hft
+```
+
+================================================================================
+SECTION 6: RETENTION POLICIES
+================================================================================
+
+6.1 Retention Configuration
+---------------------------
+
+Retention Requirements by Data Type:
+┌─────────────────────────┬────────────────┬─────────────────────────────────┐
+│ Data Type               │ Retention      │ Reason                          │
+├─────────────────────────┼────────────────┼─────────────────────────────────┤
+│ Raw tick data           │ 7 years        │ SEC Rule 17a-4, MiFID II        │
+│ Order/execution data    │ 7 years        │ Regulatory audit trail          │
+│ Aggregated OHLCV        │ 10 years       │ Strategy research               │
+│ System logs             │ 3 years        │ Operational audit               │
+│ Strategy signals        │ 5 years        │ Performance attribution         │
+│ Risk metrics            │ 7 years        │ Compliance                      │
+└─────────────────────────┴────────────────┴─────────────────────────────────┘
+
+```cpp
+// retention_policy.hpp - Data Retention Management
+#pragma once
+
+namespace hft {
+namespace lifecycle {
+
+struct RetentionPolicy {
+    std::string data_type;
+    uint32_t min_retention_days;
+    uint32_t max_retention_days;
+    bool regulatory_hold;
+    std::vector<std::string> applicable_regions;
+
+    bool canDelete(uint32_t age_days) const {
+        if (regulatory_hold) return false;
+        return age_days >= min_retention_days;
+    }
+
+    bool mustDelete(uint32_t age_days) const {
+        return age_days > max_retention_days && !regulatory_hold;
+    }
+};
+
+class RetentionPolicyManager {
+public:
+    RetentionPolicyManager() {
+        // Load default policies
+        policies_ = getDefaultPolicies();
+    }
+
+    void addPolicy(const RetentionPolicy& policy) {
+        policies_[policy.data_type] = policy;
+    }
+
+    bool canDeleteData(const std::string& data_type, uint32_t age_days) const {
+        auto it = policies_.find(data_type);
+        if (it == policies_.end()) {
+            return false;  // Unknown data type - don't delete
+        }
+        return it->second.canDelete(age_days);
+    }
+
+    bool mustDeleteData(const std::string& data_type, uint32_t age_days) const {
+        auto it = policies_.find(data_type);
+        if (it == policies_.end()) {
+            return false;
+        }
+        return it->second.mustDelete(age_days);
+    }
+
+    void setLegalHold(const std::string& data_type, bool hold) {
+        auto it = policies_.find(data_type);
+        if (it != policies_.end()) {
+            it->second.regulatory_hold = hold;
+        }
+    }
+
+    std::vector<std::string> getDataEligibleForDeletion() const {
+        std::vector<std::string> eligible;
+        auto now = std::chrono::system_clock::now();
+
+        // Scan all data and check retention
+        // Implementation depends on storage structure
+
+        return eligible;
+    }
+
+private:
+    static std::map<std::string, RetentionPolicy> getDefaultPolicies() {
+        return {
+            {"tick_data", {"tick_data", 365 * 7, 365 * 10, false, {"US", "EU"}}},
+            {"order_data", {"order_data", 365 * 7, 365 * 10, false, {"US", "EU"}}},
+            {"ohlcv", {"ohlcv", 365 * 10, 365 * 15, false, {"US", "EU"}}},
+            {"system_logs", {"system_logs", 365 * 3, 365 * 5, false, {"US", "EU"}}},
+            {"strategy_signals", {"strategy_signals", 365 * 5, 365 * 7, false, {}}},
+            {"risk_metrics", {"risk_metrics", 365 * 7, 365 * 10, false, {"US", "EU"}}}
+        };
+    }
+
+    std::map<std::string, RetentionPolicy> policies_;
+};
+
+} // namespace lifecycle
+} // namespace hft
+```
+
+================================================================================
+SECTION 7: DATA ARCHIVAL STRATEGIES
+================================================================================
+
+7.1 Cloud Archive Integration
+-----------------------------
+
+```cpp
+// cloud_archive.hpp - S3/GCS Archive Integration
+#pragma once
+
+#include <aws/s3/S3Client.h>
+#include <aws/s3/model/PutObjectRequest.h>
+#include <aws/s3/model/GetObjectRequest.h>
+
+namespace hft {
+namespace archive {
+
+struct ArchiveConfig {
+    std::string provider = "aws";  // aws, gcs, azure
+    std::string bucket_name;
+    std::string prefix = "tick_archive/";
+    std::string storage_class = "GLACIER";  // STANDARD, GLACIER, DEEP_ARCHIVE
+    bool enable_encryption = true;
+    std::string kms_key_id;
+    uint32_t multipart_threshold_mb = 100;
+};
+
+class S3ArchiveManager {
+public:
+    explicit S3ArchiveManager(const ArchiveConfig& config)
+        : config_(config) {
+        initializeClient();
+    }
+
+    // Archive data to S3
+    bool archivePartition(const std::string& local_path) {
+        std::string object_key = generateObjectKey(local_path);
+
+        // Check file size for multipart decision
+        auto file_size = std::filesystem::file_size(local_path);
+
+        if (file_size > config_.multipart_threshold_mb * 1024 * 1024) {
+            return uploadMultipart(local_path, object_key);
+        } else {
+            return uploadSingle(local_path, object_key);
+        }
+    }
+
+    // Restore from archive (async for Glacier)
+    std::future<bool> restoreFromArchive(
+        const std::string& object_key,
+        const std::string& local_path,
+        int restore_days = 7
+    ) {
+        return std::async(std::launch::async, [this, object_key, local_path, restore_days] {
+            // Initiate restore if in Glacier
+            if (!initiateGlacierRestore(object_key, restore_days)) {
+                return false;
+            }
+
+            // Wait for restore to complete (can take hours)
+            if (!waitForRestore(object_key)) {
+                return false;
+            }
+
+            // Download
+            return downloadObject(object_key, local_path);
+        });
+    }
+
+    // List archived data
+    std::vector<std::string> listArchived(const std::string& prefix) {
+        std::vector<std::string> objects;
+
+        Aws::S3::Model::ListObjectsV2Request request;
+        request.SetBucket(config_.bucket_name);
+        request.SetPrefix(config_.prefix + prefix);
+
+        auto outcome = s3_client_->ListObjectsV2(request);
+        if (outcome.IsSuccess()) {
+            for (const auto& object : outcome.GetResult().GetContents()) {
+                objects.push_back(object.GetKey());
+            }
+        }
+
+        return objects;
+    }
+
+private:
+    void initializeClient() {
+        Aws::SDKOptions options;
+        Aws::InitAPI(options);
+
+        Aws::Client::ClientConfiguration config;
+        config.region = "us-east-1";
+
+        s3_client_ = std::make_unique<Aws::S3::S3Client>(config);
+    }
+
+    std::string generateObjectKey(const std::string& local_path) {
+        // Generate key like: tick_archive/2024/01/15/BTCUSDT/data.zst
+        return config_.prefix + extractRelativePath(local_path);
+    }
+
+    bool uploadSingle(const std::string& local_path, const std::string& object_key) {
+        Aws::S3::Model::PutObjectRequest request;
+        request.SetBucket(config_.bucket_name);
+        request.SetKey(object_key);
+        request.SetStorageClass(
+            Aws::S3::Model::StorageClassMapper::GetStorageClassForName(config_.storage_class));
+
+        if (config_.enable_encryption) {
+            request.SetServerSideEncryption(Aws::S3::Model::ServerSideEncryption::aws_kms);
+            request.SetSSEKMSKeyId(config_.kms_key_id);
+        }
+
+        std::shared_ptr<Aws::IOStream> body =
+            Aws::MakeShared<Aws::FStream>("S3Upload", local_path,
+                std::ios_base::in | std::ios_base::binary);
+        request.SetBody(body);
+
+        auto outcome = s3_client_->PutObject(request);
+        return outcome.IsSuccess();
+    }
+
+    bool uploadMultipart(const std::string& local_path, const std::string& object_key) {
+        // Multipart upload for large files
+        // Implementation with 100MB parts
+        return true;
+    }
+
+    bool initiateGlacierRestore(const std::string& object_key, int days) {
+        Aws::S3::Model::RestoreObjectRequest request;
+        request.SetBucket(config_.bucket_name);
+        request.SetKey(object_key);
+
+        Aws::S3::Model::GlacierJobParameters glacier_params;
+        glacier_params.SetTier(Aws::S3::Model::Tier::Standard);  // 3-5 hours
+
+        Aws::S3::Model::RestoreRequest restore_request;
+        restore_request.SetDays(days);
+        restore_request.SetGlacierJobParameters(glacier_params);
+
+        request.SetRestoreRequest(restore_request);
+
+        auto outcome = s3_client_->RestoreObject(request);
+        return outcome.IsSuccess();
+    }
+
+    bool waitForRestore(const std::string& object_key) {
+        // Poll for restore completion
+        while (true) {
+            Aws::S3::Model::HeadObjectRequest request;
+            request.SetBucket(config_.bucket_name);
+            request.SetKey(object_key);
+
+            auto outcome = s3_client_->HeadObject(request);
+            if (outcome.IsSuccess()) {
+                auto& result = outcome.GetResult();
+                auto restore_status = result.GetRestore();
+
+                if (restore_status.find("ongoing-request=\"false\"") != std::string::npos) {
+                    return true;  // Restore complete
+                }
+            }
+
+            std::this_thread::sleep_for(std::chrono::minutes(5));
+        }
+    }
+
+    bool downloadObject(const std::string& object_key, const std::string& local_path) {
+        Aws::S3::Model::GetObjectRequest request;
+        request.SetBucket(config_.bucket_name);
+        request.SetKey(object_key);
+
+        auto outcome = s3_client_->GetObject(request);
+        if (!outcome.IsSuccess()) {
+            return false;
+        }
+
+        std::ofstream file(local_path, std::ios::binary);
+        file << outcome.GetResult().GetBody().rdbuf();
+        return true;
+    }
+
+    std::string extractRelativePath(const std::string& path) {
+        // Extract relative path for S3 key
+        return "";
+    }
+
+    ArchiveConfig config_;
+    std::unique_ptr<Aws::S3::S3Client> s3_client_;
+};
+
+} // namespace archive
+} // namespace hft
+```
+
+================================================================================
+SECTION 8: DISASTER RECOVERY
+================================================================================
+
+8.1 Backup and Recovery Strategy
+--------------------------------
+
+RPO/RTO Targets:
+┌─────────────────────────┬──────────────┬──────────────┬─────────────────────┐
+│ Data Tier               │ RPO          │ RTO          │ Backup Method       │
+├─────────────────────────┼──────────────┼──────────────┼─────────────────────┤
+│ HOT (live trading)      │ 0 (sync rep) │ < 1 min      │ Sync replication    │
+│ WARM (recent history)   │ 1 hour       │ < 30 min     │ Async replication   │
+│ COLD (archive)          │ 24 hours     │ < 4 hours    │ Daily snapshots     │
+│ GLACIER (compliance)    │ 7 days       │ < 24 hours   │ Cross-region copy   │
+└─────────────────────────┴──────────────┴──────────────┴─────────────────────┘
+
+```cpp
+// disaster_recovery.hpp - Backup and Recovery
+#pragma once
+
+namespace hft {
+namespace recovery {
+
+struct DRConfig {
+    std::string primary_region = "us-east-1";
+    std::string secondary_region = "us-west-2";
+    bool enable_cross_region_replication = true;
+    uint32_t snapshot_interval_hours = 24;
+    uint32_t snapshot_retention_days = 30;
+};
+
+class DisasterRecoveryManager {
+public:
+    explicit DisasterRecoveryManager(const DRConfig& config)
+        : config_(config) {}
+
+    // Create snapshot of current state
+    std::string createSnapshot(const std::string& tier_name) {
+        std::string snapshot_id = generateSnapshotId();
+
+        // Create consistent snapshot
+        auto snapshot_path = config_.snapshot_path + "/" + snapshot_id;
+
+        // 1. Pause writes (for hot tier)
+        pauseWrites(tier_name);
+
+        try {
+            // 2. Create snapshot
+            createFilesystemSnapshot(tier_name, snapshot_path);
+
+            // 3. Upload to backup location
+            uploadSnapshot(snapshot_path, snapshot_id);
+
+            // 4. Replicate to secondary region
+            if (config_.enable_cross_region_replication) {
+                replicateToSecondary(snapshot_id);
+            }
+
+            // 5. Update snapshot catalog
+            recordSnapshot(snapshot_id, tier_name);
+
+        } catch (...) {
+            resumeWrites(tier_name);
+            throw;
+        }
+
+        // 6. Resume writes
+        resumeWrites(tier_name);
+
+        return snapshot_id;
+    }
+
+    // Restore from snapshot
+    bool restoreFromSnapshot(const std::string& snapshot_id, const std::string& target_path) {
+        // 1. Download snapshot
+        auto local_snapshot = downloadSnapshot(snapshot_id);
+
+        // 2. Verify integrity
+        if (!verifySnapshot(local_snapshot)) {
+            return false;
+        }
+
+        // 3. Restore to target
+        restoreFiles(local_snapshot, target_path);
+
+        // 4. Verify restoration
+        return verifyRestoration(target_path, snapshot_id);
+    }
+
+    // Failover to secondary region
+    bool initiateFailover() {
+        // 1. Stop primary region writes
+        stopPrimaryWrites();
+
+        // 2. Wait for replication to complete
+        waitForReplicationSync();
+
+        // 3. Promote secondary to primary
+        promoteSecondary();
+
+        // 4. Update DNS/routing
+        updateRouting();
+
+        return true;
+    }
+
+    // Failback to primary region
+    bool initiateFailback() {
+        // Reverse of failover
+        return true;
+    }
+
+private:
+    std::string generateSnapshotId() {
+        auto now = std::chrono::system_clock::now();
+        auto time_t = std::chrono::system_clock::to_time_t(now);
+        std::stringstream ss;
+        ss << "snapshot_" << std::put_time(std::localtime(&time_t), "%Y%m%d_%H%M%S");
+        return ss.str();
+    }
+
+    void pauseWrites(const std::string& tier) {
+        // Signal to pause incoming writes
+    }
+
+    void resumeWrites(const std::string& tier) {
+        // Resume writes
+    }
+
+    void createFilesystemSnapshot(const std::string& tier, const std::string& path) {
+        // Create ZFS/LVM snapshot or copy
+    }
+
+    void uploadSnapshot(const std::string& path, const std::string& id) {
+        // Upload to S3/backup storage
+    }
+
+    void replicateToSecondary(const std::string& id) {
+        // Cross-region replication
+    }
+
+    void recordSnapshot(const std::string& id, const std::string& tier) {
+        // Record in catalog database
+    }
+
+    std::string downloadSnapshot(const std::string& id) {
+        return "";
+    }
+
+    bool verifySnapshot(const std::string& path) {
+        return true;
+    }
+
+    void restoreFiles(const std::string& snapshot, const std::string& target) {
+        // Restore files
+    }
+
+    bool verifyRestoration(const std::string& target, const std::string& snapshot_id) {
+        return true;
+    }
+
+    void stopPrimaryWrites() {}
+    void waitForReplicationSync() {}
+    void promoteSecondary() {}
+    void updateRouting() {}
+
+    DRConfig config_;
+};
+
+} // namespace recovery
+} // namespace hft
+```
+
+================================================================================
+APPENDIX: DATA LIFECYCLE CHECKLIST
+================================================================================
+
+Daily Operations:
+□ Monitor storage utilization across all tiers
+□ Verify migration jobs completed successfully
+□ Check backup/replication status
+□ Review data access patterns
+
+Weekly Operations:
+□ Run retention policy cleanup
+□ Verify backup restoration capability
+□ Review migration rule effectiveness
+□ Audit storage costs
+
+Monthly Operations:
+□ Full disaster recovery drill
+□ Review and update retention policies
+□ Capacity planning review
+□ Archive verification
+
+Annual Operations:
+□ Regulatory compliance audit
+□ Full data retention review
+□ Storage cost optimization
+□ DR plan update
+
+================================================================================
+                         END OF DATA LIFECYCLE MANAGEMENT
+================================================================================

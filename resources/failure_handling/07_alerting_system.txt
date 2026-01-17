@@ -1,0 +1,749 @@
+================================================================================
+                          ALERTING SYSTEM DESIGN
+                 Real-Time Notification Infrastructure
+================================================================================
+
+DOCUMENT: Alerting System Architecture
+VERSION: 2.1.0
+LAST UPDATED: 2025-11-26
+SCOPE: Comprehensive alerting for HFT systems
+
+================================================================================
+                          TABLE OF CONTENTS
+================================================================================
+
+1. Alerting Philosophy
+2. Alert Severity Levels
+3. PagerDuty Integration
+4. Slack Integration
+5. SMS & Email Alerts
+6. Alert Deduplication
+7. Alert Escalation
+8. Alert Fatigue Prevention
+9. Code Examples
+
+================================================================================
+                     1. ALERTING PHILOSOPHY
+================================================================================
+
+CORE PRINCIPLES:
+----------------
+1. RIGHT PERSON, RIGHT TIME
+   - Route to appropriate team member
+   - Respect on-call schedules
+   - Escalate when not acknowledged
+
+2. ACTIONABLE ALERTS ONLY
+   - Every alert must be actionable
+   - Include context for diagnosis
+   - Provide recommended actions
+
+3. MINIMIZE FALSE POSITIVES
+   - High threshold for critical alerts
+   - Statistical validation before alerting
+   - Intelligent deduplication
+
+4. FAST DELIVERY
+   - < 2 seconds end-to-end
+   - Multiple delivery channels
+   - Guarantee delivery
+
+ALERT SEVERITY MATRIX:
+----------------------
+
+Level        Response Time    Channels              Wake Up?    Escalation
+--------------------------------------------------------------------------------
+P1-CRITICAL  Immediate        PagerDuty, SMS        YES         5 min
+P2-HIGH      < 15 minutes     Slack, Email          NO          30 min
+P3-MEDIUM    < 1 hour         Email, Ticket         NO          4 hours
+P4-LOW       Next day         Ticket                NO          None
+
+ALERT TYPES:
+------------
+
+THRESHOLD ALERTS:
+- Metric exceeds threshold
+- Example: CPU > 90%, Latency > 100ms
+
+ANOMALY ALERTS:
+- Statistical deviation detected
+- Example: Order rate 3x normal
+
+PATTERN ALERTS:
+- Known failure pattern matched
+- Example: Cascading failures
+
+ABSENCE ALERTS:
+- Expected event didn't occur
+- Example: Heartbeat missed
+
+EVENT ALERTS:
+- Specific event occurred
+- Example: Circuit breaker opened
+
+================================================================================
+                     3. PAGERDUTY INTEGRATION
+================================================================================
+
+SETUP:
+
+#include <curl/curl.h>
+#include <nlohmann/json.hpp>
+
+namespace hft::alerting {
+
+class PagerDutyClient {
+private:
+    std::string routing_key_;
+    std::string api_url_{"https://events.pagerduty.com/v2/enqueue"};
+    
+public:
+    PagerDutyClient(const std::string& routing_key)
+        : routing_key_(routing_key) {}
+    
+    void send_alert(const std::string& summary,
+                   const std::string& severity,
+                   const std::map<std::string, std::string>& details) {
+        nlohmann::json payload;
+        payload["routing_key"] = routing_key_;
+        payload["event_action"] = "trigger";
+        payload["dedup_key"] = generate_dedup_key(summary);
+        
+        payload["payload"] = {
+            {"summary", summary},
+            {"severity", severity},
+            {"source", "hft-trading-system"},
+            {"timestamp", get_iso8601_timestamp()},
+            {"custom_details", details}
+        };
+        
+        // Add links for quick access
+        payload["links"] = {
+            {
+                {"href", "https://monitoring.company.com/dashboard"},
+                {"text", "System Dashboard"}
+            },
+            {
+                {"href", "https://logs.company.com"},
+                {"text", "Log Viewer"}
+            }
+        };
+        
+        send_http_post(api_url_, payload.dump());
+        
+        logger_.info("PagerDuty alert sent", {
+            {"summary", summary},
+            {"severity", severity}
+        });
+    }
+    
+    void resolve_alert(const std::string& dedup_key) {
+        nlohmann::json payload;
+        payload["routing_key"] = routing_key_;
+        payload["event_action"] = "resolve";
+        payload["dedup_key"] = dedup_key;
+        
+        send_http_post(api_url_, payload.dump());
+    }
+    
+    void acknowledge_alert(const std::string& dedup_key) {
+        nlohmann::json payload;
+        payload["routing_key"] = routing_key_;
+        payload["event_action"] = "acknowledge";
+        payload["dedup_key"] = dedup_key;
+        
+        send_http_post(api_url_, payload.dump());
+    }
+    
+private:
+    void send_http_post(const std::string& url,
+                       const std::string& json_data) {
+        CURL* curl = curl_easy_init();
+        if (!curl) {
+            throw std::runtime_error("Failed to initialize CURL");
+        }
+        
+        struct curl_slist* headers = nullptr;
+        headers = curl_slist_append(headers, "Content-Type: application/json");
+        
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_data.c_str());
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
+        
+        CURLcode res = curl_easy_perform(curl);
+        
+        curl_slist_free_all(headers);
+        curl_easy_cleanup(curl);
+        
+        if (res != CURLE_OK) {
+            throw std::runtime_error("PagerDuty alert failed: " +
+                                   std::string(curl_easy_strerror(res)));
+        }
+    }
+    
+    std::string generate_dedup_key(const std::string& summary) {
+        // Use hash of summary for deduplication
+        std::hash<std::string> hasher;
+        return "alert_" + std::to_string(hasher(summary));
+    }
+};
+
+} // namespace hft::alerting
+
+================================================================================
+                      4. SLACK INTEGRATION
+================================================================================
+
+class SlackClient {
+private:
+    std::string webhook_url_;
+    
+public:
+    void send_alert(const std::string& title,
+                   const std::string& message,
+                   const std::string& color,
+                   const std::map<std::string, std::string>& fields) {
+        nlohmann::json payload;
+        
+        // Construct rich message
+        nlohmann::json attachment;
+        attachment["color"] = color;  // "danger", "warning", "good"
+        attachment["title"] = title;
+        attachment["text"] = message;
+        attachment["ts"] = std::time(nullptr);
+        
+        // Add fields
+        nlohmann::json json_fields = nlohmann::json::array();
+        for (const auto& [key, value] : fields) {
+            json_fields.push_back({
+                {"title", key},
+                {"value", value},
+                {"short", true}
+            });
+        }
+        attachment["fields"] = json_fields;
+        
+        // Add action buttons
+        attachment["actions"] = {
+            {
+                {"type", "button"},
+                {"text", "View Logs"},
+                {"url", "https://logs.company.com"}
+            },
+            {
+                {"type", "button"},
+                {"text", "Dashboard"},
+                {"url", "https://monitoring.company.com"}
+            }
+        };
+        
+        payload["attachments"] = {attachment};
+        
+        send_http_post(webhook_url_, payload.dump());
+    }
+    
+    void send_thread_message(const std::string& thread_ts,
+                            const std::string& message) {
+        nlohmann::json payload;
+        payload["text"] = message;
+        payload["thread_ts"] = thread_ts;
+        
+        send_http_post(webhook_url_, payload.dump());
+    }
+};
+
+================================================================================
+                     7. ALERT ESCALATION
+================================================================================
+
+class AlertEscalationManager {
+private:
+    struct EscalationPolicy {
+        std::chrono::seconds ack_timeout{300};  // 5 minutes
+        std::vector<std::string> escalation_chain;
+    };
+    
+    std::unordered_map<std::string, EscalationPolicy> policies_;
+    std::unordered_map<std::string, AlertState> active_alerts_;
+    
+public:
+    void trigger_alert_with_escalation(const Alert& alert) {
+        // Send initial alert
+        send_alert(alert);
+        
+        // Track alert state
+        AlertState state{
+            .alert_id = alert.id,
+            .triggered_at = std::chrono::steady_clock::now(),
+            .acknowledged = false,
+            .escalation_level = 0
+        };
+        
+        active_alerts_[alert.id] = state;
+        
+        // Schedule escalation check
+        schedule_escalation_check(alert.id);
+    }
+    
+    void acknowledge_alert(const std::string& alert_id) {
+        auto it = active_alerts_.find(alert_id);
+        if (it != active_alerts_.end()) {
+            it->second.acknowledged = true;
+            it->second.acknowledged_at = std::chrono::steady_clock::now();
+            
+            logger_.info("Alert acknowledged", {
+                {"alert_id", alert_id}
+            });
+        }
+    }
+    
+private:
+    void schedule_escalation_check(const std::string& alert_id) {
+        timer_.schedule([this, alert_id]() {
+            check_and_escalate(alert_id);
+        }, std::chrono::seconds(300));  // Check after 5 minutes
+    }
+    
+    void check_and_escalate(const std::string& alert_id) {
+        auto it = active_alerts_.find(alert_id);
+        if (it == active_alerts_.end()) {
+            return;  // Alert resolved
+        }
+        
+        auto& state = it->second;
+        if (state.acknowledged) {
+            return;  // Alert acknowledged, no escalation needed
+        }
+        
+        // Escalate to next level
+        state.escalation_level++;
+        
+        logger_.warn("Alert not acknowledged, escalating", {
+            {"alert_id", alert_id},
+            {"escalation_level", state.escalation_level}
+        });
+        
+        const auto& policy = get_escalation_policy(alert_id);
+        if (state.escalation_level < policy.escalation_chain.size()) {
+            // Send to next person in chain
+            std::string next_person = policy.escalation_chain[state.escalation_level];
+            send_escalated_alert(alert_id, next_person);
+            
+            // Schedule next escalation check
+            schedule_escalation_check(alert_id);
+        } else {
+            // Reached end of escalation chain
+            logger_.critical("Alert reached end of escalation chain", {
+                {"alert_id", alert_id}
+            });
+            
+            // Send to all team members
+            send_broadcast_alert(alert_id);
+        }
+    }
+};
+
+================================================================================
+                  8. ALERT FATIGUE PREVENTION
+================================================================================
+
+class AlertFatiguePrevention {
+private:
+    struct AlertHistory {
+        std::deque<std::chrono::steady_clock::time_point> occurrences;
+        uint64_t total_count{0};
+        std::chrono::steady_clock::time_point last_sent;
+    };
+    
+    std::unordered_map<std::string, AlertHistory> history_;
+    
+public:
+    bool should_send_alert(const std::string& alert_key) {
+        auto& hist = history_[alert_key];
+        auto now = std::chrono::steady_clock::now();
+        
+        // Remove old occurrences (> 1 hour)
+        while (!hist.occurrences.empty() &&
+               now - hist.occurrences.front() > std::chrono::hours(1)) {
+            hist.occurrences.pop_front();
+        }
+        
+        // Add current occurrence
+        hist.occurrences.push_back(now);
+        hist.total_count++;
+        
+        // Rate limiting: max 10 alerts per hour
+        if (hist.occurrences.size() > 10) {
+            logger_.warn("Alert rate limit exceeded", {
+                {"alert_key", alert_key},
+                {"count_last_hour", hist.occurrences.size()}
+            });
+            
+            // Send summary instead
+            if (now - hist.last_sent > std::chrono::minutes(15)) {
+                send_summary_alert(alert_key, hist.occurrences.size());
+                hist.last_sent = now;
+            }
+            
+            return false;
+        }
+        
+        // Exponential backoff for repeated alerts
+        if (hist.total_count > 1) {
+            auto min_interval = calculate_backoff_interval(hist.total_count);
+            if (now - hist.last_sent < min_interval) {
+                return false;
+            }
+        }
+        
+        hist.last_sent = now;
+        return true;
+    }
+    
+private:
+    std::chrono::seconds calculate_backoff_interval(uint64_t count) {
+        // Exponential backoff: 1s, 2s, 4s, 8s, ..., max 300s
+        uint64_t interval_s = std::min(
+            static_cast<uint64_t>(1) << (count - 1),
+            300UL
+        );
+        return std::chrono::seconds(interval_s);
+    }
+    
+    void send_summary_alert(const std::string& alert_key, size_t count) {
+        alert_system_.send_alert(
+            AlertSeverity::P3_MEDIUM,
+            "Alert rate limit exceeded - sending summary",
+            {
+                {"alert_key", alert_key},
+                {"occurrences_last_hour", count}
+            }
+        );
+    }
+};
+
+class SmartAlertDeduplication {
+public:
+    bool is_duplicate(const Alert& alert) {
+        std::string fingerprint = generate_fingerprint(alert);
+        
+        auto it = recent_alerts_.find(fingerprint);
+        if (it != recent_alerts_.end()) {
+            auto age = std::chrono::steady_clock::now() - it->second;
+            
+            // Consider duplicate if within 5 minutes
+            if (age < std::chrono::minutes(5)) {
+                logger_.debug("Alert deduplicated", {
+                    {"fingerprint", fingerprint},
+                    {"age_seconds", std::chrono::duration_cast<
+                        std::chrono::seconds>(age).count()}
+                });
+                return true;
+            }
+        }
+        
+        recent_alerts_[fingerprint] = std::chrono::steady_clock::now();
+        return false;
+    }
+    
+private:
+    std::string generate_fingerprint(const Alert& alert) {
+        // Generate fingerprint from alert characteristics
+        std::stringstream ss;
+        ss << alert.type << "|"
+           << alert.severity << "|"
+           << alert.component << "|"
+           << alert.error_code;
+        
+        std::hash<std::string> hasher;
+        return std::to_string(hasher(ss.str()));
+    }
+    
+    std::unordered_map<std::string,
+                      std::chrono::steady_clock::time_point> recent_alerts_;
+};
+
+================================================================================
+                              END OF DOCUMENT
+================================================================================
+
+================================================================================
+                    9. ADVANCED ALERTING TECHNIQUES
+================================================================================
+
+9.1 INTELLIGENT ALERT CORRELATION
+----------------------------------
+
+class AlertCorrelationEngine {
+private:
+    struct AlertPattern {
+        std::vector<std::string> alert_types;
+        std::chrono::seconds time_window;
+        std::string correlated_issue;
+        AlertSeverity escalated_severity;
+    };
+    
+    std::vector<AlertPattern> patterns_;
+    std::deque<Alert> recent_alerts_;
+    
+public:
+    void initialize_patterns() {
+        // Pattern: Multiple exchange disconnects = network issue
+        patterns_.push_back({
+            .alert_types = {"exchange_disconnect", "exchange_disconnect"},
+            .time_window = std::chrono::seconds(60),
+            .correlated_issue = "Network infrastructure failure",
+            .escalated_severity = AlertSeverity::P1_CRITICAL
+        });
+        
+        // Pattern: High latency + packet loss = network congestion
+        patterns_.push_back({
+            .alert_types = {"high_latency", "packet_loss"},
+            .time_window = std::chrono::seconds(30),
+            .correlated_issue = "Network congestion detected",
+            .escalated_severity = AlertSeverity::P2_HIGH
+        });
+        
+        // Pattern: Memory + CPU alerts = resource exhaustion
+        patterns_.push_back({
+            .alert_types = {"high_memory", "high_cpu"},
+            .time_window = std::chrono::seconds(120),
+            .correlated_issue = "System resource exhaustion",
+            .escalated_severity = AlertSeverity::P1_CRITICAL
+        });
+    }
+    
+    void process_alert(const Alert& alert) {
+        recent_alerts_.push_back(alert);
+        
+        // Remove old alerts outside correlation window
+        auto now = std::chrono::steady_clock::now();
+        while (!recent_alerts_.empty() &&
+               now - recent_alerts_.front().timestamp > std::chrono::minutes(5)) {
+            recent_alerts_.pop_front();
+        }
+        
+        // Check for correlations
+        for (const auto& pattern : patterns_) {
+            if (matches_pattern(pattern)) {
+                trigger_correlated_alert(pattern);
+            }
+        }
+    }
+    
+private:
+    bool matches_pattern(const AlertPattern& pattern) {
+        auto now = std::chrono::steady_clock::now();
+        
+        std::unordered_map<std::string, int> type_counts;
+        for (const auto& alert : recent_alerts_) {
+            if (now - alert.timestamp <= pattern.time_window) {
+                type_counts[alert.type]++;
+            }
+        }
+        
+        for (const auto& type : pattern.alert_types) {
+            if (type_counts[type] == 0) {
+                return false;
+            }
+        }
+        
+        return true;
+    }
+    
+    void trigger_correlated_alert(const AlertPattern& pattern) {
+        logger_.critical("Alert pattern detected - correlated issue", {
+            {"issue", pattern.correlated_issue},
+            {"alert_types", join(pattern.alert_types, ", ")}
+        });
+        
+        alert_system_.send_alert(
+            pattern.escalated_severity,
+            "CORRELATED ISSUE: " + pattern.correlated_issue,
+            {
+                {"pattern", join(pattern.alert_types, " + ")},
+                {"time_window_s", pattern.time_window.count()}
+            },
+            AlertChannel::PAGERDUTY | AlertChannel::SMS
+        );
+    }
+};
+
+9.2 MACHINE LEARNING-BASED ANOMALY ALERTING
+--------------------------------------------
+
+class MLAnomalyAlerter {
+private:
+    // Simple moving average + std dev for anomaly detection
+    struct MetricModel {
+        std::deque<double> history;
+        size_t window_size{1000};
+        double mean{0.0};
+        double std_dev{0.0};
+        
+        void update(double value) {
+            history.push_back(value);
+            if (history.size() > window_size) {
+                history.pop_front();
+            }
+            
+            // Calculate mean
+            double sum = std::accumulate(history.begin(), history.end(), 0.0);
+            mean = sum / history.size();
+            
+            // Calculate std dev
+            double sq_sum = 0.0;
+            for (double v : history) {
+                sq_sum += (v - mean) * (v - mean);
+            }
+            std_dev = std::sqrt(sq_sum / history.size());
+        }
+        
+        bool is_anomaly(double value, double sigma_threshold = 3.0) const {
+            if (std_dev == 0.0) return false;
+            double z_score = std::abs(value - mean) / std_dev;
+            return z_score > sigma_threshold;
+        }
+    };
+    
+    std::unordered_map<std::string, MetricModel> models_;
+    
+public:
+    void track_and_alert(const std::string& metric_name,
+                        double value,
+                        double sigma_threshold = 3.0) {
+        auto& model = models_[metric_name];
+        
+        if (model.is_anomaly(value, sigma_threshold)) {
+            double z_score = std::abs(value - model.mean) / model.std_dev;
+            
+            logger_.warn("ML anomaly detected", {
+                {"metric", metric_name},
+                {"value", value},
+                {"mean", model.mean},
+                {"std_dev", model.std_dev},
+                {"z_score", z_score}
+            });
+            
+            AlertSeverity severity = z_score > 5.0 ?
+                AlertSeverity::P1_CRITICAL :
+                (z_score > 4.0 ? AlertSeverity::P2_HIGH :
+                 AlertSeverity::P3_MEDIUM);
+            
+            alert_system_.send_alert(
+                severity,
+                "Statistical anomaly detected: " + metric_name,
+                {
+                    {"metric", metric_name},
+                    {"value", value},
+                    {"expected_mean", model.mean},
+                    {"z_score", z_score}
+                }
+            );
+        }
+        
+        model.update(value);
+    }
+};
+
+9.3 ALERT DASHBOARD AND VISUALIZATION
+--------------------------------------
+
+class AlertDashboard {
+public:
+    struct DashboardMetrics {
+        uint64_t total_alerts_24h;
+        uint64_t critical_alerts_24h;
+        double avg_acknowledgment_time_s;
+        double avg_resolution_time_s;
+        std::map<std::string, uint64_t> alerts_by_type;
+        std::map<std::string, uint64_t> alerts_by_component;
+        std::vector<Alert> recent_alerts;
+    };
+    
+    DashboardMetrics get_metrics() {
+        DashboardMetrics metrics;
+        
+        auto now = std::chrono::steady_clock::now();
+        auto cutoff = now - std::chrono::hours(24);
+        
+        for (const auto& alert : alert_history_) {
+            if (alert.timestamp < cutoff) continue;
+            
+            metrics.total_alerts_24h++;
+            
+            if (alert.severity == AlertSeverity::P1_CRITICAL) {
+                metrics.critical_alerts_24h++;
+            }
+            
+            metrics.alerts_by_type[alert.type]++;
+            metrics.alerts_by_component[alert.component]++;
+            
+            if (alert.acknowledged_at.has_value()) {
+                auto ack_time = std::chrono::duration_cast<
+                    std::chrono::seconds>(
+                    *alert.acknowledged_at - alert.timestamp);
+                metrics.avg_acknowledgment_time_s += ack_time.count();
+            }
+            
+            if (alert.resolved_at.has_value()) {
+                auto resolution_time = std::chrono::duration_cast<
+                    std::chrono::seconds>(
+                    *alert.resolved_at - alert.timestamp);
+                metrics.avg_resolution_time_s += resolution_time.count();
+            }
+        }
+        
+        if (metrics.total_alerts_24h > 0) {
+            metrics.avg_acknowledgment_time_s /= metrics.total_alerts_24h;
+            metrics.avg_resolution_time_s /= metrics.total_alerts_24h;
+        }
+        
+        // Get most recent 50 alerts
+        metrics.recent_alerts = std::vector<Alert>(
+            alert_history_.end() - std::min(50UL, alert_history_.size()),
+            alert_history_.end()
+        );
+        
+        return metrics;
+    }
+    
+    std::string generate_html_dashboard() {
+        auto metrics = get_metrics();
+        
+        std::stringstream html;
+        html << "<html><head><title>Alert Dashboard</title></head><body>";
+        html << "<h1>Alert Dashboard</h1>";
+        html << "<h2>24 Hour Summary</h2>";
+        html << "<p>Total Alerts: " << metrics.total_alerts_24h << "</p>";
+        html << "<p>Critical Alerts: " << metrics.critical_alerts_24h << "</p>";
+        html << "<p>Avg Ack Time: " << metrics.avg_acknowledgment_time_s << "s</p>";
+        html << "<p>Avg Resolution Time: " << metrics.avg_resolution_time_s << "s</p>";
+        
+        html << "<h2>Alerts by Type</h2><ul>";
+        for (const auto& [type, count] : metrics.alerts_by_type) {
+            html << "<li>" << type << ": " << count << "</li>";
+        }
+        html << "</ul>";
+        
+        html << "<h2>Recent Alerts</h2><table border='1'>";
+        html << "<tr><th>Time</th><th>Severity</th><th>Type</th><th>Message</th></tr>";
+        for (const auto& alert : metrics.recent_alerts) {
+            html << "<tr>";
+            html << "<td>" << format_timestamp(alert.timestamp) << "</td>";
+            html << "<td>" << to_string(alert.severity) << "</td>";
+            html << "<td>" << alert.type << "</td>";
+            html << "<td>" << alert.message << "</td>";
+            html << "</tr>";
+        }
+        html << "</table>";
+        
+        html << "</body></html>";
+        return html.str();
+    }
+};
+
+================================================================================
+                              END OF DOCUMENT
+================================================================================

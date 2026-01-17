@@ -1,0 +1,797 @@
+================================================================================
+REPLAYING SPECIFIC MARKET CONDITIONS
+================================================================================
+
+PURPOSE: Test strategies against specific market regimes, stress events, and
+edge cases by replaying captured periods with those characteristics.
+
+KEY SCENARIOS:
+- Normal market conditions (baseline)
+- High volatility periods (VIX spike)
+- Flash crashes and fat finger events
+- Market halts and circuit breakers
+- Low liquidity periods (holidays, off-hours)
+- News events and earnings announcements
+- Coordinated selling/buying pressure
+
+================================================================================
+MARKET REGIME CLASSIFICATION
+================================================================================
+
+IDENTIFYING DIFFERENT MARKET REGIMES FROM CAPTURED DATA:
+--------------------------------------------------------
+
+class MarketRegimeClassifier {
+public:
+    enum class Regime {
+        NORMAL,          // Typical trading conditions
+        HIGH_VOL,        // Elevated volatility
+        LOW_VOL,         // Suppressed volatility
+        TRENDING_UP,     // Strong upward momentum
+        TRENDING_DOWN,   // Strong downward momentum
+        CHOPPY,          // High frequency direction changes
+        FLASH_CRASH,     // Sudden extreme move
+        CIRCUIT_BREAKER, // Exchange halt
+        LOW_LIQUIDITY,   // Thin order book
+        NEWS_EVENT,      // Sudden volume spike
+        MARKET_OPEN,     // First 15 minutes
+        MARKET_CLOSE     // Last 30 minutes
+    };
+
+    struct RegimeMetrics {
+        double realized_volatility;     // Last 5min realized vol (annualized)
+        double spread_bps;              // Bid-ask spread in bps
+        double book_depth;              // Average depth at top 5 levels
+        double trade_intensity;         // Trades per second
+        double price_trend;             // Short-term momentum
+        double price_reversal_freq;     // Direction changes per minute
+        uint64_t timestamp;
+    };
+
+    // Classify current market regime based on metrics
+    Regime classifyRegime(const RegimeMetrics& metrics) {
+        // Flash crash detection
+        if (metrics.realized_volatility > 200.0 &&  // >200% annualized vol
+            metrics.spread_bps > 50.0) {            // Wide spreads
+            return Regime::FLASH_CRASH;
+        }
+
+        // High volatility
+        if (metrics.realized_volatility > 50.0) {
+            return Regime::HIGH_VOL;
+        }
+
+        // Low volatility
+        if (metrics.realized_volatility < 10.0) {
+            return Regime::LOW_VOL;
+        }
+
+        // Low liquidity
+        if (metrics.book_depth < 100.0 ||  // contracts
+            metrics.spread_bps > 5.0) {
+            return Regime::LOW_LIQUIDITY;
+        }
+
+        // Trending markets
+        if (std::abs(metrics.price_trend) > 0.5) {  // Strong directional move
+            return metrics.price_trend > 0 ? Regime::TRENDING_UP : Regime::TRENDING_DOWN;
+        }
+
+        // Choppy market
+        if (metrics.price_reversal_freq > 10.0) {  // >10 reversals per minute
+            return Regime::CHOPPY;
+        }
+
+        // News event (sudden volume spike)
+        if (metrics.trade_intensity > 50.0) {  // >50 trades/sec
+            return Regime::NEWS_EVENT;
+        }
+
+        return Regime::NORMAL;
+    }
+
+    // Compute regime metrics from order book and trade data
+    RegimeMetrics computeMetrics(const OrderBook& book,
+                                 const std::vector<Trade>& recent_trades,
+                                 uint64_t current_time) {
+        RegimeMetrics metrics;
+        metrics.timestamp = current_time;
+
+        // Realized volatility from recent trades
+        metrics.realized_volatility = computeRealizedVolatility(recent_trades);
+
+        // Spread
+        if (book.getBestBid() > 0 && book.getBestAsk() > 0) {
+            int64_t mid_price = (book.getBestBid() + book.getBestAsk()) / 2;
+            metrics.spread_bps = 10000.0 *
+                (book.getBestAsk() - book.getBestBid()) / static_cast<double>(mid_price);
+        }
+
+        // Book depth
+        metrics.book_depth = book.getTotalDepth(5);  // Top 5 levels
+
+        // Trade intensity
+        metrics.trade_intensity = computeTradeIntensity(recent_trades, current_time);
+
+        // Price trend
+        metrics.price_trend = computePriceTrend(recent_trades);
+
+        // Reversal frequency
+        metrics.price_reversal_freq = computeReversalFrequency(recent_trades);
+
+        return metrics;
+    }
+
+private:
+    double computeRealizedVolatility(const std::vector<Trade>& trades) {
+        if (trades.size() < 2) return 0.0;
+
+        // Compute log returns
+        std::vector<double> log_returns;
+        for (size_t i = 1; i < trades.size(); ++i) {
+            double ret = std::log(static_cast<double>(trades[i].price) /
+                                 static_cast<double>(trades[i-1].price));
+            log_returns.push_back(ret);
+        }
+
+        // Compute variance
+        double mean = std::accumulate(log_returns.begin(), log_returns.end(), 0.0) /
+                     log_returns.size();
+        double variance = 0.0;
+        for (double ret : log_returns) {
+            variance += (ret - mean) * (ret - mean);
+        }
+        variance /= log_returns.size();
+
+        // Annualize (assume 252 trading days, 6.5 hours per day, 5min window)
+        double annualization_factor = std::sqrt(252.0 * 6.5 * 60.0 / 5.0);
+        double volatility = std::sqrt(variance) * annualization_factor * 100.0;
+
+        return volatility;
+    }
+
+    double computeTradeIntensity(const std::vector<Trade>& trades,
+                                 uint64_t current_time) {
+        // Count trades in last second
+        const uint64_t one_second = 1000000000ULL;
+        size_t count = 0;
+
+        for (const auto& trade : trades) {
+            if (current_time - trade.timestamp <= one_second) {
+                count++;
+            }
+        }
+
+        return static_cast<double>(count);
+    }
+
+    double computePriceTrend(const std::vector<Trade>& trades) {
+        if (trades.size() < 10) return 0.0;
+
+        // Simple linear regression on last 10 trades
+        double sum_x = 0, sum_y = 0, sum_xy = 0, sum_x2 = 0;
+        size_t n = std::min(trades.size(), size_t(10));
+
+        for (size_t i = 0; i < n; ++i) {
+            double x = static_cast<double>(i);
+            double y = static_cast<double>(trades[trades.size() - n + i].price);
+
+            sum_x += x;
+            sum_y += y;
+            sum_xy += x * y;
+            sum_x2 += x * x;
+        }
+
+        double slope = (n * sum_xy - sum_x * sum_y) / (n * sum_x2 - sum_x * sum_x);
+        return slope;
+    }
+
+    double computeReversalFrequency(const std::vector<Trade>& trades) {
+        if (trades.size() < 3) return 0.0;
+
+        size_t reversals = 0;
+        for (size_t i = 2; i < trades.size(); ++i) {
+            bool up1 = trades[i-1].price > trades[i-2].price;
+            bool up2 = trades[i].price > trades[i-1].price;
+
+            if (up1 != up2) {
+                reversals++;
+            }
+        }
+
+        // Assume trades span 1 minute (adjust based on actual timespan)
+        uint64_t timespan_ns = trades.back().timestamp - trades.front().timestamp;
+        double minutes = timespan_ns / 1e9 / 60.0;
+
+        return reversals / minutes;
+    }
+};
+
+================================================================================
+SCENARIO EXTRACTION
+================================================================================
+
+FINDING AND EXTRACTING SPECIFIC SCENARIOS FROM HISTORICAL DATA:
+---------------------------------------------------------------
+
+class ScenarioExtractor {
+public:
+    struct Scenario {
+        std::string name;
+        std::string symbol;
+        uint64_t start_time;
+        uint64_t end_time;
+        MarketRegimeClassifier::Regime regime;
+        std::string description;
+        std::string tick_file_path;
+    };
+
+    // Scan historical data and extract interesting scenarios
+    std::vector<Scenario> extractScenarios(const std::string& tick_file_path,
+                                          const std::string& symbol) {
+        std::vector<Scenario> scenarios;
+
+        TickLoader loader;
+        if (!loader.loadTickFile(tick_file_path)) {
+            LOG_ERROR("Failed to load tick file: {}", tick_file_path);
+            return scenarios;
+        }
+
+        OrderBook book(symbol);
+        std::vector<Trade> recent_trades;
+        MarketRegimeClassifier classifier;
+
+        MarketRegimeClassifier::Regime current_regime =
+            MarketRegimeClassifier::Regime::NORMAL;
+        uint64_t regime_start_time = 0;
+
+        for (auto it = loader.begin(); it != loader.end(); ++it) {
+            const auto& tick = *it;
+
+            // Update book
+            if (tick.tick_type == TickType::QUOTE) {
+                book.updateLevel(tick.side, tick.price, tick.size, 0);
+            } else if (tick.tick_type == TickType::TRADE) {
+                recent_trades.push_back(Trade{
+                    tick.exchange_timestamp,
+                    tick.price,
+                    tick.size,
+                    tick.side
+                });
+
+                // Keep only last 100 trades
+                if (recent_trades.size() > 100) {
+                    recent_trades.erase(recent_trades.begin());
+                }
+            }
+
+            // Classify regime every 10 seconds
+            if (tick.exchange_timestamp % (10 * 1000000000ULL) < 100000) {
+                auto metrics = classifier.computeMetrics(
+                    book, recent_trades, tick.exchange_timestamp
+                );
+
+                auto new_regime = classifier.classifyRegime(metrics);
+
+                // Regime transition
+                if (new_regime != current_regime) {
+                    // Save previous regime if interesting
+                    if (isInterestingRegime(current_regime)) {
+                        scenarios.push_back(Scenario{
+                            generateScenarioName(current_regime, regime_start_time),
+                            symbol,
+                            regime_start_time,
+                            tick.exchange_timestamp,
+                            current_regime,
+                            describeRegime(current_regime, metrics),
+                            tick_file_path
+                        });
+                    }
+
+                    current_regime = new_regime;
+                    regime_start_time = tick.exchange_timestamp;
+                }
+            }
+        }
+
+        LOG_INFO("Extracted {} scenarios from {}", scenarios.size(), tick_file_path);
+
+        return scenarios;
+    }
+
+private:
+    bool isInterestingRegime(MarketRegimeClassifier::Regime regime) {
+        return regime != MarketRegimeClassifier::Regime::NORMAL;
+    }
+
+    std::string generateScenarioName(MarketRegimeClassifier::Regime regime,
+                                     uint64_t timestamp) {
+        std::string regime_name;
+        switch (regime) {
+            case MarketRegimeClassifier::Regime::FLASH_CRASH:
+                regime_name = "FlashCrash";
+                break;
+            case MarketRegimeClassifier::Regime::HIGH_VOL:
+                regime_name = "HighVolatility";
+                break;
+            case MarketRegimeClassifier::Regime::LOW_LIQUIDITY:
+                regime_name = "LowLiquidity";
+                break;
+            default:
+                regime_name = "Unknown";
+        }
+
+        return regime_name + "_" + formatTimestamp(timestamp);
+    }
+
+    std::string describeRegime(MarketRegimeClassifier::Regime regime,
+                              const MarketRegimeClassifier::RegimeMetrics& metrics) {
+        std::ostringstream oss;
+        oss << "Regime: " << static_cast<int>(regime)
+            << ", Vol: " << metrics.realized_volatility << "%"
+            << ", Spread: " << metrics.spread_bps << "bps"
+            << ", Depth: " << metrics.book_depth
+            << ", Intensity: " << metrics.trade_intensity << " trades/sec";
+        return oss.str();
+    }
+};
+
+================================================================================
+STRESS TEST SCENARIOS
+================================================================================
+
+1. FLASH CRASH SCENARIO
+-----------------------
+
+// Replay May 6, 2010 style flash crash
+class FlashCrashScenario {
+public:
+    struct FlashCrashParams {
+        uint64_t crash_start_time;
+        uint64_t crash_bottom_time;
+        uint64_t crash_end_time;
+        double price_drop_pct;      // e.g., -9.2%
+        double liquidity_drop_pct;  // e.g., -95%
+        double spread_widening;     // e.g., 50x normal
+    };
+
+    void replayFlashCrash(ReplayEngine& engine,
+                         const std::string& scenario_file,
+                         const FlashCrashParams& params) {
+        LOG_INFO("Replaying flash crash scenario:");
+        LOG_INFO("  Start: {}", formatTimestamp(params.crash_start_time));
+        LOG_INFO("  Bottom: {}", formatTimestamp(params.crash_bottom_time));
+        LOG_INFO("  End: {}", formatTimestamp(params.crash_end_time));
+        LOG_INFO("  Price drop: {:.1f}%", params.price_drop_pct);
+
+        // Configure replay with specific time window
+        ReplayEngine::Config config;
+        config.start_time = params.crash_start_time - 60 * 1000000000ULL;  // 1min before
+        config.end_time = params.crash_end_time + 60 * 1000000000ULL;     // 1min after
+        config.speed = ReplayEngine::ReplaySpeed::REALTIME;  // Real-time for observation
+        config.simulate_latency = true;
+
+        // During crash: latency spikes significantly
+        // This is captured in the tick data automatically
+
+        engine.run();
+    }
+
+    // Check how strategy handled flash crash
+    void analyzeFlashCrashPerformance(const ReplayEngine::Statistics& stats,
+                                     const StrategyResults& results) {
+        LOG_INFO("=== Flash Crash Performance Analysis ===");
+
+        // Did strategy maintain risk limits?
+        if (results.max_position > results.position_limit) {
+            LOG_ERROR("FAILED: Position limit breached during flash crash!");
+        } else {
+            LOG_INFO("PASSED: Position limits maintained");
+        }
+
+        // Did stop losses trigger correctly?
+        if (results.max_drawdown_pct > 5.0) {
+            LOG_WARN("Large drawdown during flash crash: {:.1f}%",
+                    results.max_drawdown_pct);
+        }
+
+        // Were there any trading errors during high volatility?
+        if (results.order_reject_count > 0) {
+            LOG_WARN("Order rejects during flash crash: {}",
+                    results.order_reject_count);
+        }
+
+        // Recovery time
+        uint64_t recovery_time = results.recovery_timestamp -
+                                results.crash_timestamp;
+        LOG_INFO("Strategy recovery time: {:.1f} seconds",
+                recovery_time / 1e9);
+    }
+};
+
+
+2. CIRCUIT BREAKER SCENARIO
+---------------------------
+
+class CircuitBreakerScenario {
+public:
+    enum class HaltType {
+        LULD_HALT,      // Limit Up Limit Down
+        NEWS_HALT,      // News pending
+        REGULATORY_HALT // Regulatory concern
+    };
+
+    struct HaltParams {
+        uint64_t halt_start_time;
+        uint64_t halt_end_time;
+        HaltType type;
+        int64_t halt_price;
+        int64_t resume_price;
+    };
+
+    void replayCircuitBreaker(ReplayEngine& engine,
+                             const HaltParams& params) {
+        LOG_INFO("Replaying circuit breaker scenario:");
+        LOG_INFO("  Halt: {} to {}",
+                formatTimestamp(params.halt_start_time),
+                formatTimestamp(params.halt_end_time));
+
+        // Strategy should:
+        // 1. Detect halt
+        // 2. Cancel all open orders
+        // 3. Not attempt to trade during halt
+        // 4. Resume safely after halt ends
+
+        // Inject halt event into replay
+        MarketEvent halt_event;
+        halt_event.type = MarketEvent::Type::SYSTEM_EVENT;
+        halt_event.timestamp = params.halt_start_time;
+        halt_event.message = "TRADING_HALT";
+
+        MarketEvent resume_event;
+        resume_event.type = MarketEvent::Type::SYSTEM_EVENT;
+        resume_event.timestamp = params.halt_end_time;
+        resume_event.message = "TRADING_RESUMED";
+
+        engine.injectEvent(halt_event);
+        engine.injectEvent(resume_event);
+
+        engine.run();
+    }
+
+    void validateHaltHandling(const StrategyResults& results,
+                             const HaltParams& params) {
+        LOG_INFO("=== Circuit Breaker Handling Validation ===");
+
+        // Check: no orders submitted during halt
+        bool attempted_trading_during_halt = false;
+        for (const auto& order : results.all_orders) {
+            if (order.submit_timestamp >= params.halt_start_time &&
+                order.submit_timestamp < params.halt_end_time) {
+                LOG_ERROR("FAILED: Order submitted during halt!");
+                attempted_trading_during_halt = true;
+            }
+        }
+
+        if (!attempted_trading_during_halt) {
+            LOG_INFO("PASSED: No trading during halt");
+        }
+
+        // Check: all orders cancelled before halt
+        bool had_open_orders_during_halt = false;
+        for (const auto& order : results.all_orders) {
+            if (order.submit_timestamp < params.halt_start_time &&
+                order.state == OrderState::WORKING) {
+                // Check if cancelled before halt
+                if (order.cancel_timestamp > params.halt_start_time) {
+                    LOG_ERROR("FAILED: Open order not cancelled before halt!");
+                    had_open_orders_during_halt = true;
+                }
+            }
+        }
+
+        if (!had_open_orders_during_halt) {
+            LOG_INFO("PASSED: All orders cancelled before halt");
+        }
+    }
+};
+
+
+3. LOW LIQUIDITY SCENARIO
+-------------------------
+
+class LowLiquidityScenario {
+public:
+    // Test strategy in thin market conditions
+    void replayLowLiquidity(ReplayEngine& engine,
+                           const std::string& scenario_file) {
+        LOG_INFO("Replaying low liquidity scenario");
+
+        // Low liquidity characteristics:
+        // - Wide spreads (>10 bps)
+        // - Thin book depth (<100 contracts at best)
+        // - High adverse selection
+        // - Difficult to exit positions
+
+        ReplayEngine::Config config;
+        config.simulate_latency = true;
+        config.enable_fill_simulation = true;
+
+        engine.run();
+    }
+
+    void analyzeLiquidityImpact(const StrategyResults& results) {
+        LOG_INFO("=== Low Liquidity Impact Analysis ===");
+
+        // Slippage during low liquidity
+        double avg_slippage_bps = computeAverageSlippage(results.fills);
+        LOG_INFO("Average slippage: {:.2f} bps", avg_slippage_bps);
+
+        if (avg_slippage_bps > 5.0) {
+            LOG_WARN("High slippage in low liquidity: {:.2f} bps", avg_slippage_bps);
+        }
+
+        // Fill rate
+        double fill_rate = static_cast<double>(results.orders_filled) /
+                          results.orders_submitted;
+        LOG_INFO("Fill rate: {:.1f}%", fill_rate * 100.0);
+
+        if (fill_rate < 0.5) {
+            LOG_WARN("Low fill rate in thin market: {:.1f}%", fill_rate * 100.0);
+        }
+
+        // Time to exit (how long to unwind position)
+        for (const auto& exit : results.position_exits) {
+            uint64_t exit_duration = exit.end_time - exit.start_time;
+            LOG_INFO("Position exit duration: {:.1f} seconds",
+                    exit_duration / 1e9);
+
+            if (exit_duration > 10 * 1000000000ULL) {  // >10 seconds
+                LOG_WARN("Slow exit in low liquidity: {:.1f} sec",
+                        exit_duration / 1e9);
+            }
+        }
+    }
+
+private:
+    double computeAverageSlippage(const std::vector<Fill>& fills) {
+        if (fills.empty()) return 0.0;
+
+        double total_slippage_bps = 0.0;
+        for (const auto& fill : fills) {
+            // Slippage = (fill_price - decision_price) / decision_price
+            double slippage_bps = 10000.0 *
+                (fill.price - fill.decision_price) /
+                static_cast<double>(fill.decision_price);
+
+            total_slippage_bps += std::abs(slippage_bps);
+        }
+
+        return total_slippage_bps / fills.size();
+    }
+};
+
+
+4. NEWS EVENT SCENARIO
+----------------------
+
+class NewsEventScenario {
+public:
+    // Replay sudden volatility spike from news announcement
+    void replayNewsEvent(ReplayEngine& engine,
+                        uint64_t news_timestamp,
+                        const std::string& scenario_file) {
+        LOG_INFO("Replaying news event at {}", formatTimestamp(news_timestamp));
+
+        // News events characteristics:
+        // - Sudden volume spike (10-100x normal)
+        // - Sharp price move (1-5% in seconds)
+        // - Wide spreads briefly
+        // - Quote stuffing / order book instability
+
+        ReplayEngine::Config config;
+        config.start_time = news_timestamp - 60 * 1000000000ULL;  // 1min before
+        config.end_time = news_timestamp + 300 * 1000000000ULL;   // 5min after
+        config.speed = ReplayEngine::ReplaySpeed::REALTIME;
+        config.simulate_latency = true;
+
+        engine.run();
+    }
+
+    void analyzeNewsResponse(const StrategyResults& results,
+                            uint64_t news_timestamp) {
+        LOG_INFO("=== News Event Response Analysis ===");
+
+        // How quickly did strategy react to news?
+        uint64_t first_action_after_news = UINT64_MAX;
+        for (const auto& order : results.all_orders) {
+            if (order.submit_timestamp > news_timestamp) {
+                first_action_after_news =
+                    std::min(first_action_after_news, order.submit_timestamp);
+            }
+        }
+
+        if (first_action_after_news != UINT64_MAX) {
+            uint64_t reaction_time = first_action_after_news - news_timestamp;
+            LOG_INFO("Reaction time to news: {:.1f} ms", reaction_time / 1e6);
+        }
+
+        // Did strategy get adversely selected?
+        size_t adverse_fills = 0;
+        for (const auto& fill : results.fills) {
+            if (fill.timestamp > news_timestamp &&
+                fill.timestamp < news_timestamp + 5 * 1000000000ULL) {
+                // Check if fill was on wrong side of move
+                if (wasAdverselySelected(fill, results)) {
+                    adverse_fills++;
+                }
+            }
+        }
+
+        if (adverse_fills > 0) {
+            LOG_WARN("Adversely selected {} times during news event", adverse_fills);
+        }
+    }
+
+private:
+    bool wasAdverselySelected(const Fill& fill, const StrategyResults& results) {
+        // Simple check: did price move against us after fill?
+        // More sophisticated: compare fill price to VWAP over next few seconds
+        return false;  // Simplified
+    }
+};
+
+================================================================================
+SCENARIO LIBRARY
+================================================================================
+
+class ScenarioLibrary {
+public:
+    void buildLibrary(const std::string& data_directory) {
+        LOG_INFO("Building scenario library from {}", data_directory);
+
+        ScenarioExtractor extractor;
+
+        // Scan all tick files
+        for (const auto& entry : std::filesystem::directory_iterator(data_directory)) {
+            if (entry.path().extension() == ".ticks") {
+                std::string symbol = entry.path().stem().string();
+
+                auto scenarios = extractor.extractScenarios(
+                    entry.path().string(),
+                    symbol
+                );
+
+                for (const auto& scenario : scenarios) {
+                    scenarios_[scenario.name] = scenario;
+                }
+            }
+        }
+
+        LOG_INFO("Built library with {} scenarios", scenarios_.size());
+        printScenarioSummary();
+    }
+
+    const ScenarioExtractor::Scenario* getScenario(const std::string& name) const {
+        auto it = scenarios_.find(name);
+        return it != scenarios_.end() ? &it->second : nullptr;
+    }
+
+    std::vector<ScenarioExtractor::Scenario> getScenariosOfType(
+        MarketRegimeClassifier::Regime regime) const {
+        std::vector<ScenarioExtractor::Scenario> result;
+
+        for (const auto& [name, scenario] : scenarios_) {
+            if (scenario.regime == regime) {
+                result.push_back(scenario);
+            }
+        }
+
+        return result;
+    }
+
+private:
+    void printScenarioSummary() {
+        std::unordered_map<MarketRegimeClassifier::Regime, size_t> regime_counts;
+
+        for (const auto& [name, scenario] : scenarios_) {
+            regime_counts[scenario.regime]++;
+        }
+
+        LOG_INFO("Scenario breakdown:");
+        for (const auto& [regime, count] : regime_counts) {
+            LOG_INFO("  {}: {} scenarios", static_cast<int>(regime), count);
+        }
+    }
+
+    std::unordered_map<std::string, ScenarioExtractor::Scenario> scenarios_;
+};
+
+================================================================================
+COMPLETE TESTING WORKFLOW
+================================================================================
+
+// Test strategy against all scenario types
+void comprehensiveScenarioTesting(IStrategy* strategy,
+                                 const ScenarioLibrary& library) {
+    LOG_INFO("Starting comprehensive scenario testing");
+
+    struct TestResult {
+        std::string scenario_name;
+        bool passed;
+        std::string failure_reason;
+        StrategyResults results;
+    };
+
+    std::vector<TestResult> test_results;
+
+    // Test normal conditions
+    auto normal_scenarios = library.getScenariosOfType(
+        MarketRegimeClassifier::Regime::NORMAL
+    );
+    for (const auto& scenario : normal_scenarios) {
+        test_results.push_back(runScenarioTest(strategy, scenario));
+    }
+
+    // Test high volatility
+    auto high_vol_scenarios = library.getScenariosOfType(
+        MarketRegimeClassifier::Regime::HIGH_VOL
+    );
+    for (const auto& scenario : high_vol_scenarios) {
+        test_results.push_back(runScenarioTest(strategy, scenario));
+    }
+
+    // Test flash crashes
+    auto crash_scenarios = library.getScenariosOfType(
+        MarketRegimeClassifier::Regime::FLASH_CRASH
+    );
+    for (const auto& scenario : crash_scenarios) {
+        test_results.push_back(runScenarioTest(strategy, scenario));
+    }
+
+    // Test low liquidity
+    auto low_liq_scenarios = library.getScenariosOfType(
+        MarketRegimeClassifier::Regime::LOW_LIQUIDITY
+    );
+    for (const auto& scenario : low_liq_scenarios) {
+        test_results.push_back(runScenarioTest(strategy, scenario));
+    }
+
+    // Print summary
+    printTestSummary(test_results);
+}
+
+TestResult runScenarioTest(IStrategy* strategy,
+                          const ScenarioExtractor::Scenario& scenario) {
+    LOG_INFO("Testing scenario: {}", scenario.name);
+
+    ReplayEngine::Config config;
+    config.start_time = scenario.start_time;
+    config.end_time = scenario.end_time;
+    config.speed = ReplayEngine::ReplaySpeed::MAX_SPEED;
+
+    ReplayEngine engine(config);
+    engine.loadTickData(scenario.symbol, scenario.tick_file_path);
+    engine.subscribe(scenario.symbol, strategy);
+
+    engine.run();
+
+    // Collect results
+    StrategyResults results = strategy->getResults();
+
+    // Validate based on scenario type
+    TestResult test_result;
+    test_result.scenario_name = scenario.name;
+    test_result.results = results;
+    test_result.passed = validateResults(results, scenario);
+
+    if (!test_result.passed) {
+        test_result.failure_reason = "Failed validation checks";
+    }
+
+    return test_result;
+}
+
+================================================================================
+NEXT: Read 06_strategy_validation.txt for comparing replay vs live results
+================================================================================

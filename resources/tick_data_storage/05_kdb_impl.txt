@@ -1,0 +1,754 @@
+================================================================================
+                         KDB+/Q IMPLEMENTATION
+                    Industry Standard for HFT Tick Data
+================================================================================
+
+PURPOSE: kdb+ is the gold standard for tick data storage in finance.
+Used by top investment banks and hedge funds for ultra-high-performance
+time-series data management.
+
+================================================================================
+                         TABLE OF CONTENTS
+================================================================================
+
+1. Why kdb+ for HFT
+2. Installation and Licensing
+3. Q Language Fundamentals
+4. Schema Design for Tick Data
+5. C++ Integration
+6. Query Patterns
+7. Performance Optimization
+8. Production Deployment
+
+================================================================================
+                     1. WHY KDB+ FOR HFT
+================================================================================
+
+KDB+ ADVANTAGES:
+----------------
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    WHY WALL STREET USES KDB+                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  1. SPEED                                                                   │
+│     • 100x faster than traditional databases for time-series               │
+│     • In-memory columnar storage                                           │
+│     • Vectorized operations on entire columns                              │
+│                                                                             │
+│  2. Q LANGUAGE                                                              │
+│     • Built specifically for time-series analysis                          │
+│     • Extremely concise (1 line = 10 lines SQL)                            │
+│     • Native time-series operations                                         │
+│                                                                             │
+│  3. STORAGE EFFICIENCY                                                      │
+│     • 10-20x compression vs raw data                                       │
+│     • Columnar storage = fast scans                                         │
+│     • Partition by date automatically                                       │
+│                                                                             │
+│  4. INDUSTRY STANDARD                                                       │
+│     • Used by Goldman, Morgan Stanley, JPMorgan                            │
+│     • Large talent pool of kdb+ developers                                 │
+│     • Proven at massive scale (trillions of records)                       │
+│                                                                             │
+│  DOWNSIDE: EXPENSIVE LICENSE ($100K+/year/core)                            │
+│  ALTERNATIVE: 32-bit free version for development                          │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+PERFORMANCE COMPARISON:
+-----------------------
+
+| Operation              | kdb+      | PostgreSQL | MySQL    | MongoDB  |
+|------------------------|-----------|------------|----------|----------|
+| 1M row insert          | 0.1s      | 30s        | 45s      | 15s      |
+| 100M row scan          | 0.5s      | 60s        | 120s     | 90s      |
+| Time-range query       | 0.001s    | 0.5s       | 1s       | 0.8s     |
+| VWAP calculation       | 0.01s     | 5s         | 10s      | N/A      |
+| ASOF join (tick align) | 0.1s      | 60s        | N/A      | N/A      |
+
+================================================================================
+                   2. INSTALLATION AND LICENSING
+================================================================================
+
+LICENSING OPTIONS:
+------------------
+
+1. 32-BIT FREE VERSION
+   - Limited to 4GB RAM
+   - Good for development
+   - Download: https://kx.com/connect-with-us/download/
+
+2. ON-DEMAND LICENSE
+   - $20/hour on cloud
+   - Good for testing at scale
+   - AWS, Azure, GCP
+
+3. ENTERPRISE LICENSE
+   - $50K-150K per core per year
+   - Required for production
+   - Contact kx.com
+
+INSTALLATION:
+-------------
+
+```bash
+# Download 32-bit free version for Linux
+wget https://kx.com/...l64.zip
+unzip l64.zip
+cd q
+
+# Start kdb+
+./l64/q
+
+# Or with port for IPC
+./l64/q -p 5000
+```
+
+DOCKER SETUP:
+-------------
+
+```dockerfile
+FROM debian:bullseye-slim
+
+# Install dependencies
+RUN apt-get update && apt-get install -y wget unzip
+
+# Download kdb+ (32-bit free)
+RUN wget https://kx.com/.../l32.zip && \
+    unzip l32.zip && \
+    rm l32.zip
+
+ENV QHOME=/q
+ENV PATH=$PATH:/q/l32
+
+EXPOSE 5000
+
+CMD ["q", "-p", "5000"]
+```
+
+================================================================================
+                   3. Q LANGUAGE FUNDAMENTALS
+================================================================================
+
+Q BASICS:
+---------
+
+```q
+/ This is a comment in q
+
+/ Basic data types
+42              / integer
+3.14            / float
+`symbol         / symbol (interned string)
+"string"        / character vector
+2025.11.26      / date
+12:30:45.123    / time
+2025.11.26D12:30:45.123456789  / timestamp (nanosecond)
+
+/ Lists
+1 2 3 4 5       / integer list
+`a`b`c          / symbol list
+
+/ Tables (like dataframes)
+([] x:1 2 3; y:`a`b`c)   / simple table
+/ Output:
+/ x y
+/ ---
+/ 1 a
+/ 2 b
+/ 3 c
+
+/ Keyed tables (like dictionaries)
+([sym:`AAPL`GOOG] price:150 2800)
+
+/ Functions
+add:{x+y}       / lambda
+add[3;4]        / returns 7
+
+/ Select (like SQL)
+select from t where x>2
+select avg price by sym from trades
+
+/ Time-series operations
+xbar[5;12:30:47]    / rounds down to 12:30:45 (5-second bars)
+```
+
+Q FOR TIME-SERIES:
+------------------
+
+```q
+/ Create sample tick data
+ticks:([]
+    time:09:30:00 09:30:01 09:30:02;
+    sym:`AAPL`AAPL`GOOG;
+    price:150.0 150.5 2800.0;
+    size:100 200 50)
+
+/ Time-weighted average price (TWAP)
+select twap:wavg[time;price] by sym from ticks
+
+/ VWAP
+select vwap:size wavg price by sym from ticks
+
+/ OHLCV bars
+select o:first price, h:max price, l:min price,
+       c:last price, v:sum size
+    by 5 xbar time.minute, sym
+    from trades
+
+/ As-of join (time-aligned join)
+aj[`sym`time;trades;quotes]
+
+/ Window join (quotes in 100ms before trade)
+wj[-100 0+\:trades.time; `sym`time; trades;
+    (quotes; (max;`ask); (min;`bid))]
+```
+
+================================================================================
+                   4. SCHEMA DESIGN FOR TICK DATA
+================================================================================
+
+TICK DATA SCHEMA:
+-----------------
+
+```q
+/ Define tick table schema
+tick:([]
+    time:`timestamp$();        / nanosecond precision
+    sym:`symbol$();            / instrument
+    exch:`symbol$();           / exchange
+    bid:`float$();             / best bid
+    ask:`float$();             / best ask
+    bidsz:`float$();           / bid size
+    asksz:`float$()            / ask size
+)
+
+/ Trade table schema
+trade:([]
+    time:`timestamp$();
+    sym:`symbol$();
+    exch:`symbol$();
+    price:`float$();
+    size:`float$();
+    side:`symbol$();           / `B or `S
+    tid:`long$()               / trade ID
+)
+
+/ Order book depth schema
+depth:([]
+    time:`timestamp$();
+    sym:`symbol$();
+    exch:`symbol$();
+    side:`symbol$();
+    level:`int$();
+    price:`float$();
+    size:`float$();
+    norders:`int$()
+)
+```
+
+PARTITIONED DATABASE:
+---------------------
+
+```q
+/ kdb+ partitions by date automatically
+/ Directory structure:
+/ /data/hdb/
+/   2025.11.24/
+/     tick/
+/     trade/
+/   2025.11.25/
+/     tick/
+/     trade/
+/   2025.11.26/
+/     tick/
+/     trade/
+/   sym (symbol file)
+
+/ Create partitioned database
+/ Save today's data
+`:./hdb/2025.11.26/tick/ set .Q.en[`:./hdb] tick
+`:./hdb/2025.11.26/trade/ set .Q.en[`:./hdb] trade
+
+/ Load partitioned database
+\l ./hdb
+
+/ Query across partitions
+select from tick where date within 2025.11.24 2025.11.26, sym=`AAPL
+```
+
+SEGMENTED DATABASE:
+-------------------
+
+```q
+/ For very large databases, segment across disks
+/ /data/seg1/
+/ /data/seg2/
+/ /data/seg3/
+
+/ par.txt file lists segments
+/ /data/hdb/par.txt:
+/ /data/seg1
+/ /data/seg2
+/ /data/seg3
+
+/ Each segment has same partition structure
+/ Enables parallel I/O
+```
+
+================================================================================
+                   5. C++ INTEGRATION
+================================================================================
+
+C++ KDB+ CLIENT:
+----------------
+
+```cpp
+// Using the official c.o interface
+// Link with: c.o or libkdb.a
+
+extern "C" {
+    #include "k.h"  // kdb+ C API header
+}
+
+#include <string>
+#include <vector>
+
+namespace kdb {
+
+class Connection {
+public:
+    Connection(const std::string& host, int port,
+               const std::string& user = "") {
+        handle_ = khpun(host.c_str(), port,
+                        user.empty() ? "" : user.c_str(),
+                        5000);  // 5 second timeout
+        if (handle_ <= 0) {
+            throw std::runtime_error("Failed to connect to kdb+");
+        }
+    }
+
+    ~Connection() {
+        if (handle_ > 0) {
+            kclose(handle_);
+        }
+    }
+
+    // Execute q expression
+    K execute(const std::string& query) {
+        K result = k(handle_, const_cast<char*>(query.c_str()), (K)0);
+        if (!result) {
+            throw std::runtime_error("Query execution failed");
+        }
+        if (result->t == -128) {  // Error
+            std::string error(result->s);
+            r0(result);
+            throw std::runtime_error(error);
+        }
+        return result;
+    }
+
+    // Insert tick data
+    void insert_tick(
+        int64_t time_ns,
+        const std::string& symbol,
+        const std::string& exchange,
+        double bid,
+        double ask,
+        double bid_size,
+        double ask_size
+    ) {
+        // Build row as mixed list
+        K row = knk(7,
+            ktj(-KP, time_ns),           // timestamp
+            ks(const_cast<char*>(symbol.c_str())),    // sym
+            ks(const_cast<char*>(exchange.c_str())),  // exch
+            kf(bid),                      // bid
+            kf(ask),                      // ask
+            kf(bid_size),                 // bidsz
+            kf(ask_size)                  // asksz
+        );
+
+        K result = k(handle_, ".u.upd", ks("tick"), row, (K)0);
+        if (result) r0(result);
+    }
+
+    // Batch insert for better performance
+    void insert_ticks(const std::vector<Tick>& ticks) {
+        size_t n = ticks.size();
+
+        // Create column vectors
+        K times = ktn(KP, n);
+        K syms = ktn(KS, n);
+        K exchs = ktn(KS, n);
+        K bids = ktn(KF, n);
+        K asks = ktn(KF, n);
+        K bidszs = ktn(KF, n);
+        K askszs = ktn(KF, n);
+
+        for (size_t i = 0; i < n; i++) {
+            kJ(times)[i] = ticks[i].time_ns;
+            kS(syms)[i] = ss(const_cast<char*>(ticks[i].symbol.c_str()));
+            kS(exchs)[i] = ss(const_cast<char*>(ticks[i].exchange.c_str()));
+            kF(bids)[i] = ticks[i].bid;
+            kF(asks)[i] = ticks[i].ask;
+            kF(bidszs)[i] = ticks[i].bid_size;
+            kF(askszs)[i] = ticks[i].ask_size;
+        }
+
+        // Create table
+        K cols = ktn(KS, 7);
+        kS(cols)[0] = ss("time");
+        kS(cols)[1] = ss("sym");
+        kS(cols)[2] = ss("exch");
+        kS(cols)[3] = ss("bid");
+        kS(cols)[4] = ss("ask");
+        kS(cols)[5] = ss("bidsz");
+        kS(cols)[6] = ss("asksz");
+
+        K vals = knk(7, times, syms, exchs, bids, asks, bidszs, askszs);
+        K table = xT(xD(cols, vals));
+
+        K result = k(handle_, ".u.upd", ks("tick"), table, (K)0);
+        if (result) r0(result);
+    }
+
+    // Query and get results
+    struct QueryResult {
+        std::vector<std::string> columns;
+        std::vector<std::vector<double>> data;
+    };
+
+    QueryResult query_doubles(const std::string& q) {
+        K result = execute(q);
+        QueryResult qr;
+
+        if (result->t == XT) {  // Table
+            K dict = result->k;
+            K keys = kK(dict)[0];
+            K vals = kK(dict)[1];
+
+            // Get column names
+            for (int i = 0; i < keys->n; i++) {
+                qr.columns.push_back(kS(keys)[i]);
+            }
+
+            // Get data (assuming all float columns)
+            for (int i = 0; i < vals->n; i++) {
+                K col = kK(vals)[i];
+                std::vector<double> col_data;
+                if (col->t == KF) {
+                    for (int j = 0; j < col->n; j++) {
+                        col_data.push_back(kF(col)[j]);
+                    }
+                }
+                qr.data.push_back(col_data);
+            }
+        }
+
+        r0(result);
+        return qr;
+    }
+
+private:
+    I handle_;
+};
+
+}  // namespace kdb
+```
+
+USAGE EXAMPLE:
+--------------
+
+```cpp
+int main() {
+    // Connect to kdb+
+    kdb::Connection conn("localhost", 5000);
+
+    // Insert single tick
+    conn.insert_tick(
+        1732614000000000000,  // timestamp in nanoseconds
+        "BTCUSDT",
+        "BINANCE",
+        42000.50,             // bid
+        42001.00,             // ask
+        10.5,                 // bid size
+        8.2                   // ask size
+    );
+
+    // Batch insert
+    std::vector<Tick> ticks;
+    // ... populate ticks ...
+    conn.insert_ticks(ticks);
+
+    // Query
+    auto result = conn.query_doubles(
+        "select avg bid, avg ask by 5 xbar time.minute from tick "
+        "where date=.z.d, sym=`BTCUSDT"
+    );
+
+    return 0;
+}
+```
+
+================================================================================
+                   6. QUERY PATTERNS
+================================================================================
+
+COMMON HFT QUERIES IN Q:
+------------------------
+
+```q
+/ --- BASIC QUERIES ---
+
+/ Get latest tick for each symbol
+select last bid, last ask, last time by sym from tick
+
+/ Get ticks in time range
+select from tick where time within 09:30 09:31, sym=`BTCUSDT
+
+/ --- VWAP ---
+
+/ Simple VWAP
+select vwap: size wavg price by sym from trade
+
+/ Rolling VWAP (last N trades)
+select vwap: (sum price*size) % sum size
+    by sym from trade
+    where i >= count[trade] - 1000
+
+/ Time-bucketed VWAP
+select vwap: size wavg price
+    by 5 xbar time.minute, sym
+    from trade
+
+/ --- OHLCV BARS ---
+
+/ 1-minute bars
+select o:first price, h:max price, l:min price, c:last price, v:sum size
+    by 1 xbar time.minute, sym
+    from trade
+
+/ 5-minute bars
+ohlcv5:{[t;s]
+    select o:first price, h:max price, l:min price,
+           c:last price, v:sum size, n:count i
+    by 5 xbar time.minute
+    from t where sym=s
+}
+
+/ --- SPREAD ANALYSIS ---
+
+/ Average spread
+select avgSpread: avg ask-bid by sym from tick
+
+/ Spread distribution
+select spreadBps: 10000*(ask-bid)%0.5*(bid+ask) by sym from tick
+
+/ --- TIME-WEIGHTED METRICS ---
+
+/ Time-weighted average price
+select twap: time wavg price by sym from trade
+
+/ Time-weighted spread
+twSpread:{[t;s]
+    data: select time, spread:ask-bid from t where sym=s;
+    durations: 1_ deltas data`time;
+    (durations wavg 1_ data`spread)
+}
+
+/ --- AS-OF JOIN (Critical for HFT) ---
+
+/ Join trades with most recent quote
+aj[`sym`time; trade; tick]
+
+/ Result includes quote at time of each trade
+
+/ --- WINDOW JOIN ---
+
+/ Get quotes in 100ms window before each trade
+wj[-0D00:00:00.100000000 0 +\: trade`time;
+   `sym`time;
+   trade;
+   (tick; (max;`ask); (min;`bid); (avg;`bid); (avg;`ask))]
+
+/ --- ORDER BOOK RECONSTRUCTION ---
+
+/ Get order book snapshot at specific time
+bookAt:{[t;s;dt]
+    select price, size by side
+    from depth
+    where time<=dt, sym=s,
+    fby[(last;i);([]side;price)]
+}
+
+/ --- TICK IMBALANCE ---
+
+/ Order imbalance
+select imbalance: (bidsz-asksz)%(bidsz+asksz) by sym from tick
+
+/ Volume imbalance
+select volImb: sum ?[side=`B;size;neg size] by sym from trade
+```
+
+================================================================================
+                   7. PERFORMANCE OPTIMIZATION
+================================================================================
+
+OPTIMIZATION TECHNIQUES:
+------------------------
+
+```q
+/ 1. USE ATTRIBUTES
+
+/ Sorted attribute on time (mandatory for partitioned data)
+`s#tick`time
+
+/ Grouped attribute on sym (faster lookups)
+`g#tick`sym
+
+/ Unique attribute for IDs
+`u#trade`tid
+
+/ 2. AVOID ANTI-PATTERNS
+
+/ BAD: Select * with heavy filter
+select from tick where sym=`AAPL, price>100
+
+/ GOOD: Constrain partition first
+select from tick where date=.z.d, sym=`AAPL, price>100
+
+/ BAD: Row-by-row processing
+{update newcol:myFunc each x from tick}
+
+/ GOOD: Vectorized operations
+update newcol:myVectorFunc x from tick
+
+/ 3. EFFICIENT DATA TYPES
+
+/ Use symbols, not strings
+`AAPL         / Good: interned, fast comparison
+"AAPL"        / Bad: character array, slow
+
+/ Use fixed-width types
+`int$()       / 4 bytes
+`float$()     / 8 bytes
+
+/ 4. MEMORY MAPPING
+
+/ Map file to memory instead of loading
+tick: get `:./hdb/2025.11.26/tick/  / Full load
+tick: 1: `:./hdb/2025.11.26/tick/   / Memory mapped
+
+/ 5. PARALLEL EXECUTION
+
+/ Peach for parallel each
+{select from tick where date=x} peach 2025.11.24 2025.11.25 2025.11.26
+
+/ Slaves for parallel queries
+\s 8  / Use 8 slave threads
+```
+
+BENCHMARKING:
+-------------
+
+```q
+/ Time a query
+\t select avg price by sym from trade where date=.z.d
+
+/ Time 100 iterations
+\t:100 select avg price by sym from trade where date=.z.d
+
+/ Memory usage
+.Q.w[]  / Show memory stats
+
+/ Table size
+count trade           / Row count
+-22!trade             / Compressed size
+-21!`:./hdb/trade     / On-disk size
+```
+
+================================================================================
+                   8. PRODUCTION DEPLOYMENT
+================================================================================
+
+PRODUCTION ARCHITECTURE:
+------------------------
+
+```
+                    ┌─────────────────────────────────────────┐
+                    │           LOAD BALANCER                 │
+                    └──────────────────┬──────────────────────┘
+                                       │
+           ┌───────────────────────────┼───────────────────────────┐
+           │                           │                           │
+           ▼                           ▼                           ▼
+    ┌─────────────┐             ┌─────────────┐             ┌─────────────┐
+    │   RDB 1     │             │   RDB 2     │             │   RDB 3     │
+    │ (Real-time) │             │ (Real-time) │             │ (Real-time) │
+    └──────┬──────┘             └──────┬──────┘             └──────┬──────┘
+           │                           │                           │
+           └───────────────────────────┼───────────────────────────┘
+                                       │
+                                       ▼
+                            ┌─────────────────────┐
+                            │   TICKERPLANT       │
+                            │   (Pub/Sub Hub)     │
+                            └──────────┬──────────┘
+                                       │
+           ┌───────────────────────────┼───────────────────────────┐
+           │                           │                           │
+           ▼                           ▼                           ▼
+    ┌─────────────┐             ┌─────────────┐             ┌─────────────┐
+    │   HDB 1     │             │   HDB 2     │             │   HDB 3     │
+    │ (Historical)│             │ (Historical)│             │ (Historical)│
+    └─────────────┘             └─────────────┘             └─────────────┘
+```
+
+COMPONENT ROLES:
+----------------
+
+1. TICKERPLANT (TP)
+   - Receives all incoming ticks
+   - Journals to disk (WAL)
+   - Publishes to subscribers
+
+2. REAL-TIME DATABASE (RDB)
+   - Subscribes to tickerplant
+   - Holds today's data in memory
+   - Serves real-time queries
+
+3. HISTORICAL DATABASE (HDB)
+   - Partitioned by date
+   - Compressed and indexed
+   - Serves historical queries
+
+END-OF-DAY PROCESS:
+-------------------
+
+```q
+/ EOD script runs at market close
+eod:{
+    / 1. Stop tickerplant publishing
+    neg[tp_handle]"system\"t 0\"";
+
+    / 2. Flush RDB to disk
+    .Q.dpft[`:./hdb; .z.d; `sym; `tick];
+    .Q.dpft[`:./hdb; .z.d; `sym; `trade];
+
+    / 3. Clear RDB memory
+    delete tick from `.;
+    delete trade from `.;
+    .Q.gc[];
+
+    / 4. Reload HDB
+    system "l ./hdb";
+
+    / 5. Resume tickerplant
+    neg[tp_handle]"system\"t 1\"";
+}
+```
+
+================================================================================
+                         END OF DOCUMENT
+================================================================================

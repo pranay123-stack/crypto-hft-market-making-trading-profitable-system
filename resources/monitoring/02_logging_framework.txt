@@ -1,0 +1,1147 @@
+COMPREHENSIVE LOGGING FRAMEWORK FOR HFT SYSTEMS
+==============================================
+
+TABLE OF CONTENTS
+-----------------
+1. Overview & Architecture
+2. spdlog Setup & Configuration
+3. Structured Logging Implementation
+4. Log Levels & Categories
+5. High-Performance Async Logging
+6. Log Rotation & Retention
+7. Correlation IDs & Tracing
+8. Regulatory Compliance Logging
+9. Log Aggregation & Analysis
+10. C++ Implementation Examples
+11. Production Best Practices
+
+============================================
+1. OVERVIEW & ARCHITECTURE
+============================================
+
+HFT Logging Architecture:
+-------------------------
+┌───────────────────────────────────────────────────────────┐
+│                  Trading Application                       │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐ │
+│  │ Order    │  │ Market   │  │ Risk     │  │ Position │ │
+│  │ Engine   │  │ Data     │  │ Manager  │  │ Manager  │ │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘ │
+│       │             │              │              │        │
+│       └─────────────┴──────────────┴──────────────┘        │
+│                           │                                 │
+│                   ┌───────▼────────┐                       │
+│                   │  Logger Factory │                       │
+│                   │  (Thread-Local) │                       │
+│                   └───────┬────────┘                       │
+└───────────────────────────┼────────────────────────────────┘
+                            │
+        ┌───────────────────┼───────────────────┐
+        │                   │                   │
+   ┌────▼─────┐      ┌─────▼──────┐     ┌─────▼──────┐
+   │ Console  │      │ File Sink  │     │  Network   │
+   │  Sink    │      │ (Rotating) │     │   Sink     │
+   │ (Debug)  │      │ (Async)    │     │ (Syslog)   │
+   └──────────┘      └─────┬──────┘     └─────┬──────┘
+                           │                   │
+                    ┌──────▼──────┐     ┌──────▼──────┐
+                    │ Local Disk  │     │   ELK/     │
+                    │ (Hot/Cold)  │     │  Splunk    │
+                    └─────────────┘     └────────────┘
+
+Logging Categories:
+-------------------
+1. AUDIT_LOG     : Regulatory compliance, all orders/fills
+2. TRADE_LOG     : Trade executions and lifecycle
+3. MARKET_DATA   : Market data updates (sampled)
+4. RISK_LOG      : Risk violations and warnings
+5. SYSTEM_LOG    : System events and errors
+6. PERFORMANCE   : Latency and throughput metrics
+7. DEBUG_LOG     : Detailed debugging information
+
+Key Requirements:
+-----------------
+- Ultra-low latency (<1 microsecond in critical path)
+- Thread-safe without contention
+- Structured format (JSON) for parsing
+- Regulatory compliance (MiFID II, SEC)
+- Correlation across distributed systems
+- Fast search and analysis capabilities
+
+============================================
+2. SPDLOG SETUP & CONFIGURATION
+============================================
+
+Installation & Dependencies:
+----------------------------
+# CMakeLists.txt
+find_package(spdlog REQUIRED)
+find_package(fmt REQUIRED)
+
+add_executable(trading_engine
+    src/main.cpp
+    src/logging/logger_factory.cpp
+)
+
+target_link_libraries(trading_engine
+    spdlog::spdlog
+    fmt::fmt
+)
+
+# Enable async logging
+target_compile_definitions(trading_engine PRIVATE
+    SPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_TRACE
+    SPDLOG_FMT_EXTERNAL
+)
+
+Basic Configuration:
+--------------------
+#include <spdlog/spdlog.h>
+#include <spdlog/async.h>
+#include <spdlog/sinks/rotating_file_sink.h>
+#include <spdlog/sinks/stdout_color_sinks.h>
+#include <spdlog/sinks/syslog_sink.h>
+#include <spdlog/sinks/daily_file_sink.h>
+
+class LoggingConfig {
+public:
+    // Log directories
+    static constexpr const char* AUDIT_DIR = "/var/log/hft/audit";
+    static constexpr const char* TRADE_DIR = "/var/log/hft/trades";
+    static constexpr const char* SYSTEM_DIR = "/var/log/hft/system";
+    static constexpr const char* DEBUG_DIR = "/var/log/hft/debug";
+
+    // File rotation settings
+    static constexpr size_t MAX_FILE_SIZE = 100 * 1024 * 1024;  // 100MB
+    static constexpr size_t MAX_FILES = 1000;
+
+    // Async queue settings
+    static constexpr size_t QUEUE_SIZE = 32768;  // Must be power of 2
+    static constexpr size_t THREAD_COUNT = 2;
+
+    // Flush settings
+    static constexpr int FLUSH_INTERVAL_SECONDS = 1;
+
+    // Log levels by category
+    static spdlog::level::level_enum getLogLevel(const std::string& category) {
+        static std::map<std::string, spdlog::level::level_enum> levels = {
+            {"audit", spdlog::level::info},
+            {"trade", spdlog::level::info},
+            {"market_data", spdlog::level::warn},
+            {"risk", spdlog::level::info},
+            {"system", spdlog::level::info},
+            {"performance", spdlog::level::debug},
+            {"debug", spdlog::level::debug}
+        };
+
+        auto it = levels.find(category);
+        return it != levels.end() ? it->second : spdlog::level::info;
+    }
+};
+
+void initializeLogging() {
+    // Initialize async thread pool
+    spdlog::init_thread_pool(LoggingConfig::QUEUE_SIZE,
+                             LoggingConfig::THREAD_COUNT);
+
+    // Set global flush interval
+    spdlog::flush_every(std::chrono::seconds(
+        LoggingConfig::FLUSH_INTERVAL_SECONDS));
+
+    // Set global pattern with microsecond precision
+    spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%f] [%^%l%$] [%n] [%t] %v");
+
+    // Create logging directories
+    system("mkdir -p /var/log/hft/{audit,trades,system,debug}");
+}
+
+============================================
+3. STRUCTURED LOGGING IMPLEMENTATION
+============================================
+
+Custom JSON Formatter:
+----------------------
+#include <nlohmann/json.hpp>
+#include <spdlog/pattern_formatter.h>
+
+class JsonFormatter : public spdlog::custom_flag_formatter {
+public:
+    void format(const spdlog::details::log_msg& msg,
+                const std::tm& tm,
+                spdlog::memory_buf_t& dest) override {
+
+        nlohmann::json log_entry;
+
+        // Timestamp with microsecond precision
+        auto now = std::chrono::system_clock::now();
+        auto micros = std::chrono::duration_cast<std::chrono::microseconds>(
+            now.time_since_epoch()).count();
+        log_entry["timestamp"] = micros;
+        log_entry["timestamp_iso"] = formatTimestamp(now);
+
+        // Log level
+        log_entry["level"] = spdlog::level::to_string_view(msg.level).data();
+
+        // Logger name (category)
+        log_entry["logger"] = std::string(msg.logger_name.begin(),
+                                          msg.logger_name.end());
+
+        // Thread ID
+        log_entry["thread_id"] = msg.thread_id;
+
+        // Message
+        log_entry["message"] = std::string(msg.payload.begin(),
+                                           msg.payload.end());
+
+        // Source location
+        if (msg.source.filename) {
+            log_entry["source"] = {
+                {"file", msg.source.filename},
+                {"line", msg.source.line},
+                {"function", msg.source.funcname}
+            };
+        }
+
+        std::string json_str = log_entry.dump();
+        dest.append(json_str.data(), json_str.data() + json_str.size());
+        dest.push_back('\n');
+    }
+
+    std::unique_ptr<custom_flag_formatter> clone() const override {
+        return std::make_unique<JsonFormatter>();
+    }
+
+private:
+    std::string formatTimestamp(const std::chrono::system_clock::time_point& tp) {
+        auto time_t = std::chrono::system_clock::to_time_t(tp);
+        std::tm tm = *std::gmtime(&time_t);
+
+        char buf[32];
+        std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &tm);
+
+        auto micros = std::chrono::duration_cast<std::chrono::microseconds>(
+            tp.time_since_epoch()).count() % 1000000;
+
+        return std::string(buf) + "." +
+               std::to_string(micros) + "Z";
+    }
+};
+
+Structured Logger Class:
+------------------------
+#include <map>
+#include <string>
+#include <variant>
+
+using LogValue = std::variant<std::string, int64_t, double, bool>;
+using LogContext = std::map<std::string, LogValue>;
+
+class StructuredLogger {
+private:
+    std::shared_ptr<spdlog::logger> logger_;
+    LogContext default_context_;
+
+public:
+    StructuredLogger(std::shared_ptr<spdlog::logger> logger)
+        : logger_(logger) {}
+
+    // Set default context fields
+    void setDefaultContext(const LogContext& context) {
+        default_context_ = context;
+    }
+
+    void addDefaultField(const std::string& key, const LogValue& value) {
+        default_context_[key] = value;
+    }
+
+    // Structured logging with context
+    template<typename... Args>
+    void log(spdlog::level::level_enum level,
+             const std::string& message,
+             const LogContext& context = {},
+             Args&&... args) {
+
+        nlohmann::json log_data;
+
+        // Add default context
+        for (const auto& [key, value] : default_context_) {
+            log_data[key] = valueToJson(value);
+        }
+
+        // Add message-specific context
+        for (const auto& [key, value] : context) {
+            log_data[key] = valueToJson(value);
+        }
+
+        // Add formatted message
+        log_data["msg"] = fmt::format(message, std::forward<Args>(args)...);
+
+        logger_->log(level, log_data.dump());
+    }
+
+    // Convenience methods
+    template<typename... Args>
+    void info(const std::string& msg, const LogContext& ctx = {}, Args&&... args) {
+        log(spdlog::level::info, msg, ctx, std::forward<Args>(args)...);
+    }
+
+    template<typename... Args>
+    void warn(const std::string& msg, const LogContext& ctx = {}, Args&&... args) {
+        log(spdlog::level::warn, msg, ctx, std::forward<Args>(args)...);
+    }
+
+    template<typename... Args>
+    void error(const std::string& msg, const LogContext& ctx = {}, Args&&... args) {
+        log(spdlog::level::err, msg, ctx, std::forward<Args>(args)...);
+    }
+
+    template<typename... Args>
+    void debug(const std::string& msg, const LogContext& ctx = {}, Args&&... args) {
+        log(spdlog::level::debug, msg, ctx, std::forward<Args>(args)...);
+    }
+
+private:
+    nlohmann::json valueToJson(const LogValue& value) {
+        return std::visit([](auto&& arg) -> nlohmann::json {
+            return arg;
+        }, value);
+    }
+};
+
+============================================
+4. HIGH-PERFORMANCE ASYNC LOGGING
+============================================
+
+Lock-Free Logger Implementation:
+---------------------------------
+#include <spdlog/async.h>
+#include <spdlog/sinks/basic_file_sink.h>
+
+class AsyncLoggerFactory {
+public:
+    static std::shared_ptr<spdlog::logger> createAsyncLogger(
+        const std::string& name,
+        const std::string& filename,
+        size_t queue_size = 32768,
+        spdlog::async_overflow_policy policy =
+            spdlog::async_overflow_policy::block) {
+
+        auto logger = spdlog::create_async<spdlog::sinks::rotating_file_sink_mt>(
+            name,
+            filename,
+            LoggingConfig::MAX_FILE_SIZE,
+            LoggingConfig::MAX_FILES,
+            false,  // rotate_on_open
+            queue_size,
+            policy
+        );
+
+        logger->set_level(LoggingConfig::getLogLevel(name));
+
+        return logger;
+    }
+};
+
+// Ultra-Low Latency Logger (Memory Mapped)
+class MemoryMappedLogger {
+private:
+    int fd_;
+    char* mapped_region_;
+    size_t file_size_;
+    std::atomic<size_t> write_offset_{0};
+
+    static constexpr size_t MMAP_SIZE = 1024 * 1024 * 1024;  // 1GB
+
+public:
+    MemoryMappedLogger(const std::string& filename) {
+        fd_ = open(filename.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (fd_ < 0) {
+            throw std::runtime_error("Failed to open log file");
+        }
+
+        // Pre-allocate file
+        if (ftruncate(fd_, MMAP_SIZE) < 0) {
+            throw std::runtime_error("Failed to allocate file");
+        }
+
+        // Memory map the file
+        mapped_region_ = static_cast<char*>(mmap(
+            nullptr, MMAP_SIZE, PROT_READ | PROT_WRITE,
+            MAP_SHARED, fd_, 0));
+
+        if (mapped_region_ == MAP_FAILED) {
+            throw std::runtime_error("Failed to mmap file");
+        }
+
+        file_size_ = MMAP_SIZE;
+    }
+
+    ~MemoryMappedLogger() {
+        if (mapped_region_) {
+            msync(mapped_region_, file_size_, MS_SYNC);
+            munmap(mapped_region_, file_size_);
+        }
+        if (fd_ >= 0) {
+            close(fd_);
+        }
+    }
+
+    // Write log entry (lock-free)
+    void write(const char* data, size_t length) {
+        size_t offset = write_offset_.fetch_add(length,
+                                                 std::memory_order_relaxed);
+
+        if (offset + length > file_size_) {
+            // File full - in production, rotate or handle appropriately
+            return;
+        }
+
+        memcpy(mapped_region_ + offset, data, length);
+    }
+
+    void flush() {
+        size_t current_offset = write_offset_.load(std::memory_order_acquire);
+        msync(mapped_region_, current_offset, MS_SYNC);
+    }
+};
+
+// Ring Buffer Logger (Zero-Copy)
+template<size_t Size>
+class RingBufferLogger {
+private:
+    struct Entry {
+        uint64_t timestamp;
+        char data[256];
+        size_t length;
+    };
+
+    std::array<Entry, Size> buffer_;
+    std::atomic<size_t> write_index_{0};
+    std::atomic<size_t> read_index_{0};
+
+    std::thread flush_thread_;
+    std::atomic<bool> running_{true};
+
+public:
+    RingBufferLogger(const std::string& filename) {
+        flush_thread_ = std::thread(&RingBufferLogger::flushWorker,
+                                    this, filename);
+    }
+
+    ~RingBufferLogger() {
+        running_ = false;
+        if (flush_thread_.joinable()) {
+            flush_thread_.join();
+        }
+    }
+
+    template<typename... Args>
+    void log(const char* format, Args&&... args) {
+        size_t write_idx = write_index_.fetch_add(1, std::memory_order_relaxed) % Size;
+
+        Entry& entry = buffer_[write_idx];
+        entry.timestamp = getTimestampMicros();
+        entry.length = snprintf(entry.data, sizeof(entry.data),
+                               format, std::forward<Args>(args)...);
+    }
+
+private:
+    void flushWorker(const std::string& filename) {
+        std::ofstream file(filename, std::ios::app);
+
+        while (running_) {
+            size_t read_idx = read_index_.load(std::memory_order_acquire);
+            size_t write_idx = write_index_.load(std::memory_order_acquire);
+
+            while (read_idx != write_idx) {
+                const Entry& entry = buffer_[read_idx % Size];
+                file.write(entry.data, entry.length);
+
+                read_idx++;
+                read_index_.store(read_idx, std::memory_order_release);
+            }
+
+            file.flush();
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+
+    uint64_t getTimestampMicros() {
+        return std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::high_resolution_clock::now().time_since_epoch()
+        ).count();
+    }
+};
+
+============================================
+5. LOGGER FACTORY & CATEGORIES
+============================================
+
+Complete Logger Factory:
+------------------------
+#include <unordered_map>
+#include <mutex>
+
+class LoggerFactory {
+private:
+    static std::unordered_map<std::string, std::shared_ptr<StructuredLogger>> loggers_;
+    static std::mutex mutex_;
+
+public:
+    static void initialize() {
+        initializeLogging();
+
+        // Create audit logger (synchronous for compliance)
+        createAuditLogger();
+
+        // Create trade logger (async)
+        createTradeLogger();
+
+        // Create market data logger (async with sampling)
+        createMarketDataLogger();
+
+        // Create risk logger (async)
+        createRiskLogger();
+
+        // Create system logger (async)
+        createSystemLogger();
+
+        // Create performance logger (async)
+        createPerformanceLogger();
+
+        // Create debug logger (async, verbose)
+        createDebugLogger();
+    }
+
+    static std::shared_ptr<StructuredLogger> getLogger(const std::string& name) {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        auto it = loggers_.find(name);
+        if (it != loggers_.end()) {
+            return it->second;
+        }
+
+        throw std::runtime_error("Logger not found: " + name);
+    }
+
+    static std::shared_ptr<StructuredLogger> getAuditLogger() {
+        return getLogger("audit");
+    }
+
+    static std::shared_ptr<StructuredLogger> getTradeLogger() {
+        return getLogger("trade");
+    }
+
+    static std::shared_ptr<StructuredLogger> getMarketDataLogger() {
+        return getLogger("market_data");
+    }
+
+    static std::shared_ptr<StructuredLogger> getRiskLogger() {
+        return getLogger("risk");
+    }
+
+    static std::shared_ptr<StructuredLogger> getSystemLogger() {
+        return getLogger("system");
+    }
+
+    static std::shared_ptr<StructuredLogger> getPerformanceLogger() {
+        return getLogger("performance");
+    }
+
+    static std::shared_ptr<StructuredLogger> getDebugLogger() {
+        return getLogger("debug");
+    }
+
+private:
+    static void createAuditLogger() {
+        // Synchronous logger for regulatory compliance
+        auto console_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
+        auto file_sink = std::make_shared<spdlog::sinks::daily_file_sink_mt>(
+            LoggingConfig::AUDIT_DIR + std::string("/audit.log"),
+            0, 0  // Rotate at midnight
+        );
+
+        std::vector<spdlog::sink_ptr> sinks{console_sink, file_sink};
+        auto logger = std::make_shared<spdlog::logger>(
+            "audit", sinks.begin(), sinks.end());
+
+        logger->set_level(spdlog::level::info);
+        logger->flush_on(spdlog::level::info);  // Flush immediately
+
+        spdlog::register_logger(logger);
+
+        auto structured_logger = std::make_shared<StructuredLogger>(logger);
+        structured_logger->setDefaultContext({
+            {"category", std::string("audit")},
+            {"host", getHostname()},
+            {"process_id", static_cast<int64_t>(getpid())}
+        });
+
+        loggers_["audit"] = structured_logger;
+    }
+
+    static void createTradeLogger() {
+        auto logger = spdlog::create_async<spdlog::sinks::rotating_file_sink_mt>(
+            "trade",
+            LoggingConfig::TRADE_DIR + std::string("/trade.log"),
+            LoggingConfig::MAX_FILE_SIZE,
+            LoggingConfig::MAX_FILES
+        );
+
+        logger->set_level(spdlog::level::info);
+
+        auto structured_logger = std::make_shared<StructuredLogger>(logger);
+        structured_logger->setDefaultContext({
+            {"category", std::string("trade")},
+            {"host", getHostname()}
+        });
+
+        loggers_["trade"] = structured_logger;
+    }
+
+    static void createMarketDataLogger() {
+        // High-throughput logger with sampling
+        auto logger = spdlog::create_async<spdlog::sinks::rotating_file_sink_mt>(
+            "market_data",
+            LoggingConfig::SYSTEM_DIR + std::string("/market_data.log"),
+            LoggingConfig::MAX_FILE_SIZE,
+            LoggingConfig::MAX_FILES,
+            false,
+            65536,  // Larger queue for high-frequency data
+            spdlog::async_overflow_policy::overrun_oldest  // Drop old messages
+        );
+
+        logger->set_level(spdlog::level::warn);  // Only warnings/errors by default
+
+        auto structured_logger = std::make_shared<StructuredLogger>(logger);
+        structured_logger->setDefaultContext({
+            {"category", std::string("market_data")},
+            {"host", getHostname()}
+        });
+
+        loggers_["market_data"] = structured_logger;
+    }
+
+    static void createRiskLogger() {
+        auto logger = spdlog::create_async<spdlog::sinks::rotating_file_sink_mt>(
+            "risk",
+            LoggingConfig::SYSTEM_DIR + std::string("/risk.log"),
+            LoggingConfig::MAX_FILE_SIZE,
+            LoggingConfig::MAX_FILES
+        );
+
+        logger->set_level(spdlog::level::info);
+        logger->flush_on(spdlog::level::warn);  // Flush on warnings
+
+        auto structured_logger = std::make_shared<StructuredLogger>(logger);
+        structured_logger->setDefaultContext({
+            {"category", std::string("risk")},
+            {"host", getHostname()}
+        });
+
+        loggers_["risk"] = structured_logger;
+    }
+
+    static void createSystemLogger() {
+        auto logger = spdlog::create_async<spdlog::sinks::rotating_file_sink_mt>(
+            "system",
+            LoggingConfig::SYSTEM_DIR + std::string("/system.log"),
+            LoggingConfig::MAX_FILE_SIZE,
+            LoggingConfig::MAX_FILES
+        );
+
+        logger->set_level(spdlog::level::info);
+
+        auto structured_logger = std::make_shared<StructuredLogger>(logger);
+        structured_logger->setDefaultContext({
+            {"category", std::string("system")},
+            {"host", getHostname()}
+        });
+
+        loggers_["system"] = structured_logger;
+    }
+
+    static void createPerformanceLogger() {
+        auto logger = spdlog::create_async<spdlog::sinks::rotating_file_sink_mt>(
+            "performance",
+            LoggingConfig::SYSTEM_DIR + std::string("/performance.log"),
+            LoggingConfig::MAX_FILE_SIZE,
+            LoggingConfig::MAX_FILES
+        );
+
+        logger->set_level(spdlog::level::debug);
+
+        auto structured_logger = std::make_shared<StructuredLogger>(logger);
+        structured_logger->setDefaultContext({
+            {"category", std::string("performance")},
+            {"host", getHostname()}
+        });
+
+        loggers_["performance"] = structured_logger;
+    }
+
+    static void createDebugLogger() {
+        auto console_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
+        auto file_sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
+            LoggingConfig::DEBUG_DIR + std::string("/debug.log"),
+            LoggingConfig::MAX_FILE_SIZE,
+            LoggingConfig::MAX_FILES
+        );
+
+        std::vector<spdlog::sink_ptr> sinks{console_sink, file_sink};
+        auto logger = std::make_shared<spdlog::async_logger>(
+            "debug", sinks.begin(), sinks.end(),
+            spdlog::thread_pool(),
+            spdlog::async_overflow_policy::block
+        );
+
+        logger->set_level(spdlog::level::trace);
+        spdlog::register_logger(logger);
+
+        auto structured_logger = std::make_shared<StructuredLogger>(logger);
+        structured_logger->setDefaultContext({
+            {"category", std::string("debug")},
+            {"host", getHostname()}
+        });
+
+        loggers_["debug"] = structured_logger;
+    }
+
+    static std::string getHostname() {
+        char hostname[256];
+        gethostname(hostname, sizeof(hostname));
+        return std::string(hostname);
+    }
+};
+
+std::unordered_map<std::string, std::shared_ptr<StructuredLogger>>
+    LoggerFactory::loggers_;
+std::mutex LoggerFactory::mutex_;
+
+============================================
+6. CORRELATION IDS & DISTRIBUTED TRACING
+============================================
+
+Request Context with Correlation:
+----------------------------------
+#include <random>
+#include <sstream>
+#include <iomanip>
+
+class CorrelationContext {
+private:
+    std::string correlation_id_;
+    std::string parent_id_;
+    std::string span_id_;
+
+    static thread_local std::unique_ptr<CorrelationContext> current_context_;
+
+public:
+    CorrelationContext() {
+        correlation_id_ = generateUUID();
+        span_id_ = generateShortID();
+    }
+
+    explicit CorrelationContext(const std::string& correlation_id)
+        : correlation_id_(correlation_id) {
+        span_id_ = generateShortID();
+    }
+
+    static void set(std::unique_ptr<CorrelationContext> context) {
+        current_context_ = std::move(context);
+    }
+
+    static CorrelationContext* get() {
+        if (!current_context_) {
+            current_context_ = std::make_unique<CorrelationContext>();
+        }
+        return current_context_.get();
+    }
+
+    const std::string& getCorrelationId() const { return correlation_id_; }
+    const std::string& getParentId() const { return parent_id_; }
+    const std::string& getSpanId() const { return span_id_; }
+
+    void setParentId(const std::string& parent_id) { parent_id_ = parent_id; }
+
+    LogContext toLogContext() const {
+        return {
+            {"correlation_id", correlation_id_},
+            {"span_id", span_id_},
+            {"parent_id", parent_id_}
+        };
+    }
+
+private:
+    static std::string generateUUID() {
+        std::random_device rd;
+        std::mt19937_64 gen(rd());
+        std::uniform_int_distribution<uint64_t> dis;
+
+        uint64_t high = dis(gen);
+        uint64_t low = dis(gen);
+
+        std::ostringstream oss;
+        oss << std::hex << std::setfill('0')
+            << std::setw(16) << high
+            << std::setw(16) << low;
+
+        return oss.str();
+    }
+
+    static std::string generateShortID() {
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_int_distribution<uint32_t> dis;
+
+        std::ostringstream oss;
+        oss << std::hex << std::setfill('0')
+            << std::setw(8) << dis(gen);
+
+        return oss.str();
+    }
+};
+
+thread_local std::unique_ptr<CorrelationContext>
+    CorrelationContext::current_context_;
+
+// RAII Span for automatic logging
+class LogSpan {
+private:
+    std::string operation_;
+    std::chrono::high_resolution_clock::time_point start_;
+    LogContext context_;
+    std::shared_ptr<StructuredLogger> logger_;
+
+public:
+    LogSpan(std::shared_ptr<StructuredLogger> logger,
+            const std::string& operation,
+            const LogContext& context = {})
+        : operation_(operation),
+          start_(std::chrono::high_resolution_clock::now()),
+          context_(context),
+          logger_(logger) {
+
+        // Add correlation context
+        auto* corr_ctx = CorrelationContext::get();
+        auto corr_context = corr_ctx->toLogContext();
+        context_.insert(corr_context.begin(), corr_context.end());
+
+        context_["operation"] = operation_;
+        context_["event"] = std::string("span_start");
+
+        logger_->info("Starting operation: {}", context_, operation_);
+    }
+
+    ~LogSpan() {
+        auto end = std::chrono::high_resolution_clock::now();
+        auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            end - start_).count();
+
+        context_["event"] = std::string("span_end");
+        context_["duration_us"] = duration_us;
+
+        logger_->info("Completed operation: {} in {} us",
+                     context_, operation_, duration_us);
+    }
+
+    void addAttribute(const std::string& key, const LogValue& value) {
+        context_[key] = value;
+    }
+
+    void setError(const std::string& error_message) {
+        context_["error"] = error_message;
+        context_["error_occurred"] = true;
+    }
+};
+
+============================================
+7. REGULATORY COMPLIANCE LOGGING
+============================================
+
+Order Lifecycle Logging:
+-------------------------
+class AuditLogger {
+private:
+    std::shared_ptr<StructuredLogger> logger_;
+
+public:
+    AuditLogger() : logger_(LoggerFactory::getAuditLogger()) {}
+
+    void logOrderNew(const Order& order) {
+        LogContext ctx = {
+            {"event_type", std::string("ORDER_NEW")},
+            {"order_id", order.id},
+            {"client_order_id", order.client_id},
+            {"symbol", order.symbol},
+            {"exchange", order.exchange},
+            {"side", order.side},
+            {"type", order.type},
+            {"quantity", order.quantity},
+            {"price", order.price},
+            {"tif", order.time_in_force},
+            {"strategy", order.strategy},
+            {"trader_id", order.trader_id},
+            {"account", order.account}
+        };
+
+        auto* corr_ctx = CorrelationContext::get();
+        auto corr_context = corr_ctx->toLogContext();
+        ctx.insert(corr_context.begin(), corr_context.end());
+
+        logger_->info("New order", ctx);
+    }
+
+    void logOrderAck(const std::string& order_id,
+                     const std::string& exchange_order_id,
+                     uint64_t latency_us) {
+        LogContext ctx = {
+            {"event_type", std::string("ORDER_ACK")},
+            {"order_id", order_id},
+            {"exchange_order_id", exchange_order_id},
+            {"latency_us", static_cast<int64_t>(latency_us)}
+        };
+
+        logger_->info("Order acknowledged", ctx);
+    }
+
+    void logOrderFill(const Fill& fill) {
+        LogContext ctx = {
+            {"event_type", std::string("ORDER_FILL")},
+            {"order_id", fill.order_id},
+            {"exchange_order_id", fill.exchange_order_id},
+            {"exec_id", fill.exec_id},
+            {"symbol", fill.symbol},
+            {"side", fill.side},
+            {"fill_quantity", fill.quantity},
+            {"fill_price", fill.price},
+            {"leaves_quantity", fill.leaves_qty},
+            {"cumulative_quantity", fill.cumulative_qty},
+            {"fees", fill.fees},
+            {"fee_currency", fill.fee_currency},
+            {"liquidity_flag", fill.liquidity_flag}
+        };
+
+        logger_->info("Order filled", ctx);
+    }
+
+    void logOrderCancel(const std::string& order_id,
+                        const std::string& reason) {
+        LogContext ctx = {
+            {"event_type", std::string("ORDER_CANCEL")},
+            {"order_id", order_id},
+            {"cancel_reason", reason}
+        };
+
+        logger_->info("Order canceled", ctx);
+    }
+
+    void logOrderReject(const Order& order, const std::string& reason) {
+        LogContext ctx = {
+            {"event_type", std::string("ORDER_REJECT")},
+            {"order_id", order.id},
+            {"client_order_id", order.client_id},
+            {"symbol", order.symbol},
+            {"exchange", order.exchange},
+            {"reject_reason", reason}
+        };
+
+        logger_->warn("Order rejected", ctx);
+    }
+
+    void logRiskViolation(const std::string& rule_name,
+                         const std::string& violation_details,
+                         const std::string& action_taken) {
+        LogContext ctx = {
+            {"event_type", std::string("RISK_VIOLATION")},
+            {"rule_name", rule_name},
+            {"violation_details", violation_details},
+            {"action_taken", action_taken}
+        };
+
+        logger_->warn("Risk violation detected", ctx);
+    }
+};
+
+============================================
+8. PRODUCTION USAGE EXAMPLES
+============================================
+
+Trading Engine Integration:
+----------------------------
+class TradingEngine {
+private:
+    std::shared_ptr<StructuredLogger> trade_logger_;
+    std::shared_ptr<StructuredLogger> perf_logger_;
+    AuditLogger audit_logger_;
+
+public:
+    TradingEngine() {
+        LoggerFactory::initialize();
+        trade_logger_ = LoggerFactory::getTradeLogger();
+        perf_logger_ = LoggerFactory::getPerformanceLogger();
+    }
+
+    void submitOrder(const Order& order) {
+        // Create correlation context for this order
+        auto correlation_ctx = std::make_unique<CorrelationContext>();
+        auto correlation_id = correlation_ctx->getCorrelationId();
+        CorrelationContext::set(std::move(correlation_ctx));
+
+        // Create span for the entire operation
+        LogSpan span(trade_logger_, "submit_order", {
+            {"order_id", order.id},
+            {"symbol", order.symbol},
+            {"exchange", order.exchange}
+        });
+
+        // Audit log
+        audit_logger_.logOrderNew(order);
+
+        // Performance tracking
+        auto start = std::chrono::high_resolution_clock::now();
+
+        try {
+            // Validate order
+            {
+                LogSpan validation_span(trade_logger_, "validate_order");
+                validateOrder(order);
+            }
+
+            // Send to exchange
+            {
+                LogSpan send_span(trade_logger_, "send_to_exchange");
+                sendToExchange(order);
+            }
+
+            auto end = std::chrono::high_resolution_clock::now();
+            auto latency_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                end - start).count();
+
+            // Performance log
+            perf_logger_->info("Order submitted successfully", {
+                {"order_id", order.id},
+                {"total_latency_us", latency_us}
+            });
+
+        } catch (const std::exception& e) {
+            span.setError(e.what());
+            trade_logger_->error("Failed to submit order: {}", {
+                {"order_id", order.id},
+                {"error", std::string(e.what())}
+            }, e.what());
+            throw;
+        }
+    }
+
+    void onOrderFill(const Fill& fill) {
+        LogContext ctx = {
+            {"order_id", fill.order_id},
+            {"symbol", fill.symbol},
+            {"fill_qty", fill.quantity},
+            {"fill_price", fill.price}
+        };
+
+        trade_logger_->info("Order fill received", ctx);
+        audit_logger_.logOrderFill(fill);
+    }
+};
+
+Log Sampling for High-Frequency Events:
+----------------------------------------
+class SamplingLogger {
+private:
+    std::shared_ptr<StructuredLogger> logger_;
+    std::atomic<uint64_t> counter_{0};
+    uint64_t sample_rate_;
+
+public:
+    SamplingLogger(std::shared_ptr<StructuredLogger> logger,
+                   uint64_t sample_rate = 1000)
+        : logger_(logger), sample_rate_(sample_rate) {}
+
+    template<typename... Args>
+    void log(spdlog::level::level_enum level,
+             const std::string& message,
+             const LogContext& context,
+             Args&&... args) {
+
+        uint64_t count = counter_.fetch_add(1, std::memory_order_relaxed);
+
+        if (count % sample_rate_ == 0) {
+            LogContext ctx = context;
+            ctx["sample_count"] = static_cast<int64_t>(count);
+            ctx["sample_rate"] = static_cast<int64_t>(sample_rate_);
+
+            logger_->log(level, message, ctx, std::forward<Args>(args)...);
+        }
+    }
+};
+
+// Usage for high-frequency market data
+class MarketDataHandler {
+private:
+    SamplingLogger sampling_logger_;
+
+public:
+    MarketDataHandler()
+        : sampling_logger_(LoggerFactory::getMarketDataLogger(), 10000) {}
+
+    void onMarketDataUpdate(const MarketData& data) {
+        // Only log every 10,000th update
+        sampling_logger_.log(spdlog::level::debug,
+            "Market data update",
+            {
+                {"symbol", data.symbol},
+                {"bid", data.bid},
+                {"ask", data.ask}
+            }
+        );
+    }
+};
+
+Performance Measurement:
+------------------------
+#define LOG_PERFORMANCE(logger, operation, ...) \
+    do { \
+        auto __start = std::chrono::high_resolution_clock::now(); \
+        __VA_ARGS__; \
+        auto __end = std::chrono::high_resolution_clock::now(); \
+        auto __duration_us = std::chrono::duration_cast<std::chrono::microseconds>( \
+            __end - __start).count(); \
+        logger->info("Performance: " operation, { \
+            {"operation", std::string(operation)}, \
+            {"duration_us", static_cast<int64_t>(__duration_us)} \
+        }); \
+    } while(0)
+
+// Usage
+void processOrder(const Order& order) {
+    auto perf_logger = LoggerFactory::getPerformanceLogger();
+
+    LOG_PERFORMANCE(perf_logger, "order_processing", {
+        validateOrder(order);
+        routeOrder(order);
+    });
+}
+
+Log Analysis Queries:
+---------------------
+# Search for specific order
+jq '.order_id == "ORD-123456"' /var/log/hft/audit/*.log
+
+# Calculate average latency
+jq -s '[.[] | select(.operation == "submit_order") | .duration_us] | add/length' \
+    /var/log/hft/system/performance.log
+
+# Find all errors for a symbol
+jq 'select(.level == "error" and .symbol == "BTC-USD")' \
+    /var/log/hft/trades/*.log
+
+# Count orders by exchange
+jq -s 'group_by(.exchange) | map({exchange: .[0].exchange, count: length})' \
+    /var/log/hft/audit/*.log
+
+# Find correlation chain
+CORR_ID="abc123..."
+grep -r "$CORR_ID" /var/log/hft/ | jq -s 'sort_by(.timestamp)'

@@ -1,0 +1,1017 @@
+================================================================================
+MEMORY SETTINGS FOR HFT OPTIMIZATION
+================================================================================
+
+OVERVIEW:
+Memory configuration is critical for predictable, ultra-low latency in HFT
+systems. This document covers huge pages, swappiness, virtual memory tuning,
+memory locking, and NUMA-aware memory allocation.
+
+TARGET METRICS:
+- Memory Access Latency: < 100 nanoseconds (L1 cache)
+- Page Fault Latency: Eliminated (pre-allocated, locked memory)
+- TLB Miss Penalty: Minimized via huge pages
+- Memory Bandwidth: > 100 GB/s (depends on hardware)
+- Swap Usage: 0 bytes (disabled or swappiness=0)
+
+================================================================================
+1. TRANSPARENT HUGE PAGES (THP) - MUST DISABLE
+================================================================================
+
+CONCEPT:
+Transparent Huge Pages automatically promote small pages to huge pages.
+While beneficial for throughput, THP causes unpredictable latency spikes
+due to background compaction and defragmentation.
+
+WHY DISABLE THP FOR HFT:
+- Compaction causes multi-millisecond stalls
+- Unpredictable background memory operations
+- Latency variance up to 100+ milliseconds
+- Non-deterministic behavior under memory pressure
+
+CHECK THP STATUS:
+----------------------------------------
+# Current THP setting
+cat /sys/kernel/mm/transparent_hugepage/enabled
+# Output: [always] madvise never
+
+cat /sys/kernel/mm/transparent_hugepage/defrag
+# Output: [always] defer defer+madvise madvise never
+
+# THP statistics
+cat /proc/vmstat | grep thp
+----------------------------------------
+
+DISABLE THP (RUNTIME):
+----------------------------------------
+# Disable THP
+echo never > /sys/kernel/mm/transparent_hugepage/enabled
+echo never > /sys/kernel/mm/transparent_hugepage/defrag
+
+# Verify
+cat /sys/kernel/mm/transparent_hugepage/enabled
+# Should show: always madvise [never]
+----------------------------------------
+
+DISABLE THP (PERSISTENT - REQUIRED):
+----------------------------------------
+# Method 1: Kernel parameter (RECOMMENDED)
+# Edit /etc/default/grub
+GRUB_CMDLINE_LINUX="transparent_hugepage=never"
+
+# Update grub
+update-grub  # Ubuntu/Debian
+grub2-mkconfig -o /boot/grub2/grub.cfg  # RHEL/CentOS
+
+# Reboot
+reboot
+
+# Method 2: Systemd service
+cat > /etc/systemd/system/disable-thp.service << EOF
+[Unit]
+Description=Disable Transparent Huge Pages
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'echo never > /sys/kernel/mm/transparent_hugepage/enabled'
+ExecStart=/bin/sh -c 'echo never > /sys/kernel/mm/transparent_hugepage/defrag'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl enable disable-thp.service
+systemctl start disable-thp.service
+
+# Method 3: rc.local
+cat >> /etc/rc.local << EOF
+echo never > /sys/kernel/mm/transparent_hugepage/enabled
+echo never > /sys/kernel/mm/transparent_hugepage/defrag
+EOF
+chmod +x /etc/rc.local
+----------------------------------------
+
+VALIDATION:
+----------------------------------------
+# Verify THP is disabled
+cat /sys/kernel/mm/transparent_hugepage/enabled
+# Should show: always madvise [never]
+
+# Check for THP usage (should be 0)
+grep -i thp /proc/vmstat
+# AnonHugePages should be 0
+
+# Monitor for THP events
+grep -i "khugepaged" /var/log/syslog
+# Should see no activity
+----------------------------------------
+
+================================================================================
+2. MANUAL HUGE PAGES (CRITICAL FOR HFT)
+================================================================================
+
+CONCEPT:
+Manual (explicit) huge pages provide:
+- Reduced TLB misses (fewer page table entries)
+- Eliminated page faults after allocation
+- Predictable memory performance
+- Lower page table walk overhead
+
+HUGE PAGE SIZES:
+- 2 MB pages: Standard huge pages (x86_64)
+- 1 GB pages: Gigantic pages (requires CPU support)
+
+CHECK HUGE PAGE SUPPORT:
+----------------------------------------
+# Check CPU support
+grep -E "pse|pdpe1gb" /proc/cpuinfo
+
+# pse: Page Size Extension (2MB pages)
+# pdpe1gb: 1GB pages support
+
+# Check current huge page configuration
+cat /proc/meminfo | grep -i huge
+
+# Output:
+# AnonHugePages:         0 kB
+# ShmemHugePages:        0 kB
+# HugePages_Total:       0
+# HugePages_Free:        0
+# HugePages_Rsvd:        0
+# HugePages_Surp:        0
+# Hugepagesize:       2048 kB
+# Hugetlb:               0 kB
+----------------------------------------
+
+ALLOCATE 2MB HUGE PAGES:
+----------------------------------------
+# Calculate required pages
+# Example: Need 16GB for trading application
+# 16GB / 2MB = 8192 pages
+
+# Allocate huge pages (runtime)
+echo 8192 > /proc/sys/vm/nr_hugepages
+
+# Verify allocation
+cat /proc/meminfo | grep HugePages_Total
+# Should show: HugePages_Total:    8192
+
+# Check if all pages were allocated
+cat /proc/meminfo | grep HugePages_Free
+# Should match HugePages_Total if nothing is using them yet
+
+# If allocation fails (fragmented memory), allocate at boot time
+----------------------------------------
+
+ALLOCATE 2MB HUGE PAGES (PERSISTENT):
+----------------------------------------
+# Method 1: sysctl
+echo "vm.nr_hugepages = 8192" >> /etc/sysctl.conf
+sysctl -p
+
+# Method 2: Kernel parameter (better - allocates at boot)
+# Edit /etc/default/grub
+GRUB_CMDLINE_LINUX="hugepagesz=2M hugepages=8192"
+
+update-grub && reboot
+
+# Method 3: systemd service (for per-NUMA-node allocation)
+cat > /etc/systemd/system/hugepages.service << EOF
+[Unit]
+Description=Allocate Huge Pages
+DefaultDependencies=no
+Before=sysinit.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'echo 4096 > /sys/devices/system/node/node0/hugepages/hugepages-2048kB/nr_hugepages'
+ExecStart=/bin/sh -c 'echo 4096 > /sys/devices/system/node/node1/hugepages/hugepages-2048kB/nr_hugepages'
+
+[Install]
+WantedBy=sysinit.target
+EOF
+
+systemctl enable hugepages.service
+----------------------------------------
+
+ALLOCATE 1GB HUGE PAGES:
+----------------------------------------
+# 1GB pages must be allocated at boot time (cannot be allocated runtime)
+
+# Calculate required pages
+# Example: 8GB needed = 8 x 1GB pages
+
+# Edit /etc/default/grub
+GRUB_CMDLINE_LINUX="default_hugepagesz=1G hugepagesz=1G hugepages=8"
+
+# Update and reboot
+update-grub && reboot
+
+# Verify
+cat /proc/meminfo | grep -i huge
+# Hugepagesize:    1048576 kB
+# HugePages_Total:       8
+
+# Note: Cannot allocate after boot due to memory fragmentation
+----------------------------------------
+
+MIXED HUGE PAGE SIZES:
+----------------------------------------
+# Allocate both 2MB and 1GB pages
+GRUB_CMDLINE_LINUX="default_hugepagesz=1G hugepagesz=1G hugepages=8 hugepagesz=2M hugepages=4096"
+
+# This allocates:
+# - 8 x 1GB pages = 8GB
+# - 4096 x 2MB pages = 8GB
+# Total: 16GB in huge pages
+----------------------------------------
+
+MOUNT HUGETLBFS:
+----------------------------------------
+# Create mount point
+mkdir -p /mnt/huge
+mkdir -p /mnt/huge_1GB
+
+# Mount 2MB huge pages
+mount -t hugetlbfs -o pagesize=2M none /mnt/huge
+
+# Mount 1GB huge pages
+mount -t hugetlbfs -o pagesize=1G none /mnt/huge_1GB
+
+# Make persistent in /etc/fstab
+cat >> /etc/fstab << EOF
+nodev /mnt/huge hugetlbfs pagesize=2M 0 0
+nodev /mnt/huge_1GB hugetlbfs pagesize=1G 0 0
+EOF
+
+# Verify mounts
+mount | grep huge
+----------------------------------------
+
+USING HUGE PAGES IN C++:
+----------------------------------------
+// Method 1: mmap with huge pages
+#include <sys/mman.h>
+#include <fcntl.h>
+
+void* allocate_huge_pages_2MB(size_t size) {
+    // Round up to 2MB boundary
+    size = (size + (2*1024*1024 - 1)) & ~(2*1024*1024 - 1);
+
+    void* addr = mmap(nullptr, size,
+                      PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB,
+                      -1, 0);
+
+    if (addr == MAP_FAILED) {
+        perror("mmap failed");
+        return nullptr;
+    }
+
+    // Touch all pages to fault them in
+    memset(addr, 0, size);
+
+    return addr;
+}
+
+void* allocate_huge_pages_1GB(size_t size) {
+    // Round up to 1GB boundary
+    size = (size + (1024*1024*1024 - 1)) & ~(1024*1024*1024 - 1);
+
+    void* addr = mmap(nullptr, size,
+                      PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_1GB,
+                      -1, 0);
+
+    if (addr == MAP_FAILED) {
+        perror("mmap with 1GB pages failed");
+        // Fallback to 2MB pages
+        return allocate_huge_pages_2MB(size);
+    }
+
+    memset(addr, 0, size);
+    return addr;
+}
+
+// Method 2: Using hugetlbfs file
+void* allocate_from_hugetlbfs(const char* path, size_t size) {
+    int fd = open(path, O_CREAT | O_RDWR, 0755);
+    if (fd < 0) {
+        perror("open hugetlbfs file failed");
+        return nullptr;
+    }
+
+    void* addr = mmap(nullptr, size,
+                      PROT_READ | PROT_WRITE,
+                      MAP_SHARED, fd, 0);
+
+    close(fd);
+    unlink(path);  // File is removed but mapping remains
+
+    if (addr == MAP_FAILED) {
+        perror("mmap hugetlbfs failed");
+        return nullptr;
+    }
+
+    memset(addr, 0, size);
+    return addr;
+}
+
+// Usage example
+int main() {
+    // Allocate 1GB using 1GB huge pages
+    size_t size = 1024 * 1024 * 1024;
+    void* buffer = allocate_huge_pages_1GB(size);
+
+    if (buffer) {
+        // Use buffer for trading data structures
+        // ... trading logic ...
+
+        munmap(buffer, size);
+    }
+
+    return 0;
+}
+
+// Method 3: Using libhugetlbfs
+// Link with -lhugetlbfs
+#include <hugetlbfs.h>
+
+void* allocate_with_libhugetlbfs(size_t size) {
+    void* addr = get_hugepage_region(size, GHR_DEFAULT);
+    if (!addr) {
+        perror("get_hugepage_region failed");
+        return nullptr;
+    }
+    return addr;
+}
+
+void free_hugepage_region(void* addr, size_t size) {
+    free_hugepage_region(addr, size);
+}
+----------------------------------------
+
+PERMISSIONS FOR HUGE PAGES:
+----------------------------------------
+# Allow non-root users to use huge pages
+
+# Set huge page limits
+# Edit /etc/security/limits.conf
+@trading    soft    memlock    unlimited
+@trading    hard    memlock    unlimited
+
+# Or for specific user
+username    soft    memlock    unlimited
+username    hard    memlock    unlimited
+
+# Verify limits
+ulimit -l
+# Should show: unlimited
+
+# Set hugetlbfs permissions
+chmod 1777 /mnt/huge
+chmod 1777 /mnt/huge_1GB
+----------------------------------------
+
+================================================================================
+3. MEMORY LOCKING (MLOCKALL)
+================================================================================
+
+CONCEPT:
+Lock all process memory in RAM to prevent paging to disk.
+Critical for eliminating page fault latency.
+
+MEMORY LOCKING IN C++:
+----------------------------------------
+#include <sys/mman.h>
+#include <sys/resource.h>
+
+bool lock_memory() {
+    // Set memory lock limit to unlimited
+    struct rlimit rlim;
+    rlim.rlim_cur = RLIM_INFINITY;
+    rlim.rlim_max = RLIM_INFINITY;
+
+    if (setrlimit(RLIMIT_MEMLOCK, &rlim) != 0) {
+        perror("setrlimit failed");
+        return false;
+    }
+
+    // Lock all current and future memory
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
+        perror("mlockall failed");
+        return false;
+    }
+
+    return true;
+}
+
+// Pre-fault stack to avoid page faults
+void prefault_stack() {
+    constexpr size_t STACK_SIZE = 8 * 1024 * 1024;  // 8MB
+    volatile char stack[STACK_SIZE];
+
+    // Touch each page
+    for (size_t i = 0; i < STACK_SIZE; i += 4096) {
+        stack[i] = 0;
+    }
+}
+
+int main() {
+    // Lock memory at startup
+    if (!lock_memory()) {
+        return 1;
+    }
+
+    // Pre-fault stack
+    prefault_stack();
+
+    // Allocate and touch all memory
+    size_t size = 1024 * 1024 * 1024;  // 1GB
+    void* buffer = allocate_huge_pages_1GB(size);
+
+    if (buffer) {
+        // All memory is now locked in RAM
+        // No page faults will occur
+
+        // ... trading logic ...
+
+        munmap(buffer, size);
+    }
+
+    return 0;
+}
+----------------------------------------
+
+VERIFY MEMORY LOCKING:
+----------------------------------------
+# Check process memory locks
+cat /proc/<PID>/status | grep -i lock
+# VmLck should show locked memory size
+
+# Check for page faults (should be minimal after startup)
+ps -o min_flt,maj_flt,cmd -p <PID>
+# min_flt: Minor page faults (should stop increasing)
+# maj_flt: Major page faults (should be 0)
+
+# Monitor continuously
+watch -n 1 "ps -o min_flt,maj_flt,cmd -p <PID>"
+----------------------------------------
+
+================================================================================
+4. SWAP CONFIGURATION
+================================================================================
+
+CONCEPT:
+Swapping to disk causes catastrophic latency (milliseconds to seconds).
+Either disable swap entirely or set swappiness to 0.
+
+CHECK SWAP STATUS:
+----------------------------------------
+# View swap usage
+swapon --show
+free -h
+
+# Check swappiness (default: 60)
+cat /proc/sys/vm/swappiness
+----------------------------------------
+
+DISABLE SWAP (RECOMMENDED FOR DEDICATED HFT):
+----------------------------------------
+# Disable all swap
+swapoff -a
+
+# Make persistent (comment out swap in /etc/fstab)
+sed -i.bak '/swap/s/^/#/' /etc/fstab
+
+# Verify
+swapon --show
+# Should show nothing
+
+free -h
+# Swap should show 0
+----------------------------------------
+
+SET SWAPPINESS TO 0 (IF KEEPING SWAP):
+----------------------------------------
+# Set swappiness to 0 (avoid swap unless OOM)
+echo 0 > /proc/sys/vm/swappiness
+
+# Make persistent
+echo "vm.swappiness = 0" >> /etc/sysctl.conf
+sysctl -p
+
+# Verify
+cat /proc/sys/vm/swappiness
+# Should show: 0
+----------------------------------------
+
+MONITORING SWAP USAGE:
+----------------------------------------
+# Alert if swap is ever used
+watch -n 1 "free -h | grep Swap"
+
+# Script to alert on swap usage
+cat > /usr/local/bin/check_swap.sh << 'EOF'
+#!/bin/bash
+SWAP_USED=$(free | grep Swap | awk '{print $3}')
+if [ "$SWAP_USED" -gt 0 ]; then
+    echo "ALERT: Swap is being used! $SWAP_USED KB" | \
+        mail -s "Swap Alert" alerts@company.com
+fi
+EOF
+
+chmod +x /usr/local/bin/check_swap.sh
+
+# Add to cron (check every minute)
+echo "* * * * * /usr/local/bin/check_swap.sh" | crontab -
+----------------------------------------
+
+================================================================================
+5. VIRTUAL MEMORY TUNING
+================================================================================
+
+VM PARAMETERS FOR HFT:
+----------------------------------------
+# Create comprehensive VM tuning config
+cat > /etc/sysctl.d/99-hft-memory.conf << EOF
+# Swap configuration
+vm.swappiness = 0                          # Avoid swap at all costs
+vm.swap_tendency = 0                       # Reduce swap tendency
+
+# Memory overcommit (allow large allocations)
+vm.overcommit_memory = 1                   # Always overcommit
+vm.overcommit_ratio = 100                  # Allow 100% overcommit
+
+# Dirty page management (for write-back cache)
+vm.dirty_ratio = 10                        # Start blocking writes at 10%
+vm.dirty_background_ratio = 5              # Start background writeout at 5%
+vm.dirty_expire_centisecs = 3000           # Write dirty pages after 30s
+vm.dirty_writeback_centisecs = 500         # Check for dirty pages every 5s
+
+# Minimum free memory (important for huge pages)
+vm.min_free_kbytes = 1048576               # Keep 1GB free (adjust based on RAM)
+
+# Zone reclaim (NUMA systems)
+vm.zone_reclaim_mode = 0                   # Prefer remote memory over local reclaim
+
+# VFS cache pressure
+vm.vfs_cache_pressure = 50                 # Default is 100, reduce pressure
+
+# OOM killer (be careful with this)
+vm.oom_kill_allocating_task = 0            # Kill memory-hogging task
+vm.panic_on_oom = 0                        # Don't panic on OOM
+
+# Huge pages
+vm.nr_hugepages = 8192                     # Number of 2MB pages
+vm.nr_overcommit_hugepages = 1024          # Additional huge pages if needed
+
+# Transparent huge pages (disabled)
+# Set via kernel parameter instead
+
+# Apply settings
+EOF
+
+sysctl -p /etc/sysctl.d/99-hft-memory.conf
+----------------------------------------
+
+VM PARAMETER EXPLANATIONS:
+----------------------------------------
+# vm.swappiness = 0
+# Don't swap unless absolutely necessary (OOM condition)
+
+# vm.overcommit_memory = 1
+# Allow allocations even if physical memory is insufficient
+# Required for mlockall with large memory requirements
+
+# vm.dirty_ratio = 10
+# Maximum % of memory that can be dirty before blocking writes
+# Lower value = more frequent writeout = lower latency variance
+
+# vm.min_free_kbytes = 1048576 (1GB)
+# Reserve memory for emergency allocations and huge pages
+# Set to ~1% of total RAM for huge pages
+# Higher value reduces fragmentation
+
+# vm.zone_reclaim_mode = 0
+# On NUMA systems, prefer allocating from remote nodes
+# rather than reclaiming local memory
+# Reduces latency spikes from reclamation
+----------------------------------------
+
+MONITORING VM STATISTICS:
+----------------------------------------
+# View comprehensive VM stats
+cat /proc/vmstat
+
+# Key metrics for HFT:
+cat /proc/vmstat | grep -E "pgfault|pgmajfault|compact|thp"
+
+# pgfault: Page faults (should stop increasing after warmup)
+# pgmajfault: Major page faults (should be 0)
+# compact_*: Memory compaction events (should be 0)
+# thp_*: THP events (should be 0 with THP disabled)
+
+# Monitor in real-time
+watch -d -n 1 "cat /proc/vmstat | grep -E 'pgfault|pgmajfault'"
+----------------------------------------
+
+================================================================================
+6. NUMA MEMORY CONFIGURATION
+================================================================================
+
+CONCEPT:
+On NUMA systems, memory access latency varies based on which NUMA node
+the memory is allocated from. Pin memory to same node as CPU.
+
+CHECK NUMA TOPOLOGY:
+----------------------------------------
+# View NUMA configuration
+numactl --hardware
+
+# Sample output:
+# available: 2 nodes (0-1)
+# node 0 cpus: 0 2 4 6
+# node 0 size: 64GB
+# node 0 free: 32GB
+# node 1 cpus: 1 3 5 7
+# node 1 size: 64GB
+# node 1 free: 32GB
+# node distances:
+# node   0   1
+#   0:  10  21    # Local = 10, Remote = 21 (2.1x latency)
+#   1:  21  10
+
+# View NUMA statistics
+numastat
+
+# Per-process NUMA stats
+numastat -p <PID>
+----------------------------------------
+
+NUMA MEMORY POLICY:
+----------------------------------------
+# Allocate memory from specific node
+numactl --membind=0 --cpunodebind=0 ./trading_engine
+
+# Interleave memory across nodes (for shared data)
+numactl --interleave=all ./trading_engine
+
+# Prefer local node but allow fallback
+numactl --preferred=0 ./trading_engine
+
+# In C++ code:
+#include <numa.h>
+#include <numaif.h>
+
+void configure_numa() {
+    if (numa_available() < 0) {
+        // NUMA not available
+        return;
+    }
+
+    // Bind to NUMA node 0
+    struct bitmask *node = numa_allocate_nodemask();
+    numa_bitmask_setbit(node, 0);
+    numa_bind(node);
+    numa_free_nodemask(node);
+
+    // Set memory policy for allocations
+    numa_set_preferred(0);  // Prefer node 0
+
+    // Allocate memory from specific node
+    void* mem = numa_alloc_onnode(size, 0);  // Node 0
+    // Use memory...
+    numa_free(mem, size);
+}
+----------------------------------------
+
+ALLOCATE HUGE PAGES PER NUMA NODE:
+----------------------------------------
+# Allocate 2048 x 2MB pages on each NUMA node
+echo 2048 > /sys/devices/system/node/node0/hugepages/hugepages-2048kB/nr_hugepages
+echo 2048 > /sys/devices/system/node/node1/hugepages/hugepages-2048kB/nr_hugepages
+
+# Verify
+cat /sys/devices/system/node/node*/hugepages/hugepages-2048kB/nr_hugepages
+
+# Check allocation success
+cat /sys/devices/system/node/node*/hugepages/hugepages-2048kB/free_hugepages
+----------------------------------------
+
+MONITOR NUMA MEMORY:
+----------------------------------------
+# Real-time NUMA stats
+watch -n 1 numastat
+
+# Check for remote memory access (NUMA misses)
+numastat -p <PID>
+
+# numa_miss should be low (< 1% of numa_hit)
+
+# Detailed NUMA events
+perf stat -e 'node-loads,node-load-misses,node-stores' ./trading_engine
+----------------------------------------
+
+================================================================================
+7. MEMORY BANDWIDTH OPTIMIZATION
+================================================================================
+
+CHECK MEMORY BANDWIDTH:
+----------------------------------------
+# Install mbw (memory bandwidth benchmark)
+apt-get install mbw
+
+# Test memory bandwidth
+mbw -n 100 1024
+
+# Sample output:
+# 0: MEMCPY 16384.00 MiB/s
+# 1: MEMCPY 16512.00 MiB/s
+# AVG: MEMCPY 16448.00 MiB/s
+
+# Should achieve close to theoretical bandwidth
+# DDR4-3200: ~25 GB/s per channel
+# DDR5-4800: ~38 GB/s per channel
+
+# Stream benchmark (more comprehensive)
+gcc -O3 -mcmodel=medium stream.c -o stream
+./stream
+----------------------------------------
+
+PREFETCHING OPTIMIZATION:
+----------------------------------------
+// Software prefetch to reduce cache misses
+#include <xmmintrin.h>  // SSE
+#include <emmintrin.h>  // SSE2
+
+void process_with_prefetch(const Data* data, size_t count) {
+    constexpr int PREFETCH_AHEAD = 8;
+
+    for (size_t i = 0; i < count; i++) {
+        // Prefetch data that will be used soon
+        if (i + PREFETCH_AHEAD < count) {
+            _mm_prefetch((const char*)&data[i + PREFETCH_AHEAD],
+                        _MM_HINT_T0);  // Prefetch to L1 cache
+        }
+
+        // Process current data
+        process_data(data[i]);
+    }
+}
+
+// Prefetch variants:
+// _MM_HINT_T0: Prefetch to L1 (closest, most aggressive)
+// _MM_HINT_T1: Prefetch to L2
+// _MM_HINT_T2: Prefetch to L3
+// _MM_HINT_NTA: Non-temporal (bypass cache)
+----------------------------------------
+
+NON-TEMPORAL STORES (FOR LARGE WRITES):
+----------------------------------------
+// Use non-temporal stores to avoid cache pollution
+#include <emmintrin.h>
+
+void large_memcpy_nt(void* dst, const void* src, size_t size) {
+    __m128i* d = (__m128i*)dst;
+    const __m128i* s = (const __m128i*)src;
+    size_t count = size / sizeof(__m128i);
+
+    for (size_t i = 0; i < count; i++) {
+        __m128i val = _mm_load_si128(&s[i]);
+        _mm_stream_si128(&d[i], val);  // Non-temporal store
+    }
+
+    _mm_sfence();  // Ensure stores are visible
+}
+----------------------------------------
+
+================================================================================
+8. MEMORY DEBUGGING AND PROFILING
+================================================================================
+
+CHECK MEMORY USAGE:
+----------------------------------------
+# Process memory map
+cat /proc/<PID>/maps
+
+# Memory summary
+cat /proc/<PID>/status | grep -E "Vm|Huge"
+
+# Detailed memory info
+pmap -x <PID>
+
+# With huge page info
+pmap -X <PID> | grep huge
+----------------------------------------
+
+PROFILE MEMORY ACCESS:
+----------------------------------------
+# Cache misses
+perf stat -e cache-references,cache-misses ./trading_engine
+
+# Calculate cache miss rate
+# (cache-misses / cache-references) * 100
+# Target: < 1% miss rate
+
+# Detailed cache profiling
+perf record -e cache-misses ./trading_engine
+perf report
+
+# Memory access profiling
+perf mem record ./trading_engine
+perf mem report
+
+# TLB misses
+perf stat -e dTLB-load-misses,dTLB-loads ./trading_engine
+----------------------------------------
+
+MEMORY LEAK DETECTION:
+----------------------------------------
+# Valgrind (use only in development, too slow for production)
+valgrind --leak-check=full --show-leak-kinds=all ./trading_engine
+
+# AddressSanitizer (compile-time option)
+# Compile with: -fsanitize=address
+g++ -fsanitize=address -g trading_engine.cpp -o trading_engine
+
+# HeapTrack (lightweight heap profiler)
+heaptrack ./trading_engine
+heaptrack_gui heaptrack.trading_engine.PID.gz
+----------------------------------------
+
+================================================================================
+9. MEMORY ALLOCATION STRATEGIES
+================================================================================
+
+MEMORY POOLS:
+----------------------------------------
+// Pre-allocated memory pool for fixed-size objects
+template<typename T, size_t PoolSize>
+class MemoryPool {
+private:
+    alignas(64) T pool[PoolSize];
+    std::bitset<PoolSize> allocated;
+    size_t next_free = 0;
+
+public:
+    MemoryPool() {
+        // Touch all pages to fault them in
+        memset(pool, 0, sizeof(pool));
+    }
+
+    T* allocate() {
+        // Find free slot
+        for (size_t i = next_free; i < PoolSize; i++) {
+            if (!allocated[i]) {
+                allocated[i] = true;
+                next_free = i + 1;
+                return &pool[i];
+            }
+        }
+        return nullptr;  // Pool exhausted
+    }
+
+    void deallocate(T* ptr) {
+        size_t idx = ptr - pool;
+        if (idx < PoolSize) {
+            allocated[idx] = false;
+            if (idx < next_free) next_free = idx;
+        }
+    }
+};
+
+// Usage
+MemoryPool<Order, 10000> order_pool;
+Order* order = order_pool.allocate();
+// ... use order ...
+order_pool.deallocate(order);
+----------------------------------------
+
+STACK-BASED ALLOCATION:
+----------------------------------------
+// Use stack for temporary data (fastest allocation)
+template<typename T, size_t N>
+class StackAllocator {
+private:
+    alignas(64) char buffer[N * sizeof(T)];
+    size_t used = 0;
+
+public:
+    T* allocate(size_t count) {
+        if (used + count <= N) {
+            T* ptr = reinterpret_cast<T*>(buffer + used * sizeof(T));
+            used += count;
+            return ptr;
+        }
+        return nullptr;
+    }
+
+    void reset() { used = 0; }
+};
+
+// Usage for per-request temporary data
+void process_order() {
+    StackAllocator<TempData, 100> temp_alloc;
+
+    TempData* data = temp_alloc.allocate(10);
+    // ... use data ...
+    temp_alloc.reset();  // Fast "deallocation"
+}
+----------------------------------------
+
+CUSTOM ALLOCATOR FOR STL:
+----------------------------------------
+// STL allocator using huge pages
+template<typename T>
+class HugePageAllocator {
+public:
+    using value_type = T;
+
+    HugePageAllocator() = default;
+
+    template<typename U>
+    HugePageAllocator(const HugePageAllocator<U>&) {}
+
+    T* allocate(size_t n) {
+        size_t size = n * sizeof(T);
+        void* ptr = mmap(nullptr, size,
+                        PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB,
+                        -1, 0);
+        if (ptr == MAP_FAILED) {
+            throw std::bad_alloc();
+        }
+        return static_cast<T*>(ptr);
+    }
+
+    void deallocate(T* ptr, size_t n) {
+        munmap(ptr, n * sizeof(T));
+    }
+};
+
+// Usage
+std::vector<Order, HugePageAllocator<Order>> orders;
+----------------------------------------
+
+================================================================================
+10. MEMORY CONFIGURATION CHECKLIST
+================================================================================
+
+VALIDATION SCRIPT:
+----------------------------------------
+#!/bin/bash
+echo "=== Memory Configuration Validation ==="
+
+echo "Transparent Huge Pages:"
+cat /sys/kernel/mm/transparent_hugepage/enabled
+
+echo -e "\nHuge Pages:"
+cat /proc/meminfo | grep -i huge
+
+echo -e "\nSwap:"
+swapon --show
+cat /proc/sys/vm/swappiness
+
+echo -e "\nVM Parameters:"
+sysctl vm.min_free_kbytes vm.zone_reclaim_mode vm.overcommit_memory
+
+echo -e "\nNUMA:"
+numactl --hardware | head -10
+
+echo -e "\nMemory Bandwidth Test:"
+mbw -q 100 | tail -1
+
+echo -e "\nPage Fault Check (run after application starts):"
+echo "Use: watch -n 1 'ps -o min_flt,maj_flt,cmd -p <PID>'"
+----------------------------------------
+
+CHECKLIST:
+----------------------------------------
+[ ] Transparent Huge Pages disabled
+[ ] Manual huge pages allocated (2MB or 1GB)
+[ ] Hugetlbfs mounted
+[ ] Memory locking limits set (ulimit -l unlimited)
+[ ] Swap disabled or swappiness=0
+[ ] VM parameters tuned
+[ ] NUMA policy configured
+[ ] Application uses mlockall()
+[ ] All memory pre-faulted
+[ ] Page faults verified = 0 after startup
+[ ] Memory bandwidth tested
+[ ] Huge page usage verified
+[ ] Configuration persists across reboot
+
+TARGET VALIDATION:
+- HugePages_Total > 0
+- HugePages_Free < HugePages_Total (in use)
+- Swap: 0 bytes used
+- Major page faults: 0
+- Memory bandwidth: > 80% of theoretical
+----------------------------------------
+
+================================================================================
+END OF DOCUMENT
+================================================================================

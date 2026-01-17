@@ -1,0 +1,704 @@
+================================================================================
+INTERRUPT HANDLING OPTIMIZATION FOR HFT SYSTEMS
+===============================================================================
+
+OVERVIEW:
+Interrupt handling is critical for low-latency systems. Improper interrupt
+configuration causes latency spikes, jitter, and CPU interference on trading
+threads. This document covers IRQ affinity, interrupt balancing, MSI-X
+configuration, and soft IRQ tuning.
+
+TARGET METRICS:
+- IRQ Response Time: < 5 microseconds
+- IRQs on Trading CPUs: 0 (isolated CPUs should have no interrupts)
+- Interrupt Coalescing: Disabled or minimal
+- Soft IRQ Overhead: < 0.1% CPU on trading cores
+- IRQ Storms: None (< 100K interrupts/second per IRQ)
+
+================================================================================
+1. INTERRUPT BASICS
+================================================================================
+
+INTERRUPT TYPES:
+- Hardware IRQs: From devices (NIC, disk, timer, etc.)
+- Software IRQs (softirqs): Deferred processing (network stack, block I/O)
+- Inter-Processor Interrupts (IPIs): CPU-to-CPU communication
+- Timer Interrupts: Periodic system ticks (eliminated on isolated CPUs)
+
+VIEW INTERRUPTS:
+----------------------------------------
+# View all interrupts
+cat /proc/interrupts
+
+# Sample output:
+#            CPU0       CPU1       CPU2       CPU3
+#   0:         24          0          0          0   IO-APIC   2-edge      timer
+#   8:          0          0          0          1   IO-APIC   8-edge      rtc0
+#  16:          0          0     123456          0   IO-APIC  16-fasteoi   ehci_hcd
+#  24:          0    1234567          0          0   PCI-MSI 458752-edge      eth0-rx-0
+#  25:          0          0    2345678          0   PCI-MSI 458753-edge      eth0-tx-0
+
+# Columns: IRQ number, count per CPU, type, device
+
+# View interrupt rates (per second)
+watch -n 1 "cat /proc/interrupts"
+
+# Calculate rates
+cat /proc/interrupts > /tmp/int1 && sleep 1 && cat /proc/interrupts > /tmp/int2 && \
+    diff /tmp/int1 /tmp/int2
+----------------------------------------
+
+SOFT INTERRUPTS:
+----------------------------------------
+# View soft IRQ stats
+cat /proc/softirqs
+
+# Sample output:
+#                    CPU0       CPU1       CPU2       CPU3
+#          HI:          0          0          0          0
+#       TIMER:     123456      45678      12345       1234
+#      NET_TX:     234567          0     123456          0
+#      NET_RX:    3456789    1234567          0          0
+#       BLOCK:      12345       2345        345         34
+# BLOCK_IOPOLL:          0          0          0          0
+#     TASKLET:        123        456        789        012
+#       SCHED:    1234567    1234567    1234567    1234567
+#     HRTIMER:       1234       5678       9012       3456
+#         RCU:     234567     123456      12345       1234
+
+# Key soft IRQs:
+# NET_RX: Network receive processing
+# NET_TX: Network transmit processing
+# BLOCK: Block I/O completion
+# TIMER: Timer processing
+# SCHED: Scheduler
+# RCU: Read-Copy-Update
+
+# Monitor soft IRQ rates
+watch -n 1 "cat /proc/softirqs"
+----------------------------------------
+
+================================================================================
+2. IRQ BALANCE (MUST DISABLE FOR HFT)
+================================================================================
+
+CONCEPT:
+IRQ balance automatically distributes interrupts across CPUs for load
+balancing. This causes unpredictable interrupt delivery to isolated CPUs.
+
+DISABLE IRQ BALANCE:
+----------------------------------------
+# Stop and disable irqbalance service
+systemctl stop irqbalance
+systemctl disable irqbalance
+systemctl mask irqbalance
+
+# Verify
+systemctl status irqbalance
+# Should show: masked (dead)
+
+# Check if irqbalance is running
+ps aux | grep irqbalance
+# Should show no running process
+
+# Make permanent across reboots
+systemctl disable --now irqbalance
+----------------------------------------
+
+WHY DISABLE:
+- Interrupts can move between CPUs unpredictably
+- Causes cache pollution on isolated trading CPUs
+- Introduces latency variance
+- Manual pinning provides better control
+- HFT systems know their interrupt topology
+
+================================================================================
+3. IRQ AFFINITY CONFIGURATION
+================================================================================
+
+CONCEPT:
+IRQ affinity determines which CPUs can handle a specific interrupt.
+Pin interrupts to non-isolated CPUs (typically CPU 0).
+
+VIEW IRQ AFFINITY:
+----------------------------------------
+# View affinity for all IRQs
+for irq in /proc/irq/*/smp_affinity_list; do
+    echo "$irq: $(cat $irq)"
+done
+
+# View specific IRQ affinity (IRQ 24)
+cat /proc/irq/24/smp_affinity_list
+# Output: 0-7 (can run on CPUs 0-7)
+
+# Hexadecimal affinity mask
+cat /proc/irq/24/smp_affinity
+# Output: ff (binary: 11111111 = CPUs 0-7)
+----------------------------------------
+
+SET IRQ AFFINITY:
+----------------------------------------
+# Set IRQ 24 to CPU 0 only (decimal list format)
+echo 0 > /proc/irq/24/smp_affinity_list
+
+# Set multiple CPUs (CPU 0 and 8)
+echo 0,8 > /proc/irq/24/smp_affinity_list
+
+# Set range of CPUs
+echo 0-3 > /proc/irq/24/smp_affinity_list
+
+# Verify
+cat /proc/irq/24/smp_affinity_list
+
+# Using hexadecimal mask (CPU 0 = 0x01)
+echo 1 > /proc/irq/24/smp_affinity
+# 0x01 = binary 0001 = CPU 0
+
+# Multiple CPUs (CPU 0 and 1 = 0x03)
+echo 3 > /proc/irq/24/smp_affinity
+# 0x03 = binary 0011 = CPUs 0,1
+----------------------------------------
+
+PIN ALL IRQS TO CPU 0:
+----------------------------------------
+#!/bin/bash
+# Pin all IRQs to CPU 0 (avoid isolated CPUs)
+
+for irq in /proc/irq/*/smp_affinity_list; do
+    # Skip special IRQs
+    irq_num=$(echo $irq | egrep -o '[0-9]+')
+
+    if [ -f "/proc/irq/$irq_num/smp_affinity_list" ]; then
+        echo "Setting IRQ $irq_num to CPU 0"
+        echo 0 > "/proc/irq/$irq_num/smp_affinity_list" 2>/dev/null || true
+    fi
+done
+
+# Save script as /usr/local/bin/pin_irqs.sh
+# Make executable: chmod +x /usr/local/bin/pin_irqs.sh
+----------------------------------------
+
+SYSTEMD SERVICE FOR IRQ PINNING:
+----------------------------------------
+# Create service to run at boot
+cat > /etc/systemd/system/pin-irqs.service << EOF
+[Unit]
+Description=Pin IRQs to CPU 0
+After=multi-user.target
+Before=trading.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/pin_irqs.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable pin-irqs.service
+systemctl start pin-irqs.service
+----------------------------------------
+
+NETWORK CARD IRQ AFFINITY:
+----------------------------------------
+# Find network card IRQs
+grep eth0 /proc/interrupts | awk '{print $1}' | sed 's/://g'
+
+# Example output: 24 25 26 27 (multi-queue NICs have multiple IRQs)
+
+# Pin each queue to specific CPU
+# Strategy: Pin all NIC IRQs to CPU 0 (or distribute to non-isolated CPUs)
+
+#!/bin/bash
+INTERFACE="eth0"
+TARGET_CPU=0
+
+# Get all IRQs for interface
+IRQS=$(grep $INTERFACE /proc/interrupts | awk '{print $1}' | sed 's/://g')
+
+for irq in $IRQS; do
+    echo "Pinning IRQ $irq ($INTERFACE) to CPU $TARGET_CPU"
+    echo $TARGET_CPU > /proc/irq/$irq/smp_affinity_list
+done
+
+# Verify
+for irq in $IRQS; do
+    echo "IRQ $irq: $(cat /proc/irq/$irq/smp_affinity_list)"
+done
+----------------------------------------
+
+ADVANCED: PER-QUEUE IRQ DISTRIBUTION:
+----------------------------------------
+# For multi-queue NICs, distribute queues to non-isolated CPUs
+#!/bin/bash
+INTERFACE="eth0"
+NON_ISOLATED_CPUS=(0 8)  # CPUs not isolated
+
+IRQS=($(grep $INTERFACE /proc/interrupts | awk '{print $1}' | sed 's/://g'))
+
+# Distribute round-robin
+for i in "${!IRQS[@]}"; do
+    irq=${IRQS[$i]}
+    cpu=${NON_ISOLATED_CPUS[$((i % ${#NON_ISOLATED_CPUS[@]}))]}
+
+    echo "Pinning IRQ $irq to CPU $cpu"
+    echo $cpu > /proc/irq/$irq/smp_affinity_list
+done
+----------------------------------------
+
+================================================================================
+4. MSI-X INTERRUPTS
+================================================================================
+
+CONCEPT:
+MSI-X (Message Signaled Interrupts - Extended) provides multiple interrupt
+vectors per device, enabling per-queue interrupts for multi-queue NICs.
+
+CHECK MSI-X SUPPORT:
+----------------------------------------
+# Check if device uses MSI-X
+lspci -vv -s <device_bus_id> | grep -i msi
+
+# Example for NIC at bus 03:00.0
+lspci -vv -s 03:00.0 | grep -i msi
+
+# Sample output:
+# Capabilities: [50] MSI-X: Enable+ Count=64 Masked-
+# MSI-X: Enable+ means MSI-X is enabled
+
+# List all MSI-X capable devices
+lspci -vv | grep -i "msi-x"
+----------------------------------------
+
+ENABLE MSI-X:
+----------------------------------------
+# MSI-X is typically enabled by default on modern systems
+# If not, may need BIOS setting or kernel parameter
+
+# Check MSI mode for device
+cat /sys/bus/pci/devices/0000:03:00.0/msi_bus
+# 1 = MSI enabled
+
+# Enable MSI (if disabled)
+echo 1 > /sys/bus/pci/devices/0000:03:00.0/msi_bus
+
+# Verify interrupt type in /proc/interrupts
+grep eth0 /proc/interrupts
+# Should show "PCI-MSI" or "PCI-MSI-edge"
+----------------------------------------
+
+MSI-X VECTOR ALLOCATION:
+----------------------------------------
+# Number of MSI-X vectors per device
+lspci -vv -s 03:00.0 | grep "MSI-X: Enable"
+# MSI-X: Enable+ Count=64
+
+# In /proc/interrupts, each vector has separate IRQ
+grep eth0 /proc/interrupts
+#  24:  PCI-MSI 458752-edge  eth0-rx-0
+#  25:  PCI-MSI 458753-edge  eth0-tx-0
+#  26:  PCI-MSI 458754-edge  eth0-rx-1
+#  27:  PCI-MSI 458755-edge  eth0-tx-1
+
+# Typically: separate vectors for RX/TX queues
+----------------------------------------
+
+OPTIMAL MSI-X CONFIGURATION:
+----------------------------------------
+# Match MSI-X vectors to number of CPU queues
+# For HFT: Minimal queues (1-2) pinned to non-isolated CPUs
+
+# Set number of combined queues on NIC
+ethtool -L eth0 combined 2
+
+# This allocates 2 RX and 2 TX queues
+# Each queue gets its own MSI-X vector
+
+# Pin IRQs appropriately (see IRQ affinity section)
+----------------------------------------
+
+================================================================================
+5. TIMER INTERRUPTS
+================================================================================
+
+CONCEPT:
+Timer interrupts occur periodically (1000 Hz by default). On isolated CPUs
+with nohz_full, timer ticks are eliminated.
+
+CHECK TIMER FREQUENCY:
+----------------------------------------
+# Kernel timer frequency
+zcat /proc/config.gz | grep CONFIG_HZ=
+# CONFIG_HZ=1000 means 1000 ticks/second = 1ms period
+
+# View timer interrupts per CPU
+cat /proc/interrupts | grep -i timer
+----------------------------------------
+
+ELIMINATE TIMER TICKS ON ISOLATED CPUS:
+----------------------------------------
+# Use nohz_full kernel parameter (already covered in kernel settings)
+GRUB_CMDLINE_LINUX="nohz_full=1-7 rcu_nocbs=1-7"
+
+# This enables "tickless" mode on isolated CPUs
+# Timer interrupts only fire when absolutely necessary
+
+# Verify
+cat /sys/devices/system/cpu/nohz_full
+# Should show: 1-7
+
+# Monitor timer interrupts (should be minimal on isolated CPUs)
+cat /proc/interrupts | grep -i timer
+
+# CPU1-7 should have very low timer counts vs CPU0
+----------------------------------------
+
+HIGH-RESOLUTION TIMERS:
+----------------------------------------
+# Ensure high-resolution timers are enabled (RT kernel requirement)
+zcat /proc/config.gz | grep CONFIG_HIGH_RES_TIMERS
+# CONFIG_HIGH_RES_TIMERS=y
+
+# Check timer resolution
+cat /proc/timer_list | grep resolution
+# .resolution: 1 nsecs
+
+# This enables nanosecond-precision timers
+----------------------------------------
+
+================================================================================
+6. SOFT IRQ TUNING
+================================================================================
+
+SOFT IRQ BUDGET:
+----------------------------------------
+# Net soft IRQ budget (number of packets per poll)
+cat /proc/sys/net/core/netdev_budget
+# Default: 300
+
+# For low latency, reduce budget to process packets immediately
+echo 100 > /proc/sys/net/core/netdev_budget
+
+# For throughput, increase budget
+echo 600 > /proc/sys/net/core/netdev_budget
+
+# Budget time (microseconds per poll)
+cat /proc/sys/net/core/netdev_budget_usecs
+# Default: 2000 (2ms)
+
+# Reduce for lower latency
+echo 1000 > /proc/sys/net/core/netdev_budget_usecs
+
+# Make persistent
+cat >> /etc/sysctl.conf << EOF
+net.core.netdev_budget = 100
+net.core.netdev_budget_usecs = 1000
+EOF
+
+sysctl -p
+----------------------------------------
+
+SOFT IRQ THREADS:
+----------------------------------------
+# Soft IRQs can run as threads (ksoftirqd)
+ps aux | grep ksoftirqd
+
+# Example output:
+# ksoftirqd/0  (on CPU 0)
+# ksoftirqd/1  (on CPU 1)
+# ...
+
+# Pin ksoftirqd threads to non-isolated CPUs
+for pid in $(pgrep ksoftirqd); do
+    cpu=$(ps -o comm= -p $pid | grep -o '[0-9]\+')
+
+    # Pin to CPU 0 if on isolated CPU
+    if [ $cpu -ge 1 ] && [ $cpu -le 7 ]; then
+        taskset -cp 0 $pid
+        echo "Moved ksoftirqd/$cpu to CPU 0"
+    fi
+done
+----------------------------------------
+
+RPS (RECEIVE PACKET STEERING):
+----------------------------------------
+# RPS distributes soft IRQ processing across CPUs
+# Generally not needed with hardware multi-queue and proper IRQ affinity
+
+# Check RPS configuration
+cat /sys/class/net/eth0/queues/rx-0/rps_cpus
+
+# Disable RPS (set to 0)
+echo 0 > /sys/class/net/eth0/queues/rx-*/rps_cpus
+
+# If using RPS, configure to avoid isolated CPUs
+# Example: Use CPUs 0 and 8 only (0x0101 in hex)
+echo 101 > /sys/class/net/eth0/queues/rx-0/rps_cpus
+----------------------------------------
+
+XPS (TRANSMIT PACKET STEERING):
+----------------------------------------
+# XPS maps TX queues to CPUs
+# Ensure isolated CPUs use appropriate TX queue
+
+# View XPS configuration
+cat /sys/class/net/eth0/queues/tx-0/xps_cpus
+
+# Configure XPS to match CPU affinity
+# If trading threads on CPUs 1-4 use TX queue 0
+echo 1e > /sys/class/net/eth0/queues/tx-0/xps_cpus
+# 0x1e = binary 11110 = CPUs 1-4
+----------------------------------------
+
+================================================================================
+7. INTERRUPT STORMS
+================================================================================
+
+CONCEPT:
+Interrupt storm: Excessive interrupts (>100K/sec) that overwhelm CPU.
+Usually indicates misconfiguration or hardware issue.
+
+DETECT INTERRUPT STORMS:
+----------------------------------------
+# Monitor interrupt rates
+cat /proc/interrupts > /tmp/int1
+sleep 1
+cat /proc/interrupts > /tmp/int2
+
+# Calculate differences
+paste /tmp/int1 /tmp/int2 | awk '{print $1, ($2-$10)}'
+
+# Look for IRQs with > 100K interrupts/second
+
+# Automated detection
+#!/bin/bash
+THRESHOLD=100000
+
+cat /proc/interrupts > /tmp/int1
+sleep 1
+cat /proc/interrupts > /tmp/int2
+
+paste /tmp/int1 /tmp/int2 | while read line; do
+    irq=$(echo $line | awk '{print $1}')
+    diff=$(echo $line | awk '{sum=0; for(i=2;i<=9;i++) sum+=$i; for(i=10;i<=17;i++) sum-=$i; print sum}')
+
+    if [ $diff -gt $THRESHOLD ]; then
+        echo "IRQ storm detected on IRQ $irq: $diff interrupts/sec"
+    fi
+done
+----------------------------------------
+
+MITIGATE INTERRUPT STORMS:
+----------------------------------------
+# 1. Increase interrupt coalescing (if too aggressive)
+ethtool -C eth0 rx-usecs 10
+
+# 2. Check for hardware issues
+dmesg | grep -i error
+
+# 3. Update drivers
+ethtool -i eth0 | grep version
+
+# 4. Check for IRQ sharing (avoid)
+cat /proc/interrupts | grep <IRQ_NUM>
+
+# 5. Disable interrupt source temporarily
+echo 0 > /proc/irq/<IRQ_NUM>/smp_affinity_list
+
+# 6. Reboot device
+echo 1 > /sys/class/net/eth0/device/reset
+----------------------------------------
+
+================================================================================
+8. THREADED INTERRUPTS (RT KERNEL)
+================================================================================
+
+CONCEPT:
+RT kernel makes interrupt handlers preemptible by running them as threads.
+This improves real-time responsiveness.
+
+THREADED INTERRUPTS IN RT KERNEL:
+----------------------------------------
+# Check if interrupts are threaded
+ps aux | grep "irq/"
+
+# Example output (RT kernel):
+# irq/24-eth0-rx-0
+# irq/25-eth0-tx-0
+
+# These are interrupt handler threads
+
+# Set priority for interrupt threads
+#!/bin/bash
+for pid in $(pgrep "irq/"); do
+    # Set real-time priority
+    chrt -f -p 50 $pid
+    echo "Set IRQ thread $pid to priority 50"
+done
+
+# Trading threads should have higher priority (90-99)
+# Interrupt threads: 40-60
+# Other threads: < 40
+----------------------------------------
+
+INTERRUPT THREAD AFFINITY:
+----------------------------------------
+# Pin interrupt threads to non-isolated CPUs
+for pid in $(pgrep "irq/"); do
+    taskset -cp 0 $pid
+    echo "Pinned IRQ thread $pid to CPU 0"
+done
+----------------------------------------
+
+================================================================================
+9. INTERRUPT MONITORING TOOLS
+================================================================================
+
+IRQTOP:
+----------------------------------------
+# Install irqtop
+apt-get install irqtop
+
+# Monitor interrupt rates in real-time
+irqtop
+
+# Sample output shows IRQs sorted by rate
+# Useful for identifying high-rate interrupt sources
+----------------------------------------
+
+PERF INTERRUPT PROFILING:
+----------------------------------------
+# Profile interrupts
+perf stat -e 'irq:*' -a sleep 10
+
+# Record interrupt events
+perf record -e 'irq:irq_handler_entry' -a sleep 10
+perf report
+
+# This shows which IRQs are most active
+# and which handlers are called most frequently
+
+# Softirq profiling
+perf stat -e 'irq:softirq_entry' -a sleep 10
+----------------------------------------
+
+LATENCY IMPACT OF INTERRUPTS:
+----------------------------------------
+# Trace interrupt latency
+perf ftrace -T -G '*irq*' -a sleep 10
+
+# Measure impact on application latency
+cyclictest -p 99 -t 1 -n -m -i 200 -l 100000 -h 100
+
+# Compare with/without interrupts on isolated CPUs
+# Difference shows interrupt impact
+
+# Target: < 1% latency increase from interrupts
+----------------------------------------
+
+================================================================================
+10. ADVANCED: INTERRUPT AFFINITY HINTS
+================================================================================
+
+AFFINITY HINTS:
+----------------------------------------
+# Some devices provide affinity hints for optimal IRQ placement
+cat /proc/irq/*/affinity_hint
+
+# These are suggestions from device drivers
+# May not align with HFT requirements
+
+# View hints for NIC IRQs
+for irq in $(grep eth0 /proc/interrupts | awk '{print $1}' | sed 's/://g'); do
+    echo "IRQ $irq hint: $(cat /proc/irq/$irq/affinity_hint)"
+done
+
+# Ignore hints and set manually for HFT
+# Our manual placement is more optimal
+----------------------------------------
+
+NUMA-AWARE IRQ PLACEMENT:
+----------------------------------------
+# For NUMA systems, pin interrupts to same node as device
+# Find device NUMA node
+cat /sys/class/net/eth0/device/numa_node
+# Output: 0 (device on NUMA node 0)
+
+# Pin IRQs to CPUs on same node
+# Node 0 CPUs: 0-7 (for example)
+for irq in $(grep eth0 /proc/interrupts | awk '{print $1}' | sed 's/://g'); do
+    echo 0 > /proc/irq/$irq/smp_affinity_list  # CPU 0 on node 0
+done
+
+# This minimizes cross-node interrupt traffic
+----------------------------------------
+
+================================================================================
+11. INTERRUPT HANDLING CHECKLIST
+================================================================================
+
+CONFIGURATION:
+[ ] IRQ balance disabled
+[ ] All IRQs pinned to non-isolated CPUs (typically CPU 0)
+[ ] Network card IRQs identified and pinned
+[ ] MSI-X enabled and configured
+[ ] Interrupt coalescing disabled or minimized
+[ ] Timer ticks eliminated on isolated CPUs (nohz_full)
+[ ] Soft IRQ budget tuned
+[ ] ksoftirqd threads pinned to non-isolated CPUs
+[ ] Interrupt threads pinned (RT kernel)
+
+MONITORING:
+[ ] No interrupts on isolated CPUs (verify /proc/interrupts)
+[ ] No interrupt storms (< 100K/sec per IRQ)
+[ ] Soft IRQ overhead < 0.1% on trading CPUs
+[ ] IRQ response time < 5 microseconds
+[ ] Configuration persistent across reboots
+
+VALIDATION:
+----------------------------------------
+#!/bin/bash
+echo "=== Interrupt Configuration Validation ==="
+
+echo -e "\nIRQ Balance:"
+systemctl status irqbalance | grep Active
+
+echo -e "\nIRQs on Isolated CPUs (should be 0):"
+isolated_cpus="1-7"
+cat /proc/interrupts | awk -v cpus="$isolated_cpus" 'NR>1 {
+    for(i=2;i<=NF-4;i++) sum+=$i;
+    if(sum>0) print $0;
+    sum=0
+}' | head -5
+
+echo -e "\nSoft IRQ on Isolated CPUs:"
+cat /proc/softirqs | awk '{if(NR==1) print; if(NR>1) for(i=3;i<=9;i++) if($i>1000) {print; break}}'
+
+echo -e "\nNIC IRQ Affinity:"
+for irq in $(grep eth0 /proc/interrupts | awk '{print $1}' | sed 's/://g'); do
+    echo "IRQ $irq: $(cat /proc/irq/$irq/smp_affinity_list)"
+done
+
+echo -e "\nInterrupt Rate Check (run for 5 seconds):"
+cat /proc/interrupts > /tmp/int1
+sleep 5
+cat /proc/interrupts > /tmp/int2
+paste /tmp/int1 /tmp/int2 | awk 'NR>1 {
+    rate=0;
+    for(i=2;i<=9;i++) rate+=($i+$(i+9))/5;
+    if(rate>100000) printf "WARN: High rate on %s: %.0f/sec\n", $1, rate
+}'
+----------------------------------------
+
+TARGET METRICS:
+- IRQs on isolated CPUs: 0
+- IRQ response: < 5 microseconds
+- Soft IRQ CPU: < 0.1% on trading cores
+- Interrupt rate: < 100K/sec per IRQ
+- Configuration: Persistent
+
+================================================================================
+END OF DOCUMENT
+================================================================================

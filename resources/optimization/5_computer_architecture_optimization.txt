@@ -1,0 +1,1042 @@
+================================================================================
+HFT COMPUTER ARCHITECTURE OPTIMIZATION TECHNIQUES
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Theory and Fundamental Concepts
+2. CPU Microarchitecture Understanding
+3. SIMD Instructions (SSE, AVX, AVX-512)
+4. Hardware Prefetching
+5. CPU Cache Architecture
+6. Pipeline Optimization
+7. Branch Prediction
+8. Out-of-Order Execution
+9. Hyper-Threading Considerations
+10. Benchmarking and Measurement
+11. Expected Improvements
+
+================================================================================
+1. THEORY AND FUNDAMENTAL CONCEPTS
+================================================================================
+
+Modern CPU Architecture (Intel/AMD x86-64):
+--------------------------------------------
+1. Superscalar execution: Multiple instructions per cycle
+2. Out-of-order execution: Execute instructions as dependencies resolve
+3. Speculative execution: Predict and execute before knowing if needed
+4. SIMD units: Process multiple data elements in parallel
+5. Hardware prefetchers: Predict and load data before needed
+6. Multi-level cache: L1, L2, L3 for fast data access
+7. Branch predictors: Predict control flow
+
+Typical Modern CPU (e.g., Intel Skylake-X):
+--------------------------------------------
+- Cores: 8-28 cores
+- Clock speed: 2.1-4.5 GHz
+- L1 Cache: 32 KB I + 32 KB D per core
+- L2 Cache: 1 MB per core
+- L3 Cache: 1.375-38.5 MB shared
+- SIMD: AVX-512 (512-bit)
+- Pipeline depth: 14-19 stages
+- Max IPC: 4-6 instructions per cycle
+- Memory bandwidth: 100-200 GB/s
+
+Latency Numbers Every HFT Programmer Should Know:
+--------------------------------------------------
+- L1 cache reference: 1 ns
+- Branch mispredict: 5 ns
+- L2 cache reference: 3 ns
+- Mutex lock/unlock: 25 ns
+- L3 cache reference: 20 ns
+- Main memory reference: 100 ns
+- Compress 1KB with Snappy: 3,000 ns
+- Send 1KB over 10 Gbps network: 10,000 ns
+- SSD random read: 150,000 ns
+- Read 1 MB sequentially from memory: 250,000 ns
+- Round trip within same datacenter: 500,000 ns
+- Read 1 MB sequentially from SSD: 1,000,000 ns
+- Disk seek: 10,000,000 ns
+
+HFT Architecture Optimization Goals:
+-------------------------------------
+1. Maximize instructions per cycle (IPC > 3.0)
+2. Minimize cache misses (< 1% miss rate)
+3. Eliminate branch mispredictions (< 1% misprediction rate)
+4. Utilize SIMD instructions (4-8x throughput)
+5. Leverage hardware prefetching
+6. Optimize for pipeline efficiency
+7. Minimize memory access latency
+
+================================================================================
+2. CPU MICROARCHITECTURE UNDERSTANDING
+================================================================================
+
+2.1 CPU Feature Detection
+--------------------------
+
+```cpp
+#include <cpuid.h>
+#include <cstdint>
+
+class CPUFeatures {
+public:
+    struct Features {
+        bool sse;
+        bool sse2;
+        bool sse3;
+        bool ssse3;
+        bool sse41;
+        bool sse42;
+        bool avx;
+        bool avx2;
+        bool avx512f;
+        bool fma;
+        bool bmi1;
+        bool bmi2;
+        bool popcnt;
+        bool lzcnt;
+        bool rdrand;
+        bool rdseed;
+    };
+
+    static Features detect() {
+        Features features = {};
+        uint32_t eax, ebx, ecx, edx;
+
+        // Check for CPUID support
+        if (!__get_cpuid(1, &eax, &ebx, &ecx, &edx)) {
+            return features;
+        }
+
+        // Basic features (CPUID function 1)
+        features.sse = (edx >> 25) & 1;
+        features.sse2 = (edx >> 26) & 1;
+        features.sse3 = (ecx >> 0) & 1;
+        features.ssse3 = (ecx >> 9) & 1;
+        features.sse41 = (ecx >> 19) & 1;
+        features.sse42 = (ecx >> 20) & 1;
+        features.avx = (ecx >> 28) & 1;
+        features.fma = (ecx >> 12) & 1;
+        features.popcnt = (ecx >> 23) & 1;
+        features.rdrand = (ecx >> 30) & 1;
+
+        // Extended features (CPUID function 7)
+        if (__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) {
+            features.avx2 = (ebx >> 5) & 1;
+            features.bmi1 = (ebx >> 3) & 1;
+            features.bmi2 = (ebx >> 8) & 1;
+            features.avx512f = (ebx >> 16) & 1;
+            features.rdseed = (ebx >> 18) & 1;
+        }
+
+        // Extended features (CPUID function 0x80000001)
+        if (__get_cpuid(0x80000001, &eax, &ebx, &ecx, &edx)) {
+            features.lzcnt = (ecx >> 5) & 1;
+        }
+
+        return features;
+    }
+
+    static void printFeatures() {
+        Features f = detect();
+
+        printf("CPU Features:\n");
+        printf("  SSE:      %s\n", f.sse ? "YES" : "NO");
+        printf("  SSE2:     %s\n", f.sse2 ? "YES" : "NO");
+        printf("  SSE3:     %s\n", f.sse3 ? "YES" : "NO");
+        printf("  SSSE3:    %s\n", f.ssse3 ? "YES" : "NO");
+        printf("  SSE4.1:   %s\n", f.sse41 ? "YES" : "NO");
+        printf("  SSE4.2:   %s\n", f.sse42 ? "YES" : "NO");
+        printf("  AVX:      %s\n", f.avx ? "YES" : "NO");
+        printf("  AVX2:     %s\n", f.avx2 ? "YES" : "NO");
+        printf("  AVX-512:  %s\n", f.avx512f ? "YES" : "NO");
+        printf("  FMA:      %s\n", f.fma ? "YES" : "NO");
+        printf("  BMI1:     %s\n", f.bmi1 ? "YES" : "NO");
+        printf("  BMI2:     %s\n", f.bmi2 ? "YES" : "NO");
+        printf("  POPCNT:   %s\n", f.popcnt ? "YES" : "NO");
+        printf("  LZCNT:    %s\n", f.lzcnt ? "YES" : "NO");
+    }
+};
+
+// Usage
+int main() {
+    CPUFeatures::printFeatures();
+    return 0;
+}
+```
+
+2.2 Cache Line Size Detection
+------------------------------
+
+```cpp
+#include <unistd.h>
+
+class CacheInfo {
+public:
+    static size_t getCacheLineSize() {
+        long size = sysconf(_SC_LEVEL1_DCACHE_LINESIZE);
+        return (size > 0) ? size : 64;  // Default to 64 bytes
+    }
+
+    static void printCacheInfo() {
+        printf("Cache Information:\n");
+        printf("  L1 Data Cache Line Size: %zu bytes\n", getCacheLineSize());
+        printf("  L1 Data Cache Size: %ld KB\n",
+               sysconf(_SC_LEVEL1_DCACHE_SIZE) / 1024);
+        printf("  L2 Cache Size: %ld KB\n",
+               sysconf(_SC_LEVEL2_CACHE_SIZE) / 1024);
+        printf("  L3 Cache Size: %ld KB\n",
+               sysconf(_SC_LEVEL3_CACHE_SIZE) / 1024);
+    }
+};
+```
+
+================================================================================
+3. SIMD INSTRUCTIONS (SSE, AVX, AVX-512)
+================================================================================
+
+3.1 SSE/AVX/AVX-512 Comparison
+-------------------------------
+
+SIMD Width:
+- SSE: 128-bit (2 double, 4 float, 4 int32)
+- AVX: 256-bit (4 double, 8 float, 8 int32)
+- AVX-512: 512-bit (8 double, 16 float, 16 int32)
+
+Performance multiplier:
+- SSE: 2-4x vs scalar
+- AVX: 4-8x vs scalar
+- AVX-512: 8-16x vs scalar
+
+3.2 SSE Example
+---------------
+
+```cpp
+#include <emmintrin.h>  // SSE2
+#include <xmmintrin.h>  // SSE
+
+// Add two arrays of doubles using SSE2
+void addArraysSSE(const double* a, const double* b, double* c, size_t n) {
+    size_t i = 0;
+
+    // Process 2 doubles at a time
+    for (; i + 1 < n; i += 2) {
+        __m128d va = _mm_loadu_pd(&a[i]);  // Load 2 doubles from a
+        __m128d vb = _mm_loadu_pd(&b[i]);  // Load 2 doubles from b
+        __m128d vc = _mm_add_pd(va, vb);   // Add
+        _mm_storeu_pd(&c[i], vc);          // Store result
+    }
+
+    // Handle remainder
+    for (; i < n; ++i) {
+        c[i] = a[i] + b[i];
+    }
+}
+
+// Latency: ~50% of scalar version
+// Throughput: 2x scalar
+```
+
+3.3 AVX Example
+---------------
+
+```cpp
+#include <immintrin.h>  // AVX
+
+// Calculate mid prices using AVX
+void calculateMidPricesAVX(const double* bids, const double* asks,
+                           double* mids, size_t n) {
+    const __m256d half = _mm256_set1_pd(0.5);
+    size_t i = 0;
+
+    // Process 4 doubles at a time
+    for (; i + 3 < n; i += 4) {
+        __m256d vbid = _mm256_loadu_pd(&bids[i]);
+        __m256d vask = _mm256_loadu_pd(&asks[i]);
+        __m256d vsum = _mm256_add_pd(vbid, vask);
+        __m256d vmid = _mm256_mul_pd(vsum, half);
+        _mm256_storeu_pd(&mids[i], vmid);
+    }
+
+    // Handle remainder
+    for (; i < n; ++i) {
+        mids[i] = (bids[i] + asks[i]) * 0.5;
+    }
+}
+
+// Latency: ~25% of scalar version
+// Throughput: 4x scalar
+```
+
+3.4 AVX-512 Example
+-------------------
+
+```cpp
+#include <immintrin.h>  // AVX-512
+
+// Process order quantities with AVX-512
+void processQuantitiesAVX512(const uint32_t* quantities,
+                             uint32_t* results, size_t n) {
+    size_t i = 0;
+
+    // Process 16 int32s at a time
+    for (; i + 15 < n; i += 16) {
+        __m512i vq = _mm512_loadu_si512(&quantities[i]);
+        __m512i vr = _mm512_mullo_epi32(vq, _mm512_set1_epi32(100));
+        _mm512_storeu_si512(&results[i], vr);
+    }
+
+    // Handle remainder
+    for (; i < n; ++i) {
+        results[i] = quantities[i] * 100;
+    }
+}
+
+// Throughput: 16x scalar
+```
+
+3.5 FMA (Fused Multiply-Add)
+-----------------------------
+
+```cpp
+// FMA: result = (a * b) + c in single operation
+// More accurate and faster than separate multiply and add
+
+void calculateVWAP_FMA(const double* prices, const double* volumes,
+                       double* vwap, size_t n) {
+    __m256d sum_pv = _mm256_setzero_pd();
+    __m256d sum_v = _mm256_setzero_pd();
+
+    size_t i = 0;
+    for (; i + 3 < n; i += 4) {
+        __m256d vp = _mm256_loadu_pd(&prices[i]);
+        __m256d vv = _mm256_loadu_pd(&volumes[i]);
+
+        // FMA: sum_pv = (vp * vv) + sum_pv
+        sum_pv = _mm256_fmadd_pd(vp, vv, sum_pv);
+        sum_v = _mm256_add_pd(sum_v, vv);
+    }
+
+    // Horizontal sum
+    double total_pv = 0, total_v = 0;
+    double* p_pv = (double*)&sum_pv;
+    double* p_v = (double*)&sum_v;
+
+    for (int j = 0; j < 4; ++j) {
+        total_pv += p_pv[j];
+        total_v += p_v[j];
+    }
+
+    // Handle remainder
+    for (; i < n; ++i) {
+        total_pv += prices[i] * volumes[i];
+        total_v += volumes[i];
+    }
+
+    *vwap = total_pv / total_v;
+}
+
+// FMA benefits:
+// - Single rounding error instead of two
+// - Better performance (1 instruction vs 2)
+// - Higher precision
+```
+
+3.6 Masked Operations (AVX-512)
+--------------------------------
+
+```cpp
+// Process only valid orders using AVX-512 masks
+void processValidOrders(const Order* orders, Order* results,
+                        const bool* valid, size_t n) {
+    size_t resultIdx = 0;
+
+    for (size_t i = 0; i < n; i += 16) {
+        // Load validity mask
+        __mmask16 mask = 0;
+        for (int j = 0; j < 16 && i + j < n; ++j) {
+            if (valid[i + j]) {
+                mask |= (1 << j);
+            }
+        }
+
+        // Load order IDs
+        __m512i orderIds = _mm512_loadu_si512(&orders[i].id);
+
+        // Compress valid orders
+        __m512i validIds = _mm512_mask_compress_epi32(_mm512_setzero_si512(),
+                                                      mask, orderIds);
+
+        // Store compressed results
+        _mm512_storeu_si512(&results[resultIdx].id, validIds);
+        resultIdx += _mm_popcnt_u32(mask);
+    }
+}
+```
+
+================================================================================
+4. HARDWARE PREFETCHING
+================================================================================
+
+4.1 Software Prefetching
+-------------------------
+
+```cpp
+#include <xmmintrin.h>
+
+class Prefetcher {
+public:
+    // Prefetch for read with high temporal locality
+    static void prefetchRead(const void* addr) {
+        _mm_prefetch((const char*)addr, _MM_HINT_T0);
+    }
+
+    // Prefetch for read with moderate temporal locality
+    static void prefetchReadModerate(const void* addr) {
+        _mm_prefetch((const char*)addr, _MM_HINT_T1);
+    }
+
+    // Prefetch for read with low temporal locality
+    static void prefetchReadLow(const void* addr) {
+        _mm_prefetch((const char*)addr, _MM_HINT_T2);
+    }
+
+    // Prefetch for write (non-temporal)
+    static void prefetchWrite(const void* addr) {
+        _mm_prefetch((const char*)addr, _MM_HINT_NTA);
+    }
+};
+
+// Example: Prefetch order book levels
+void processOrderBook(const PriceLevel* levels, size_t count) {
+    constexpr size_t PREFETCH_DISTANCE = 8;
+
+    for (size_t i = 0; i < count; ++i) {
+        // Prefetch future data
+        if (i + PREFETCH_DISTANCE < count) {
+            Prefetcher::prefetchRead(&levels[i + PREFETCH_DISTANCE]);
+        }
+
+        // Process current level
+        processLevel(levels[i]);
+    }
+}
+
+// Improvement: 10-30% faster for pointer-chasing workloads
+```
+
+4.2 Optimal Prefetch Distance
+------------------------------
+
+```cpp
+// Calculate optimal prefetch distance
+inline size_t calculatePrefetchDistance(size_t dataSize, size_t latency) {
+    // Latency in cycles, assuming 1 iteration per cycle
+    // prefetchDistance = latency / cyclesPerIteration
+    return latency;
+}
+
+// Example for different scenarios
+constexpr size_t PREFETCH_DISTANCE_L1 = 4;   // ~4 cycles to L1
+constexpr size_t PREFETCH_DISTANCE_L2 = 12;  // ~12 cycles to L2
+constexpr size_t PREFETCH_DISTANCE_L3 = 36;  // ~36 cycles to L3
+constexpr size_t PREFETCH_DISTANCE_MEM = 100; // ~100 cycles to memory
+
+void processWithAdaptivePrefetch(const Data* data, size_t count) {
+    size_t distance = PREFETCH_DISTANCE_L3;  // Assume L3 cache miss
+
+    for (size_t i = 0; i < count; ++i) {
+        if (i + distance < count) {
+            Prefetcher::prefetchRead(&data[i + distance]);
+        }
+
+        processData(data[i]);
+    }
+}
+```
+
+4.3 Multiple Prefetch Streams
+------------------------------
+
+```cpp
+// Prefetch multiple data structures simultaneously
+void processMultipleStreams(const double* prices,
+                           const uint32_t* quantities,
+                           const Timestamp* times,
+                           size_t count) {
+    constexpr size_t PREFETCH_DISTANCE = 16;
+
+    for (size_t i = 0; i < count; ++i) {
+        // Prefetch all streams
+        if (i + PREFETCH_DISTANCE < count) {
+            Prefetcher::prefetchRead(&prices[i + PREFETCH_DISTANCE]);
+            Prefetcher::prefetchRead(&quantities[i + PREFETCH_DISTANCE]);
+            Prefetcher::prefetchRead(&times[i + PREFETCH_DISTANCE]);
+        }
+
+        // Process current data
+        processQuote(prices[i], quantities[i], times[i]);
+    }
+}
+```
+
+================================================================================
+5. CPU CACHE ARCHITECTURE
+================================================================================
+
+5.1 Cache-Aware Data Layout
+----------------------------
+
+```cpp
+// Cache line size is typically 64 bytes
+constexpr size_t CACHE_LINE_SIZE = 64;
+
+// Align structures to cache line boundaries
+struct alignas(CACHE_LINE_SIZE) CacheAlignedOrder {
+    uint64_t id;           // 8 bytes
+    double price;          // 8 bytes
+    uint32_t quantity;     // 4 bytes
+    uint32_t timestamp;    // 4 bytes
+    uint16_t symbolId;     // 2 bytes
+    uint8_t side;          // 1 byte
+    uint8_t type;          // 1 byte
+    char padding[36];      // Pad to 64 bytes
+};
+
+static_assert(sizeof(CacheAlignedOrder) == 64, "Order must be 64 bytes");
+
+// Benefit: Each order fits exactly in one cache line
+// No false sharing between adjacent orders
+```
+
+5.2 False Sharing Prevention
+-----------------------------
+
+```cpp
+// BAD: False sharing
+struct Counters {
+    std::atomic<uint64_t> counter1;  // On same cache line
+    std::atomic<uint64_t> counter2;  // False sharing!
+};
+
+// Thread 1 updates counter1, Thread 2 updates counter2
+// Both on same cache line = cache line ping-pong
+// Performance: Very slow (100x slower than optimal)
+
+// GOOD: Cache line padding
+struct alignas(CACHE_LINE_SIZE) OptimizedCounters {
+    alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> counter1;
+    alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> counter2;
+};
+
+// Each counter on separate cache line
+// No false sharing
+// Performance: Optimal
+```
+
+5.3 Cache-Friendly Algorithms
+------------------------------
+
+```cpp
+// Cache-friendly order book traversal
+class CacheFriendlyOrderBook {
+    static constexpr size_t MAX_LEVELS = 100;
+    static constexpr size_t ORDERS_PER_LEVEL = 50;
+
+    // Store orders contiguously (cache-friendly)
+    struct Level {
+        double price;
+        uint32_t orderCount;
+        uint32_t padding;
+        std::array<Order, ORDERS_PER_LEVEL> orders;
+    };
+
+    std::array<Level, MAX_LEVELS> levels;
+
+public:
+    void processBidSide() {
+        // Sequential access = excellent cache locality
+        for (auto& level : levels) {
+            if (level.orderCount == 0) continue;
+
+            // All orders in level are in same cache region
+            for (size_t i = 0; i < level.orderCount; ++i) {
+                processOrder(level.orders[i]);
+            }
+        }
+    }
+};
+
+// Cache miss rate: < 1%
+// vs. pointer-based structure: 20-40% cache miss rate
+```
+
+================================================================================
+6. PIPELINE OPTIMIZATION
+================================================================================
+
+6.1 Instruction-Level Parallelism
+----------------------------------
+
+```cpp
+// BAD: Sequential dependencies
+double calculateBad(double a, double b, double c, double d) {
+    double result = a * b;      // Depends on a, b
+    result = result + c;        // Depends on previous result
+    result = result * d;        // Depends on previous result
+    return result;
+}
+// Pipeline stalls waiting for each operation
+// Latency: 3 * latency(op) = ~12-15 cycles
+
+// GOOD: Independent operations
+double calculateGood(double a, double b, double c, double d,
+                    double e, double f, double g, double h) {
+    double result1 = a * b;     // Independent
+    double result2 = c * d;     // Independent
+    double result3 = e * f;     // Independent
+    double result4 = g * h;     // Independent
+
+    // All multiplications execute in parallel
+    double sum1 = result1 + result2;
+    double sum2 = result3 + result4;
+
+    return sum1 + sum2;
+}
+// All 4 multiplications execute in parallel
+// Latency: latency(mul) + 2 * latency(add) = ~6-8 cycles
+// 2x faster
+```
+
+6.2 Loop Unrolling for ILP
+---------------------------
+
+```cpp
+// Manually unroll loop to expose ILP
+void processOrdersUnrolled(Order* orders, size_t count) {
+    size_t i = 0;
+
+    // Process 4 orders at a time
+    for (; i + 3 < count; i += 4) {
+        // All 4 processOrder calls can execute in parallel
+        // if they're independent
+        processOrder(orders[i + 0]);
+        processOrder(orders[i + 1]);
+        processOrder(orders[i + 2]);
+        processOrder(orders[i + 3]);
+    }
+
+    // Handle remainder
+    for (; i < count; ++i) {
+        processOrder(orders[i]);
+    }
+}
+
+// IPC improvement: 2-4x
+```
+
+6.3 Avoiding Pipeline Stalls
+-----------------------------
+
+```cpp
+// BAD: Data dependency causes stalls
+uint64_t fibonacci(int n) {
+    uint64_t a = 0, b = 1;
+    for (int i = 0; i < n; ++i) {
+        uint64_t temp = a + b;  // Depends on a and b
+        a = b;                  // Depends on previous b
+        b = temp;               // Depends on temp
+    }
+    return b;
+}
+// Each iteration depends on previous iteration
+// Cannot parallelize
+
+// GOOD: Independent operations (where possible)
+double sumArray(const double* data, size_t n) {
+    // Use multiple accumulators to avoid dependency chain
+    double sum1 = 0, sum2 = 0, sum3 = 0, sum4 = 0;
+
+    size_t i = 0;
+    for (; i + 3 < n; i += 4) {
+        sum1 += data[i + 0];  // Independent
+        sum2 += data[i + 1];  // Independent
+        sum3 += data[i + 2];  // Independent
+        sum4 += data[i + 3];  // Independent
+    }
+
+    // Combine sums
+    double total = (sum1 + sum2) + (sum3 + sum4);
+
+    // Handle remainder
+    for (; i < n; ++i) {
+        total += data[i];
+    }
+
+    return total;
+}
+// 4 independent addition chains
+// CPU can execute all 4 in parallel
+// 4x faster
+```
+
+================================================================================
+7. BRANCH PREDICTION
+================================================================================
+
+7.1 Branch Prediction Theory
+-----------------------------
+
+Modern CPUs use:
+- Pattern-based prediction (last N branches)
+- Correlation-based prediction (branch history)
+- Hybrid predictors
+
+Branch misprediction penalty: 10-20 cycles
+
+7.2 Branch Prediction Hints
+----------------------------
+
+```cpp
+// Use [[likely]] and [[unlikely]] (C++20)
+void processOrder(const Order& order) {
+    if (order.type == OrderType::LIMIT) [[likely]] {
+        // This branch is predicted taken
+        processLimitOrder(order);
+    } else [[unlikely]] {
+        // This branch is predicted not taken
+        processMarketOrder(order);
+    }
+}
+
+// GCC/Clang builtin
+inline bool likely(bool cond) {
+    return __builtin_expect(cond, 1);
+}
+
+inline bool unlikely(bool cond) {
+    return __builtin_expect(cond, 0);
+}
+
+void processOrderBuiltin(const Order& order) {
+    if (likely(order.type == OrderType::LIMIT)) {
+        processLimitOrder(order);
+    } else {
+        processMarketOrder(order);
+    }
+}
+```
+
+7.3 Branchless Programming
+---------------------------
+
+```cpp
+// BAD: Branch-heavy code
+int max(int a, int b) {
+    if (a > b) {
+        return a;
+    } else {
+        return b;
+    }
+}
+// Potential branch misprediction
+
+// GOOD: Branchless
+int maxBranchless(int a, int b) {
+    return a > b ? a : b;  // Compiled to conditional move (CMOV)
+}
+// No branch, no misprediction
+
+// Example: Branchless absolute value
+int absBranchless(int x) {
+    int mask = x >> 31;  // All 1s if negative, all 0s if positive
+    return (x + mask) ^ mask;
+}
+
+// Example: Branchless min/max
+double minBranchless(double a, double b) {
+    return a < b ? a : b;  // CMOV instruction
+}
+
+// Example: Branchless clamp
+int clamp(int x, int min, int max) {
+    x = (x < min) ? min : x;
+    x = (x > max) ? max : x;
+    return x;
+}
+```
+
+7.4 Lookup Table Instead of Branches
+-------------------------------------
+
+```cpp
+// BAD: Multiple branches
+uint32_t getFeeMultiplier(uint8_t vipLevel) {
+    if (vipLevel == 0) return 100;
+    if (vipLevel == 1) return 90;
+    if (vipLevel == 2) return 80;
+    if (vipLevel == 3) return 70;
+    return 100;
+}
+// 3 branches, high misprediction rate
+
+// GOOD: Lookup table
+constexpr std::array<uint32_t, 4> FEE_MULTIPLIERS = {100, 90, 80, 70};
+
+uint32_t getFeeMultiplierLUT(uint8_t vipLevel) {
+    return FEE_MULTIPLIERS[std::min(vipLevel, 3)];
+}
+// Zero branches, single array lookup
+// 5-10x faster
+```
+
+================================================================================
+8. OUT-OF-ORDER EXECUTION
+================================================================================
+
+8.1 Understanding Out-of-Order Execution
+-----------------------------------------
+
+Modern CPUs can execute instructions out of order if:
+1. No data dependencies exist
+2. Resources (execution units) are available
+3. No memory ordering constraints
+
+```cpp
+// These instructions can execute out of order
+void independentOps() {
+    int a = 1 + 2;      // Independent
+    int b = 3 * 4;      // Independent
+    int c = 5 - 6;      // Independent
+    int d = 7 / 8;      // Independent
+
+    // CPU can execute all 4 simultaneously
+}
+
+// These instructions must execute in order
+void dependentOps() {
+    int a = 1 + 2;      // Must execute first
+    int b = a * 4;      // Depends on a
+    int c = b - 6;      // Depends on b
+    int d = c / 8;      // Depends on c
+
+    // CPU must execute sequentially
+}
+```
+
+8.2 Optimizing for Out-of-Order Execution
+------------------------------------------
+
+```cpp
+// Restructure code to expose more parallelism
+// BAD: Sequential dependencies
+double calculatePriceImpact(const Order& order) {
+    double impact = order.quantity * IMPACT_FACTOR;
+    impact = impact / totalVolume;
+    impact = impact * volatility;
+    impact = impact + baseImpact;
+    return impact;
+}
+// Each operation depends on previous
+// CPU cannot parallelize
+
+// GOOD: Independent operations
+double calculatePriceImpactOptimized(const Order& order) {
+    // Calculate intermediate values independently
+    double qtyImpact = order.quantity * IMPACT_FACTOR;
+    double volFactor = 1.0 / totalVolume;
+    double volImpact = volatility;
+
+    // Combine in parallel
+    double partialImpact = qtyImpact * volFactor;
+    double totalImpact = partialImpact * volImpact + baseImpact;
+
+    return totalImpact;
+}
+// More operations can execute in parallel
+```
+
+================================================================================
+9. HYPER-THREADING CONSIDERATIONS
+================================================================================
+
+9.1 Hyper-Threading (SMT) Impact
+---------------------------------
+
+Hyper-Threading allows 2 threads per physical core:
+- Shares execution units between threads
+- Can improve throughput for some workloads
+- Can reduce per-thread performance for HFT
+
+For HFT: Usually disable hyper-threading
+- Ensures deterministic performance
+- Eliminates resource contention
+- Reduces latency variance
+
+```bash
+# Disable hyper-threading
+echo off > /sys/devices/system/cpu/smt/control
+
+# Or disable specific logical cores
+for cpu in /sys/devices/system/cpu/cpu{1,3,5,7}/online; do
+    echo 0 > $cpu
+done
+```
+
+9.2 Core Assignment Strategy
+-----------------------------
+
+```cpp
+// Assign critical threads to physical cores only
+void assignCriticalThread() {
+    // Physical cores: 0, 2, 4, 6, ...
+    // Logical cores: 1, 3, 5, 7, ...
+
+    // Assign to physical core 2
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(2, &cpuset);  // Physical core, not logical
+
+    pthread_t thread = pthread_self();
+    pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset);
+}
+```
+
+================================================================================
+10. BENCHMARKING AND MEASUREMENT
+================================================================================
+
+10.1 Performance Counter Monitoring
+------------------------------------
+
+```cpp
+#include <linux/perf_event.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+class PerfMonitor {
+    int fd_cycles;
+    int fd_instructions;
+    int fd_cache_misses;
+    int fd_branch_misses;
+
+public:
+    PerfMonitor() {
+        fd_cycles = openPerfCounter(PERF_COUNT_HW_CPU_CYCLES);
+        fd_instructions = openPerfCounter(PERF_COUNT_HW_INSTRUCTIONS);
+        fd_cache_misses = openPerfCounter(PERF_COUNT_HW_CACHE_MISSES);
+        fd_branch_misses = openPerfCounter(PERF_COUNT_HW_BRANCH_MISSES);
+    }
+
+    void start() {
+        ioctl(fd_cycles, PERF_EVENT_IOC_RESET, 0);
+        ioctl(fd_instructions, PERF_EVENT_IOC_RESET, 0);
+        ioctl(fd_cache_misses, PERF_EVENT_IOC_RESET, 0);
+        ioctl(fd_branch_misses, PERF_EVENT_IOC_RESET, 0);
+
+        ioctl(fd_cycles, PERF_EVENT_IOC_ENABLE, 0);
+        ioctl(fd_instructions, PERF_EVENT_IOC_ENABLE, 0);
+        ioctl(fd_cache_misses, PERF_EVENT_IOC_ENABLE, 0);
+        ioctl(fd_branch_misses, PERF_EVENT_IOC_ENABLE, 0);
+    }
+
+    void stop() {
+        uint64_t cycles, instructions, cache_misses, branch_misses;
+
+        read(fd_cycles, &cycles, sizeof(cycles));
+        read(fd_instructions, &instructions, sizeof(instructions));
+        read(fd_cache_misses, &cache_misses, sizeof(cache_misses));
+        read(fd_branch_misses, &branch_misses, sizeof(branch_misses));
+
+        double ipc = (double)instructions / cycles;
+        double cache_miss_rate = (double)cache_misses / instructions * 100;
+        double branch_miss_rate = (double)branch_misses / instructions * 100;
+
+        printf("Performance Metrics:\n");
+        printf("  Cycles: %lu\n", cycles);
+        printf("  Instructions: %lu\n", instructions);
+        printf("  IPC: %.2f\n", ipc);
+        printf("  Cache Misses: %lu (%.2f%%)\n", cache_misses, cache_miss_rate);
+        printf("  Branch Misses: %lu (%.2f%%)\n", branch_misses, branch_miss_rate);
+    }
+
+private:
+    int openPerfCounter(uint32_t type) {
+        struct perf_event_attr pe = {};
+        pe.type = PERF_TYPE_HARDWARE;
+        pe.size = sizeof(struct perf_event_attr);
+        pe.config = type;
+        pe.disabled = 1;
+        pe.exclude_kernel = 1;
+        pe.exclude_hv = 1;
+
+        return syscall(__NR_perf_event_open, &pe, 0, -1, -1, 0);
+    }
+};
+
+// Usage
+PerfMonitor monitor;
+monitor.start();
+processOrders();
+monitor.stop();
+```
+
+10.2 SIMD Performance Measurement
+----------------------------------
+
+```bash
+# Measure SIMD utilization with perf
+perf stat -e fp_arith_inst_retired.scalar_double,fp_arith_inst_retired.128b_packed_double,fp_arith_inst_retired.256b_packed_double,fp_arith_inst_retired.512b_packed_double ./trading_engine
+
+# High packed instruction count = good SIMD utilization
+```
+
+================================================================================
+11. EXPECTED IMPROVEMENTS
+================================================================================
+
+Optimization Technique                    | Performance Gain | Complexity
+------------------------------------------|------------------|-------------
+SIMD (AVX2)                               | 2-4x            | Medium
+SIMD (AVX-512)                            | 4-8x            | Medium
+Software prefetching                      | 1.1-1.3x        | Low
+Cache-friendly data layout                | 1.2-2x          | Medium
+Branch elimination                        | 1.1-1.5x        | Low
+Branchless programming                    | 1.2-3x          | Medium
+ILP optimization                          | 1.2-1.8x        | High
+Hardware feature utilization              | 1.1-1.4x        | Low
+False sharing elimination                 | 2-10x           | Low
+Hyper-threading disable                   | 1.1-1.3x        | Low
+
+Combined Effect: 10-50x improvement
+
+Real-World HFT Example:
+-----------------------
+Market Data Processing:
+
+BEFORE architecture optimization:
+- Scalar processing: 1 quote per iteration
+- Cache miss rate: 25%
+- Branch misprediction: 12%
+- IPC: 1.2
+- Throughput: 500K quotes/sec
+
+AFTER architecture optimization:
+- SIMD processing: 8 quotes per iteration (AVX-512)
+- Cache miss rate: 2%
+- Branch misprediction: 1%
+- IPC: 3.8
+- Throughput: 8M quotes/sec (16x improvement)
+
+Latency per quote: 2000 ns → 125 ns (16x faster)
+
+Competitive Advantage:
+- Process market data 16x faster
+- React to price changes 1875 ns earlier
+- Can monitor 16x more symbols
+- Better alpha capture through faster signal generation
+
+================================================================================
+END OF COMPUTER ARCHITECTURE OPTIMIZATION GUIDE
+================================================================================

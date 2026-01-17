@@ -1,0 +1,873 @@
+================================================================================
+DAILY P&L REPORTING SYSTEM
+High-Frequency Trading Platform
+================================================================================
+
+OVERVIEW:
+Daily P&L reporting system for real-time and end-of-day profit and loss
+calculations, including realized/unrealized P&L, fees, slippage analysis,
+and multi-level aggregations (strategy, symbol, venue, account).
+
+================================================================================
+1. P&L DATA MODEL
+================================================================================
+
+-- PostgreSQL Schema for P&L Data
+CREATE TABLE daily_pnl (
+    pnl_id BIGSERIAL PRIMARY KEY,
+    trade_date DATE NOT NULL,
+    strategy_id VARCHAR(50) NOT NULL,
+    symbol VARCHAR(20) NOT NULL,
+    venue VARCHAR(20),
+    account_id VARCHAR(50),
+
+    -- P&L Components
+    realized_pnl NUMERIC(18,4) DEFAULT 0,
+    unrealized_pnl NUMERIC(18,4) DEFAULT 0,
+    gross_pnl NUMERIC(18,4) DEFAULT 0,
+    net_pnl NUMERIC(18,4) DEFAULT 0,
+
+    -- Cost Breakdown
+    commission NUMERIC(12,4) DEFAULT 0,
+    exchange_fees NUMERIC(12,4) DEFAULT 0,
+    clearing_fees NUMERIC(12,4) DEFAULT 0,
+    regulatory_fees NUMERIC(12,4) DEFAULT 0,
+    rebates NUMERIC(12,4) DEFAULT 0,
+
+    -- Trading Metrics
+    trade_count INTEGER DEFAULT 0,
+    volume_traded BIGINT DEFAULT 0,
+    winning_trades INTEGER DEFAULT 0,
+    losing_trades INTEGER DEFAULT 0,
+
+    -- Slippage Analysis
+    expected_pnl NUMERIC(18,4) DEFAULT 0,
+    slippage NUMERIC(12,4) DEFAULT 0,
+    market_impact NUMERIC(12,4) DEFAULT 0,
+
+    -- Position Info
+    start_position BIGINT DEFAULT 0,
+    end_position BIGINT DEFAULT 0,
+    max_position BIGINT DEFAULT 0,
+    avg_position NUMERIC(12,2) DEFAULT 0,
+
+    -- Timestamps
+    calculation_time TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW(),
+
+    CONSTRAINT uk_daily_pnl UNIQUE (trade_date, strategy_id, symbol, venue, account_id)
+);
+
+CREATE INDEX idx_daily_pnl_date ON daily_pnl(trade_date DESC);
+CREATE INDEX idx_daily_pnl_strategy ON daily_pnl(strategy_id, trade_date DESC);
+CREATE INDEX idx_daily_pnl_symbol ON daily_pnl(symbol, trade_date DESC);
+
+-- Intraday P&L Snapshot (Real-time)
+CREATE TABLE intraday_pnl (
+    snapshot_id BIGSERIAL PRIMARY KEY,
+    snapshot_time TIMESTAMP NOT NULL,
+    strategy_id VARCHAR(50) NOT NULL,
+    symbol VARCHAR(20) NOT NULL,
+    venue VARCHAR(20),
+
+    realized_pnl NUMERIC(18,4),
+    unrealized_pnl NUMERIC(18,4),
+    gross_pnl NUMERIC(18,4),
+    net_pnl NUMERIC(18,4),
+    total_fees NUMERIC(12,4),
+
+    current_position BIGINT,
+    avg_entry_price NUMERIC(12,4),
+    current_price NUMERIC(12,4),
+
+    CONSTRAINT uk_intraday_pnl UNIQUE (snapshot_time, strategy_id, symbol, venue)
+);
+
+CREATE INDEX idx_intraday_pnl_time ON intraday_pnl(snapshot_time DESC);
+CREATE INDEX idx_intraday_pnl_strategy_time ON intraday_pnl(strategy_id, snapshot_time DESC);
+
+-- P&L Attribution
+CREATE TABLE pnl_attribution (
+    attribution_id BIGSERIAL PRIMARY KEY,
+    trade_date DATE NOT NULL,
+    strategy_id VARCHAR(50) NOT NULL,
+
+    signal_pnl NUMERIC(18,4) DEFAULT 0,
+    timing_pnl NUMERIC(18,4) DEFAULT 0,
+    execution_pnl NUMERIC(18,4) DEFAULT 0,
+    slippage_pnl NUMERIC(18,4) DEFAULT 0,
+    fee_cost NUMERIC(12,4) DEFAULT 0,
+
+    total_pnl NUMERIC(18,4) DEFAULT 0,
+
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+================================================================================
+2. SQL QUERIES FOR P&L EXTRACTION
+================================================================================
+
+-- Daily P&L Summary by Strategy
+SELECT
+    trade_date,
+    strategy_id,
+    SUM(gross_pnl) as total_gross_pnl,
+    SUM(net_pnl) as total_net_pnl,
+    SUM(commission + exchange_fees + clearing_fees + regulatory_fees) as total_fees,
+    SUM(rebates) as total_rebates,
+    SUM(slippage) as total_slippage,
+    SUM(trade_count) as total_trades,
+    SUM(volume_traded) as total_volume,
+    ROUND(100.0 * SUM(winning_trades)::NUMERIC / NULLIF(SUM(trade_count), 0), 2) as win_rate
+FROM daily_pnl
+WHERE trade_date = CURRENT_DATE
+GROUP BY trade_date, strategy_id
+ORDER BY total_net_pnl DESC;
+
+-- Daily P&L by Symbol
+SELECT
+    d.trade_date,
+    d.symbol,
+    SUM(d.net_pnl) as net_pnl,
+    SUM(d.gross_pnl) as gross_pnl,
+    SUM(d.trade_count) as trades,
+    SUM(d.volume_traded) as volume,
+    AVG(d.slippage / NULLIF(d.gross_pnl, 0)) * 100 as avg_slippage_pct,
+    STRING_AGG(DISTINCT d.strategy_id, ', ') as strategies
+FROM daily_pnl d
+WHERE d.trade_date = CURRENT_DATE
+GROUP BY d.trade_date, d.symbol
+ORDER BY net_pnl DESC;
+
+-- Top 10 Most Profitable Strategies (Last 30 Days)
+SELECT
+    strategy_id,
+    COUNT(DISTINCT trade_date) as trading_days,
+    SUM(net_pnl) as total_pnl,
+    AVG(net_pnl) as avg_daily_pnl,
+    STDDEV(net_pnl) as pnl_volatility,
+    SUM(net_pnl) / NULLIF(STDDEV(net_pnl), 0) as sharpe_ratio,
+    SUM(trade_count) as total_trades,
+    SUM(CASE WHEN net_pnl > 0 THEN 1 ELSE 0 END)::NUMERIC / COUNT(*) * 100 as positive_days_pct
+FROM daily_pnl
+WHERE trade_date >= CURRENT_DATE - INTERVAL '30 days'
+GROUP BY strategy_id
+ORDER BY total_pnl DESC
+LIMIT 10;
+
+-- Intraday P&L Progression
+SELECT
+    DATE_TRUNC('hour', snapshot_time) as hour,
+    strategy_id,
+    AVG(gross_pnl) as avg_gross_pnl,
+    AVG(net_pnl) as avg_net_pnl,
+    MAX(net_pnl) as max_pnl,
+    MIN(net_pnl) as min_pnl,
+    STDDEV(net_pnl) as pnl_std
+FROM intraday_pnl
+WHERE snapshot_time >= CURRENT_DATE
+GROUP BY DATE_TRUNC('hour', snapshot_time), strategy_id
+ORDER BY hour, strategy_id;
+
+-- P&L by Venue Analysis
+SELECT
+    venue,
+    COUNT(DISTINCT strategy_id) as num_strategies,
+    SUM(net_pnl) as total_net_pnl,
+    SUM(gross_pnl) as total_gross_pnl,
+    SUM(commission + exchange_fees + clearing_fees + regulatory_fees) as total_fees,
+    SUM(rebates) as total_rebates,
+    SUM(net_pnl) / NULLIF(SUM(ABS(gross_pnl)), 0) as fee_efficiency
+FROM daily_pnl
+WHERE trade_date = CURRENT_DATE
+GROUP BY venue
+ORDER BY total_net_pnl DESC;
+
+-- Month-to-Date P&L Summary
+SELECT
+    DATE_TRUNC('month', trade_date) as month,
+    strategy_id,
+    SUM(net_pnl) as mtd_pnl,
+    AVG(net_pnl) as avg_daily_pnl,
+    MAX(net_pnl) as best_day,
+    MIN(net_pnl) as worst_day,
+    SUM(CASE WHEN net_pnl > 0 THEN net_pnl ELSE 0 END) as positive_pnl,
+    SUM(CASE WHEN net_pnl < 0 THEN net_pnl ELSE 0 END) as negative_pnl,
+    SUM(trade_count) as total_trades
+FROM daily_pnl
+WHERE trade_date >= DATE_TRUNC('month', CURRENT_DATE)
+GROUP BY DATE_TRUNC('month', trade_date), strategy_id
+ORDER BY mtd_pnl DESC;
+
+================================================================================
+3. C++ P&L CALCULATION ENGINE
+================================================================================
+
+#ifndef PNL_CALCULATOR_HPP
+#define PNL_CALCULATOR_HPP
+
+#include <string>
+#include <vector>
+#include <map>
+#include <memory>
+#include <chrono>
+#include <mutex>
+#include <boost/date_time/posix_time/posix_time.hpp>
+
+namespace hft {
+namespace reporting {
+
+struct Trade {
+    uint64_t trade_id;
+    std::string strategy_id;
+    std::string symbol;
+    std::string venue;
+    char side;  // 'B' or 'S'
+    int64_t quantity;
+    double price;
+    double commission;
+    double exchange_fee;
+    double clearing_fee;
+    double regulatory_fee;
+    double rebate;
+    std::chrono::system_clock::time_point timestamp;
+};
+
+struct Position {
+    std::string symbol;
+    int64_t quantity;
+    double avg_entry_price;
+    double realized_pnl;
+    double total_commission;
+    double total_fees;
+    double total_rebates;
+    int32_t trade_count;
+
+    Position() : quantity(0), avg_entry_price(0.0), realized_pnl(0.0),
+                 total_commission(0.0), total_fees(0.0), total_rebates(0.0),
+                 trade_count(0) {}
+};
+
+struct PnLSnapshot {
+    std::string strategy_id;
+    std::string symbol;
+    std::string venue;
+
+    double realized_pnl;
+    double unrealized_pnl;
+    double gross_pnl;
+    double net_pnl;
+
+    double total_commission;
+    double total_fees;
+    double total_rebates;
+
+    int32_t trade_count;
+    int64_t volume_traded;
+    int32_t winning_trades;
+    int32_t losing_trades;
+
+    int64_t current_position;
+    double avg_entry_price;
+    double current_price;
+
+    std::chrono::system_clock::time_point snapshot_time;
+};
+
+class PnLCalculator {
+public:
+    PnLCalculator() = default;
+
+    // Process a single trade
+    void processTrade(const Trade& trade) {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        std::string key = makeKey(trade.strategy_id, trade.symbol, trade.venue);
+        auto& pos = positions_[key];
+
+        // Update position
+        updatePosition(pos, trade);
+
+        // Store trade for historical analysis
+        trades_.push_back(trade);
+
+        // Update intraday snapshot
+        last_prices_[trade.symbol] = trade.price;
+    }
+
+    // Calculate P&L for a position
+    PnLSnapshot calculatePnL(const std::string& strategy_id,
+                            const std::string& symbol,
+                            const std::string& venue,
+                            double current_price) {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        std::string key = makeKey(strategy_id, symbol, venue);
+        const auto& pos = positions_[key];
+
+        PnLSnapshot snapshot;
+        snapshot.strategy_id = strategy_id;
+        snapshot.symbol = symbol;
+        snapshot.venue = venue;
+        snapshot.snapshot_time = std::chrono::system_clock::now();
+
+        // Realized P&L
+        snapshot.realized_pnl = pos.realized_pnl;
+
+        // Unrealized P&L
+        snapshot.unrealized_pnl = calculateUnrealizedPnL(pos, current_price);
+
+        // Gross P&L
+        snapshot.gross_pnl = snapshot.realized_pnl + snapshot.unrealized_pnl;
+
+        // Net P&L (after fees)
+        snapshot.total_commission = pos.total_commission;
+        snapshot.total_fees = pos.total_fees;
+        snapshot.total_rebates = pos.total_rebates;
+        snapshot.net_pnl = snapshot.gross_pnl - snapshot.total_commission
+                          - snapshot.total_fees + snapshot.total_rebates;
+
+        // Trading metrics
+        snapshot.trade_count = pos.trade_count;
+        snapshot.current_position = pos.quantity;
+        snapshot.avg_entry_price = pos.avg_entry_price;
+        snapshot.current_price = current_price;
+
+        return snapshot;
+    }
+
+    // Get all positions for a strategy
+    std::vector<PnLSnapshot> getStrategyPnL(const std::string& strategy_id) {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        std::vector<PnLSnapshot> snapshots;
+        for (const auto& [key, pos] : positions_) {
+            if (key.find(strategy_id) == 0) {
+                // Extract symbol and venue from key
+                size_t pos1 = key.find('|');
+                size_t pos2 = key.find('|', pos1 + 1);
+                std::string symbol = key.substr(pos1 + 1, pos2 - pos1 - 1);
+                std::string venue = key.substr(pos2 + 1);
+
+                double current_price = getLastPrice(symbol);
+                snapshots.push_back(calculatePnL(strategy_id, symbol, venue, current_price));
+            }
+        }
+        return snapshots;
+    }
+
+    // Daily P&L rollup
+    std::map<std::string, double> getDailyPnL() {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        std::map<std::string, double> daily_pnl;
+        for (const auto& [key, pos] : positions_) {
+            std::string symbol = extractSymbol(key);
+            double current_price = getLastPrice(symbol);
+            double pnl = pos.realized_pnl + calculateUnrealizedPnL(pos, current_price);
+            pnl -= (pos.total_commission + pos.total_fees - pos.total_rebates);
+
+            daily_pnl[key] = pnl;
+        }
+        return daily_pnl;
+    }
+
+    // Reset positions for new trading day
+    void resetDailyPositions() {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        for (auto& [key, pos] : positions_) {
+            // Carry forward position but reset daily P&L metrics
+            pos.realized_pnl = 0.0;
+            pos.total_commission = 0.0;
+            pos.total_fees = 0.0;
+            pos.total_rebates = 0.0;
+            pos.trade_count = 0;
+        }
+        trades_.clear();
+    }
+
+private:
+    std::map<std::string, Position> positions_;
+    std::map<std::string, double> last_prices_;
+    std::vector<Trade> trades_;
+    mutable std::mutex mutex_;
+
+    std::string makeKey(const std::string& strategy, const std::string& symbol,
+                       const std::string& venue) {
+        return strategy + "|" + symbol + "|" + venue;
+    }
+
+    std::string extractSymbol(const std::string& key) {
+        size_t pos1 = key.find('|');
+        size_t pos2 = key.find('|', pos1 + 1);
+        return key.substr(pos1 + 1, pos2 - pos1 - 1);
+    }
+
+    void updatePosition(Position& pos, const Trade& trade) {
+        double trade_value = trade.quantity * trade.price;
+
+        if (trade.side == 'B') {
+            // Buy
+            if (pos.quantity < 0) {
+                // Closing short or flipping to long
+                int64_t close_qty = std::min(-pos.quantity, trade.quantity);
+                pos.realized_pnl += close_qty * (pos.avg_entry_price - trade.price);
+
+                if (trade.quantity > -pos.quantity) {
+                    // Flipping to long
+                    int64_t new_qty = trade.quantity + pos.quantity;
+                    pos.avg_entry_price = trade.price;
+                    pos.quantity = new_qty;
+                } else {
+                    pos.quantity += trade.quantity;
+                }
+            } else {
+                // Adding to long or opening long
+                double total_cost = (pos.quantity * pos.avg_entry_price) + trade_value;
+                pos.quantity += trade.quantity;
+                pos.avg_entry_price = pos.quantity > 0 ? total_cost / pos.quantity : 0.0;
+            }
+        } else {
+            // Sell
+            if (pos.quantity > 0) {
+                // Closing long or flipping to short
+                int64_t close_qty = std::min(pos.quantity, trade.quantity);
+                pos.realized_pnl += close_qty * (trade.price - pos.avg_entry_price);
+
+                if (trade.quantity > pos.quantity) {
+                    // Flipping to short
+                    int64_t new_qty = trade.quantity - pos.quantity;
+                    pos.avg_entry_price = trade.price;
+                    pos.quantity = -new_qty;
+                } else {
+                    pos.quantity -= trade.quantity;
+                }
+            } else {
+                // Adding to short or opening short
+                double total_value = (-pos.quantity * pos.avg_entry_price) + trade_value;
+                pos.quantity -= trade.quantity;
+                pos.avg_entry_price = pos.quantity < 0 ? total_value / (-pos.quantity) : 0.0;
+            }
+        }
+
+        // Update costs
+        pos.total_commission += trade.commission;
+        pos.total_fees += (trade.exchange_fee + trade.clearing_fee + trade.regulatory_fee);
+        pos.total_rebates += trade.rebate;
+        pos.trade_count++;
+    }
+
+    double calculateUnrealizedPnL(const Position& pos, double current_price) const {
+        if (pos.quantity == 0) return 0.0;
+
+        if (pos.quantity > 0) {
+            // Long position
+            return pos.quantity * (current_price - pos.avg_entry_price);
+        } else {
+            // Short position
+            return (-pos.quantity) * (pos.avg_entry_price - current_price);
+        }
+    }
+
+    double getLastPrice(const std::string& symbol) const {
+        auto it = last_prices_.find(symbol);
+        return it != last_prices_.end() ? it->second : 0.0;
+    }
+};
+
+// P&L Report Generator
+class PnLReportGenerator {
+public:
+    explicit PnLReportGenerator(std::shared_ptr<PnLCalculator> calculator)
+        : calculator_(calculator) {}
+
+    std::string generateDailyReport(const std::string& strategy_id) {
+        auto snapshots = calculator_->getStrategyPnL(strategy_id);
+
+        std::ostringstream report;
+        report << "=== DAILY P&L REPORT ===\n";
+        report << "Strategy: " << strategy_id << "\n";
+        report << "Date: " << getCurrentDate() << "\n\n";
+
+        double total_realized = 0.0;
+        double total_unrealized = 0.0;
+        double total_gross = 0.0;
+        double total_net = 0.0;
+        double total_fees = 0.0;
+        int32_t total_trades = 0;
+
+        report << std::setw(10) << "Symbol"
+               << std::setw(15) << "Realized"
+               << std::setw(15) << "Unrealized"
+               << std::setw(15) << "Gross"
+               << std::setw(15) << "Net"
+               << std::setw(10) << "Trades\n";
+        report << std::string(80, '-') << "\n";
+
+        for (const auto& snap : snapshots) {
+            report << std::setw(10) << snap.symbol
+                   << std::setw(15) << std::fixed << std::setprecision(2) << snap.realized_pnl
+                   << std::setw(15) << snap.unrealized_pnl
+                   << std::setw(15) << snap.gross_pnl
+                   << std::setw(15) << snap.net_pnl
+                   << std::setw(10) << snap.trade_count << "\n";
+
+            total_realized += snap.realized_pnl;
+            total_unrealized += snap.unrealized_pnl;
+            total_gross += snap.gross_pnl;
+            total_net += snap.net_pnl;
+            total_fees += (snap.total_commission + snap.total_fees - snap.total_rebates);
+            total_trades += snap.trade_count;
+        }
+
+        report << std::string(80, '-') << "\n";
+        report << std::setw(10) << "TOTAL"
+               << std::setw(15) << total_realized
+               << std::setw(15) << total_unrealized
+               << std::setw(15) << total_gross
+               << std::setw(15) << total_net
+               << std::setw(10) << total_trades << "\n\n";
+
+        report << "Total Fees: $" << std::fixed << std::setprecision(2) << total_fees << "\n";
+        report << "Fee Percentage: " << std::setprecision(4)
+               << (total_fees / std::abs(total_gross) * 100.0) << "%\n";
+
+        return report.str();
+    }
+
+private:
+    std::shared_ptr<PnLCalculator> calculator_;
+
+    std::string getCurrentDate() {
+        auto now = std::chrono::system_clock::now();
+        std::time_t now_c = std::chrono::system_clock::to_time_t(now);
+        std::tm now_tm = *std::localtime(&now_c);
+
+        char buffer[32];
+        std::strftime(buffer, sizeof(buffer), "%Y-%m-%d", &now_tm);
+        return std::string(buffer);
+    }
+};
+
+} // namespace reporting
+} // namespace hft
+
+#endif // PNL_CALCULATOR_HPP
+
+================================================================================
+4. PYTHON P&L ANALYSIS SCRIPTS
+================================================================================
+
+#!/usr/bin/env python3
+"""
+Daily P&L Analysis and Reporting
+"""
+
+import psycopg2
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import matplotlib.pyplot as plt
+import seaborn as sns
+from typing import Dict, List, Tuple
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.image import MIMEImage
+import io
+
+class PnLAnalyzer:
+    def __init__(self, db_config: Dict[str, str]):
+        self.conn = psycopg2.connect(**db_config)
+
+    def get_daily_pnl(self, trade_date: str = None) -> pd.DataFrame:
+        """Fetch daily P&L data"""
+        if trade_date is None:
+            trade_date = datetime.now().strftime('%Y-%m-%d')
+
+        query = """
+            SELECT
+                strategy_id, symbol, venue,
+                realized_pnl, unrealized_pnl, gross_pnl, net_pnl,
+                commission, exchange_fees, clearing_fees, regulatory_fees, rebates,
+                trade_count, volume_traded, winning_trades, losing_trades,
+                slippage, market_impact
+            FROM daily_pnl
+            WHERE trade_date = %s
+            ORDER BY net_pnl DESC
+        """
+        return pd.read_sql_query(query, self.conn, params=(trade_date,))
+
+    def calculate_summary_stats(self, df: pd.DataFrame) -> Dict:
+        """Calculate summary statistics"""
+        return {
+            'total_net_pnl': df['net_pnl'].sum(),
+            'total_gross_pnl': df['gross_pnl'].sum(),
+            'total_fees': (df['commission'] + df['exchange_fees'] +
+                          df['clearing_fees'] + df['regulatory_fees']).sum(),
+            'total_rebates': df['rebates'].sum(),
+            'total_trades': df['trade_count'].sum(),
+            'total_volume': df['volume_traded'].sum(),
+            'avg_pnl_per_trade': df['net_pnl'].sum() / df['trade_count'].sum(),
+            'win_rate': (df['winning_trades'].sum() / df['trade_count'].sum() * 100),
+            'num_strategies': df['strategy_id'].nunique(),
+            'num_symbols': df['symbol'].nunique(),
+            'total_slippage': df['slippage'].sum(),
+            'fee_percentage': ((df['commission'] + df['exchange_fees'] +
+                               df['clearing_fees'] + df['regulatory_fees']).sum() /
+                              abs(df['gross_pnl'].sum()) * 100)
+        }
+
+    def get_strategy_breakdown(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Get P&L breakdown by strategy"""
+        return df.groupby('strategy_id').agg({
+            'net_pnl': 'sum',
+            'gross_pnl': 'sum',
+            'commission': 'sum',
+            'trade_count': 'sum',
+            'volume_traded': 'sum',
+            'winning_trades': 'sum',
+            'losing_trades': 'sum',
+            'slippage': 'sum'
+        }).round(2)
+
+    def get_symbol_breakdown(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Get P&L breakdown by symbol"""
+        return df.groupby('symbol').agg({
+            'net_pnl': 'sum',
+            'gross_pnl': 'sum',
+            'trade_count': 'sum',
+            'volume_traded': 'sum',
+            'slippage': 'sum'
+        }).sort_values('net_pnl', ascending=False).round(2)
+
+    def plot_pnl_distribution(self, df: pd.DataFrame) -> io.BytesIO:
+        """Create P&L distribution plot"""
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+        # Strategy P&L
+        strategy_pnl = df.groupby('strategy_id')['net_pnl'].sum().sort_values()
+        axes[0, 0].barh(strategy_pnl.index, strategy_pnl.values)
+        axes[0, 0].set_xlabel('Net P&L ($)')
+        axes[0, 0].set_title('P&L by Strategy')
+        axes[0, 0].grid(True, alpha=0.3)
+
+        # Symbol P&L
+        symbol_pnl = df.groupby('symbol')['net_pnl'].sum().sort_values(ascending=False).head(15)
+        axes[0, 1].bar(range(len(symbol_pnl)), symbol_pnl.values)
+        axes[0, 1].set_xticks(range(len(symbol_pnl)))
+        axes[0, 1].set_xticklabels(symbol_pnl.index, rotation=45, ha='right')
+        axes[0, 1].set_ylabel('Net P&L ($)')
+        axes[0, 1].set_title('Top 15 Symbols by P&L')
+        axes[0, 1].grid(True, alpha=0.3)
+
+        # Trade Count vs P&L
+        axes[1, 0].scatter(df['trade_count'], df['net_pnl'], alpha=0.6)
+        axes[1, 0].set_xlabel('Trade Count')
+        axes[1, 0].set_ylabel('Net P&L ($)')
+        axes[1, 0].set_title('Trade Count vs P&L')
+        axes[1, 0].grid(True, alpha=0.3)
+
+        # Cumulative P&L
+        cumulative_pnl = df.sort_values('trade_count')['net_pnl'].cumsum()
+        axes[1, 1].plot(cumulative_pnl.values)
+        axes[1, 1].set_xlabel('Position')
+        axes[1, 1].set_ylabel('Cumulative P&L ($)')
+        axes[1, 1].set_title('Cumulative P&L Distribution')
+        axes[1, 1].grid(True, alpha=0.3)
+
+        plt.tight_layout()
+
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+        buf.seek(0)
+        plt.close()
+
+        return buf
+
+    def generate_html_report(self, trade_date: str = None) -> str:
+        """Generate HTML P&L report"""
+        df = self.get_daily_pnl(trade_date)
+        stats = self.calculate_summary_stats(df)
+        strategy_breakdown = self.get_strategy_breakdown(df)
+        symbol_breakdown = self.get_symbol_breakdown(df)
+
+        if trade_date is None:
+            trade_date = datetime.now().strftime('%Y-%m-%d')
+
+        html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Daily P&L Report - {trade_date}</title>
+            <style>
+                body {{ font-family: Arial, sans-serif; margin: 20px; }}
+                h1 {{ color: #333; }}
+                h2 {{ color: #666; margin-top: 30px; }}
+                table {{ border-collapse: collapse; width: 100%; margin: 20px 0; }}
+                th, td {{ border: 1px solid #ddd; padding: 12px; text-align: right; }}
+                th {{ background-color: #4CAF50; color: white; }}
+                tr:nth-child(even) {{ background-color: #f2f2f2; }}
+                .positive {{ color: green; font-weight: bold; }}
+                .negative {{ color: red; font-weight: bold; }}
+                .summary {{ background-color: #e7f3fe; padding: 15px; border-radius: 5px; }}
+            </style>
+        </head>
+        <body>
+            <h1>Daily P&L Report - {trade_date}</h1>
+
+            <div class="summary">
+                <h2>Summary Statistics</h2>
+                <table style="width: 50%;">
+                    <tr><td>Total Net P&L:</td><td class="{'positive' if stats['total_net_pnl'] > 0 else 'negative'}">${stats['total_net_pnl']:,.2f}</td></tr>
+                    <tr><td>Total Gross P&L:</td><td>${stats['total_gross_pnl']:,.2f}</td></tr>
+                    <tr><td>Total Fees:</td><td>${stats['total_fees']:,.2f}</td></tr>
+                    <tr><td>Total Rebates:</td><td>${stats['total_rebates']:,.2f}</td></tr>
+                    <tr><td>Total Trades:</td><td>{stats['total_trades']:,}</td></tr>
+                    <tr><td>Total Volume:</td><td>{stats['total_volume']:,}</td></tr>
+                    <tr><td>Avg P&L per Trade:</td><td>${stats['avg_pnl_per_trade']:.2f}</td></tr>
+                    <tr><td>Win Rate:</td><td>{stats['win_rate']:.2f}%</td></tr>
+                    <tr><td>Fee Percentage:</td><td>{stats['fee_percentage']:.4f}%</td></tr>
+                </table>
+            </div>
+
+            <h2>P&L by Strategy</h2>
+            {strategy_breakdown.to_html(classes='data')}
+
+            <h2>P&L by Symbol (Top 20)</h2>
+            {symbol_breakdown.head(20).to_html(classes='data')}
+
+        </body>
+        </html>
+        """
+
+        return html
+
+    def close(self):
+        self.conn.close()
+
+def send_pnl_report_email(html_content: str, chart_buffer: io.BytesIO,
+                          recipients: List[str], smtp_config: Dict):
+    """Send P&L report via email"""
+    msg = MIMEMultipart('related')
+    msg['Subject'] = f"Daily P&L Report - {datetime.now().strftime('%Y-%m-%d')}"
+    msg['From'] = smtp_config['from_email']
+    msg['To'] = ', '.join(recipients)
+
+    # Attach HTML
+    msg.attach(MIMEText(html_content, 'html'))
+
+    # Attach chart
+    img = MIMEImage(chart_buffer.read())
+    img.add_header('Content-ID', '<pnl_chart>')
+    msg.attach(img)
+
+    # Send email
+    with smtplib.SMTP(smtp_config['host'], smtp_config['port']) as server:
+        server.starttls()
+        server.login(smtp_config['username'], smtp_config['password'])
+        server.send_message(msg)
+
+if __name__ == '__main__':
+    db_config = {
+        'host': 'localhost',
+        'database': 'hft_trading',
+        'user': 'trading_user',
+        'password': 'secure_password'
+    }
+
+    analyzer = PnLAnalyzer(db_config)
+
+    # Generate report
+    html_report = analyzer.generate_html_report()
+
+    # Save to file
+    with open(f'daily_pnl_report_{datetime.now().strftime("%Y%m%d")}.html', 'w') as f:
+        f.write(html_report)
+
+    print("P&L report generated successfully")
+
+    analyzer.close()
+
+================================================================================
+5. PDF REPORT GENERATION
+================================================================================
+
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import letter, A4
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+from reportlab.lib.enums import TA_CENTER, TA_RIGHT
+
+class PnLPDFGenerator:
+    def __init__(self, filename: str):
+        self.filename = filename
+        self.doc = SimpleDocTemplate(filename, pagesize=letter)
+        self.styles = getSampleStyleSheet()
+        self.story = []
+
+    def add_title(self, title: str):
+        """Add report title"""
+        title_style = ParagraphStyle(
+            'CustomTitle',
+            parent=self.styles['Heading1'],
+            fontSize=24,
+            textColor=colors.HexColor('#1f4788'),
+            spaceAfter=30,
+            alignment=TA_CENTER
+        )
+        self.story.append(Paragraph(title, title_style))
+        self.story.append(Spacer(1, 0.2*inch))
+
+    def add_summary_table(self, summary_data: Dict):
+        """Add summary statistics table"""
+        data = [
+            ['Metric', 'Value'],
+            ['Total Net P&L', f"${summary_data['total_net_pnl']:,.2f}"],
+            ['Total Gross P&L', f"${summary_data['total_gross_pnl']:,.2f}"],
+            ['Total Fees', f"${summary_data['total_fees']:,.2f}"],
+            ['Total Trades', f"{summary_data['total_trades']:,}"],
+            ['Win Rate', f"{summary_data['win_rate']:.2f}%"],
+            ['Avg P&L/Trade', f"${summary_data['avg_pnl_per_trade']:.2f}"]
+        ]
+
+        table = Table(data, colWidths=[3*inch, 2*inch])
+        table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 14),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black)
+        ]))
+
+        self.story.append(table)
+        self.story.append(Spacer(1, 0.3*inch))
+
+    def build(self):
+        """Build PDF document"""
+        self.doc.build(self.story)
+
+================================================================================
+6. AUTOMATED REPORT SCHEDULING
+================================================================================
+
+# Cron job configuration for daily P&L reports
+# Add to crontab: crontab -e
+
+# Generate daily P&L report at 6:00 PM EST (after market close)
+0 18 * * 1-5 /usr/bin/python3 /opt/hft/reporting/generate_daily_pnl.py
+
+# Generate weekly summary report on Mondays at 8:00 AM
+0 8 * * 1 /usr/bin/python3 /opt/hft/reporting/generate_weekly_pnl.py
+
+# Real-time intraday snapshots every 30 minutes during market hours
+*/30 9-16 * * 1-5 /usr/bin/python3 /opt/hft/reporting/intraday_pnl_snapshot.py
+
+================================================================================
+END OF DAILY P&L REPORT DOCUMENTATION
+================================================================================

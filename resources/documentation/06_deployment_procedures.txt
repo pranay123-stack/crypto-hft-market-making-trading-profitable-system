@@ -1,0 +1,1372 @@
+================================================================================
+HFT SYSTEM DEPLOYMENT PROCEDURES
+================================================================================
+
+VERSION: 1.0
+LAST UPDATED: 2025-11-25
+OWNER: DevOps Team
+CLASSIFICATION: Internal Use Only
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+
+1. DEPLOYMENT OVERVIEW
+2. PREREQUISITES
+3. INITIAL DEPLOYMENT (GREENFIELD)
+4. UPDATE DEPLOYMENT (BLUE-GREEN)
+5. ROLLBACK PROCEDURES
+6. DATABASE MIGRATIONS
+7. CONFIGURATION DEPLOYMENT
+8. CANARY DEPLOYMENT
+9. MULTI-REGION DEPLOYMENT
+10. DISASTER RECOVERY DEPLOYMENT
+11. DEPLOYMENT VALIDATION
+12. POST-DEPLOYMENT CHECKLIST
+
+================================================================================
+1. DEPLOYMENT OVERVIEW
+================================================================================
+
+1.1 DEPLOYMENT STRATEGY
+-----------------------
+
+Primary Strategy: Blue-Green Deployment
+- Zero downtime deployments
+- Quick rollback capability
+- Full validation before traffic switch
+
+Alternative Strategies:
+- Canary: Gradual rollout to subset of traffic
+- Rolling: Sequential update of nodes
+- Recreate: Simple stop-and-start (dev/staging only)
+
+1.2 DEPLOYMENT ENVIRONMENTS
+---------------------------
+
+Development:
+- Server: hft-dev-01
+- Purpose: Developer testing
+- Deployment frequency: Continuous (multiple times per day)
+- Approval required: No
+
+Staging:
+- Server: hft-staging-01
+- Purpose: Pre-production validation
+- Deployment frequency: Daily
+- Approval required: Team lead
+
+Production:
+- Servers: hft-prod-01 (primary), hft-prod-02 (standby)
+- Purpose: Live trading
+- Deployment frequency: Weekly (or emergency)
+- Approval required: VP Engineering + Trading Desk
+
+1.3 DEPLOYMENT ARTIFACTS
+------------------------
+
+Binary Artifacts:
+- /opt/hft_system/bin/hft_system
+- /opt/hft_system/lib/*.so
+
+Configuration Files:
+- /opt/hft_system/config/*.json
+
+Database Migrations:
+- /opt/hft_system/migrations/*.sql
+
+Documentation:
+- /opt/hft_system/docs/*
+
+Version: Tagged in Git (format: v1.2.3)
+
+================================================================================
+2. PREREQUISITES
+================================================================================
+
+2.1 PRE-DEPLOYMENT CHECKLIST
+-----------------------------
+
+□ Code Review
+  - All code reviewed and approved
+  - CI/CD pipeline passed
+  - Security scan completed
+  - Performance tests passed
+
+□ Testing
+  - Unit tests: 100% pass rate
+  - Integration tests: 100% pass rate
+  - Load tests: Acceptable performance
+  - Backtests: Strategies validated
+
+□ Documentation
+  - CHANGELOG.md updated
+  - API documentation updated
+  - Configuration changes documented
+  - Runbooks updated if needed
+
+□ Approvals
+  - Code review approval
+  - QA sign-off
+  - Trading desk approval (production only)
+  - Change management ticket approved
+
+□ Communications
+  - Deployment notification sent
+  - Stakeholders informed
+  - Trading desk notified
+  - Maintenance window scheduled (if needed)
+
+□ Backups
+  - Database backup completed
+  - Configuration backed up
+  - Previous version available for rollback
+
+□ Resources
+  - Deployment team available
+  - On-call engineer assigned
+  - Rollback plan reviewed
+
+2.2 SYSTEM REQUIREMENTS
+-----------------------
+
+Hardware:
+- CPU: 32+ cores (Intel Xeon Gold or AMD EPYC)
+- RAM: 128GB DDR4-3200 or higher
+- Storage: 2TB NVMe SSD RAID 1
+- Network: 10Gbps Ethernet
+
+Software:
+- OS: Ubuntu 22.04 LTS
+- Kernel: Real-time kernel (5.15-rt or higher)
+- Database: PostgreSQL 14+ with TimescaleDB
+- Monitoring: Prometheus + Grafana
+
+Dependencies:
+- C++ Standard Library (libc++/libstdc++)
+- Boost 1.75+
+- OpenSSL 3.0+
+- libpq (PostgreSQL client)
+- zlib, lz4 (compression)
+
+================================================================================
+3. INITIAL DEPLOYMENT (GREENFIELD)
+================================================================================
+
+3.1 SERVER PROVISIONING
+------------------------
+
+Step 1: Provision Server
+```bash
+# Using cloud provider or physical server
+# Ensure specifications meet requirements
+```
+
+Step 2: Install Operating System
+```bash
+# Install Ubuntu 22.04 LTS Server
+# Partition scheme:
+# - /boot: 1GB
+# - /: 100GB (root)
+# - /data: Remaining space
+# - swap: 16GB (on separate disk)
+```
+
+Step 3: Configure Hostname and Network
+```bash
+# Set hostname
+sudo hostnamectl set-hostname hft-prod-01
+
+# Configure static IP
+sudo vi /etc/netplan/00-installer-config.yaml
+```
+
+/etc/netplan/00-installer-config.yaml:
+```yaml
+network:
+  version: 2
+  ethernets:
+    eth0:
+      addresses:
+        - 10.0.0.10/24
+      gateway4: 10.0.0.1
+      nameservers:
+        addresses: [8.8.8.8, 8.8.4.4]
+```
+
+```bash
+sudo netplan apply
+```
+
+3.2 SYSTEM CONFIGURATION
+-------------------------
+
+Step 1: Update System
+```bash
+sudo apt update
+sudo apt upgrade -y
+```
+
+Step 2: Install Real-Time Kernel
+```bash
+sudo apt install linux-image-rt-amd64 linux-headers-rt-amd64
+sudo reboot
+
+# Verify after reboot
+uname -r
+# Should show: 5.15.X-rt-amd64 or similar
+```
+
+Step 3: Configure System Limits
+```bash
+# Edit /etc/security/limits.conf
+sudo tee -a /etc/security/limits.conf <<EOF
+hft_user soft nofile 65536
+hft_user hard nofile 65536
+hft_user soft memlock unlimited
+hft_user hard memlock unlimited
+hft_user soft rtprio 99
+hft_user hard rtprio 99
+EOF
+
+# Edit /etc/sysctl.conf
+sudo tee -a /etc/sysctl.conf <<EOF
+# Network tuning
+net.ipv4.tcp_nodelay=1
+net.ipv4.tcp_low_latency=1
+net.core.rmem_max=134217728
+net.core.wmem_max=134217728
+net.ipv4.tcp_rmem=4096 87380 67108864
+net.ipv4.tcp_wmem=4096 65536 67108864
+
+# Memory
+vm.swappiness=1
+vm.overcommit_memory=1
+
+# Huge pages
+vm.nr_hugepages=4096
+
+# File handles
+fs.file-max=2097152
+EOF
+
+sudo sysctl -p
+```
+
+Step 4: Configure CPU Governor
+```bash
+# Set CPU governor to performance
+echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+
+# Make permanent
+sudo apt install cpufrequtils
+echo 'GOVERNOR="performance"' | sudo tee /etc/default/cpufrequtils
+sudo systemctl restart cpufrequtils
+```
+
+Step 5: Disable Services
+```bash
+# Disable unnecessary services
+sudo systemctl disable bluetooth
+sudo systemctl disable cups
+sudo systemctl disable snapd
+sudo systemctl disable unattended-upgrades
+```
+
+3.3 INSTALL DEPENDENCIES
+-------------------------
+
+Step 1: Install Build Tools
+```bash
+sudo apt install -y build-essential cmake git
+sudo apt install -y gcc-12 g++-12
+sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 100
+sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-12 100
+```
+
+Step 2: Install Libraries
+```bash
+sudo apt install -y \
+  libboost-all-dev \
+  libssl-dev \
+  libpq-dev \
+  zlib1g-dev \
+  liblz4-dev \
+  libcurl4-openssl-dev \
+  libjsoncpp-dev
+```
+
+Step 3: Install PostgreSQL and TimescaleDB
+```bash
+# Add PostgreSQL repository
+sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
+
+# Add TimescaleDB repository
+sudo sh -c "echo 'deb https://packagecloud.io/timescale/timescaledb/ubuntu/ $(lsb_release -c -s) main' > /etc/apt/sources.list.d/timescaledb.list"
+wget --quiet -O - https://packagecloud.io/timescale/timescaledb/gpgkey | sudo apt-key add -
+
+# Install
+sudo apt update
+sudo apt install -y postgresql-14 postgresql-14-timescaledb
+
+# Tune database
+sudo timescaledb-tune --quiet --yes
+
+# Restart PostgreSQL
+sudo systemctl restart postgresql
+```
+
+Step 4: Install Monitoring Tools
+```bash
+# Prometheus
+wget https://github.com/prometheus/prometheus/releases/download/v2.40.0/prometheus-2.40.0.linux-amd64.tar.gz
+tar xvf prometheus-2.40.0.linux-amd64.tar.gz
+sudo mv prometheus-2.40.0.linux-amd64 /opt/prometheus
+
+# Grafana
+sudo apt-get install -y software-properties-common
+sudo add-apt-repository "deb https://packages.grafana.com/oss/deb stable main"
+wget -q -O - https://packages.grafana.com/gpg.key | sudo apt-key add -
+sudo apt update
+sudo apt install -y grafana
+
+# Node Exporter
+wget https://github.com/prometheus/node_exporter/releases/download/v1.5.0/node_exporter-1.5.0.linux-amd64.tar.gz
+tar xvf node_exporter-1.5.0.linux-amd64.tar.gz
+sudo mv node_exporter-1.5.0.linux-amd64 /opt/node_exporter
+```
+
+3.4 CREATE DATABASE
+--------------------
+
+Step 1: Create User and Database
+```bash
+sudo -u postgres psql <<EOF
+CREATE USER hft_user WITH PASSWORD 'SECURE_PASSWORD_HERE';
+CREATE DATABASE hft_db OWNER hft_user;
+\c hft_db
+CREATE EXTENSION timescaledb;
+EOF
+```
+
+Step 2: Run Migrations
+```bash
+cd /opt/hft_system
+psql -h localhost -U hft_user -d hft_db -f migrations/001_initial_schema.sql
+psql -h localhost -U hft_user -d hft_db -f migrations/002_create_hypertables.sql
+psql -h localhost -U hft_user -d hft_db -f migrations/003_create_indexes.sql
+```
+
+3.5 DEPLOY APPLICATION
+-----------------------
+
+Step 1: Create Application User
+```bash
+sudo useradd -r -s /bin/bash -d /opt/hft_system -m hft_user
+```
+
+Step 2: Clone Repository (or copy files)
+```bash
+sudo -u hft_user git clone https://github.com/company/hft_system.git /opt/hft_system
+cd /opt/hft_system
+sudo -u hft_user git checkout tags/v1.0.0
+```
+
+Step 3: Build Application
+```bash
+cd /opt/hft_system
+mkdir build
+cd build
+cmake -DCMAKE_BUILD_TYPE=Release ..
+make -j$(nproc)
+```
+
+Step 4: Install Application
+```bash
+sudo make install
+# This installs to /opt/hft_system/bin/
+```
+
+Step 5: Create Log Directory
+```bash
+sudo mkdir -p /var/log/hft_system
+sudo chown hft_user:hft_user /var/log/hft_system
+sudo chmod 755 /var/log/hft_system
+```
+
+Step 6: Deploy Configuration
+```bash
+cd /opt/hft_system
+sudo -u hft_user cp config/production.json.example config/production.json
+sudo -u hft_user vi config/production.json
+# Update with production values
+```
+
+Step 7: Configure Secrets
+```bash
+# Store API keys in environment variables
+sudo -u hft_user tee -a /opt/hft_system/.env <<EOF
+BINANCE_API_KEY=your_binance_key
+BINANCE_API_SECRET=your_binance_secret
+COINBASE_API_KEY=your_coinbase_key
+COINBASE_API_SECRET=your_coinbase_secret
+DB_PASSWORD=your_database_password
+EOF
+
+sudo chmod 600 /opt/hft_system/.env
+```
+
+3.6 CONFIGURE SYSTEMD SERVICE
+------------------------------
+
+Step 1: Create Service File
+```bash
+sudo tee /etc/systemd/system/hft_system.service <<EOF
+[Unit]
+Description=HFT Trading System
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=hft_user
+Group=hft_user
+WorkingDirectory=/opt/hft_system
+EnvironmentFile=/opt/hft_system/.env
+ExecStart=/opt/hft_system/bin/hft_system --config=/opt/hft_system/config/production.json
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hft_system
+
+# Resource limits
+LimitNOFILE=65536
+LimitMEMLOCK=infinity
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+```
+
+Step 2: Enable and Start Service
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable hft_system
+sudo systemctl start hft_system
+```
+
+Step 3: Verify Service
+```bash
+sudo systemctl status hft_system
+sudo journalctl -u hft_system -f
+```
+
+3.7 CONFIGURE MONITORING
+-------------------------
+
+Step 1: Configure Prometheus
+```bash
+sudo tee /opt/prometheus/prometheus.yml <<EOF
+global:
+  scrape_interval: 1s
+
+scrape_configs:
+  - job_name: 'hft_system'
+    static_configs:
+      - targets: ['localhost:8080']
+    metrics_path: '/api/v1/metrics'
+
+  - job_name: 'node_exporter'
+    static_configs:
+      - targets: ['localhost:9100']
+EOF
+
+sudo systemctl restart prometheus
+```
+
+Step 2: Start Grafana
+```bash
+sudo systemctl enable grafana-server
+sudo systemctl start grafana-server
+```
+
+Step 3: Import Dashboards
+```bash
+# Access Grafana at http://localhost:3000
+# Default credentials: admin/admin
+# Import dashboards from /opt/hft_system/monitoring/dashboards/
+```
+
+3.8 DEPLOYMENT VALIDATION
+--------------------------
+
+Run validation script:
+```bash
+cd /opt/hft_system
+./scripts/validate_deployment.sh
+```
+
+Expected output:
+```
+HFT System Deployment Validation
+=================================
+✓ System binaries installed
+✓ Configuration files present
+✓ Database connection successful
+✓ Migrations up to date
+✓ Service running
+✓ API responding
+✓ Monitoring configured
+✓ Logs being written
+✓ All checks passed
+
+Deployment Status: SUCCESS
+```
+
+================================================================================
+4. UPDATE DEPLOYMENT (BLUE-GREEN)
+================================================================================
+
+4.1 BLUE-GREEN DEPLOYMENT PROCEDURE
+------------------------------------
+
+Timeline: 30-60 minutes
+Requires: 2 servers (blue=current, green=new)
+
+Step 1: Prepare Green Environment
+```bash
+# On green server (hft-prod-02)
+ssh hft-prod-02
+
+# Pull latest code
+cd /opt/hft_system
+sudo -u hft_user git fetch --tags
+sudo -u hft_user git checkout tags/v1.1.0
+
+# Build
+cd build
+cmake -DCMAKE_BUILD_TYPE=Release ..
+make -j$(nproc)
+sudo make install
+```
+
+Step 2: Run Database Migrations (if any)
+```bash
+# Backup database first
+./scripts/backup_database.sh
+
+# Run migrations
+psql -h localhost -U hft_user -d hft_db -f migrations/004_new_migration.sql
+
+# Verify
+psql -h localhost -U hft_user -d hft_db -c "\dt"
+```
+
+Step 3: Update Configuration
+```bash
+# Copy configuration from blue
+scp hft-prod-01:/opt/hft_system/config/production.json /opt/hft_system/config/
+
+# Update any new parameters
+vi /opt/hft_system/config/production.json
+```
+
+Step 4: Start Green System
+```bash
+# Start in standby mode first
+sudo systemctl start hft_system
+
+# Monitor logs
+sudo journalctl -u hft_system -f
+```
+
+Step 5: Smoke Test Green System
+```bash
+# Run smoke tests
+./scripts/smoke_test.sh
+
+# Expected output: All tests pass
+```
+
+Step 6: Synchronize State
+```bash
+# Ensure green has latest positions
+./scripts/sync_from_database.sh
+```
+
+Step 7: Switch Traffic (Coordinated Cutover)
+```bash
+# Coordinate with trading desk for low-activity window
+
+# On blue (hft-prod-01):
+./scripts/graceful_shutdown.sh
+
+# Wait for clean shutdown (30 seconds)
+
+# On green (hft-prod-02):
+# Change role to primary
+curl -X PUT http://localhost:8080/api/v1/config \
+  -d '{"role": "primary"}'
+
+# Enable trading
+curl -X PUT http://localhost:8080/api/v1/config \
+  -d '{"trading_enabled": true}'
+
+# Start strategies
+./scripts/start_all_strategies.sh
+```
+
+Step 8: Monitor New Deployment
+```bash
+# Watch metrics
+./scripts/watch_metrics.sh
+
+# Check for errors
+tail -f /var/log/hft_system/errors.log
+
+# Monitor for 30 minutes
+```
+
+Step 9: Update Blue to Standby
+```bash
+# On blue (hft-prod-01):
+# Update to same version
+cd /opt/hft_system
+sudo -u hft_user git checkout tags/v1.1.0
+cd build
+make -j$(nproc)
+sudo make install
+
+# Start as standby
+sudo systemctl start hft_system
+```
+
+Step 10: Validate Deployment
+```bash
+# Run full validation
+./scripts/validate_deployment.sh
+
+# Check failover works
+./scripts/test_failover.sh
+```
+
+Total Deployment Time: ~45 minutes
+Downtime: < 5 seconds (during cutover)
+
+================================================================================
+5. ROLLBACK PROCEDURES
+================================================================================
+
+5.1 IMMEDIATE ROLLBACK (< 30 MINUTES AFTER DEPLOYMENT)
+-------------------------------------------------------
+
+Scenario: Critical bug discovered immediately after deployment
+
+Step 1: Assess Situation
+```bash
+# Check error logs
+tail -100 /var/log/hft_system/errors.log
+
+# Check positions
+curl -s http://localhost:8080/api/v1/positions | jq .
+
+# Check P&L
+curl -s http://localhost:8080/api/v1/strategies | jq '.strategies[].performance.daily_pnl_usd'
+```
+
+Step 2: Activate Killswitch
+```bash
+# Stop all trading immediately
+curl -X POST http://localhost:8080/api/v1/killswitch \
+  -d '{"reason": "Critical bug - rolling back"}'
+```
+
+Step 3: Switch Back to Blue
+```bash
+# On blue (hft-prod-01) - still has previous version
+sudo systemctl start hft_system
+
+# Verify it starts correctly
+sudo systemctl status hft_system
+
+# Enable trading on blue
+curl -X PUT http://hft-prod-01:8080/api/v1/config \
+  -d '{"trading_enabled": true}'
+```
+
+Step 4: Stop Green
+```bash
+# On green (hft-prod-02)
+sudo systemctl stop hft_system
+```
+
+Step 5: Reconcile Positions
+```bash
+# Ensure positions match exchanges
+./scripts/reconcile_positions.sh
+
+# Check for any discrepancies
+cat /var/log/hft_system/reconciliation_*.log
+```
+
+Step 6: Notify Stakeholders
+```bash
+./scripts/notify_rollback.sh "Rolled back to v1.0.0 due to [REASON]"
+```
+
+Rollback Time: < 10 minutes
+
+5.2 DATABASE ROLLBACK
+----------------------
+
+If database migration needs to be reverted:
+
+Step 1: Stop Application
+```bash
+sudo systemctl stop hft_system
+```
+
+Step 2: Restore Database
+```bash
+# Restore from backup taken before migration
+./scripts/restore_database.sh /var/backup/hft_db_20251125_100000.dump
+
+# Or run rollback migration
+psql -h localhost -U hft_user -d hft_db -f migrations/rollback/004_rollback.sql
+```
+
+Step 3: Restart Application
+```bash
+sudo systemctl start hft_system
+```
+
+5.3 PARTIAL ROLLBACK (SINGLE COMPONENT)
+----------------------------------------
+
+If only one component needs rollback:
+
+Example: Rollback single strategy
+```bash
+# Stop new strategy
+curl -X POST http://localhost:8080/api/v1/strategies/new_strategy/stop
+
+# Unload new strategy
+curl -X DELETE http://localhost:8080/api/v1/strategies/new_strategy
+
+# Load old strategy
+curl -X POST http://localhost:8080/api/v1/strategies/load \
+  -d '{"config_file": "config/strategies/old_strategy.json"}'
+
+# Start old strategy
+curl -X POST http://localhost:8080/api/v1/strategies/old_strategy/start
+```
+
+================================================================================
+6. DATABASE MIGRATIONS
+================================================================================
+
+6.1 CREATING MIGRATIONS
+------------------------
+
+Migration naming: XXX_description.sql (where XXX is sequential number)
+
+Example: migrations/005_add_strategy_metrics.sql
+```sql
+-- Migration: Add strategy metrics table
+-- Version: 1.1.0
+-- Date: 2025-11-25
+
+BEGIN;
+
+CREATE TABLE IF NOT EXISTS strategy_metrics (
+    strategy_id VARCHAR(255) NOT NULL,
+    timestamp TIMESTAMPTZ NOT NULL,
+    metric_name VARCHAR(255) NOT NULL,
+    metric_value DOUBLE PRECISION,
+    PRIMARY KEY (strategy_id, timestamp, metric_name)
+);
+
+SELECT create_hypertable('strategy_metrics', 'timestamp',
+    chunk_time_interval => INTERVAL '1 day',
+    if_not_exists => TRUE);
+
+CREATE INDEX idx_strategy_metrics_id_time 
+    ON strategy_metrics (strategy_id, timestamp DESC);
+
+-- Update schema version
+INSERT INTO schema_version (version, description, applied_at)
+VALUES (5, 'Add strategy metrics table', NOW());
+
+COMMIT;
+```
+
+Rollback migration: migrations/rollback/005_rollback.sql
+```sql
+-- Rollback: Remove strategy metrics table
+-- Version: 1.0.0
+
+BEGIN;
+
+DROP TABLE IF EXISTS strategy_metrics CASCADE;
+
+DELETE FROM schema_version WHERE version = 5;
+
+COMMIT;
+```
+
+6.2 RUNNING MIGRATIONS
+-----------------------
+
+Manual migration:
+```bash
+psql -h localhost -U hft_user -d hft_db -f migrations/005_add_strategy_metrics.sql
+```
+
+Automated migration (in deployment script):
+```bash
+for migration in migrations/*.sql; do
+    echo "Running migration: $migration"
+    psql -h localhost -U hft_user -d hft_db -f "$migration"
+    if [ $? -ne 0 ]; then
+        echo "Migration failed: $migration"
+        exit 1
+    fi
+done
+```
+
+6.3 MIGRATION BEST PRACTICES
+-----------------------------
+
+1. Always wrap in transaction (BEGIN/COMMIT)
+2. Make migrations idempotent (use IF NOT EXISTS)
+3. Test migrations on staging first
+4. Take database backup before migration
+5. Provide rollback script
+6. Document breaking changes
+7. Avoid long-running operations (no full table scans)
+8. Use CREATE INDEX CONCURRENTLY for production
+
+================================================================================
+7. CONFIGURATION DEPLOYMENT
+================================================================================
+
+7.1 CONFIGURATION CHANGE PROCEDURE
+-----------------------------------
+
+For configuration-only changes (no code changes):
+
+Step 1: Update Configuration Files
+```bash
+cd /opt/hft_system/config
+git pull origin main
+```
+
+Step 2: Validate Configuration
+```bash
+./bin/hft_system --validate-config --config=config/production.json
+```
+
+Step 3: Hot Reload (if possible)
+```bash
+curl -X GET http://localhost:8080/api/v1/config/reload
+```
+
+Step 4: Restart if Required
+```bash
+# Check if restart required
+curl -s http://localhost:8080/api/v1/config/status | jq .requires_restart
+
+# If true:
+./scripts/graceful_shutdown.sh
+sleep 10
+sudo systemctl start hft_system
+```
+
+7.2 STRATEGY DEPLOYMENT
+------------------------
+
+Deploying new strategy (without system restart):
+
+Step 1: Deploy Strategy Configuration
+```bash
+cp config/strategies/new_strategy.json /opt/hft_system/config/strategies/
+```
+
+Step 2: Deploy Strategy Code (if new code)
+```bash
+# Build strategy library
+cd /opt/hft_system/strategies/new_strategy
+make
+# Copies to /opt/hft_system/lib/strategies/
+```
+
+Step 3: Load Strategy
+```bash
+curl -X POST http://localhost:8080/api/v1/strategies/load \
+  -d '{"config_file": "config/strategies/new_strategy.json"}'
+```
+
+Step 4: Test in Paper Trading
+```bash
+curl -X PUT http://localhost:8080/api/v1/strategies/new_strategy/config \
+  -d '{"paper_trading": true}'
+
+curl -X POST http://localhost:8080/api/v1/strategies/new_strategy/start
+```
+
+Step 5: Monitor Performance
+```bash
+# Monitor for 24 hours in paper trading
+./scripts/monitor_strategy.sh new_strategy
+
+# Check P&L, win rate, etc.
+curl -s http://localhost:8080/api/v1/strategies/new_strategy | jq .performance
+```
+
+Step 6: Enable Live Trading (if validated)
+```bash
+curl -X PUT http://localhost:8080/api/v1/strategies/new_strategy/config \
+  -d '{"paper_trading": false}'
+```
+
+================================================================================
+8. CANARY DEPLOYMENT
+================================================================================
+
+8.1 CANARY DEPLOYMENT PROCEDURE
+--------------------------------
+
+Use when: Testing risky changes with minimal exposure
+
+Step 1: Deploy Canary Version
+```bash
+# Deploy to canary node (separate from production)
+ssh hft-canary-01
+
+# Deploy new version
+cd /opt/hft_system
+sudo -u hft_user git checkout tags/v1.1.0-canary
+# ... build and deploy ...
+```
+
+Step 2: Route Small Percentage of Strategies
+```bash
+# Start with 10% of strategies on canary
+# Configure on canary:
+# - 1 low-risk strategy
+# - Small position limits
+# - Paper trading initially
+```
+
+Step 3: Monitor Canary
+```bash
+# Monitor metrics closely
+./scripts/compare_metrics.sh hft-prod-01 hft-canary-01
+
+# Check for:
+# - Increased errors
+# - Higher latency
+# - Performance degradation
+# - Unexpected behavior
+```
+
+Step 4: Gradual Rollout
+```bash
+# If canary successful after 24 hours:
+# - Increase to 25% of strategies
+# Wait 24 hours
+# - Increase to 50%
+# Wait 24 hours
+# - Full rollout
+```
+
+Step 5: Monitor and Compare
+```bash
+# Generate comparison report
+./scripts/canary_report.sh
+
+# Metrics to compare:
+# - Latency (P50, P99, P999)
+# - Error rate
+# - Order success rate
+# - Strategy P&L
+# - Resource usage
+```
+
+Step 6: Rollout or Rollback
+```bash
+# If all metrics acceptable:
+# - Proceed with full deployment
+
+# If any issues:
+# - Rollback canary
+# - Investigate issues
+# - Fix and redeploy to canary
+```
+
+================================================================================
+9. MULTI-REGION DEPLOYMENT
+================================================================================
+
+9.1 REGION SETUP
+----------------
+
+Regions:
+- US East (Primary): New York (Equinix NY4)
+- Europe: London (Equinix LD5)
+- Asia: Tokyo (Equinix TY3)
+
+Each region:
+- Dedicated trading node
+- Local database replica
+- Independent strategies (region-specific exchanges)
+
+9.2 REGIONAL DEPLOYMENT
+-----------------------
+
+Step 1: Deploy to Primary Region (US East)
+```bash
+# Deploy to hft-us-east-01
+# Follow standard deployment procedure
+```
+
+Step 2: Validate Primary Region
+```bash
+# Run full validation
+./scripts/validate_deployment.sh
+```
+
+Step 3: Deploy to Secondary Regions
+```bash
+# Deploy to Europe
+ssh hft-eu-west-01
+# ... deploy same version ...
+
+# Deploy to Asia
+ssh hft-asia-east-01
+# ... deploy same version ...
+```
+
+Step 4: Configure Region-Specific Settings
+```bash
+# Each region connects to geographically close exchanges
+# US East: Coinbase, Kraken, Gemini
+# Europe: Bitstamp, Kraken, Binance-EU
+# Asia: Binance, OKX, Bybit
+```
+
+Step 5: Test Inter-Region Communication
+```bash
+# Test database replication
+./scripts/test_replication.sh
+
+# Test cross-region arbitrage (if applicable)
+```
+
+================================================================================
+10. DISASTER RECOVERY DEPLOYMENT
+================================================================================
+
+10.1 DR SITE SETUP
+------------------
+
+DR Site: Separate geographic location
+Purpose: Business continuity in case of primary site failure
+
+Step 1: Provision DR Infrastructure
+```bash
+# Same specs as production
+# Located in different datacenter/region
+```
+
+Step 2: Deploy Application
+```bash
+# Deploy same version as production
+# Keep in standby mode
+```
+
+Step 3: Configure Database Replication
+```bash
+# Set up streaming replication from primary
+# Edit postgresql.conf on primary:
+wal_level = replica
+max_wal_senders = 3
+wal_keep_size = 1GB
+
+# Edit pg_hba.conf on primary:
+host replication hft_user DR_IP/32 md5
+
+# On DR site:
+pg_basebackup -h PRIMARY_IP -D /var/lib/postgresql/14/main -U hft_user -P -Xs -R
+```
+
+Step 4: Test DR Failover
+```bash
+# Monthly DR drill
+./scripts/dr_failover_test.sh
+
+# Steps:
+# 1. Stop primary (simulated failure)
+# 2. Promote DR to primary
+# 3. Verify trading can resume
+# 4. Measure recovery time
+# 5. Failback to primary
+# 6. Document results
+```
+
+================================================================================
+11. DEPLOYMENT VALIDATION
+================================================================================
+
+11.1 AUTOMATED VALIDATION
+--------------------------
+
+Script: /opt/hft_system/scripts/validate_deployment.sh
+
+```bash
+#!/bin/bash
+set -e
+
+echo "========================================="
+echo "HFT System Deployment Validation"
+echo "========================================="
+
+# Check binaries
+echo -n "Checking binaries... "
+if [ -f /opt/hft_system/bin/hft_system ]; then
+    echo "✓"
+else
+    echo "✗ Binary not found"
+    exit 1
+fi
+
+# Check configuration
+echo -n "Checking configuration... "
+if [ -f /opt/hft_system/config/production.json ]; then
+    echo "✓"
+else
+    echo "✗ Config not found"
+    exit 1
+fi
+
+# Validate configuration
+echo -n "Validating configuration... "
+/opt/hft_system/bin/hft_system --validate-config --config=/opt/hft_system/config/production.json > /dev/null 2>&1
+if [ $? -eq 0 ]; then
+    echo "✓"
+else
+    echo "✗ Config validation failed"
+    exit 1
+fi
+
+# Check database connection
+echo -n "Checking database... "
+psql -h localhost -U hft_user -d hft_db -c "SELECT 1;" > /dev/null 2>&1
+if [ $? -eq 0 ]; then
+    echo "✓"
+else
+    echo "✗ Database connection failed"
+    exit 1
+fi
+
+# Check service status
+echo -n "Checking service... "
+systemctl is-active --quiet hft_system
+if [ $? -eq 0 ]; then
+    echo "✓"
+else
+    echo "✗ Service not running"
+    exit 1
+fi
+
+# Check API response
+echo -n "Checking API... "
+curl -s http://localhost:8080/api/v1/health | grep -q "healthy"
+if [ $? -eq 0 ]; then
+    echo "✓"
+else
+    echo "✗ API not responding"
+    exit 1
+fi
+
+# Check exchange connections
+echo -n "Checking exchange connections... "
+CONNECTED=$(curl -s http://localhost:8080/api/v1/status | jq '[.exchanges[] | select(.status=="connected")] | length')
+TOTAL=$(curl -s http://localhost:8080/api/v1/status | jq '.exchanges | length')
+if [ "$CONNECTED" -eq "$TOTAL" ]; then
+    echo "✓ ($CONNECTED/$TOTAL)"
+else
+    echo "⚠ ($CONNECTED/$TOTAL connected)"
+fi
+
+# Check logs
+echo -n "Checking logs... "
+if [ -f /var/log/hft_system/system.log ]; then
+    echo "✓"
+else
+    echo "✗ Logs not being written"
+    exit 1
+fi
+
+# Check monitoring
+echo -n "Checking monitoring... "
+curl -s http://localhost:9090/-/healthy > /dev/null 2>&1
+if [ $? -eq 0 ]; then
+    echo "✓"
+else
+    echo "✗ Prometheus not responding"
+fi
+
+echo "========================================="
+echo "Deployment Status: SUCCESS"
+echo "========================================="
+```
+
+11.2 MANUAL VALIDATION CHECKLIST
+---------------------------------
+
+□ System Health
+  - Service running: systemctl status hft_system
+  - No errors in logs: tail /var/log/hft_system/errors.log
+  - API responding: curl http://localhost:8080/api/v1/health
+
+□ Exchange Connectivity
+  - All exchanges connected
+  - Market data flowing
+  - Latency acceptable (< 50ms)
+
+□ Database
+  - Connection successful
+  - Migrations applied
+  - Queries performing well
+
+□ Strategies
+  - All strategies loaded
+  - Can start/stop strategies
+  - Paper trading works
+
+□ Trading
+  - Can submit orders
+  - Can cancel orders
+  - Fills processed correctly
+  - Positions updated
+
+□ Risk Management
+  - Risk checks functioning
+  - Limits enforced
+  - Kill switch works
+
+□ Monitoring
+  - Metrics exporting
+  - Dashboards showing data
+  - Alerts configured
+
+□ Performance
+  - Latency within targets (P99 < 1ms)
+  - CPU usage reasonable (< 60%)
+  - Memory usage stable
+  - No memory leaks
+
+□ Failover
+  - Standby node ready
+  - Failover tested
+  - Failback works
+
+================================================================================
+12. POST-DEPLOYMENT CHECKLIST
+================================================================================
+
+12.1 IMMEDIATE POST-DEPLOYMENT (0-1 HOUR)
+------------------------------------------
+
+□ Monitor System
+  - Watch logs: tail -f /var/log/hft_system/system.log
+  - Watch metrics: Grafana dashboards
+  - Check for errors
+
+□ Verify Trading
+  - Strategies running
+  - Orders being placed
+  - Fills occurring
+  - Positions accurate
+
+□ Check Performance
+  - Latency acceptable
+  - No degradation from previous version
+  - Resource usage normal
+
+□ Communication
+  - Notify stakeholders of successful deployment
+  - Update status page
+  - Close change management ticket
+
+12.2 EXTENDED MONITORING (1-24 HOURS)
+--------------------------------------
+
+□ Performance Comparison
+  - Compare metrics to previous version
+  - Check for regressions
+  - Monitor strategy P&L
+
+□ Error Monitoring
+  - Review error logs
+  - Check for new error patterns
+  - Investigate warnings
+
+□ Capacity Planning
+  - Check resource usage trends
+  - Verify sufficient headroom
+  - Plan for scaling if needed
+
+12.3 POST-DEPLOYMENT REVIEW (1 WEEK)
+-------------------------------------
+
+□ Performance Analysis
+  - Generate deployment report
+  - Analyze strategy performance
+  - Compare to backtests
+
+□ Issues Review
+  - Document any issues encountered
+  - Root cause analysis
+  - Update runbooks
+
+□ Lessons Learned
+  - What went well?
+  - What could be improved?
+  - Update deployment procedures
+
+================================================================================
+CONTACT INFORMATION
+================================================================================
+
+Deployment Team:
+- Lead: devops-lead@company.com
+- Team: devops@company.com
+- Slack: #deployments
+
+On-Call:
+- DevOps: +1-555-0102
+- Engineering: +1-555-0101
+
+Approvals:
+- Trading Desk: trading@company.com
+- VP Engineering: vp-eng@company.com
+
+================================================================================
+DOCUMENT REVISION HISTORY
+================================================================================
+
+Version    Date          Author              Changes
+------------------------------------------------------------------------
+1.0        2025-11-25    DevOps Team         Initial deployment procedures
+
+================================================================================
+END OF DOCUMENT
+================================================================================

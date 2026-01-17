@@ -1,0 +1,916 @@
+================================================================================
+CAPACITY PLANNING FOR HFT SYSTEMS
+SCALABILITY ANALYSIS AND RESOURCE FORECASTING
+================================================================================
+
+TABLE OF CONTENTS
+1. Capacity Planning Framework
+2. Performance Modeling
+3. Resource Utilization Analysis
+4. Scalability Testing
+5. Bottleneck Identification
+6. Growth Forecasting
+7. Cost-Performance Optimization
+8. Capacity Monitoring and Alerting
+
+================================================================================
+1. CAPACITY PLANNING FRAMEWORK
+================================================================================
+
+// Capacity Planning Core Infrastructure
+// File: capacity_planning.hpp
+
+#ifndef CAPACITY_PLANNING_HPP
+#define CAPACITY_PLANNING_HPP
+
+#include <iostream>
+#include <vector>
+#include <map>
+#include <chrono>
+#include <cmath>
+#include <algorithm>
+#include <numeric>
+
+namespace hft {
+namespace capacity {
+
+// Resource utilization metrics
+struct ResourceMetrics {
+    double cpu_utilization;        // 0.0 to 1.0
+    double memory_utilization;     // 0.0 to 1.0
+    double network_utilization;    // 0.0 to 1.0
+    double disk_io_utilization;    // 0.0 to 1.0
+
+    size_t cpu_cores_used;
+    size_t memory_mb_used;
+    size_t network_mbps_used;
+    size_t disk_iops_used;
+
+    uint64_t timestamp_ms;
+
+    bool is_saturated(double threshold = 0.80) const {
+        return cpu_utilization > threshold ||
+               memory_utilization > threshold ||
+               network_utilization > threshold ||
+               disk_io_utilization > threshold;
+    }
+
+    double get_max_utilization() const {
+        return std::max({cpu_utilization, memory_utilization,
+                        network_utilization, disk_io_utilization});
+    }
+};
+
+// Workload characteristics
+struct WorkloadProfile {
+    size_t avg_messages_per_second;
+    size_t avg_orders_per_second;
+    size_t avg_message_size_bytes;
+    size_t concurrent_connections;
+    double peak_to_avg_ratio;
+
+    // Resource consumption per operation
+    double cpu_ns_per_message;
+    size_t memory_bytes_per_connection;
+    size_t network_bytes_per_order;
+
+    size_t calculate_required_cpu_cores(size_t target_messages_per_sec) const {
+        double total_cpu_ns = target_messages_per_sec * cpu_ns_per_message;
+        double cpu_seconds = total_cpu_ns / 1e9;
+
+        // Add overhead for context switching, GC, etc.
+        cpu_seconds *= 1.3;
+
+        return static_cast<size_t>(std::ceil(cpu_seconds));
+    }
+
+    size_t calculate_required_memory_mb(size_t target_connections) const {
+        size_t memory_bytes = target_connections * memory_bytes_per_connection;
+
+        // Add 30% overhead for OS, buffers, etc.
+        memory_bytes = static_cast<size_t>(memory_bytes * 1.3);
+
+        return memory_bytes / (1024 * 1024);
+    }
+
+    size_t calculate_required_bandwidth_mbps(size_t target_orders_per_sec) const {
+        size_t bytes_per_sec = target_orders_per_sec * network_bytes_per_order;
+        size_t bits_per_sec = bytes_per_sec * 8;
+
+        // Add 20% overhead for protocol headers
+        bits_per_sec = static_cast<size_t>(bits_per_sec * 1.2);
+
+        return bits_per_sec / (1024 * 1024);
+    }
+};
+
+// System capacity specification
+struct SystemCapacity {
+    size_t cpu_cores;
+    size_t memory_mb;
+    size_t network_bandwidth_mbps;
+    size_t disk_iops;
+    size_t max_connections;
+
+    double cpu_headroom;      // Reserve capacity (e.g., 0.20 = 20%)
+    double memory_headroom;
+    double network_headroom;
+
+    size_t get_effective_cpu_cores() const {
+        return static_cast<size_t>(cpu_cores * (1.0 - cpu_headroom));
+    }
+
+    size_t get_effective_memory_mb() const {
+        return static_cast<size_t>(memory_mb * (1.0 - memory_headroom));
+    }
+
+    size_t get_effective_bandwidth_mbps() const {
+        return static_cast<size_t>(network_bandwidth_mbps * (1.0 - network_headroom));
+    }
+};
+
+// Capacity planning calculator
+class CapacityPlanner {
+private:
+    WorkloadProfile workload;
+    SystemCapacity current_capacity;
+    std::vector<ResourceMetrics> historical_metrics;
+
+public:
+    CapacityPlanner(const WorkloadProfile& wp, const SystemCapacity& sc)
+        : workload(wp), current_capacity(sc) {}
+
+    void add_metrics(const ResourceMetrics& metrics) {
+        historical_metrics.push_back(metrics);
+    }
+
+    // Calculate maximum sustainable throughput
+    struct ThroughputCapacity {
+        size_t max_messages_per_sec;
+        size_t max_orders_per_sec;
+        size_t max_connections;
+        std::string limiting_resource;
+        double utilization_at_limit;
+    };
+
+    ThroughputCapacity calculate_max_throughput() const {
+        ThroughputCapacity result;
+
+        // CPU limit
+        double effective_cpu_cores = current_capacity.get_effective_cpu_cores();
+        double cpu_ns_available = effective_cpu_cores * 1e9;  // ns per second
+        size_t cpu_limited_messages = static_cast<size_t>(
+            cpu_ns_available / workload.cpu_ns_per_message);
+
+        // Memory limit
+        size_t effective_memory_mb = current_capacity.get_effective_memory_mb();
+        size_t memory_limited_connections = (effective_memory_mb * 1024 * 1024) /
+                                           workload.memory_bytes_per_connection;
+
+        // Network limit
+        size_t effective_bandwidth_mbps = current_capacity.get_effective_bandwidth_mbps();
+        size_t network_limited_orders = (effective_bandwidth_mbps * 1024 * 1024) /
+                                       (workload.network_bytes_per_order * 8);
+
+        // Find bottleneck
+        if (cpu_limited_messages < network_limited_orders) {
+            result.limiting_resource = "CPU";
+            result.max_messages_per_sec = cpu_limited_messages;
+            result.utilization_at_limit = 1.0 - current_capacity.cpu_headroom;
+        } else {
+            result.limiting_resource = "Network";
+            result.max_messages_per_sec = cpu_limited_messages;
+            result.utilization_at_limit = 1.0 - current_capacity.network_headroom;
+        }
+
+        result.max_orders_per_sec = network_limited_orders;
+        result.max_connections = memory_limited_connections;
+
+        return result;
+    }
+
+    // Forecast future capacity needs
+    struct CapacityForecast {
+        size_t months_until_exhaustion;
+        size_t required_cpu_cores;
+        size_t required_memory_mb;
+        size_t required_bandwidth_mbps;
+        double current_headroom_percent;
+    };
+
+    CapacityForecast forecast_capacity_needs(double monthly_growth_rate,
+                                             size_t forecast_months = 12) const {
+        CapacityForecast forecast;
+
+        if (historical_metrics.empty()) {
+            std::cerr << "No historical metrics available\n";
+            return forecast;
+        }
+
+        // Calculate current average utilization
+        double avg_cpu_util = calculate_average_utilization(
+            [](const ResourceMetrics& m) { return m.cpu_utilization; });
+
+        double avg_mem_util = calculate_average_utilization(
+            [](const ResourceMetrics& m) { return m.memory_utilization; });
+
+        double avg_net_util = calculate_average_utilization(
+            [](const ResourceMetrics& m) { return m.network_utilization; });
+
+        // Find maximum utilization
+        double max_util = std::max({avg_cpu_util, avg_mem_util, avg_net_util});
+        forecast.current_headroom_percent = (1.0 - max_util) * 100.0;
+
+        // Project when we'll hit 80% utilization
+        double target_utilization = 0.80;
+        if (max_util < target_utilization) {
+            double months = std::log((target_utilization / max_util)) /
+                          std::log(1.0 + monthly_growth_rate);
+            forecast.months_until_exhaustion = static_cast<size_t>(months);
+        } else {
+            forecast.months_until_exhaustion = 0;  // Already at capacity
+        }
+
+        // Calculate required resources for forecast period
+        double growth_multiplier = std::pow(1.0 + monthly_growth_rate, forecast_months);
+
+        forecast.required_cpu_cores = static_cast<size_t>(
+            current_capacity.cpu_cores * growth_multiplier);
+        forecast.required_memory_mb = static_cast<size_t>(
+            current_capacity.memory_mb * growth_multiplier);
+        forecast.required_bandwidth_mbps = static_cast<size_t>(
+            current_capacity.network_bandwidth_mbps * growth_multiplier);
+
+        return forecast;
+    }
+
+    // Recommend scaling actions
+    struct ScalingRecommendation {
+        bool needs_scaling;
+        std::string reason;
+        std::vector<std::string> actions;
+        double urgency;  // 0.0 to 1.0
+    };
+
+    ScalingRecommendation get_scaling_recommendations() const {
+        ScalingRecommendation rec;
+        rec.needs_scaling = false;
+        rec.urgency = 0.0;
+
+        if (historical_metrics.empty()) {
+            return rec;
+        }
+
+        // Analyze recent metrics (last 10%)
+        size_t recent_count = std::max(size_t(1),
+                                      historical_metrics.size() / 10);
+        auto recent_start = historical_metrics.end() - recent_count;
+
+        // Check for saturation events
+        size_t saturation_count = std::count_if(recent_start,
+                                                historical_metrics.end(),
+            [](const ResourceMetrics& m) { return m.is_saturated(0.80); });
+
+        double saturation_rate = static_cast<double>(saturation_count) / recent_count;
+
+        if (saturation_rate > 0.10) {  // >10% of time saturated
+            rec.needs_scaling = true;
+            rec.urgency = saturation_rate;
+            rec.reason = "System saturated " +
+                        std::to_string(static_cast<int>(saturation_rate * 100)) +
+                        "% of the time";
+
+            // Identify which resources to scale
+            double avg_cpu = calculate_average_utilization(
+                [](const ResourceMetrics& m) { return m.cpu_utilization; },
+                recent_start, historical_metrics.end());
+
+            double avg_mem = calculate_average_utilization(
+                [](const ResourceMetrics& m) { return m.memory_utilization; },
+                recent_start, historical_metrics.end());
+
+            double avg_net = calculate_average_utilization(
+                [](const ResourceMetrics& m) { return m.network_utilization; },
+                recent_start, historical_metrics.end());
+
+            if (avg_cpu > 0.80) {
+                rec.actions.push_back("Add CPU cores (current: " +
+                    std::to_string(static_cast<int>(avg_cpu * 100)) + "% avg utilization)");
+            }
+            if (avg_mem > 0.80) {
+                rec.actions.push_back("Add memory (current: " +
+                    std::to_string(static_cast<int>(avg_mem * 100)) + "% avg utilization)");
+            }
+            if (avg_net > 0.80) {
+                rec.actions.push_back("Increase network bandwidth (current: " +
+                    std::to_string(static_cast<int>(avg_net * 100)) + "% avg utilization)");
+            }
+        }
+
+        return rec;
+    }
+
+    void print_capacity_analysis() const {
+        std::cout << "\n=== Capacity Analysis ===\n";
+
+        auto max_throughput = calculate_max_throughput();
+        std::cout << "Maximum Sustainable Throughput:\n";
+        std::cout << "  Messages/sec: " << max_throughput.max_messages_per_sec << "\n";
+        std::cout << "  Orders/sec:   " << max_throughput.max_orders_per_sec << "\n";
+        std::cout << "  Connections:  " << max_throughput.max_connections << "\n";
+        std::cout << "  Limiting Resource: " << max_throughput.limiting_resource << "\n";
+        std::cout << "  Utilization at Limit: "
+                  << (max_throughput.utilization_at_limit * 100) << "%\n";
+
+        auto forecast = forecast_capacity_needs(0.10, 12);  // 10% monthly growth
+        std::cout << "\nCapacity Forecast (12 months, 10% monthly growth):\n";
+        std::cout << "  Months until capacity exhaustion: "
+                  << forecast.months_until_exhaustion << "\n";
+        std::cout << "  Required CPU cores: " << forecast.required_cpu_cores << "\n";
+        std::cout << "  Required memory: " << forecast.required_memory_mb << " MB\n";
+        std::cout << "  Required bandwidth: "
+                  << forecast.required_bandwidth_mbps << " Mbps\n";
+        std::cout << "  Current headroom: "
+                  << std::fixed << std::setprecision(1)
+                  << forecast.current_headroom_percent << "%\n";
+
+        auto recommendations = get_scaling_recommendations();
+        if (recommendations.needs_scaling) {
+            std::cout << "\n*** SCALING RECOMMENDED ***\n";
+            std::cout << "Reason: " << recommendations.reason << "\n";
+            std::cout << "Urgency: "
+                      << (recommendations.urgency * 100) << "%\n";
+            std::cout << "Actions:\n";
+            for (const auto& action : recommendations.actions) {
+                std::cout << "  - " << action << "\n";
+            }
+        } else {
+            std::cout << "\nNo scaling required at this time\n";
+        }
+    }
+
+private:
+    template<typename Func>
+    double calculate_average_utilization(Func getter) const {
+        return calculate_average_utilization(getter,
+                                             historical_metrics.begin(),
+                                             historical_metrics.end());
+    }
+
+    template<typename Func, typename Iter>
+    double calculate_average_utilization(Func getter, Iter begin, Iter end) const {
+        if (begin == end) return 0.0;
+
+        double sum = 0.0;
+        size_t count = 0;
+
+        for (auto it = begin; it != end; ++it) {
+            sum += getter(*it);
+            count++;
+        }
+
+        return sum / count;
+    }
+};
+
+} // namespace capacity
+} // namespace hft
+
+#endif // CAPACITY_PLANNING_HPP
+
+================================================================================
+2. PERFORMANCE MODELING
+================================================================================
+
+// Performance prediction models
+// File: performance_models.hpp
+
+#ifndef PERFORMANCE_MODELS_HPP
+#define PERFORMANCE_MODELS_HPP
+
+#include <vector>
+#include <cmath>
+
+namespace hft {
+namespace capacity {
+
+// Universal Scalability Law (USL) Model
+class USLModel {
+private:
+    double alpha;  // Contention coefficient
+    double beta;   // Coherency coefficient
+    double lambda; // Serial fraction
+
+public:
+    USLModel(double a = 0.01, double b = 0.0001, double l = 0.05)
+        : alpha(a), beta(b), lambda(l) {}
+
+    // Predict throughput for N processors
+    double predict_throughput(size_t num_processors,
+                             double single_proc_throughput = 1.0) const {
+        double n = static_cast<double>(num_processors);
+
+        double denominator = 1.0 + alpha * (n - 1.0) + beta * n * (n - 1.0);
+        return (n * single_proc_throughput) / denominator;
+    }
+
+    // Predict latency for N processors
+    double predict_latency(size_t num_processors,
+                          double single_proc_latency = 1.0) const {
+        return single_proc_latency / predict_relative_capacity(num_processors);
+    }
+
+    // Relative capacity (speedup)
+    double predict_relative_capacity(size_t num_processors) const {
+        return predict_throughput(num_processors, 1.0);
+    }
+
+    // Find optimal number of processors
+    size_t find_optimal_processors(size_t max_processors = 256) const {
+        double max_throughput = 0.0;
+        size_t optimal = 1;
+
+        for (size_t n = 1; n <= max_processors; ++n) {
+            double throughput = predict_throughput(n);
+            if (throughput > max_throughput) {
+                max_throughput = throughput;
+                optimal = n;
+            } else {
+                // Throughput decreasing, we've passed the optimum
+                break;
+            }
+        }
+
+        return optimal;
+    }
+
+    // Calibrate model from measurements
+    void calibrate(const std::vector<std::pair<size_t, double>>& measurements) {
+        // Simple least-squares fitting
+        // In production, use proper non-linear regression
+
+        if (measurements.size() < 3) {
+            std::cerr << "Need at least 3 measurements for calibration\n";
+            return;
+        }
+
+        // Placeholder for proper calibration
+        // Would use Levenberg-Marquardt or similar algorithm
+        std::cout << "Model calibration not fully implemented\n";
+    }
+
+    void print_analysis(size_t max_processors = 64) const {
+        std::cout << "\n=== USL Scalability Analysis ===\n";
+        std::cout << "Parameters:\n";
+        std::cout << "  Alpha (contention):  " << alpha << "\n";
+        std::cout << "  Beta (coherency):    " << beta << "\n";
+        std::cout << "  Lambda (serial):     " << lambda << "\n\n";
+
+        std::cout << "Processors | Throughput | Speedup | Efficiency\n";
+        std::cout << "-----------|------------|---------|------------\n";
+
+        for (size_t n : {1, 2, 4, 8, 16, 32, 64}) {
+            if (n > max_processors) break;
+
+            double throughput = predict_throughput(n);
+            double speedup = predict_relative_capacity(n);
+            double efficiency = speedup / n * 100.0;
+
+            std::cout << std::setw(10) << n << " | "
+                      << std::setw(10) << std::fixed << std::setprecision(2)
+                      << throughput << " | "
+                      << std::setw(7) << speedup << " | "
+                      << std::setw(9) << efficiency << "%\n";
+        }
+
+        size_t optimal = find_optimal_processors(max_processors);
+        std::cout << "\nOptimal processors: " << optimal << "\n";
+    }
+};
+
+// Amdahl's Law (simpler model)
+class AmdahlModel {
+private:
+    double parallel_fraction;
+
+public:
+    AmdahlModel(double pf = 0.95) : parallel_fraction(pf) {}
+
+    double predict_speedup(size_t num_processors) const {
+        double serial_fraction = 1.0 - parallel_fraction;
+        double n = static_cast<double>(num_processors);
+
+        return 1.0 / (serial_fraction + parallel_fraction / n);
+    }
+
+    double get_theoretical_max_speedup() const {
+        return 1.0 / (1.0 - parallel_fraction);
+    }
+
+    void print_analysis(size_t max_processors = 64) const {
+        std::cout << "\n=== Amdahl's Law Analysis ===\n";
+        std::cout << "Parallel fraction: "
+                  << (parallel_fraction * 100) << "%\n";
+        std::cout << "Theoretical max speedup: "
+                  << get_theoretical_max_speedup() << "x\n\n";
+
+        std::cout << "Processors | Speedup | Efficiency\n";
+        std::cout << "-----------|---------|------------\n";
+
+        for (size_t n : {1, 2, 4, 8, 16, 32, 64}) {
+            if (n > max_processors) break;
+
+            double speedup = predict_speedup(n);
+            double efficiency = speedup / n * 100.0;
+
+            std::cout << std::setw(10) << n << " | "
+                      << std::setw(7) << std::fixed << std::setprecision(2)
+                      << speedup << " | "
+                      << std::setw(9) << efficiency << "%\n";
+        }
+    }
+};
+
+// Queueing Theory Model (M/M/c)
+class QueueingModel {
+private:
+    double arrival_rate;    // λ (requests per second)
+    double service_rate;    // μ (requests per second per server)
+    size_t num_servers;     // c
+
+public:
+    QueueingModel(double lambda, double mu, size_t c)
+        : arrival_rate(lambda), service_rate(mu), num_servers(c) {}
+
+    double get_utilization() const {
+        return arrival_rate / (num_servers * service_rate);
+    }
+
+    double get_average_response_time() const {
+        double rho = get_utilization();
+        double c = static_cast<double>(num_servers);
+
+        // Simplified M/M/c formula
+        if (rho >= 1.0) {
+            return INFINITY;  // System unstable
+        }
+
+        return (1.0 / service_rate) * (1.0 + rho / (c * (1.0 - rho)));
+    }
+
+    double get_average_queue_length() const {
+        return arrival_rate * get_average_response_time();
+    }
+
+    size_t find_required_servers(double target_response_time,
+                                 size_t max_servers = 1000) const {
+        for (size_t c = 1; c <= max_servers; ++c) {
+            QueueingModel model(arrival_rate, service_rate, c);
+            if (model.get_average_response_time() <= target_response_time) {
+                return c;
+            }
+        }
+        return max_servers;
+    }
+
+    void print_analysis() const {
+        std::cout << "\n=== M/M/c Queueing Analysis ===\n";
+        std::cout << "Arrival rate (λ): " << arrival_rate << " req/s\n";
+        std::cout << "Service rate (μ): " << service_rate << " req/s\n";
+        std::cout << "Servers (c): " << num_servers << "\n\n";
+
+        double util = get_utilization();
+        std::cout << "Utilization: " << (util * 100) << "%\n";
+
+        if (util >= 1.0) {
+            std::cout << "WARNING: System is overloaded!\n";
+        } else {
+            std::cout << "Average response time: "
+                      << (get_average_response_time() * 1000) << " ms\n";
+            std::cout << "Average queue length: "
+                      << get_average_queue_length() << " requests\n";
+        }
+    }
+};
+
+} // namespace capacity
+} // namespace hft
+
+#endif // PERFORMANCE_MODELS_HPP
+
+================================================================================
+3. SCALABILITY TESTING
+================================================================================
+
+// Scalability test framework
+// File: scalability_tests.cpp
+
+#include "capacity_planning.hpp"
+#include "performance_models.hpp"
+
+namespace hft {
+namespace capacity {
+
+class ScalabilityTester {
+public:
+    struct ScalabilityResult {
+        size_t num_cores;
+        double throughput;
+        double latency_p50_ms;
+        double latency_p99_ms;
+        double cpu_utilization;
+        double efficiency;  // throughput per core
+    };
+
+    std::vector<ScalabilityResult> run_scalability_test(
+        size_t min_cores = 1,
+        size_t max_cores = 64,
+        size_t iterations_per_test = 100000) {
+
+        std::cout << "\n=== Scalability Test ===\n";
+        std::cout << "Testing from " << min_cores << " to "
+                  << max_cores << " cores\n\n";
+
+        std::vector<ScalabilityResult> results;
+
+        for (size_t cores = min_cores; cores <= max_cores; cores *= 2) {
+            std::cout << "Testing with " << cores << " cores...\n";
+
+            ScalabilityResult result;
+            result.num_cores = cores;
+
+            // Run workload with specified number of threads
+            auto metrics = run_workload(cores, iterations_per_test);
+
+            result.throughput = metrics.throughput;
+            result.latency_p50_ms = metrics.p50_latency;
+            result.latency_p99_ms = metrics.p99_latency;
+            result.cpu_utilization = metrics.cpu_util;
+            result.efficiency = metrics.throughput / cores;
+
+            results.push_back(result);
+
+            print_result(result);
+        }
+
+        analyze_scalability(results);
+
+        return results;
+    }
+
+private:
+    struct WorkloadMetrics {
+        double throughput;
+        double p50_latency;
+        double p99_latency;
+        double cpu_util;
+    };
+
+    WorkloadMetrics run_workload(size_t num_threads, size_t iterations) {
+        WorkloadMetrics metrics;
+
+        std::vector<std::thread> threads;
+        std::atomic<uint64_t> operations_completed{0};
+        std::vector<double> latencies;
+        std::mutex latency_mutex;
+
+        auto start = std::chrono::high_resolution_clock::now();
+
+        for (size_t t = 0; t < num_threads; ++t) {
+            threads.emplace_back([&, iterations]() {
+                for (size_t i = 0; i < iterations; ++i) {
+                    auto op_start = std::chrono::high_resolution_clock::now();
+
+                    // Simulate work
+                    simulate_hft_operation();
+
+                    auto op_end = std::chrono::high_resolution_clock::now();
+                    auto latency_ns = std::chrono::duration_cast<
+                        std::chrono::nanoseconds>(op_end - op_start).count();
+
+                    {
+                        std::lock_guard<std::mutex> lock(latency_mutex);
+                        latencies.push_back(latency_ns / 1e6);  // Convert to ms
+                    }
+
+                    operations_completed.fetch_add(1);
+                }
+            });
+        }
+
+        for (auto& thread : threads) {
+            thread.join();
+        }
+
+        auto end = std::chrono::high_resolution_clock::now();
+        auto duration_sec = std::chrono::duration_cast<
+            std::chrono::milliseconds>(end - start).count() / 1000.0;
+
+        // Calculate metrics
+        metrics.throughput = operations_completed.load() / duration_sec;
+
+        std::sort(latencies.begin(), latencies.end());
+        metrics.p50_latency = latencies[latencies.size() / 2];
+        metrics.p99_latency = latencies[static_cast<size_t>(latencies.size() * 0.99)];
+
+        // Simplified CPU utilization (would use actual measurement in production)
+        metrics.cpu_util = std::min(0.95, static_cast<double>(num_threads) /
+                                          std::thread::hardware_concurrency());
+
+        return metrics;
+    }
+
+    void simulate_hft_operation() {
+        // Simulate typical HFT operation workload
+        volatile double result = 0.0;
+        for (int i = 0; i < 1000; ++i) {
+            result += std::sin(i) * std::cos(i);
+        }
+    }
+
+    void print_result(const ScalabilityResult& result) {
+        std::cout << "  Cores: " << result.num_cores << "\n";
+        std::cout << "    Throughput: " << std::fixed << std::setprecision(0)
+                  << result.throughput << " ops/s\n";
+        std::cout << "    P50 Latency: " << std::setprecision(3)
+                  << result.latency_p50_ms << " ms\n";
+        std::cout << "    P99 Latency: " << result.latency_p99_ms << " ms\n";
+        std::cout << "    Efficiency: " << std::setprecision(0)
+                  << result.efficiency << " ops/s/core\n\n";
+    }
+
+    void analyze_scalability(const std::vector<ScalabilityResult>& results) {
+        std::cout << "\n=== Scalability Analysis ===\n";
+
+        if (results.size() < 2) return;
+
+        // Calculate speedup relative to single core
+        double baseline_throughput = results[0].throughput;
+
+        std::cout << "Cores | Speedup | Efficiency | Latency Impact\n";
+        std::cout << "------|---------|------------|-----------------\n";
+
+        for (const auto& result : results) {
+            double speedup = result.throughput / baseline_throughput;
+            double ideal_speedup = static_cast<double>(result.num_cores);
+            double efficiency = (speedup / ideal_speedup) * 100.0;
+            double latency_increase = (result.latency_p99_ms /
+                                      results[0].latency_p99_ms);
+
+            std::cout << std::setw(5) << result.num_cores << " | "
+                      << std::setw(7) << std::fixed << std::setprecision(2)
+                      << speedup << " | "
+                      << std::setw(9) << efficiency << "% | "
+                      << std::setw(15) << latency_increase << "x\n";
+        }
+
+        // Determine scalability classification
+        const auto& last_result = results.back();
+        double final_efficiency = (last_result.throughput / baseline_throughput) /
+                                 last_result.num_cores;
+
+        std::cout << "\nScalability Assessment:\n";
+        if (final_efficiency > 0.90) {
+            std::cout << "  EXCELLENT - Nearly linear scaling\n";
+        } else if (final_efficiency > 0.70) {
+            std::cout << "  GOOD - Sublinear but acceptable scaling\n";
+        } else if (final_efficiency > 0.50) {
+            std::cout << "  MODERATE - Significant contention present\n";
+        } else {
+            std::cout << "  POOR - Severe scalability issues\n";
+        }
+    }
+};
+
+} // namespace capacity
+} // namespace hft
+
+================================================================================
+4. CAPACITY PLANNING EXAMPLE
+================================================================================
+
+// Complete capacity planning example
+// File: capacity_planning_example.cpp
+
+#include "capacity_planning.hpp"
+#include "performance_models.hpp"
+#include "scalability_tests.cpp"
+
+int main() {
+    using namespace hft::capacity;
+
+    std::cout << "================================================\n";
+    std::cout << "HFT SYSTEM CAPACITY PLANNING ANALYSIS\n";
+    std::cout << "================================================\n";
+
+    // Define current workload profile
+    WorkloadProfile workload;
+    workload.avg_messages_per_second = 5'000'000;
+    workload.avg_orders_per_second = 500'000;
+    workload.avg_message_size_bytes = 256;
+    workload.concurrent_connections = 1000;
+    workload.peak_to_avg_ratio = 3.0;
+    workload.cpu_ns_per_message = 500;
+    workload.memory_bytes_per_connection = 1024 * 1024;  // 1MB
+    workload.network_bytes_per_order = 512;
+
+    // Define current system capacity
+    SystemCapacity current_system;
+    current_system.cpu_cores = 32;
+    current_system.memory_mb = 256 * 1024;  // 256GB
+    current_system.network_bandwidth_mbps = 10'000;  // 10 Gbps
+    current_system.disk_iops = 100'000;
+    current_system.max_connections = 10'000;
+    current_system.cpu_headroom = 0.20;      // 20% reserve
+    current_system.memory_headroom = 0.20;
+    current_system.network_headroom = 0.20;
+
+    // Create capacity planner
+    CapacityPlanner planner(workload, current_system);
+
+    // Simulate historical metrics
+    std::cout << "\nGenerating simulated historical metrics...\n";
+    for (size_t i = 0; i < 1000; ++i) {
+        ResourceMetrics metrics;
+        metrics.cpu_utilization = 0.60 + (i * 0.0002);  // Gradually increasing
+        metrics.memory_utilization = 0.50;
+        metrics.network_utilization = 0.40;
+        metrics.disk_io_utilization = 0.30;
+        metrics.timestamp_ms = i * 1000;
+
+        planner.add_metrics(metrics);
+    }
+
+    // Perform capacity analysis
+    planner.print_capacity_analysis();
+
+    // Run scalability tests
+    ScalabilityTester tester;
+    auto scalability_results = tester.run_scalability_test(1, 64, 10000);
+
+    // Performance modeling
+    std::cout << "\n================================================\n";
+    std::cout << "PERFORMANCE MODELING\n";
+    std::cout << "================================================\n";
+
+    // USL Model
+    USLModel usl(0.02, 0.0005, 0.05);
+    usl.print_analysis(64);
+
+    // Amdahl's Law
+    AmdahlModel amdahl(0.95);
+    amdahl.print_analysis(64);
+
+    // Queueing Theory
+    QueueingModel queue(workload.avg_orders_per_second,
+                       workload.avg_orders_per_second * 1.5,  // 50% headroom
+                       current_system.cpu_cores);
+    queue.print_analysis();
+
+    std::cout << "\n================================================\n";
+    std::cout << "CAPACITY PLANNING COMPLETE\n";
+    std::cout << "================================================\n";
+
+    return 0;
+}
+
+================================================================================
+CAPACITY PLANNING GUIDELINES
+================================================================================
+
+HEADROOM RECOMMENDATIONS:
+========================
+Resource          | Normal Headroom | Peak Headroom | Critical Systems
+------------------|-----------------|---------------|------------------
+CPU               | 20-30%          | 40-50%        | 50-60%
+Memory            | 20-30%          | 30-40%        | 40-50%
+Network           | 30-40%          | 50-60%        | 60-70%
+Disk I/O          | 30-40%          | 50-60%        | 60-70%
+
+SCALING TRIGGERS:
+=================
+- Resource utilization > 70% for sustained period (1 hour)
+- Resource utilization > 85% for any 5-minute window
+- Growth rate indicates capacity exhaustion within 3 months
+- P99 latency degradation > 20%
+- Error rate increase > 0.1%
+
+FORECASTING PARAMETERS:
+======================
+- Use 12-month rolling average for trend analysis
+- Apply 20% safety margin to growth projections
+- Account for seasonal variations
+- Include planned feature releases in forecast
+- Review and update forecasts monthly
+
+COST OPTIMIZATION:
+==================
+- Right-size instances based on actual utilization
+- Use spot instances for non-critical workloads
+- Implement auto-scaling for variable load
+- Consolidate underutilized resources
+- Monitor cost per transaction
+
+================================================================================
+END OF CAPACITY PLANNING
+================================================================================

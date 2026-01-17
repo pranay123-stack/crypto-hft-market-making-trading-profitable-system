@@ -1,0 +1,1128 @@
+================================================================================
+EVENT-DRIVEN BACKTESTING ARCHITECTURE
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Event-Driven Design Principles
+2. Event Queue Implementation
+3. Event Types and Hierarchy
+4. Event Router and Dispatcher
+5. Strategy Event Handlers
+6. Market Data Events
+7. Order Lifecycle Events
+8. Time Management
+9. Event Replay System
+10. Complete Implementation Examples
+
+================================================================================
+1. EVENT-DRIVEN DESIGN PRINCIPLES
+================================================================================
+
+Event-driven backtesting simulates real-world trading by processing events
+in chronological order, exactly as they would occur in live trading.
+
+Key Principles:
+---------------
+1. Temporal Causality: Events are processed in strict timestamp order
+2. No Look-Ahead Bias: Future information is never accessible
+3. Realistic Latency: Simulates network and processing delays
+4. Asynchronous Processing: Mimics real distributed systems
+5. Event Atomicity: Each event is processed independently
+
+Event Flow:
+-----------
+┌──────────────────────────────────────────────────────────────┐
+│                    Historical Data                           │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐                  │
+│  │ Market   │  │  Trades  │  │ Quotes   │                  │
+│  │ Events   │  │          │  │          │                  │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘                  │
+└───────┼─────────────┼─────────────┼────────────────────────┘
+        │             │             │
+        └─────────────┴──────┬──────┘
+                             │
+                    ┌────────▼─────────┐
+                    │   Event Queue    │
+                    │  (Priority Queue) │
+                    │  Sorted by Time  │
+                    └────────┬─────────┘
+                             │
+                    ┌────────▼─────────┐
+                    │  Event Dispatcher │
+                    └────────┬─────────┘
+                             │
+        ┌────────────────────┼────────────────────┐
+        │                    │                    │
+   ┌────▼─────┐      ┌──────▼──────┐      ┌──────▼──────┐
+   │Strategy 1│      │  Strategy 2 │      │ Execution   │
+   │          │      │             │      │ Simulator   │
+   └────┬─────┘      └──────┬──────┘      └──────┬──────┘
+        │                   │                    │
+        └───────────────────┴──────┬─────────────┘
+                                   │
+                          ┌────────▼─────────┐
+                          │  Order Events    │
+                          │  Fill Events     │
+                          └──────────────────┘
+
+================================================================================
+2. EVENT QUEUE IMPLEMENTATION
+================================================================================
+
+/*******************************************************************************
+ * ADVANCED EVENT QUEUE WITH PRIORITY AND PARTITIONING
+ ******************************************************************************/
+
+#pragma once
+#include <queue>
+#include <vector>
+#include <memory>
+#include <mutex>
+#include <condition_variable>
+#include <chrono>
+#include <atomic>
+#include <map>
+#include <functional>
+
+namespace HFT {
+namespace Backtest {
+
+using Timestamp = std::chrono::time_point<std::chrono::system_clock,
+                                          std::chrono::nanoseconds>;
+using Duration = std::chrono::nanoseconds;
+
+/*******************************************************************************
+ * BASE EVENT CLASS
+ ******************************************************************************/
+
+enum class EventType : uint8_t {
+    MARKET_TICK,           // Individual tick (trade/quote)
+    ORDER_BOOK_UPDATE,     // Full order book snapshot
+    ORDER_REQUEST,         // New order from strategy
+    ORDER_ACK,             // Order acknowledgment
+    ORDER_FILL,            // Fill notification
+    ORDER_CANCEL_REQUEST,  // Cancel request
+    ORDER_CANCEL_ACK,      // Cancel acknowledgment
+    ORDER_REJECT,          // Order rejection
+    TIMER,                 // Scheduled timer event
+    SIGNAL,                // Trading signal
+    RISK_CHECK,            // Risk management event
+    SETTLEMENT,            // End-of-day settlement
+    CUSTOM                 // User-defined events
+};
+
+enum class EventPriority : uint8_t {
+    CRITICAL = 0,    // Risk management, emergency stops
+    HIGH = 1,        // Market data, fills
+    NORMAL = 2,      // Orders, signals
+    LOW = 3          // Analytics, logging
+};
+
+struct Event {
+    EventType type;
+    EventPriority priority;
+    Timestamp timestamp;
+    uint64_t sequence_number;
+    std::string source;
+    std::string destination;
+
+    Event(EventType t, Timestamp ts)
+        : type(t), priority(EventPriority::NORMAL),
+          timestamp(ts), sequence_number(0) {}
+
+    virtual ~Event() = default;
+
+    // For debugging and logging
+    virtual std::string to_string() const {
+        return "Event[" + std::to_string(static_cast<int>(type)) + "]";
+    }
+};
+
+/*******************************************************************************
+ * PRIORITY EVENT QUEUE
+ ******************************************************************************/
+
+class PriorityEventQueue {
+private:
+    struct EventComparator {
+        bool operator()(const std::shared_ptr<Event>& a,
+                       const std::shared_ptr<Event>& b) const {
+            // First sort by timestamp
+            if (a->timestamp != b->timestamp) {
+                return a->timestamp > b->timestamp; // Min heap
+            }
+            // Then by priority (lower value = higher priority)
+            if (a->priority != b->priority) {
+                return a->priority > b->priority;
+            }
+            // Finally by sequence number for determinism
+            return a->sequence_number > b->sequence_number;
+        }
+    };
+
+    using QueueType = std::priority_queue<
+        std::shared_ptr<Event>,
+        std::vector<std::shared_ptr<Event>>,
+        EventComparator
+    >;
+
+    QueueType queue_;
+    std::atomic<uint64_t> sequence_counter_{0};
+    mutable std::mutex mutex_;
+    std::condition_variable cv_;
+
+    // Statistics
+    std::atomic<uint64_t> events_pushed_{0};
+    std::atomic<uint64_t> events_popped_{0};
+
+public:
+    void push(std::shared_ptr<Event> event) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            event->sequence_number = sequence_counter_++;
+            queue_.push(std::move(event));
+            events_pushed_++;
+        }
+        cv_.notify_one();
+    }
+
+    void push_batch(std::vector<std::shared_ptr<Event>>& events) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (auto& event : events) {
+                event->sequence_number = sequence_counter_++;
+                queue_.push(std::move(event));
+            }
+            events_pushed_ += events.size();
+        }
+        cv_.notify_all();
+    }
+
+    std::shared_ptr<Event> pop() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (queue_.empty()) {
+            return nullptr;
+        }
+        auto event = queue_.top();
+        queue_.pop();
+        events_popped_++;
+        return event;
+    }
+
+    std::shared_ptr<Event> pop_blocking(
+        const std::chrono::milliseconds& timeout = std::chrono::milliseconds(0)) {
+
+        std::unique_lock<std::mutex> lock(mutex_);
+
+        if (timeout.count() > 0) {
+            cv_.wait_for(lock, timeout, [this] { return !queue_.empty(); });
+        } else {
+            cv_.wait(lock, [this] { return !queue_.empty(); });
+        }
+
+        if (queue_.empty()) {
+            return nullptr;
+        }
+
+        auto event = queue_.top();
+        queue_.pop();
+        events_popped_++;
+        return event;
+    }
+
+    bool empty() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return queue_.empty();
+    }
+
+    size_t size() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return queue_.size();
+    }
+
+    Timestamp next_timestamp() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (queue_.empty()) {
+            return Timestamp::max();
+        }
+        return queue_.top()->timestamp;
+    }
+
+    void clear() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        while (!queue_.empty()) {
+            queue_.pop();
+        }
+        sequence_counter_ = 0;
+    }
+
+    // Statistics
+    uint64_t get_events_pushed() const { return events_pushed_; }
+    uint64_t get_events_popped() const { return events_popped_; }
+    uint64_t get_events_pending() const { return events_pushed_ - events_popped_; }
+};
+
+/*******************************************************************************
+ * PARTITIONED EVENT QUEUE - For parallel processing
+ ******************************************************************************/
+
+class PartitionedEventQueue {
+private:
+    std::vector<std::unique_ptr<PriorityEventQueue>> partitions_;
+    size_t num_partitions_;
+    std::hash<std::string> hasher_;
+
+public:
+    PartitionedEventQueue(size_t num_partitions = 4)
+        : num_partitions_(num_partitions) {
+
+        for (size_t i = 0; i < num_partitions_; ++i) {
+            partitions_.push_back(std::make_unique<PriorityEventQueue>());
+        }
+    }
+
+    void push(std::shared_ptr<Event> event, const std::string& partition_key) {
+        size_t partition = hasher_(partition_key) % num_partitions_;
+        partitions_[partition]->push(std::move(event));
+    }
+
+    std::shared_ptr<Event> pop(size_t partition) {
+        if (partition >= num_partitions_) {
+            return nullptr;
+        }
+        return partitions_[partition]->pop();
+    }
+
+    std::shared_ptr<Event> pop_next() {
+        // Find partition with earliest event
+        size_t best_partition = 0;
+        Timestamp earliest = Timestamp::max();
+
+        for (size_t i = 0; i < num_partitions_; ++i) {
+            Timestamp ts = partitions_[i]->next_timestamp();
+            if (ts < earliest) {
+                earliest = ts;
+                best_partition = i;
+            }
+        }
+
+        if (earliest == Timestamp::max()) {
+            return nullptr; // All empty
+        }
+
+        return partitions_[best_partition]->pop();
+    }
+
+    bool empty() const {
+        for (const auto& partition : partitions_) {
+            if (!partition->empty()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    size_t total_size() const {
+        size_t total = 0;
+        for (const auto& partition : partitions_) {
+            total += partition->size();
+        }
+        return total;
+    }
+};
+
+================================================================================
+3. EVENT TYPES AND HIERARCHY
+================================================================================
+
+/*******************************************************************************
+ * MARKET DATA EVENTS
+ ******************************************************************************/
+
+struct MarketTickEvent : public Event {
+    uint32_t symbol_id;
+    std::string symbol;
+
+    // Trade data
+    double trade_price;
+    int64_t trade_size;
+    uint8_t trade_side;  // 0=buy, 1=sell, 2=unknown
+
+    // Quote data
+    double bid_price;
+    double ask_price;
+    int64_t bid_size;
+    int64_t ask_size;
+
+    MarketTickEvent(Timestamp ts, const std::string& sym)
+        : Event(EventType::MARKET_TICK, ts),
+          symbol_id(0), symbol(sym),
+          trade_price(0.0), trade_size(0), trade_side(2),
+          bid_price(0.0), ask_price(0.0),
+          bid_size(0), ask_size(0) {
+        priority = EventPriority::HIGH;
+    }
+
+    bool has_trade() const {
+        return trade_price > 0.0 && trade_size > 0;
+    }
+
+    bool has_quote() const {
+        return bid_price > 0.0 && ask_price > 0.0;
+    }
+
+    double get_mid_price() const {
+        if (has_quote()) {
+            return (bid_price + ask_price) / 2.0;
+        }
+        return trade_price;
+    }
+
+    std::string to_string() const override {
+        char buffer[256];
+        snprintf(buffer, sizeof(buffer),
+                "MarketTick[%s, price=%.2f, bid=%.2f, ask=%.2f]",
+                symbol.c_str(), trade_price, bid_price, ask_price);
+        return std::string(buffer);
+    }
+};
+
+/*******************************************************************************
+ * ORDER BOOK UPDATE EVENT
+ ******************************************************************************/
+
+struct OrderBookLevel {
+    double price;
+    int64_t size;
+    uint16_t order_count;
+};
+
+struct OrderBookUpdateEvent : public Event {
+    std::string symbol;
+    uint32_t symbol_id;
+
+    std::vector<OrderBookLevel> bids;  // Sorted descending
+    std::vector<OrderBookLevel> asks;  // Sorted ascending
+
+    bool is_snapshot;  // true = full snapshot, false = incremental
+
+    OrderBookUpdateEvent(Timestamp ts, const std::string& sym)
+        : Event(EventType::ORDER_BOOK_UPDATE, ts),
+          symbol(sym), symbol_id(0), is_snapshot(true) {
+        priority = EventPriority::HIGH;
+    }
+
+    double get_mid_price() const {
+        if (bids.empty() || asks.empty()) return 0.0;
+        return (bids[0].price + asks[0].price) / 2.0;
+    }
+
+    double get_spread() const {
+        if (bids.empty() || asks.empty()) return 0.0;
+        return asks[0].price - bids[0].price;
+    }
+
+    int64_t get_bid_liquidity(int levels = -1) const {
+        int64_t total = 0;
+        int count = (levels < 0) ? bids.size() : std::min(levels, (int)bids.size());
+        for (int i = 0; i < count; ++i) {
+            total += bids[i].size;
+        }
+        return total;
+    }
+
+    int64_t get_ask_liquidity(int levels = -1) const {
+        int64_t total = 0;
+        int count = (levels < 0) ? asks.size() : std::min(levels, (int)asks.size());
+        for (int i = 0; i < count; ++i) {
+            total += asks[i].size;
+        }
+        return total;
+    }
+};
+
+/*******************************************************************************
+ * ORDER EVENTS
+ ******************************************************************************/
+
+enum class OrderSide : uint8_t {
+    BUY = 0,
+    SELL = 1
+};
+
+enum class OrderType : uint8_t {
+    MARKET,
+    LIMIT,
+    STOP,
+    STOP_LIMIT,
+    ICEBERG,
+    POST_ONLY,
+    FILL_OR_KILL,
+    IMMEDIATE_OR_CANCEL
+};
+
+enum class OrderStatus : uint8_t {
+    PENDING_NEW,
+    NEW,
+    PARTIALLY_FILLED,
+    FILLED,
+    PENDING_CANCEL,
+    CANCELLED,
+    REJECTED,
+    EXPIRED
+};
+
+enum class TimeInForce : uint8_t {
+    GTC,  // Good till cancel
+    IOC,  // Immediate or cancel
+    FOK,  // Fill or kill
+    DAY,  // Day order
+    GTD   // Good till date
+};
+
+struct OrderRequestEvent : public Event {
+    uint64_t client_order_id;
+    std::string strategy_id;
+    std::string symbol;
+    uint32_t symbol_id;
+
+    OrderType order_type;
+    OrderSide side;
+    double price;
+    int64_t quantity;
+    TimeInForce tif;
+
+    // For iceberg orders
+    int64_t visible_quantity;
+
+    // For stop orders
+    double stop_price;
+
+    OrderRequestEvent(Timestamp ts, const std::string& sym)
+        : Event(EventType::ORDER_REQUEST, ts),
+          client_order_id(0), symbol(sym), symbol_id(0),
+          order_type(OrderType::LIMIT),
+          side(OrderSide::BUY),
+          price(0.0), quantity(0),
+          tif(TimeInForce::GTC),
+          visible_quantity(0),
+          stop_price(0.0) {
+        priority = EventPriority::NORMAL;
+    }
+
+    std::string to_string() const override {
+        char buffer[256];
+        snprintf(buffer, sizeof(buffer),
+                "OrderRequest[id=%lu, %s, %s, qty=%ld, price=%.2f]",
+                client_order_id, symbol.c_str(),
+                (side == OrderSide::BUY) ? "BUY" : "SELL",
+                quantity, price);
+        return std::string(buffer);
+    }
+};
+
+struct OrderAckEvent : public Event {
+    uint64_t client_order_id;
+    uint64_t exchange_order_id;
+    std::string strategy_id;
+    std::string symbol;
+    OrderStatus status;
+
+    OrderAckEvent(Timestamp ts)
+        : Event(EventType::ORDER_ACK, ts),
+          client_order_id(0),
+          exchange_order_id(0),
+          status(OrderStatus::NEW) {
+        priority = EventPriority::HIGH;
+    }
+
+    std::string to_string() const override {
+        char buffer[256];
+        snprintf(buffer, sizeof(buffer),
+                "OrderAck[client_id=%lu, exchange_id=%lu, status=%d]",
+                client_order_id, exchange_order_id,
+                static_cast<int>(status));
+        return std::string(buffer);
+    }
+};
+
+struct OrderFillEvent : public Event {
+    uint64_t client_order_id;
+    uint64_t exchange_order_id;
+    uint64_t fill_id;
+    std::string strategy_id;
+    std::string symbol;
+
+    OrderSide side;
+    double fill_price;
+    int64_t fill_quantity;
+    int64_t remaining_quantity;
+
+    double commission;
+    bool is_maker;
+
+    OrderFillEvent(Timestamp ts)
+        : Event(EventType::ORDER_FILL, ts),
+          client_order_id(0),
+          exchange_order_id(0),
+          fill_id(0),
+          side(OrderSide::BUY),
+          fill_price(0.0),
+          fill_quantity(0),
+          remaining_quantity(0),
+          commission(0.0),
+          is_maker(false) {
+        priority = EventPriority::HIGH;
+    }
+
+    std::string to_string() const override {
+        char buffer[256];
+        snprintf(buffer, sizeof(buffer),
+                "OrderFill[id=%lu, qty=%ld, price=%.2f, commission=%.2f]",
+                fill_id, fill_quantity, fill_price, commission);
+        return std::string(buffer);
+    }
+};
+
+struct OrderRejectEvent : public Event {
+    uint64_t client_order_id;
+    std::string strategy_id;
+    std::string symbol;
+    std::string reason;
+
+    OrderRejectEvent(Timestamp ts)
+        : Event(EventType::ORDER_REJECT, ts),
+          client_order_id(0) {
+        priority = EventPriority::HIGH;
+    }
+
+    std::string to_string() const override {
+        return "OrderReject[id=" + std::to_string(client_order_id) +
+               ", reason=" + reason + "]";
+    }
+};
+
+/*******************************************************************************
+ * TIMER EVENT
+ ******************************************************************************/
+
+struct TimerEvent : public Event {
+    std::string timer_id;
+    uint64_t interval_ns;
+    bool recurring;
+
+    TimerEvent(Timestamp ts, const std::string& id)
+        : Event(EventType::TIMER, ts),
+          timer_id(id),
+          interval_ns(0),
+          recurring(false) {
+        priority = EventPriority::LOW;
+    }
+
+    std::string to_string() const override {
+        return "Timer[" + timer_id + "]";
+    }
+};
+
+/*******************************************************************************
+ * SIGNAL EVENT
+ ******************************************************************************/
+
+struct SignalEvent : public Event {
+    std::string signal_id;
+    std::string symbol;
+    std::string strategy_id;
+
+    enum class SignalType {
+        ENTRY_LONG,
+        ENTRY_SHORT,
+        EXIT_LONG,
+        EXIT_SHORT,
+        CLOSE_ALL,
+        CUSTOM
+    };
+
+    SignalType signal_type;
+    double signal_strength;  // -1.0 to 1.0
+    std::map<std::string, double> metadata;
+
+    SignalEvent(Timestamp ts, const std::string& sym)
+        : Event(EventType::SIGNAL, ts),
+          signal_id(""), symbol(sym),
+          signal_type(SignalType::CUSTOM),
+          signal_strength(0.0) {
+        priority = EventPriority::NORMAL;
+    }
+
+    std::string to_string() const override {
+        char buffer[256];
+        snprintf(buffer, sizeof(buffer),
+                "Signal[%s, strength=%.2f]",
+                symbol.c_str(), signal_strength);
+        return std::string(buffer);
+    }
+};
+
+================================================================================
+4. EVENT ROUTER AND DISPATCHER
+================================================================================
+
+/*******************************************************************************
+ * EVENT HANDLER INTERFACE
+ ******************************************************************************/
+
+class IEventHandler {
+public:
+    virtual ~IEventHandler() = default;
+
+    virtual void on_market_tick(const MarketTickEvent& event) {}
+    virtual void on_order_book_update(const OrderBookUpdateEvent& event) {}
+    virtual void on_order_ack(const OrderAckEvent& event) {}
+    virtual void on_order_fill(const OrderFillEvent& event) {}
+    virtual void on_order_reject(const OrderRejectEvent& event) {}
+    virtual void on_timer(const TimerEvent& event) {}
+    virtual void on_signal(const SignalEvent& event) {}
+
+    virtual std::string get_handler_id() const = 0;
+};
+
+/*******************************************************************************
+ * EVENT DISPATCHER
+ ******************************************************************************/
+
+class EventDispatcher {
+private:
+    std::map<std::string, std::shared_ptr<IEventHandler>> handlers_;
+    std::map<EventType, std::vector<std::string>> subscriptions_;
+    mutable std::shared_mutex mutex_;
+
+    // Statistics
+    std::atomic<uint64_t> events_dispatched_{0};
+    std::map<EventType, std::atomic<uint64_t>> events_by_type_;
+
+public:
+    void register_handler(std::shared_ptr<IEventHandler> handler) {
+        std::unique_lock<std::shared_mutex> lock(mutex_);
+        handlers_[handler->get_handler_id()] = handler;
+    }
+
+    void subscribe(const std::string& handler_id, EventType event_type) {
+        std::unique_lock<std::shared_mutex> lock(mutex_);
+        subscriptions_[event_type].push_back(handler_id);
+    }
+
+    void subscribe_all(const std::string& handler_id) {
+        std::unique_lock<std::shared_mutex> lock(mutex_);
+        for (int i = 0; i <= static_cast<int>(EventType::CUSTOM); ++i) {
+            subscriptions_[static_cast<EventType>(i)].push_back(handler_id);
+        }
+    }
+
+    void dispatch(const std::shared_ptr<Event>& event) {
+        std::shared_lock<std::shared_mutex> lock(mutex_);
+
+        auto it = subscriptions_.find(event->type);
+        if (it == subscriptions_.end()) {
+            return; // No subscribers
+        }
+
+        for (const auto& handler_id : it->second) {
+            auto handler_it = handlers_.find(handler_id);
+            if (handler_it == handlers_.end()) {
+                continue;
+            }
+
+            dispatch_to_handler(handler_it->second, event);
+        }
+
+        events_dispatched_++;
+        events_by_type_[event->type]++;
+    }
+
+    uint64_t get_events_dispatched() const {
+        return events_dispatched_;
+    }
+
+    uint64_t get_events_by_type(EventType type) const {
+        auto it = events_by_type_.find(type);
+        return (it != events_by_type_.end()) ? it->second.load() : 0;
+    }
+
+private:
+    void dispatch_to_handler(std::shared_ptr<IEventHandler> handler,
+                           const std::shared_ptr<Event>& event) {
+        switch (event->type) {
+            case EventType::MARKET_TICK: {
+                auto tick = std::static_pointer_cast<MarketTickEvent>(event);
+                handler->on_market_tick(*tick);
+                break;
+            }
+            case EventType::ORDER_BOOK_UPDATE: {
+                auto ob = std::static_pointer_cast<OrderBookUpdateEvent>(event);
+                handler->on_order_book_update(*ob);
+                break;
+            }
+            case EventType::ORDER_ACK: {
+                auto ack = std::static_pointer_cast<OrderAckEvent>(event);
+                handler->on_order_ack(*ack);
+                break;
+            }
+            case EventType::ORDER_FILL: {
+                auto fill = std::static_pointer_cast<OrderFillEvent>(event);
+                handler->on_order_fill(*fill);
+                break;
+            }
+            case EventType::ORDER_REJECT: {
+                auto reject = std::static_pointer_cast<OrderRejectEvent>(event);
+                handler->on_order_reject(*reject);
+                break;
+            }
+            case EventType::TIMER: {
+                auto timer = std::static_pointer_cast<TimerEvent>(event);
+                handler->on_timer(*timer);
+                break;
+            }
+            case EventType::SIGNAL: {
+                auto signal = std::static_pointer_cast<SignalEvent>(event);
+                handler->on_signal(*signal);
+                break;
+            }
+            default:
+                break;
+        }
+    }
+};
+
+================================================================================
+5. TIME MANAGEMENT
+================================================================================
+
+/*******************************************************************************
+ * SIMULATED CLOCK
+ ******************************************************************************/
+
+class SimulatedClock {
+private:
+    Timestamp current_time_;
+    Timestamp start_time_;
+    Timestamp end_time_;
+    mutable std::mutex mutex_;
+
+    // Speed multiplier (1.0 = realtime, 0.0 = max speed)
+    double speed_multiplier_;
+
+public:
+    SimulatedClock()
+        : current_time_(Timestamp::min()),
+          start_time_(Timestamp::min()),
+          end_time_(Timestamp::max()),
+          speed_multiplier_(0.0) {}
+
+    void set_time_range(Timestamp start, Timestamp end) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        start_time_ = start;
+        end_time_ = end;
+        current_time_ = start;
+    }
+
+    void set_time(Timestamp time) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        current_time_ = time;
+    }
+
+    Timestamp now() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return current_time_;
+    }
+
+    void advance(Duration duration) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        current_time_ += duration;
+    }
+
+    bool is_finished() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return current_time_ >= end_time_;
+    }
+
+    void set_speed(double multiplier) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        speed_multiplier_ = multiplier;
+    }
+
+    // For realtime simulation
+    void sleep_until(Timestamp target_time) {
+        if (speed_multiplier_ <= 0.0) {
+            return; // Max speed - no sleep
+        }
+
+        auto current = now();
+        if (target_time <= current) {
+            return;
+        }
+
+        auto sim_duration = target_time - current;
+        auto real_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+            sim_duration * speed_multiplier_);
+
+        std::this_thread::sleep_for(real_duration);
+    }
+};
+
+/*******************************************************************************
+ * TIMER MANAGER
+ ******************************************************************************/
+
+class TimerManager {
+private:
+    struct Timer {
+        std::string id;
+        Timestamp next_fire;
+        Duration interval;
+        bool recurring;
+        std::function<void()> callback;
+    };
+
+    std::vector<Timer> timers_;
+    SimulatedClock& clock_;
+    PriorityEventQueue& event_queue_;
+    mutable std::mutex mutex_;
+
+public:
+    TimerManager(SimulatedClock& clock, PriorityEventQueue& queue)
+        : clock_(clock), event_queue_(queue) {}
+
+    void schedule(const std::string& id,
+                 Duration delay,
+                 bool recurring = false,
+                 std::function<void()> callback = nullptr) {
+
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        Timer timer;
+        timer.id = id;
+        timer.next_fire = clock_.now() + delay;
+        timer.interval = delay;
+        timer.recurring = recurring;
+        timer.callback = callback;
+
+        timers_.push_back(timer);
+
+        // Create timer event
+        auto event = std::make_shared<TimerEvent>(timer.next_fire, id);
+        event->interval_ns = std::chrono::duration_cast<Duration>(delay).count();
+        event->recurring = recurring;
+
+        event_queue_.push(event);
+    }
+
+    void process_timer(const TimerEvent& event) {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        auto it = std::find_if(timers_.begin(), timers_.end(),
+            [&event](const Timer& t) { return t.id == event.timer_id; });
+
+        if (it == timers_.end()) {
+            return;
+        }
+
+        // Execute callback if provided
+        if (it->callback) {
+            it->callback();
+        }
+
+        // Reschedule if recurring
+        if (it->recurring) {
+            it->next_fire += it->interval;
+
+            auto new_event = std::make_shared<TimerEvent>(it->next_fire, it->id);
+            new_event->interval_ns = std::chrono::duration_cast<Duration>(
+                it->interval).count();
+            new_event->recurring = true;
+
+            event_queue_.push(new_event);
+        } else {
+            timers_.erase(it);
+        }
+    }
+
+    void cancel(const std::string& id) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        timers_.erase(
+            std::remove_if(timers_.begin(), timers_.end(),
+                [&id](const Timer& t) { return t.id == id; }),
+            timers_.end());
+    }
+};
+
+================================================================================
+6. EVENT REPLAY SYSTEM
+================================================================================
+
+/*******************************************************************************
+ * MARKET DATA REPLAYER
+ ******************************************************************************/
+
+#include "historical_data_management.h"
+
+class MarketDataReplayer {
+private:
+    HFT::Data::HistoricalDataManager& data_manager_;
+    PriorityEventQueue& event_queue_;
+    std::vector<std::string> symbols_;
+
+public:
+    MarketDataReplayer(HFT::Data::HistoricalDataManager& data_mgr,
+                      PriorityEventQueue& queue)
+        : data_manager_(data_mgr), event_queue_(queue) {}
+
+    void add_symbol(const std::string& symbol) {
+        symbols_.push_back(symbol);
+    }
+
+    void replay_date(const std::string& date,
+                    int64_t start_ns,
+                    int64_t end_ns) {
+
+        for (const auto& symbol : symbols_) {
+            // Load trades
+            auto trades = data_manager_.get_trades(symbol, date, start_ns, end_ns);
+
+            for (const auto& trade : trades) {
+                auto event = std::make_shared<MarketTickEvent>(
+                    trade.get_timestamp(), symbol);
+
+                event->symbol_id = trade.symbol_id;
+                event->trade_price = trade.price;
+                event->trade_size = trade.size;
+                event->trade_side = trade.side;
+
+                event_queue_.push(event);
+            }
+
+            // Load quotes
+            auto quotes = data_manager_.get_quotes(symbol, date, start_ns, end_ns);
+
+            for (const auto& quote : quotes) {
+                auto event = std::make_shared<MarketTickEvent>(
+                    quote.get_timestamp(), symbol);
+
+                event->symbol_id = quote.symbol_id;
+                event->bid_price = quote.bid_price;
+                event->ask_price = quote.ask_price;
+                event->bid_size = quote.bid_size;
+                event->ask_size = quote.ask_size;
+
+                event_queue_.push(event);
+            }
+        }
+    }
+};
+
+/*******************************************************************************
+ * COMPLETE EVENT-DRIVEN BACKTEST ENGINE
+ ******************************************************************************/
+
+class EventDrivenBacktestEngine {
+private:
+    PriorityEventQueue event_queue_;
+    EventDispatcher dispatcher_;
+    SimulatedClock clock_;
+    TimerManager timer_manager_;
+    MarketDataReplayer replayer_;
+
+    bool is_running_;
+    Timestamp simulation_start_;
+    Timestamp simulation_end_;
+
+    std::atomic<uint64_t> events_processed_{0};
+
+public:
+    EventDrivenBacktestEngine(HFT::Data::HistoricalDataManager& data_mgr)
+        : timer_manager_(clock_, event_queue_),
+          replayer_(data_mgr, event_queue_),
+          is_running_(false) {}
+
+    void register_handler(std::shared_ptr<IEventHandler> handler) {
+        dispatcher_.register_handler(handler);
+    }
+
+    void subscribe(const std::string& handler_id, EventType event_type) {
+        dispatcher_.subscribe(handler_id, event_type);
+    }
+
+    void add_symbol(const std::string& symbol) {
+        replayer_.add_symbol(symbol);
+    }
+
+    void set_time_range(Timestamp start, Timestamp end) {
+        simulation_start_ = start;
+        simulation_end_ = end;
+        clock_.set_time_range(start, end);
+    }
+
+    void run() {
+        is_running_ = true;
+
+        // Main event loop
+        while (is_running_ && !event_queue_.empty()) {
+            auto event = event_queue_.pop();
+            if (!event) break;
+
+            // Update clock
+            clock_.set_time(event->timestamp);
+
+            // Check if we've reached end time
+            if (clock_.is_finished()) {
+                break;
+            }
+
+            // Dispatch event
+            dispatcher_.dispatch(event);
+
+            events_processed_++;
+
+            // Progress reporting
+            if (events_processed_ % 100000 == 0) {
+                report_progress();
+            }
+        }
+
+        is_running_ = false;
+    }
+
+    void stop() {
+        is_running_ = false;
+    }
+
+    Timestamp get_current_time() const {
+        return clock_.now();
+    }
+
+    uint64_t get_events_processed() const {
+        return events_processed_;
+    }
+
+private:
+    void report_progress() {
+        auto current = clock_.now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+            current - simulation_start_);
+        auto total = std::chrono::duration_cast<std::chrono::seconds>(
+            simulation_end_ - simulation_start_);
+
+        double progress = static_cast<double>(elapsed.count()) /
+                         total.count() * 100.0;
+
+        printf("Progress: %.2f%% (%lu events)\n",
+               progress, events_processed_.load());
+    }
+};
+
+} // namespace Backtest
+} // namespace HFT
+
+================================================================================
+END OF EVENT-DRIVEN BACKTESTING
+================================================================================

@@ -1,0 +1,926 @@
+================================================================================
+DISASTER RECOVERY - STATE RECOVERY & RECONCILIATION
+High-Frequency Trading System
+Zero Data Loss Target | Position Accuracy: 100%
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. State Management Overview
+2. Order State Recovery
+3. Position Reconciliation
+4. Risk State Recovery
+5. Market Data State Recovery
+6. Transaction Log Replay
+7. Checkpoint & Snapshot Management
+8. Distributed State Synchronization
+9. Reconciliation Procedures
+10. State Validation & Audit
+
+================================================================================
+1. STATE MANAGEMENT OVERVIEW
+================================================================================
+
+1.1 STATE ARCHITECTURE
+----------------------
+
+┌─────────────────────────────────────────────────────────────────────┐
+│                    STATE MANAGEMENT LAYERS                          │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  Layer 1: TRANSIENT STATE (In-Memory)                              │
+│  ┌────────────────────────────────────────────────────────┐       │
+│  │ - Current Order Book                                   │       │
+│  │ - Active WebSocket Connections                         │       │
+│  │ - Real-time Market Data Feed                           │       │
+│  │ Recovery: Re-subscribe and rebuild (seconds)           │       │
+│  └────────────────────────────────────────────────────────┘       │
+│                                                                     │
+│  Layer 2: VOLATILE STATE (Redis/Cache)                             │
+│  ┌────────────────────────────────────────────────────────┐       │
+│  │ - Pending Orders                                       │       │
+│  │ - Session State                                        │       │
+│  │ - Rate Limits                                          │       │
+│  │ Recovery: Redis persistence (AOF/RDB)                  │       │
+│  └────────────────────────────────────────────────────────┘       │
+│                                                                     │
+│  Layer 3: PERSISTENT STATE (Database)                              │
+│  ┌────────────────────────────────────────────────────────┐       │
+│  │ - Filled Orders                                        │       │
+│  │ - Positions                                            │       │
+│  │ - Account Balances                                     │       │
+│  │ - Trade History                                        │       │
+│  │ Recovery: Database replication                         │       │
+│  └────────────────────────────────────────────────────────┘       │
+│                                                                     │
+│  Layer 4: IMMUTABLE STATE (Append-Only Log)                        │
+│  ┌────────────────────────────────────────────────────────┐       │
+│  │ - Transaction Log (WAL)                                │       │
+│  │ - Audit Trail                                          │       │
+│  │ - Event Sourcing Log                                   │       │
+│  │ Recovery: Replay from checkpoint                       │       │
+│  └────────────────────────────────────────────────────────┘       │
+└─────────────────────────────────────────────────────────────────────┘
+
+1.2 STATE RECOVERY PRIORITIES
+------------------------------
+
+Priority 1 (0-30 seconds):
+- Current Positions
+- Active Orders
+- Risk Limits
+- Account Balances
+
+Priority 2 (30-120 seconds):
+- Pending Settlements
+- P&L Calculations
+- Market Data Subscriptions
+- Trading Strategies
+
+Priority 3 (2-10 minutes):
+- Historical Data
+- Analytics State
+- Reporting State
+
+================================================================================
+2. ORDER STATE RECOVERY
+================================================================================
+
+2.1 ORDER LIFECYCLE STATE MACHINE
+----------------------------------
+
+Order States:
+- PENDING: Order created, not yet sent
+- SENT: Order sent to exchange
+- ACKNOWLEDGED: Exchange confirmed receipt
+- PARTIAL: Partially filled
+- FILLED: Fully executed
+- CANCELLED: Cancelled by user/system
+- REJECTED: Rejected by exchange/risk
+- EXPIRED: Time-based expiration
+
+Recovery Script: /opt/hft/scripts/recover_order_state.py
+
+```python
+#!/usr/bin/env python3
+"""
+Order State Recovery
+Recovers active orders and reconciles with exchange
+"""
+
+import psycopg2
+import redis
+import requests
+import json
+from datetime import datetime, timedelta
+import logging
+
+class OrderStateRecovery:
+    def __init__(self):
+        self.db = psycopg2.connect("dbname=trading user=hft password=pwd")
+        self.redis = redis.StrictRedis(host='localhost', port=6379, db=0)
+        self.logger = logging.getLogger(__name__)
+        self.discrepancies = []
+
+    def recover_active_orders(self):
+        """Recover active orders from database"""
+        self.logger.info("Recovering active orders from database")
+
+        cursor = self.db.cursor()
+        cursor.execute("""
+            SELECT order_id, symbol, side, quantity, price,
+                   filled_quantity, status, exchange_order_id,
+                   created_at, updated_at
+            FROM orders
+            WHERE status IN ('PENDING', 'SENT', 'ACKNOWLEDGED', 'PARTIAL')
+            AND created_at > NOW() - INTERVAL '24 hours'
+            ORDER BY created_at DESC
+        """)
+
+        orders = cursor.fetchall()
+        self.logger.info(f"Found {len(orders)} active orders")
+
+        return orders
+
+    def query_exchange_order_status(self, exchange_order_id):
+        """Query exchange for current order status"""
+        try:
+            response = requests.get(
+                f'https://api.exchange.com/v1/orders/{exchange_order_id}',
+                headers={'API-Key': 'YOUR_API_KEY'},
+                timeout=5
+            )
+
+            if response.status_code == 200:
+                return response.json()
+            elif response.status_code == 404:
+                return None  # Order not found on exchange
+            else:
+                self.logger.error(
+                    f"Exchange query failed: {response.status_code}"
+                )
+                return None
+
+        except Exception as e:
+            self.logger.error(f"Exchange query error: {e}")
+            return None
+
+    def reconcile_order(self, db_order, exchange_order):
+        """Reconcile order state between DB and exchange"""
+        order_id = db_order[0]
+        db_status = db_order[6]
+        db_filled = db_order[5]
+
+        if exchange_order is None:
+            # Order not found on exchange
+            if db_status in ['SENT', 'ACKNOWLEDGED']:
+                self.logger.warning(
+                    f"Order {order_id} not found on exchange, marking REJECTED"
+                )
+                self.update_order_status(order_id, 'REJECTED')
+                self.discrepancies.append({
+                    'order_id': order_id,
+                    'issue': 'not_found_on_exchange',
+                    'action': 'marked_rejected'
+                })
+            return
+
+        exch_status = exchange_order.get('status')
+        exch_filled = exchange_order.get('filled_quantity', 0)
+
+        # Map exchange status to internal status
+        status_map = {
+            'NEW': 'ACKNOWLEDGED',
+            'PARTIALLY_FILLED': 'PARTIAL',
+            'FILLED': 'FILLED',
+            'CANCELED': 'CANCELLED',
+            'REJECTED': 'REJECTED',
+            'EXPIRED': 'EXPIRED'
+        }
+
+        internal_status = status_map.get(exch_status, 'UNKNOWN')
+
+        # Check for discrepancies
+        if db_status != internal_status or db_filled != exch_filled:
+            self.logger.warning(
+                f"Discrepancy for order {order_id}: "
+                f"DB({db_status}, {db_filled}) vs "
+                f"Exchange({internal_status}, {exch_filled})"
+            )
+
+            # Update to exchange state (source of truth)
+            self.update_order_state(
+                order_id, internal_status, exch_filled
+            )
+
+            self.discrepancies.append({
+                'order_id': order_id,
+                'db_status': db_status,
+                'db_filled': db_filled,
+                'exchange_status': internal_status,
+                'exchange_filled': exch_filled,
+                'action': 'updated_to_exchange_state'
+            })
+
+    def update_order_status(self, order_id, status):
+        """Update order status in database"""
+        cursor = self.db.cursor()
+        cursor.execute("""
+            UPDATE orders
+            SET status = %s, updated_at = NOW()
+            WHERE order_id = %s
+        """, (status, order_id))
+        self.db.commit()
+
+    def update_order_state(self, order_id, status, filled_quantity):
+        """Update order state in database"""
+        cursor = self.db.cursor()
+        cursor.execute("""
+            UPDATE orders
+            SET status = %s,
+                filled_quantity = %s,
+                updated_at = NOW()
+            WHERE order_id = %s
+        """, (status, filled_quantity, order_id))
+        self.db.commit()
+
+    def rebuild_redis_state(self):
+        """Rebuild Redis order state from database"""
+        self.logger.info("Rebuilding Redis order state")
+
+        # Clear existing state
+        self.redis.delete('active_orders')
+        self.redis.delete('pending_orders')
+
+        # Get active orders
+        cursor = self.db.cursor()
+        cursor.execute("""
+            SELECT order_id, symbol, side, quantity, price, status
+            FROM orders
+            WHERE status IN ('PENDING', 'SENT', 'ACKNOWLEDGED', 'PARTIAL')
+        """)
+
+        for order in cursor.fetchall():
+            order_id, symbol, side, quantity, price, status = order
+
+            # Add to Redis sets
+            self.redis.sadd('active_orders', order_id)
+
+            # Store order details
+            order_key = f'order:{order_id}'
+            self.redis.hmset(order_key, {
+                'symbol': symbol,
+                'side': side,
+                'quantity': quantity,
+                'price': price,
+                'status': status
+            })
+
+            # Set expiry (24 hours)
+            self.redis.expire(order_key, 86400)
+
+        active_count = self.redis.scard('active_orders')
+        self.logger.info(f"Rebuilt Redis state with {active_count} active orders")
+
+    def perform_recovery(self):
+        """Main recovery procedure"""
+        self.logger.info("=== ORDER STATE RECOVERY ===")
+
+        # Step 1: Get active orders from DB
+        db_orders = self.recover_active_orders()
+
+        # Step 2: Reconcile with exchange
+        for order in db_orders:
+            exchange_order_id = order[7]
+
+            if exchange_order_id:
+                exchange_order = self.query_exchange_order_status(
+                    exchange_order_id
+                )
+                self.reconcile_order(order, exchange_order)
+            else:
+                # Order never sent to exchange
+                order_id = order[0]
+                self.logger.info(
+                    f"Order {order_id} never sent to exchange, "
+                    f"marking as FAILED"
+                )
+                self.update_order_status(order_id, 'FAILED')
+
+        # Step 3: Rebuild Redis state
+        self.rebuild_redis_state()
+
+        # Step 4: Report discrepancies
+        if self.discrepancies:
+            self.logger.warning(
+                f"Found {len(self.discrepancies)} order discrepancies"
+            )
+            self.save_discrepancy_report()
+        else:
+            self.logger.info("No order discrepancies found")
+
+        self.logger.info("=== ORDER RECOVERY COMPLETE ===")
+        return self.discrepancies
+
+    def save_discrepancy_report(self):
+        """Save discrepancy report"""
+        report_file = f"/var/log/hft/order_discrepancies_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+
+        with open(report_file, 'w') as f:
+            json.dump({
+                'timestamp': datetime.now().isoformat(),
+                'discrepancies': self.discrepancies,
+                'count': len(self.discrepancies)
+            }, f, indent=2)
+
+        self.logger.info(f"Discrepancy report saved: {report_file}")
+
+if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO)
+
+    recovery = OrderStateRecovery()
+    discrepancies = recovery.perform_recovery()
+
+    if discrepancies:
+        print(f"WARNING: Found {len(discrepancies)} discrepancies")
+        exit(1)
+    else:
+        print("Order state recovery completed successfully")
+        exit(0)
+```
+
+================================================================================
+3. POSITION RECONCILIATION
+================================================================================
+
+3.1 POSITION CALCULATION
+-------------------------
+
+Position Reconciliation Script: /opt/hft/scripts/reconcile_positions.py
+
+```python
+#!/usr/bin/env python3
+"""
+Position Reconciliation
+Reconciles calculated positions with exchange positions
+"""
+
+import psycopg2
+import redis
+import requests
+from collections import defaultdict
+import json
+from datetime import datetime
+import logging
+
+class PositionReconciliation:
+    def __init__(self):
+        self.db = psycopg2.connect("dbname=trading user=hft password=pwd")
+        self.redis = redis.StrictRedis(host='localhost', port=6379, db=0)
+        self.logger = logging.getLogger(__name__)
+        self.tolerance = 0.001  # Floating point tolerance
+
+    def calculate_positions_from_trades(self):
+        """Calculate positions from filled trades"""
+        self.logger.info("Calculating positions from trade history")
+
+        cursor = self.db.cursor()
+        cursor.execute("""
+            SELECT
+                symbol,
+                side,
+                SUM(filled_quantity) as total_quantity,
+                COUNT(*) as trade_count
+            FROM trades
+            WHERE status = 'FILLED'
+            GROUP BY symbol, side
+        """)
+
+        positions = defaultdict(float)
+
+        for row in cursor.fetchall():
+            symbol, side, quantity, count = row
+
+            # BUY adds to position, SELL subtracts
+            if side == 'BUY':
+                positions[symbol] += quantity
+            elif side == 'SELL':
+                positions[symbol] -= quantity
+
+        self.logger.info(f"Calculated positions for {len(positions)} symbols")
+        return dict(positions)
+
+    def get_database_positions(self):
+        """Get positions from positions table"""
+        self.logger.info("Retrieving positions from database")
+
+        cursor = self.db.cursor()
+        cursor.execute("""
+            SELECT symbol, position, last_updated
+            FROM positions
+        """)
+
+        positions = {}
+        for row in cursor.fetchall():
+            symbol, position, last_updated = row
+            positions[symbol] = {
+                'position': position,
+                'last_updated': last_updated
+            }
+
+        return positions
+
+    def get_exchange_positions(self):
+        """Get positions from exchange API"""
+        self.logger.info("Querying exchange positions")
+
+        try:
+            response = requests.get(
+                'https://api.exchange.com/v1/positions',
+                headers={'API-Key': 'YOUR_API_KEY'},
+                timeout=10
+            )
+
+            if response.status_code == 200:
+                data = response.json()
+                positions = {}
+
+                for item in data.get('positions', []):
+                    symbol = item['symbol']
+                    position = float(item['quantity'])
+                    positions[symbol] = position
+
+                self.logger.info(
+                    f"Retrieved positions for {len(positions)} symbols from exchange"
+                )
+                return positions
+            else:
+                self.logger.error(
+                    f"Exchange API error: {response.status_code}"
+                )
+                return {}
+
+        except Exception as e:
+            self.logger.error(f"Failed to query exchange positions: {e}")
+            return {}
+
+    def reconcile(self):
+        """Perform three-way reconciliation"""
+        self.logger.info("=== POSITION RECONCILIATION ===")
+
+        # Get positions from three sources
+        calculated_positions = self.calculate_positions_from_trades()
+        db_positions = self.get_database_positions()
+        exchange_positions = self.get_exchange_positions()
+
+        # Get all symbols
+        all_symbols = set(calculated_positions.keys()) | \
+                     set(db_positions.keys()) | \
+                     set(exchange_positions.keys())
+
+        discrepancies = []
+        matched = 0
+
+        for symbol in all_symbols:
+            calc_pos = calculated_positions.get(symbol, 0)
+            db_pos = db_positions.get(symbol, {}).get('position', 0)
+            exch_pos = exchange_positions.get(symbol, 0)
+
+            # Check if all three match
+            if (abs(calc_pos - db_pos) < self.tolerance and
+                abs(calc_pos - exch_pos) < self.tolerance):
+                matched += 1
+                continue
+
+            # Found discrepancy
+            discrepancy = {
+                'symbol': symbol,
+                'calculated': calc_pos,
+                'database': db_pos,
+                'exchange': exch_pos,
+                'calc_db_diff': calc_pos - db_pos,
+                'calc_exch_diff': calc_pos - exch_pos,
+                'db_exch_diff': db_pos - exch_pos
+            }
+
+            discrepancies.append(discrepancy)
+
+            self.logger.warning(
+                f"Position mismatch for {symbol}: "
+                f"Calculated={calc_pos}, DB={db_pos}, Exchange={exch_pos}"
+            )
+
+            # Determine correct position (exchange is source of truth)
+            correct_position = exch_pos
+
+            # Update database
+            self.update_position(symbol, correct_position)
+
+        # Summary
+        self.logger.info(f"Matched positions: {matched}")
+        self.logger.info(f"Discrepancies found: {len(discrepancies)}")
+
+        if discrepancies:
+            self.save_reconciliation_report(discrepancies)
+            self.send_alert(discrepancies)
+
+        self.logger.info("=== RECONCILIATION COMPLETE ===")
+        return discrepancies
+
+    def update_position(self, symbol, position):
+        """Update position in database"""
+        cursor = self.db.cursor()
+
+        cursor.execute("""
+            INSERT INTO positions (symbol, position, last_updated)
+            VALUES (%s, %s, NOW())
+            ON CONFLICT (symbol)
+            DO UPDATE SET
+                position = EXCLUDED.position,
+                last_updated = NOW()
+        """, (symbol, position))
+
+        self.db.commit()
+
+        # Update Redis cache
+        self.redis.hset('positions', symbol, position)
+
+        self.logger.info(f"Updated position for {symbol}: {position}")
+
+    def save_reconciliation_report(self, discrepancies):
+        """Save reconciliation report"""
+        report_file = f"/var/log/hft/position_reconciliation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+
+        with open(report_file, 'w') as f:
+            json.dump({
+                'timestamp': datetime.now().isoformat(),
+                'discrepancies': discrepancies,
+                'count': len(discrepancies)
+            }, f, indent=2)
+
+        self.logger.info(f"Reconciliation report saved: {report_file}")
+
+    def send_alert(self, discrepancies):
+        """Send alert for discrepancies"""
+        if len(discrepancies) > 10:
+            severity = 'CRITICAL'
+        elif len(discrepancies) > 5:
+            severity = 'WARNING'
+        else:
+            severity = 'INFO'
+
+        message = f"Position reconciliation found {len(discrepancies)} discrepancies"
+
+        # Log to syslog or alerting system
+        self.logger.critical(message) if severity == 'CRITICAL' else self.logger.warning(message)
+
+if __name__ == '__main__':
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+
+    reconciler = PositionReconciliation()
+    discrepancies = reconciler.reconcile()
+
+    if discrepancies:
+        print(f"Found {len(discrepancies)} position discrepancies")
+        exit(1)
+    else:
+        print("All positions reconciled successfully")
+        exit(0)
+```
+
+================================================================================
+4. CHECKPOINT & SNAPSHOT MANAGEMENT
+================================================================================
+
+4.1 CHECKPOINT CREATION
+------------------------
+
+Checkpoint Script: /opt/hft/scripts/create_checkpoint.sh
+
+```bash
+#!/bin/bash
+# Create System Checkpoint
+
+CHECKPOINT_DIR="/var/lib/hft/checkpoints"
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+CHECKPOINT_NAME="checkpoint_$TIMESTAMP"
+CHECKPOINT_PATH="$CHECKPOINT_DIR/$CHECKPOINT_NAME"
+
+mkdir -p "$CHECKPOINT_PATH"
+
+echo "Creating system checkpoint: $CHECKPOINT_NAME"
+
+# 1. Checkpoint Trading Engine State
+echo "Checkpointing trading engine..."
+redis-cli SAVE
+cp /var/lib/redis/dump.rdb "$CHECKPOINT_PATH/redis_dump.rdb"
+
+# 2. Checkpoint Database
+echo "Checkpointing database..."
+pg_dump -Fc trading > "$CHECKPOINT_PATH/database.dump"
+
+# 3. Checkpoint Active Orders
+echo "Checkpointing active orders..."
+psql -d trading -c "\COPY (SELECT * FROM orders WHERE status IN ('PENDING','PARTIAL','SENT')) TO '$CHECKPOINT_PATH/active_orders.csv' CSV HEADER"
+
+# 4. Checkpoint Positions
+echo "Checkpointing positions..."
+psql -d trading -c "\COPY positions TO '$CHECKPOINT_PATH/positions.csv' CSV HEADER"
+
+# 5. Checkpoint Risk State
+echo "Checkpointing risk state..."
+psql -d trading -c "\COPY risk_limits TO '$CHECKPOINT_PATH/risk_limits.csv' CSV HEADER"
+
+# 6. Checkpoint Configuration
+echo "Checkpointing configuration..."
+tar -czf "$CHECKPOINT_PATH/config.tar.gz" /etc/hft/ /opt/hft/config/
+
+# 7. Create manifest
+cat > "$CHECKPOINT_PATH/MANIFEST.txt" <<EOF
+Checkpoint: $CHECKPOINT_NAME
+Timestamp: $TIMESTAMP
+Hostname: $(hostname)
+Database Size: $(du -h "$CHECKPOINT_PATH/database.dump" | cut -f1)
+Redis Size: $(du -h "$CHECKPOINT_PATH/redis_dump.rdb" | cut -f1)
+Active Orders: $(wc -l < "$CHECKPOINT_PATH/active_orders.csv")
+Positions: $(wc -l < "$CHECKPOINT_PATH/positions.csv")
+Total Size: $(du -sh "$CHECKPOINT_PATH" | cut -f1)
+EOF
+
+# 8. Create metadata
+cat > "$CHECKPOINT_PATH/metadata.json" <<EOF
+{
+  "checkpoint_name": "$CHECKPOINT_NAME",
+  "timestamp": "$(date -Iseconds)",
+  "hostname": "$(hostname)",
+  "components": [
+    "redis",
+    "database",
+    "orders",
+    "positions",
+    "risk",
+    "config"
+  ],
+  "size_bytes": $(du -sb "$CHECKPOINT_PATH" | cut -f1)
+}
+EOF
+
+# 9. Compress checkpoint
+echo "Compressing checkpoint..."
+tar -czf "$CHECKPOINT_DIR/$CHECKPOINT_NAME.tar.gz" -C "$CHECKPOINT_DIR" "$CHECKPOINT_NAME"
+
+# 10. Cleanup uncompressed
+rm -rf "$CHECKPOINT_PATH"
+
+# 11. Retention (keep last 10 checkpoints)
+echo "Applying retention policy..."
+ls -t "$CHECKPOINT_DIR"/checkpoint_*.tar.gz | tail -n +11 | xargs rm -f 2>/dev/null || true
+
+echo "Checkpoint created: $CHECKPOINT_DIR/$CHECKPOINT_NAME.tar.gz"
+```
+
+4.2 CHECKPOINT RESTORATION
+---------------------------
+
+Restore Script: /opt/hft/scripts/restore_checkpoint.sh
+
+```bash
+#!/bin/bash
+# Restore from Checkpoint
+
+CHECKPOINT_FILE=$1
+
+if [ -z "$CHECKPOINT_FILE" ]; then
+    echo "Usage: $0 <checkpoint_file>"
+    echo ""
+    echo "Available checkpoints:"
+    ls -lh /var/lib/hft/checkpoints/checkpoint_*.tar.gz
+    exit 1
+fi
+
+echo "=== CHECKPOINT RESTORATION ==="
+echo "Checkpoint: $CHECKPOINT_FILE"
+
+# 1. Extract checkpoint
+TEMP_DIR=$(mktemp -d)
+echo "Extracting to $TEMP_DIR..."
+tar -xzf "$CHECKPOINT_FILE" -C "$TEMP_DIR"
+
+CHECKPOINT_NAME=$(basename "$CHECKPOINT_FILE" .tar.gz)
+CHECKPOINT_PATH="$TEMP_DIR/$CHECKPOINT_NAME"
+
+# 2. Display manifest
+cat "$CHECKPOINT_PATH/MANIFEST.txt"
+
+# 3. Confirm restoration
+read -p "Proceed with restoration? (yes/no) " CONFIRM
+if [[ $CONFIRM != "yes" ]]; then
+    echo "Restoration cancelled"
+    rm -rf "$TEMP_DIR"
+    exit 0
+fi
+
+# 4. Stop services
+echo "Stopping services..."
+systemctl stop hft-trading-engine
+systemctl stop redis
+
+# 5. Restore Redis
+echo "Restoring Redis..."
+cp "$CHECKPOINT_PATH/redis_dump.rdb" /var/lib/redis/dump.rdb
+chown redis:redis /var/lib/redis/dump.rdb
+
+# 6. Restore Database
+echo "Restoring database..."
+pg_restore -d trading -c "$CHECKPOINT_PATH/database.dump"
+
+# 7. Restore Configuration
+echo "Restoring configuration..."
+tar -xzf "$CHECKPOINT_PATH/config.tar.gz" -C /
+
+# 8. Start services
+echo "Starting services..."
+systemctl start redis
+systemctl start hft-trading-engine
+
+# 9. Verify restoration
+echo "Verifying restoration..."
+sleep 10
+
+if systemctl is-active --quiet hft-trading-engine && \
+   systemctl is-active --quiet redis; then
+    echo "Restoration successful"
+else
+    echo "ERROR: Service verification failed"
+    exit 1
+fi
+
+# 10. Cleanup
+rm -rf "$TEMP_DIR"
+
+echo "=== RESTORATION COMPLETE ==="
+```
+
+================================================================================
+5. TRANSACTION LOG REPLAY
+================================================================================
+
+5.1 WAL REPLAY PROCEDURE
+-------------------------
+
+WAL Replay Script: /opt/hft/scripts/replay_wal.sh
+
+```bash
+#!/bin/bash
+# Replay Write-Ahead Logs
+
+CHECKPOINT_LSN=$1
+TARGET_LSN=${2:-"latest"}
+
+if [ -z "$CHECKPOINT_LSN" ]; then
+    echo "Usage: $0 <checkpoint_lsn> [target_lsn]"
+    exit 1
+fi
+
+echo "=== WAL REPLAY ==="
+echo "From LSN: $CHECKPOINT_LSN"
+echo "To LSN: $TARGET_LSN"
+
+# Get WAL files to replay
+WAL_ARCHIVE="/var/lib/pgsql/wal_archive"
+
+# List WAL files
+echo "WAL files to replay:"
+ls -lh $WAL_ARCHIVE/
+
+# PostgreSQL will automatically replay WALs during recovery
+# This is more of a validation script
+
+# Check current replay status
+REPLAY_LSN=$(psql -t -c "SELECT pg_last_wal_replay_lsn();" | tr -d ' ')
+echo "Current replay LSN: $REPLAY_LSN"
+
+# Monitor replay progress
+while true; do
+    CURRENT_LSN=$(psql -t -c "SELECT pg_last_wal_replay_lsn();" | tr -d ' ')
+    echo "Replay LSN: $CURRENT_LSN"
+
+    if [ "$CURRENT_LSN" == "$TARGET_LSN" ]; then
+        echo "Replay complete"
+        break
+    fi
+
+    sleep 1
+done
+```
+
+================================================================================
+6. STATE VALIDATION & AUDIT
+================================================================================
+
+6.1 COMPREHENSIVE STATE VALIDATION
+-----------------------------------
+
+Validation Script: /opt/hft/scripts/validate_state.py
+
+```python
+#!/usr/bin/env python3
+"""
+Comprehensive State Validation
+Validates all system state components
+"""
+
+import psycopg2
+import redis
+import json
+from datetime import datetime
+import logging
+
+class StateValidator:
+    def __init__(self):
+        self.db = psycopg2.connect("dbname=trading user=hft")
+        self.redis = redis.StrictRedis(host='localhost', port=6379, db=0)
+        self.logger = logging.getLogger(__name__)
+        self.issues = []
+
+    def validate_orders(self):
+        """Validate order state consistency"""
+        cursor = self.db.cursor()
+
+        # Check for orphaned orders
+        cursor.execute("""
+            SELECT COUNT(*)
+            FROM orders
+            WHERE status = 'SENT'
+            AND created_at < NOW() - INTERVAL '1 hour'
+        """)
+
+        orphaned = cursor.fetchone()[0]
+        if orphaned > 0:
+            self.issues.append(f"Found {orphaned} orphaned orders")
+
+        # Validate filled quantity
+        cursor.execute("""
+            SELECT COUNT(*)
+            FROM orders
+            WHERE filled_quantity > quantity
+        """)
+
+        invalid = cursor.fetchone()[0]
+        if invalid > 0:
+            self.issues.append(f"Found {invalid} orders with invalid fill quantity")
+
+    def validate_positions(self):
+        """Validate position calculations"""
+        # Implement position validation
+        pass
+
+    def validate_redis_db_sync(self):
+        """Validate Redis and DB are in sync"""
+        # Check order count
+        db_count = self.get_db_active_order_count()
+        redis_count = self.redis.scard('active_orders')
+
+        if db_count != redis_count:
+            self.issues.append(
+                f"Order count mismatch: DB={db_count}, Redis={redis_count}"
+            )
+
+    def get_db_active_order_count(self):
+        cursor = self.db.cursor()
+        cursor.execute("""
+            SELECT COUNT(*)
+            FROM orders
+            WHERE status IN ('PENDING', 'SENT', 'ACKNOWLEDGED', 'PARTIAL')
+        """)
+        return cursor.fetchone()[0]
+
+    def run_validation(self):
+        self.logger.info("=== STATE VALIDATION ===")
+
+        self.validate_orders()
+        self.validate_positions()
+        self.validate_redis_db_sync()
+
+        if self.issues:
+            self.logger.warning(f"Found {len(self.issues)} issues:")
+            for issue in self.issues:
+                self.logger.warning(f"  - {issue}")
+            return False
+        else:
+            self.logger.info("All validations passed")
+            return True
+
+if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO)
+    validator = StateValidator()
+    success = validator.run_validation()
+    exit(0 if success else 1)
+```
+
+================================================================================
+END OF DOCUMENT
+================================================================================

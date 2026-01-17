@@ -1,0 +1,622 @@
+================================================================================
+REPLAY ENGINE ARCHITECTURE - EVENT-DRIVEN DESIGN
+================================================================================
+
+OVERVIEW: Event-driven architecture that precisely replicates live trading
+system behavior by replaying captured market data through same event handlers.
+
+================================================================================
+ARCHITECTURAL PRINCIPLES
+================================================================================
+
+1. EVENT-DRIVEN DESIGN
+   - All market data processed as discrete events
+   - Strict timestamp ordering maintained
+   - Deterministic event processing
+   - No polling or busy waiting
+
+2. ZERO COPY WHERE POSSIBLE
+   - Memory-mapped tick files
+   - Direct buffer references
+   - Minimal data transformation
+   - Cache-friendly access patterns
+
+3. MODULAR COMPONENTS
+   - Loosely coupled subsystems
+   - Well-defined interfaces
+   - Easy to test in isolation
+   - Pluggable latency/fill models
+
+4. DETERMINISTIC REPLAY
+   - Same input produces same output
+   - Controlled randomness with fixed seeds
+   - Reproducible for debugging
+   - Bit-for-bit identical results
+
+================================================================================
+SYSTEM ARCHITECTURE DIAGRAM
+================================================================================
+
+                    CAPTURE SUBSYSTEM (Live Trading)
+    +----------------------------------------------------------+
+    |  Market Data --> TickCapture --> Storage --> Validator  |
+    |     Feed           |              |            |         |
+    |                 Timestamp      Compress    Checksum      |
+    |                                                           |
+    +----------------------------------------------------------+
+                              |
+                         [Tick Files]
+                              |
+                              v
+                     REPLAY SUBSYSTEM (Backtesting)
+    +----------------------------------------------------------+
+    |                                                           |
+    |  +----------------+    +------------------+              |
+    |  | TickLoader     |--->| EventQueue       |              |
+    |  | - MemoryMap    |    | - PriorityQueue  |              |
+    |  | - Decompress   |    | - Timestamp Sort |              |
+    |  | - Validate     |    +------------------+              |
+    |  +----------------+             |                        |
+    |                                 v                        |
+    |                      +--------------------+              |
+    |                      | ReplayEngine       |              |
+    |                      | - EventDispatch    |              |
+    |                      | - TimingControl    |              |
+    |                      | - StateManagement  |              |
+    |                      +--------------------+              |
+    |                       /        |         \               |
+    |                      /         |          \              |
+    |            +--------+  +-------+-------+  +--------+     |
+    |            | Latency|  | FillSimulator |  | Order  |     |
+    |            | Model  |  | - QueuePos    |  | Manager|     |
+    |            +--------+  | - Adverse Sel |  +--------+     |
+    |                        +---------------+                 |
+    |                                |                         |
+    |                                v                         |
+    |                        +---------------+                 |
+    |                        | Strategy      |                 |
+    |                        | (User Code)   |                 |
+    |                        +---------------+                 |
+    |                                                           |
+    +----------------------------------------------------------+
+
+================================================================================
+CORE COMPONENTS
+================================================================================
+
+1. TICK LOADER
+--------------
+
+Purpose: Load captured tick data into memory-mapped structures for fast access
+
+class TickLoader {
+public:
+    // Memory-mapped file for zero-copy access
+    struct MemoryMappedFile {
+        int fd;
+        void* addr;
+        size_t length;
+        const TickHeader* header;
+        const uint8_t* data;
+    };
+
+    // Tick file format with versioning
+    struct TickHeader {
+        uint32_t magic;              // 0x54434B46 "TCKF"
+        uint32_t version;            // File format version
+        uint64_t tick_count;         // Total ticks in file
+        uint64_t start_timestamp;    // First tick timestamp
+        uint64_t end_timestamp;      // Last tick timestamp
+        uint32_t symbol_id;          // Symbol identifier
+        uint32_t compression_type;   // 0=none, 1=delta, 2=zstd
+        uint64_t checksum;           // CRC64 of data
+        uint64_t index_offset;       // Offset to timestamp index
+        uint8_t reserved[64];        // Future expansion
+    };
+
+    // Individual tick structure
+    struct Tick {
+        uint64_t exchange_timestamp;  // Exchange timestamp (ns)
+        uint64_t receive_timestamp;   // Our receive timestamp (ns)
+        uint32_t sequence_number;     // Exchange sequence number
+        uint8_t  tick_type;           // TRADE, QUOTE, ORDER, etc.
+        uint8_t  side;                // BID, ASK, or BOTH
+        uint16_t flags;               // Various flags
+        int64_t  price;               // Fixed point price (nanos)
+        int64_t  size;                // Size in contracts/shares
+        uint32_t order_id;            // Order ID if applicable
+        uint32_t participant_id;      // Market participant ID
+    } __attribute__((packed));
+
+    // Load tick file with memory mapping
+    bool loadTickFile(const std::string& path) {
+        // Open file
+        fd_ = open(path.c_str(), O_RDONLY);
+        if (fd_ < 0) {
+            LOG_ERROR("Failed to open tick file: {}", path);
+            return false;
+        }
+
+        // Get file size
+        struct stat st;
+        if (fstat(fd_, &st) < 0) {
+            close(fd_);
+            return false;
+        }
+
+        // Memory map entire file
+        void* addr = mmap(nullptr, st.st_size, PROT_READ,
+                         MAP_PRIVATE | MAP_POPULATE, fd_, 0);
+        if (addr == MAP_FAILED) {
+            close(fd_);
+            return false;
+        }
+
+        // Advise kernel about access pattern
+        madvise(addr, st.st_size, MADV_SEQUENTIAL | MADV_WILLNEED);
+
+        // Parse header
+        header_ = reinterpret_cast<const TickHeader*>(addr);
+
+        // Validate magic and version
+        if (header_->magic != 0x54434B46) {
+            LOG_ERROR("Invalid tick file magic");
+            munmap(addr, st.st_size);
+            close(fd_);
+            return false;
+        }
+
+        // Validate checksum
+        uint64_t computed_checksum = crc64(
+            reinterpret_cast<const uint8_t*>(addr) + sizeof(TickHeader),
+            st.st_size - sizeof(TickHeader)
+        );
+
+        if (computed_checksum != header_->checksum) {
+            LOG_ERROR("Tick file checksum mismatch");
+            munmap(addr, st.st_size);
+            close(fd_);
+            return false;
+        }
+
+        // Setup data pointers
+        data_ = reinterpret_cast<const uint8_t*>(addr) + sizeof(TickHeader);
+        data_size_ = st.st_size - sizeof(TickHeader);
+
+        // Load timestamp index for fast seeking
+        loadTimestampIndex();
+
+        LOG_INFO("Loaded {} ticks from {} to {}",
+                 header_->tick_count,
+                 formatTimestamp(header_->start_timestamp),
+                 formatTimestamp(header_->end_timestamp));
+
+        return true;
+    }
+
+    // Iterator interface for sequential access
+    class TickIterator {
+    public:
+        TickIterator(const TickLoader* loader, size_t offset)
+            : loader_(loader), offset_(offset) {}
+
+        const Tick& operator*() const {
+            return loader_->decodeTick(offset_);
+        }
+
+        TickIterator& operator++() {
+            offset_ = loader_->nextTickOffset(offset_);
+            return *this;
+        }
+
+        bool operator!=(const TickIterator& other) const {
+            return offset_ != other.offset_;
+        }
+
+    private:
+        const TickLoader* loader_;
+        size_t offset_;
+    };
+
+    TickIterator begin() const { return TickIterator(this, 0); }
+    TickIterator end() const { return TickIterator(this, data_size_); }
+
+    // Random access by timestamp
+    TickIterator seek(uint64_t timestamp) const {
+        size_t offset = binarySearchTimestamp(timestamp);
+        return TickIterator(this, offset);
+    }
+
+private:
+    int fd_{-1};
+    const TickHeader* header_{nullptr};
+    const uint8_t* data_{nullptr};
+    size_t data_size_{0};
+    std::vector<uint64_t> timestamp_index_;  // Checkpoint timestamps
+    std::vector<uint64_t> offset_index_;     // Corresponding offsets
+};
+
+
+2. EVENT QUEUE
+--------------
+
+Purpose: Priority queue that maintains strict timestamp ordering of events
+
+template<typename EventType>
+class EventQueue {
+public:
+    // Event wrapper with timestamp
+    struct TimestampedEvent {
+        uint64_t timestamp;  // Event timestamp in nanoseconds
+        EventType event;
+        uint32_t priority;   // For tie-breaking (0 = highest)
+
+        bool operator>(const TimestampedEvent& other) const {
+            if (timestamp != other.timestamp)
+                return timestamp > other.timestamp;
+            return priority > other.priority;  // Lower priority value = higher priority
+        }
+    };
+
+    void push(uint64_t timestamp, const EventType& event, uint32_t priority = 0) {
+        queue_.emplace(TimestampedEvent{timestamp, event, priority});
+    }
+
+    bool pop(TimestampedEvent& event) {
+        if (queue_.empty())
+            return false;
+        event = queue_.top();
+        queue_.pop();
+        return true;
+    }
+
+    bool peek(TimestampedEvent& event) const {
+        if (queue_.empty())
+            return false;
+        event = queue_.top();
+        return true;
+    }
+
+    size_t size() const { return queue_.size(); }
+    bool empty() const { return queue_.empty(); }
+
+private:
+    std::priority_queue<
+        TimestampedEvent,
+        std::vector<TimestampedEvent>,
+        std::greater<TimestampedEvent>
+    > queue_;
+};
+
+
+3. REPLAY ENGINE CORE
+----------------------
+
+Purpose: Main engine that dispatches events and controls replay timing
+
+class ReplayEngine {
+public:
+    enum class ReplaySpeed {
+        REALTIME,      // 1x speed (real wall clock time)
+        FAST_2X,       // 2x speed
+        FAST_10X,      // 10x speed
+        FAST_100X,     // 100x speed
+        MAX_SPEED,     // As fast as possible
+        STEP_BY_STEP   // Manual stepping (debugging)
+    };
+
+    struct ReplayConfig {
+        ReplaySpeed speed = ReplaySpeed::REALTIME;
+        bool simulate_latency = true;
+        std::string latency_model = "historical";
+        uint64_t start_time = 0;
+        uint64_t end_time = UINT64_MAX;
+        bool enable_fill_simulation = true;
+        bool deterministic = true;
+        uint64_t random_seed = 12345;
+        bool validate_sequencing = true;
+        bool log_events = false;
+    };
+
+    explicit ReplayEngine(const ReplayConfig& config)
+        : config_(config)
+        , random_generator_(config.random_seed)
+    {
+        if (config_.simulate_latency) {
+            latency_simulator_ = createLatencySimulator(config_.latency_model);
+        }
+        if (config_.enable_fill_simulation) {
+            fill_simulator_ = std::make_unique<FillSimulator>();
+        }
+    }
+
+    // Load tick data for a symbol
+    bool loadTickData(const std::string& symbol, const std::string& path) {
+        auto loader = std::make_unique<TickLoader>();
+        if (!loader->loadTickFile(path)) {
+            LOG_ERROR("Failed to load tick data for {}", symbol);
+            return false;
+        }
+
+        tick_loaders_[symbol] = std::move(loader);
+
+        // Enqueue all ticks into event queue
+        enqueueTicks(symbol);
+
+        return true;
+    }
+
+    // Subscribe strategy to market data
+    void subscribe(const std::string& symbol, IStrategy* strategy) {
+        subscribers_[symbol].push_back(strategy);
+    }
+
+    // Main replay loop
+    void run() {
+        LOG_INFO("Starting replay from {} to {}",
+                 formatTimestamp(config_.start_time),
+                 formatTimestamp(config_.end_time));
+
+        current_time_ = config_.start_time;
+        start_wall_time_ = std::chrono::steady_clock::now();
+
+        while (!event_queue_.empty()) {
+            EventQueue<MarketEvent>::TimestampedEvent timed_event;
+            if (!event_queue_.pop(timed_event)) {
+                break;
+            }
+
+            // Check if beyond end time
+            if (timed_event.timestamp > config_.end_time) {
+                break;
+            }
+
+            // Update current time
+            current_time_ = timed_event.timestamp;
+
+            // Timing control (for realtime/fast replay)
+            controlTiming(timed_event.timestamp);
+
+            // Process event
+            processEvent(timed_event.event);
+
+            // Statistics
+            events_processed_++;
+
+            if (events_processed_ % 100000 == 0) {
+                logProgress();
+            }
+        }
+
+        LOG_INFO("Replay completed. Processed {} events", events_processed_);
+        printStatistics();
+    }
+
+    // Step-by-step execution (for debugging)
+    bool step() {
+        if (config_.speed != ReplaySpeed::STEP_BY_STEP) {
+            LOG_ERROR("Step mode only available in STEP_BY_STEP speed");
+            return false;
+        }
+
+        EventQueue<MarketEvent>::TimestampedEvent timed_event;
+        if (!event_queue_.pop(timed_event)) {
+            return false;
+        }
+
+        current_time_ = timed_event.timestamp;
+        processEvent(timed_event.event);
+        events_processed_++;
+
+        return true;
+    }
+
+private:
+    void enqueueTicks(const std::string& symbol) {
+        auto* loader = tick_loaders_[symbol].get();
+
+        for (const auto& tick : *loader) {
+            // Skip ticks outside time range
+            if (tick.exchange_timestamp < config_.start_time ||
+                tick.exchange_timestamp > config_.end_time) {
+                continue;
+            }
+
+            // Create market event from tick
+            MarketEvent event = createMarketEvent(symbol, tick);
+
+            // Add to event queue with proper timestamp
+            uint64_t event_time = tick.exchange_timestamp;
+
+            // Apply latency if enabled
+            if (config_.simulate_latency && latency_simulator_) {
+                uint64_t latency = latency_simulator_->sampleLatency(tick);
+                event_time += latency;
+            }
+
+            // Priority: market data = 0, order acks = 1, fills = 2
+            uint32_t priority = 0;
+            if (event.type == EventType::ORDER_ACK) priority = 1;
+            if (event.type == EventType::FILL) priority = 2;
+
+            event_queue_.push(event_time, event, priority);
+        }
+
+        LOG_INFO("Enqueued {} events for {}", event_queue_.size(), symbol);
+    }
+
+    void processEvent(const MarketEvent& event) {
+        // Update internal state based on event type
+        switch (event.type) {
+            case EventType::TRADE:
+                processTrade(event);
+                break;
+            case EventType::QUOTE:
+                processQuote(event);
+                break;
+            case EventType::ORDER_ACK:
+                processOrderAck(event);
+                break;
+            case EventType::FILL:
+                processFill(event);
+                break;
+            case EventType::CANCEL_ACK:
+                processCancelAck(event);
+                break;
+            default:
+                LOG_WARN("Unknown event type: {}", static_cast<int>(event.type));
+        }
+
+        // Dispatch to subscribers
+        auto it = subscribers_.find(event.symbol);
+        if (it != subscribers_.end()) {
+            for (auto* strategy : it->second) {
+                strategy->onMarketEvent(event);
+            }
+        }
+    }
+
+    void processQuote(const MarketEvent& event) {
+        // Update internal order book
+        auto& book = order_books_[event.symbol];
+        book.updateQuote(event.side, event.price, event.size);
+
+        // Check if any pending orders should be filled
+        if (fill_simulator_) {
+            checkPendingFills(event.symbol);
+        }
+    }
+
+    void processTrade(const MarketEvent& event) {
+        // Update last trade price
+        last_trade_price_[event.symbol] = event.price;
+
+        // Check aggressive fills
+        if (fill_simulator_) {
+            checkAggressiveFills(event.symbol, event.price, event.side);
+        }
+    }
+
+    void controlTiming(uint64_t event_timestamp) {
+        if (config_.speed == ReplaySpeed::MAX_SPEED ||
+            config_.speed == ReplaySpeed::STEP_BY_STEP) {
+            return;  // No timing control
+        }
+
+        // Calculate wall time that should have elapsed
+        uint64_t replay_time_elapsed = event_timestamp - config_.start_time;
+
+        double speed_multiplier = 1.0;
+        switch (config_.speed) {
+            case ReplaySpeed::REALTIME:   speed_multiplier = 1.0; break;
+            case ReplaySpeed::FAST_2X:    speed_multiplier = 2.0; break;
+            case ReplaySpeed::FAST_10X:   speed_multiplier = 10.0; break;
+            case ReplaySpeed::FAST_100X:  speed_multiplier = 100.0; break;
+            default: break;
+        }
+
+        uint64_t target_wall_time_ns = replay_time_elapsed / speed_multiplier;
+
+        // Actual wall time elapsed
+        auto now = std::chrono::steady_clock::now();
+        auto actual_wall_time = now - start_wall_time_;
+        uint64_t actual_wall_time_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(actual_wall_time).count();
+
+        // Sleep if we're ahead of schedule
+        if (actual_wall_time_ns < target_wall_time_ns) {
+            uint64_t sleep_ns = target_wall_time_ns - actual_wall_time_ns;
+            std::this_thread::sleep_for(std::chrono::nanoseconds(sleep_ns));
+        }
+    }
+
+    void logProgress() {
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = now - start_wall_time_;
+        double elapsed_sec = std::chrono::duration<double>(elapsed).count();
+
+        double events_per_sec = events_processed_ / elapsed_sec;
+        uint64_t replay_time_elapsed = current_time_ - config_.start_time;
+        double replay_time_sec = replay_time_elapsed / 1e9;
+
+        LOG_INFO("Progress: {} events, {:.1f} events/sec, replay time: {:.1f}s",
+                 events_processed_, events_per_sec, replay_time_sec);
+    }
+
+    ReplayConfig config_;
+    std::mt19937_64 random_generator_;
+
+    std::unordered_map<std::string, std::unique_ptr<TickLoader>> tick_loaders_;
+    std::unordered_map<std::string, std::vector<IStrategy*>> subscribers_;
+
+    EventQueue<MarketEvent> event_queue_;
+
+    std::unique_ptr<LatencySimulator> latency_simulator_;
+    std::unique_ptr<FillSimulator> fill_simulator_;
+
+    std::unordered_map<std::string, OrderBook> order_books_;
+    std::unordered_map<std::string, int64_t> last_trade_price_;
+
+    uint64_t current_time_{0};
+    uint64_t events_processed_{0};
+    std::chrono::steady_clock::time_point start_wall_time_;
+};
+
+
+================================================================================
+EVENT TYPES AND STRUCTURES
+================================================================================
+
+enum class EventType : uint8_t {
+    QUOTE,           // Best bid/ask update
+    TRADE,           // Trade print
+    BOOK_SNAPSHOT,   // Full book snapshot
+    ORDER_SUBMIT,    // Strategy submits order
+    ORDER_ACK,       // Exchange acknowledges order
+    FILL,            // Order filled (full or partial)
+    CANCEL_SUBMIT,   // Strategy cancels order
+    CANCEL_ACK,      // Exchange acknowledges cancel
+    REJECT,          // Order rejected
+    SYSTEM_EVENT     // Market open/close, halt, etc.
+};
+
+struct MarketEvent {
+    EventType type;
+    std::string symbol;
+    uint64_t timestamp;
+    Side side;
+    int64_t price;
+    int64_t size;
+    uint32_t order_id;
+    uint32_t participant_id;
+    std::string message;
+};
+
+
+================================================================================
+ARCHITECTURE PATTERNS
+================================================================================
+
+1. OBSERVER PATTERN
+   - Strategies subscribe to market events
+   - Replay engine notifies all subscribers
+   - Decouples strategy from engine
+
+2. STRATEGY PATTERN
+   - Pluggable latency models
+   - Pluggable fill models
+   - Easy to swap implementations
+
+3. FACTORY PATTERN
+   - Create latency simulators based on config
+   - Create fill simulators based on config
+   - Extensible for new models
+
+4. COMMAND PATTERN
+   - All strategy actions as commands
+   - Queueable and replayable
+   - Support for undo/redo
+
+================================================================================
+NEXT: Read 02_tick_capture.txt for tick capture system details
+================================================================================

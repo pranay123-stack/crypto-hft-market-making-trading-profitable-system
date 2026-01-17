@@ -1,0 +1,1024 @@
+================================================================================
+CACHE STRATEGY FOR HFT SYSTEMS
+Redis & Memcached Implementation
+================================================================================
+
+OVERVIEW
+--------
+This document provides comprehensive caching strategies for high-frequency
+trading systems using Redis and Memcached. Focus on low-latency data access,
+cache coherency, and optimal cache design patterns.
+
+================================================================================
+1. CACHE ARCHITECTURE
+================================================================================
+
+1.1 CACHE HIERARCHY
+-------------------
+
+┌─────────────────────────────────────────────────────────────┐
+│                    Application Layer                        │
+│                    (Trading Strategies)                     │
+└───────────────┬─────────────────────────────────────────────┘
+                │
+    ┌───────────▼───────────┐
+    │   L1 Cache (In-Memory) │
+    │   - Hot market data     │
+    │   - Position cache      │
+    │   - Order book snapshot │
+    │   Latency: < 100ns      │
+    └───────────┬───────────┘
+                │ Miss
+    ┌───────────▼──────────────┐
+    │   L2 Cache (Redis)        │
+    │   - Reference data        │
+    │   - Historical quotes     │
+    │   - Calculated indicators │
+    │   Latency: < 1ms          │
+    └───────────┬──────────────┘
+                │ Miss
+    ┌───────────▼──────────────┐
+    │   L3 Cache (Memcached)    │
+    │   - Session data          │
+    │   - Configuration         │
+    │   - Large datasets        │
+    │   Latency: < 5ms          │
+    └───────────┬──────────────┘
+                │ Miss
+    ┌───────────▼──────────────┐
+    │   Database (PostgreSQL)   │
+    │   TimescaleDB/ClickHouse  │
+    │   Latency: 10-100ms       │
+    └───────────────────────────┘
+
+1.2 CACHE REQUIREMENTS
+----------------------
+
+Performance Requirements:
+- Read Latency: < 1ms (P99)
+- Write Latency: < 2ms (P99)
+- Throughput: 100K+ ops/sec per node
+- Hit Rate: > 95%
+- Availability: 99.99%
+
+Data Requirements:
+- Real-time market data (sub-second TTL)
+- Reference data (minutes to hours TTL)
+- User sessions (hours TTL)
+- Calculated metrics (seconds to minutes TTL)
+
+================================================================================
+2. REDIS IMPLEMENTATION
+================================================================================
+
+2.1 REDIS DATA STRUCTURES FOR HFT
+----------------------------------
+
+// C++ Redis Client Configuration
+#include <sw/redis++/redis++.h>
+#include <chrono>
+
+using namespace sw::redis;
+
+class HFTRedisClient {
+private:
+    Redis* redis_;
+    ConnectionOptions conn_opts_;
+    ConnectionPoolOptions pool_opts_;
+
+public:
+    HFTRedisClient(const std::string& host, int port) {
+        // Configure connection
+        conn_opts_.host = host;
+        conn_opts_.port = port;
+        conn_opts_.socket_timeout = std::chrono::milliseconds(100);
+        conn_opts_.keep_alive = true;
+
+        // Configure connection pool
+        pool_opts_.size = 50;
+        pool_opts_.wait_timeout = std::chrono::milliseconds(100);
+        pool_opts_.connection_lifetime = std::chrono::minutes(10);
+
+        redis_ = new Redis(conn_opts_, pool_opts_);
+    }
+
+    ~HFTRedisClient() {
+        delete redis_;
+    }
+
+    // Market Data Caching
+    void cacheQuote(const std::string& symbol, const Quote& quote) {
+        std::string key = "quote:" + symbol;
+
+        // Store as hash for efficient field access
+        std::unordered_map<std::string, std::string> fields = {
+            {"bid_price", std::to_string(quote.bid_price)},
+            {"bid_size", std::to_string(quote.bid_size)},
+            {"ask_price", std::to_string(quote.ask_price)},
+            {"ask_size", std::to_string(quote.ask_size)},
+            {"timestamp", std::to_string(quote.timestamp_ns)}
+        };
+
+        redis_->hmset(key, fields.begin(), fields.end());
+        redis_->expire(key, std::chrono::seconds(5)); // 5 second TTL
+    }
+
+    std::optional<Quote> getQuote(const std::string& symbol) {
+        std::string key = "quote:" + symbol;
+
+        std::vector<std::string> fields = {
+            "bid_price", "bid_size", "ask_price", "ask_size", "timestamp"
+        };
+
+        std::vector<OptionalString> values;
+        redis_->hmget(key, fields.begin(), fields.end(),
+                      std::back_inserter(values));
+
+        if (!values[0]) return std::nullopt; // Key not found
+
+        Quote quote;
+        quote.bid_price = std::stod(*values[0]);
+        quote.bid_size = std::stod(*values[1]);
+        quote.ask_price = std::stod(*values[2]);
+        quote.ask_size = std::stod(*values[3]);
+        quote.timestamp_ns = std::stoll(*values[4]);
+
+        return quote;
+    }
+
+    // Order Book Caching (Sorted Set)
+    void cacheOrderBookLevel(const std::string& symbol,
+                             const std::string& side,
+                             double price, double size) {
+        std::string key = "orderbook:" + symbol + ":" + side;
+
+        // Use sorted set with price as score
+        redis_->zadd(key, price, std::to_string(size));
+
+        // Keep only top 10 levels
+        if (side == "bid") {
+            redis_->zremrangebyrank(key, 0, -11); // Keep top 10
+        } else {
+            redis_->zremrangebyrank(key, 10, -1); // Keep bottom 10
+        }
+
+        redis_->expire(key, std::chrono::seconds(10));
+    }
+
+    std::vector<OrderBookLevel> getOrderBook(const std::string& symbol,
+                                             const std::string& side,
+                                             int depth = 10) {
+        std::string key = "orderbook:" + symbol + ":" + side;
+
+        std::vector<std::pair<std::string, double>> results;
+
+        if (side == "bid") {
+            // Get top bids (highest prices)
+            redis_->zrevrangebyscore(key, UnboundedInterval<double>{},
+                                     std::back_inserter(results),
+                                     {0, depth, true});
+        } else {
+            // Get top asks (lowest prices)
+            redis_->zrangebyscore(key, UnboundedInterval<double>{},
+                                  std::back_inserter(results),
+                                  {0, depth, true});
+        }
+
+        std::vector<OrderBookLevel> levels;
+        for (const auto& [size_str, price] : results) {
+            OrderBookLevel level;
+            level.price = price;
+            level.size = std::stod(size_str);
+            levels.push_back(level);
+        }
+
+        return levels;
+    }
+
+    // Position Caching
+    void cachePosition(int account_id, const std::string& symbol,
+                       const Position& position) {
+        std::string key = "position:" + std::to_string(account_id) +
+                         ":" + symbol;
+
+        std::unordered_map<std::string, std::string> fields = {
+            {"quantity", std::to_string(position.quantity)},
+            {"avg_price", std::to_string(position.avg_price)},
+            {"market_value", std::to_string(position.market_value)},
+            {"unrealized_pnl", std::to_string(position.unrealized_pnl)},
+            {"side", position.side}
+        };
+
+        redis_->hmset(key, fields.begin(), fields.end());
+        redis_->expire(key, std::chrono::seconds(60)); // 1 minute TTL
+    }
+
+    std::unordered_map<std::string, Position> getAllPositions(int account_id) {
+        std::string pattern = "position:" + std::to_string(account_id) + ":*";
+
+        std::unordered_set<std::string> keys;
+        redis_->keys(pattern, std::inserter(keys, keys.begin()));
+
+        std::unordered_map<std::string, Position> positions;
+
+        for (const auto& key : keys) {
+            // Extract symbol from key
+            size_t last_colon = key.find_last_of(':');
+            std::string symbol = key.substr(last_colon + 1);
+
+            std::vector<std::string> fields = {
+                "quantity", "avg_price", "market_value",
+                "unrealized_pnl", "side"
+            };
+
+            std::vector<OptionalString> values;
+            redis_->hmget(key, fields.begin(), fields.end(),
+                          std::back_inserter(values));
+
+            if (values[0]) {
+                Position pos;
+                pos.quantity = std::stod(*values[0]);
+                pos.avg_price = std::stod(*values[1]);
+                pos.market_value = std::stod(*values[2]);
+                pos.unrealized_pnl = std::stod(*values[3]);
+                pos.side = *values[4];
+
+                positions[symbol] = pos;
+            }
+        }
+
+        return positions;
+    }
+
+    // Instrument Reference Data
+    void cacheInstrument(const Instrument& instrument) {
+        std::string key = "instrument:" + instrument.symbol;
+
+        std::unordered_map<std::string, std::string> fields = {
+            {"instrument_id", std::to_string(instrument.id)},
+            {"exchange", instrument.exchange},
+            {"type", instrument.type},
+            {"tick_size", std::to_string(instrument.tick_size)},
+            {"lot_size", std::to_string(instrument.lot_size)},
+            {"currency", instrument.currency}
+        };
+
+        redis_->hmset(key, fields.begin(), fields.end());
+        redis_->expire(key, std::chrono::hours(24)); // 24 hour TTL
+    }
+
+    // Time-series data with Redis Streams
+    void appendTrade(const std::string& symbol, const Trade& trade) {
+        std::string stream_key = "trades:" + symbol;
+
+        std::unordered_map<std::string, std::string> fields = {
+            {"price", std::to_string(trade.price)},
+            {"quantity", std::to_string(trade.quantity)},
+            {"side", trade.side},
+            {"timestamp", std::to_string(trade.timestamp_ns)}
+        };
+
+        redis_->xadd(stream_key, "*", fields.begin(), fields.end());
+
+        // Trim to last 1000 trades
+        redis_->xtrim(stream_key, 1000, true);
+    }
+
+    std::vector<Trade> getRecentTrades(const std::string& symbol,
+                                       int count = 100) {
+        std::string stream_key = "trades:" + symbol;
+
+        std::vector<Trade> trades;
+
+        // Read last N entries
+        std::unordered_map<std::string, std::vector<StreamEntry>> results;
+        redis_->xrevrange(stream_key, "+", "-", count, std::back_inserter(results));
+
+        for (const auto& [key, entries] : results) {
+            for (const auto& entry : entries) {
+                Trade trade;
+                trade.price = std::stod(entry.second.at("price"));
+                trade.quantity = std::stod(entry.second.at("quantity"));
+                trade.side = entry.second.at("side");
+                trade.timestamp_ns = std::stoll(entry.second.at("timestamp"));
+                trades.push_back(trade);
+            }
+        }
+
+        return trades;
+    }
+
+    // Rate Limiting with Redis
+    bool checkRateLimit(const std::string& user_id,
+                        int max_requests,
+                        int window_seconds) {
+        std::string key = "ratelimit:" + user_id;
+
+        // Increment counter
+        long long count = redis_->incr(key);
+
+        if (count == 1) {
+            // First request, set expiration
+            redis_->expire(key, std::chrono::seconds(window_seconds));
+        }
+
+        return count <= max_requests;
+    }
+
+    // Distributed Lock for Critical Sections
+    class DistributedLock {
+    private:
+        Redis* redis_;
+        std::string key_;
+        std::string value_;
+        bool locked_;
+
+    public:
+        DistributedLock(Redis* redis, const std::string& resource,
+                       int timeout_ms = 1000)
+            : redis_(redis), key_("lock:" + resource), locked_(false) {
+
+            // Generate unique value
+            value_ = generateUUID();
+
+            // Try to acquire lock
+            auto result = redis_->set(key_, value_, std::chrono::milliseconds(timeout_ms),
+                                     UpdateType::NOT_EXIST);
+
+            locked_ = result.has_value();
+        }
+
+        ~DistributedLock() {
+            if (locked_) {
+                // Release lock using Lua script to ensure atomicity
+                std::string script = R"(
+                    if redis.call("get", KEYS[1]) == ARGV[1] then
+                        return redis.call("del", KEYS[1])
+                    else
+                        return 0
+                    end
+                )";
+
+                std::vector<std::string> keys = {key_};
+                std::vector<std::string> args = {value_};
+
+                redis_->eval<long long>(script, keys.begin(), keys.end(),
+                                       args.begin(), args.end());
+            }
+        }
+
+        bool isLocked() const { return locked_; }
+
+    private:
+        std::string generateUUID() {
+            // Simple UUID generation (use proper UUID library in production)
+            return std::to_string(std::chrono::high_resolution_clock::now()
+                                 .time_since_epoch().count());
+        }
+    };
+
+    // Pub/Sub for Market Data Distribution
+    void publishMarketData(const std::string& channel,
+                          const std::string& message) {
+        redis_->publish(channel, message);
+    }
+
+    void subscribeMarketData(const std::string& channel,
+                            std::function<void(const std::string&)> callback) {
+        auto sub = redis_->subscriber();
+
+        sub.on_message([callback](std::string channel, std::string msg) {
+            callback(msg);
+        });
+
+        sub.subscribe(channel);
+
+        // Keep consuming messages (in separate thread)
+        while (true) {
+            try {
+                sub.consume();
+            } catch (const Error& err) {
+                // Handle error
+                break;
+            }
+        }
+    }
+};
+
+2.2 REDIS PIPELINE FOR BATCH OPERATIONS
+----------------------------------------
+
+class RedisPipeline {
+private:
+    Redis* redis_;
+
+public:
+    RedisPipeline(Redis* redis) : redis_(redis) {}
+
+    void batchUpdateQuotes(const std::vector<Quote>& quotes) {
+        auto pipe = redis_->pipeline();
+
+        for (const auto& quote : quotes) {
+            std::string key = "quote:" + quote.symbol;
+
+            std::unordered_map<std::string, std::string> fields = {
+                {"bid_price", std::to_string(quote.bid_price)},
+                {"bid_size", std::to_string(quote.bid_size)},
+                {"ask_price", std::to_string(quote.ask_price)},
+                {"ask_size", std::to_string(quote.ask_size)},
+                {"timestamp", std::to_string(quote.timestamp_ns)}
+            };
+
+            pipe.hmset(key, fields.begin(), fields.end());
+            pipe.expire(key, std::chrono::seconds(5));
+        }
+
+        // Execute all commands in one round-trip
+        auto replies = pipe.exec();
+    }
+
+    std::vector<std::optional<Quote>> batchGetQuotes(
+        const std::vector<std::string>& symbols) {
+
+        auto pipe = redis_->pipeline();
+
+        std::vector<std::string> fields = {
+            "bid_price", "bid_size", "ask_price", "ask_size", "timestamp"
+        };
+
+        for (const auto& symbol : symbols) {
+            std::string key = "quote:" + symbol;
+            pipe.hmget(key, fields.begin(), fields.end());
+        }
+
+        auto replies = pipe.exec();
+
+        std::vector<std::optional<Quote>> quotes;
+        for (size_t i = 0; i < replies.size(); ++i) {
+            auto values = replies.get<std::vector<OptionalString>>(i);
+
+            if (!values[0]) {
+                quotes.push_back(std::nullopt);
+            } else {
+                Quote quote;
+                quote.bid_price = std::stod(*values[0]);
+                quote.bid_size = std::stod(*values[1]);
+                quote.ask_price = std::stod(*values[2]);
+                quote.ask_size = std::stod(*values[3]);
+                quote.timestamp_ns = std::stoll(*values[4]);
+                quotes.push_back(quote);
+            }
+        }
+
+        return quotes;
+    }
+};
+
+2.3 REDIS LUA SCRIPTS FOR ATOMIC OPERATIONS
+--------------------------------------------
+
+// Atomic order submission with inventory check
+const std::string ORDER_SUBMIT_SCRIPT = R"(
+    local position_key = "position:" .. ARGV[1] .. ":" .. ARGV[2]
+    local current_qty = redis.call("hget", position_key, "quantity")
+
+    if not current_qty then
+        current_qty = 0
+    else
+        current_qty = tonumber(current_qty)
+    end
+
+    local order_qty = tonumber(ARGV[3])
+    local side = ARGV[4]
+    local max_position = tonumber(ARGV[5])
+
+    -- Check position limits
+    local new_qty = current_qty
+    if side == "buy" then
+        new_qty = current_qty + order_qty
+    else
+        new_qty = current_qty - order_qty
+    end
+
+    if math.abs(new_qty) > max_position then
+        return {0, "Position limit exceeded"}
+    end
+
+    -- Create order
+    local order_id = redis.call("incr", "order_id_counter")
+    local order_key = "order:" .. order_id
+
+    redis.call("hmset", order_key,
+        "account_id", ARGV[1],
+        "symbol", ARGV[2],
+        "quantity", ARGV[3],
+        "side", ARGV[4],
+        "status", "pending",
+        "timestamp", ARGV[6]
+    )
+
+    redis.call("expire", order_key, 3600)
+
+    return {1, tostring(order_id)}
+)";
+
+// Usage in C++
+std::pair<bool, std::string> atomicOrderSubmit(
+    Redis* redis,
+    const std::string& account_id,
+    const std::string& symbol,
+    double quantity,
+    const std::string& side,
+    double max_position) {
+
+    std::vector<std::string> keys = {};
+    std::vector<std::string> args = {
+        account_id,
+        symbol,
+        std::to_string(quantity),
+        side,
+        std::to_string(max_position),
+        std::to_string(std::chrono::system_clock::now().time_since_epoch().count())
+    };
+
+    auto result = redis->eval<std::vector<std::string>>(
+        ORDER_SUBMIT_SCRIPT,
+        keys.begin(), keys.end(),
+        args.begin(), args.end()
+    );
+
+    bool success = (result[0] == "1");
+    return {success, result[1]};
+}
+
+================================================================================
+3. MEMCACHED IMPLEMENTATION
+================================================================================
+
+3.1 MEMCACHED FOR SESSION AND CONFIGURATION DATA
+-------------------------------------------------
+
+#include <libmemcached/memcached.h>
+#include <string>
+#include <vector>
+
+class MemcachedClient {
+private:
+    memcached_st* memc_;
+
+public:
+    MemcachedClient(const std::vector<std::string>& servers) {
+        memc_ = memcached_create(nullptr);
+
+        for (const auto& server : servers) {
+            size_t pos = server.find(':');
+            std::string host = server.substr(0, pos);
+            int port = std::stoi(server.substr(pos + 1));
+
+            memcached_server_add(memc_, host.c_str(), port);
+        }
+
+        // Set binary protocol for better performance
+        memcached_behavior_set(memc_, MEMCACHED_BEHAVIOR_BINARY_PROTOCOL, 1);
+
+        // Enable consistent hashing
+        memcached_behavior_set(memc_, MEMCACHED_BEHAVIOR_DISTRIBUTION,
+                              MEMCACHED_DISTRIBUTION_CONSISTENT);
+
+        // Set connection pool size
+        memcached_behavior_set(memc_, MEMCACHED_BEHAVIOR_SOCKET_SEND_SIZE, 4096);
+        memcached_behavior_set(memc_, MEMCACHED_BEHAVIOR_SOCKET_RECV_SIZE, 4096);
+    }
+
+    ~MemcachedClient() {
+        memcached_free(memc_);
+    }
+
+    bool set(const std::string& key, const std::string& value,
+             time_t expiration = 0) {
+        memcached_return_t rc = memcached_set(
+            memc_,
+            key.c_str(), key.length(),
+            value.c_str(), value.length(),
+            expiration,
+            0 // flags
+        );
+
+        return rc == MEMCACHED_SUCCESS;
+    }
+
+    std::optional<std::string> get(const std::string& key) {
+        size_t value_length;
+        uint32_t flags;
+        memcached_return_t rc;
+
+        char* value = memcached_get(
+            memc_,
+            key.c_str(), key.length(),
+            &value_length,
+            &flags,
+            &rc
+        );
+
+        if (rc != MEMCACHED_SUCCESS || !value) {
+            return std::nullopt;
+        }
+
+        std::string result(value, value_length);
+        free(value);
+
+        return result;
+    }
+
+    bool remove(const std::string& key) {
+        memcached_return_t rc = memcached_delete(
+            memc_,
+            key.c_str(), key.length(),
+            0
+        );
+
+        return rc == MEMCACHED_SUCCESS;
+    }
+
+    // Multi-get for batch retrieval
+    std::unordered_map<std::string, std::string> multiGet(
+        const std::vector<std::string>& keys) {
+
+        // Prepare keys
+        std::vector<const char*> key_ptrs;
+        std::vector<size_t> key_lengths;
+
+        for (const auto& key : keys) {
+            key_ptrs.push_back(key.c_str());
+            key_lengths.push_back(key.length());
+        }
+
+        // Issue multi-get
+        memcached_return_t rc = memcached_mget(
+            memc_,
+            key_ptrs.data(),
+            key_lengths.data(),
+            keys.size()
+        );
+
+        std::unordered_map<std::string, std::string> results;
+
+        if (rc != MEMCACHED_SUCCESS) {
+            return results;
+        }
+
+        // Fetch results
+        char return_key[MEMCACHED_MAX_KEY];
+        size_t return_key_length;
+        char* return_value;
+        size_t return_value_length;
+        uint32_t flags;
+
+        while ((return_value = memcached_fetch(
+                    memc_,
+                    return_key,
+                    &return_key_length,
+                    &return_value_length,
+                    &flags,
+                    &rc))) {
+
+            if (rc == MEMCACHED_SUCCESS) {
+                std::string key(return_key, return_key_length);
+                std::string value(return_value, return_value_length);
+                results[key] = value;
+            }
+
+            free(return_value);
+        }
+
+        return results;
+    }
+
+    // Atomic increment
+    uint64_t increment(const std::string& key, uint64_t offset = 1) {
+        uint64_t value;
+        memcached_return_t rc = memcached_increment(
+            memc_,
+            key.c_str(), key.length(),
+            offset,
+            &value
+        );
+
+        if (rc != MEMCACHED_SUCCESS) {
+            return 0;
+        }
+
+        return value;
+    }
+
+    // Cache-aside pattern implementation
+    template<typename T>
+    std::optional<T> getOrLoad(
+        const std::string& key,
+        std::function<std::optional<T>()> loader,
+        std::function<std::string(const T&)> serializer,
+        std::function<T(const std::string&)> deserializer,
+        time_t ttl = 300) {
+
+        // Try cache first
+        auto cached = get(key);
+        if (cached) {
+            return deserializer(*cached);
+        }
+
+        // Load from source
+        auto value = loader();
+        if (!value) {
+            return std::nullopt;
+        }
+
+        // Store in cache
+        std::string serialized = serializer(*value);
+        set(key, serialized, ttl);
+
+        return value;
+    }
+};
+
+3.2 CACHE WARMING AND PRELOADING
+---------------------------------
+
+class CacheWarmer {
+private:
+    HFTRedisClient* redis_;
+    MemcachedClient* memcached_;
+    DatabaseConnection* db_;
+
+public:
+    CacheWarmer(HFTRedisClient* redis, MemcachedClient* memcached,
+                DatabaseConnection* db)
+        : redis_(redis), memcached_(memcached), db_(db) {}
+
+    void warmInstrumentCache() {
+        // Load all active instruments
+        auto instruments = db_->query("SELECT * FROM instruments WHERE is_tradable = true");
+
+        for (const auto& row : instruments) {
+            Instrument inst;
+            inst.id = row["instrument_id"];
+            inst.symbol = row["symbol"];
+            inst.exchange = row["exchange"];
+            inst.type = row["instrument_type"];
+            inst.tick_size = row["tick_size"];
+            inst.lot_size = row["lot_size"];
+            inst.currency = row["currency"];
+
+            redis_->cacheInstrument(inst);
+        }
+
+        std::cout << "Warmed instrument cache with " << instruments.size()
+                  << " instruments" << std::endl;
+    }
+
+    void warmPositionCache(int account_id) {
+        // Load all open positions
+        auto positions = db_->query(
+            "SELECT * FROM positions WHERE account_id = ? AND closed_at IS NULL",
+            account_id
+        );
+
+        for (const auto& row : positions) {
+            Position pos;
+            pos.quantity = row["quantity"];
+            pos.avg_price = row["avg_entry_price"];
+            pos.market_value = row["market_value"];
+            pos.unrealized_pnl = row["unrealized_pnl"];
+            pos.side = row["side"];
+
+            redis_->cachePosition(account_id, row["symbol"], pos);
+        }
+
+        std::cout << "Warmed position cache for account " << account_id
+                  << " with " << positions.size() << " positions" << std::endl;
+    }
+
+    void warmMarketDataCache(const std::vector<std::string>& symbols) {
+        // Subscribe to market data feed and populate cache
+        // This would typically be done by the market data pipeline
+        std::cout << "Warming market data cache for " << symbols.size()
+                  << " symbols" << std::endl;
+    }
+};
+
+================================================================================
+4. CACHE INVALIDATION STRATEGIES
+================================================================================
+
+4.1 TIME-BASED INVALIDATION (TTL)
+----------------------------------
+
+Cache TTL Guidelines:
+- Market quotes: 1-5 seconds
+- Order book: 5-10 seconds
+- Positions: 30-60 seconds
+- Instrument reference: 24 hours
+- User sessions: 1-8 hours
+- Configuration: 1 hour or on-demand
+
+4.2 EVENT-BASED INVALIDATION
+-----------------------------
+
+class CacheInvalidator {
+private:
+    HFTRedisClient* redis_;
+    MemcachedClient* memcached_;
+
+public:
+    void onTradeExecution(const Execution& execution) {
+        // Invalidate position cache
+        std::string position_key = "position:" +
+            std::to_string(execution.account_id) + ":" +
+            execution.symbol;
+
+        redis_->del(position_key);
+
+        // Publish invalidation event
+        redis_->publish("cache:invalidate", position_key);
+    }
+
+    void onOrderBookUpdate(const std::string& symbol) {
+        // Order book is updated in-place, no invalidation needed
+        // TTL handles staleness
+    }
+
+    void onInstrumentUpdate(const Instrument& instrument) {
+        std::string key = "instrument:" + instrument.symbol;
+        redis_->del(key);
+
+        // Reload immediately
+        redis_->cacheInstrument(instrument);
+    }
+
+    void onConfigurationChange(const std::string& config_key) {
+        memcached_->remove("config:" + config_key);
+
+        // Notify all nodes
+        redis_->publish("config:reload", config_key);
+    }
+};
+
+4.3 WRITE-THROUGH CACHE PATTERN
+--------------------------------
+
+class WriteThroughCache {
+private:
+    HFTRedisClient* redis_;
+    DatabaseConnection* db_;
+
+public:
+    void updatePosition(int account_id, const std::string& symbol,
+                       const Position& position) {
+        // Write to database first
+        db_->execute(
+            "UPDATE positions SET quantity = ?, avg_entry_price = ?, "
+            "market_value = ?, unrealized_pnl = ?, last_updated_at = NOW() "
+            "WHERE account_id = ? AND instrument_id = "
+            "(SELECT instrument_id FROM instruments WHERE symbol = ?)",
+            position.quantity, position.avg_price, position.market_value,
+            position.unrealized_pnl, account_id, symbol
+        );
+
+        // Then update cache
+        redis_->cachePosition(account_id, symbol, position);
+    }
+};
+
+================================================================================
+5. CACHE MONITORING AND METRICS
+================================================================================
+
+5.1 CACHE METRICS COLLECTION
+-----------------------------
+
+class CacheMetrics {
+private:
+    std::atomic<uint64_t> hits_{0};
+    std::atomic<uint64_t> misses_{0};
+    std::atomic<uint64_t> writes_{0};
+    std::atomic<uint64_t> evictions_{0};
+
+    LatencyHistogram read_latency_;
+    LatencyHistogram write_latency_;
+
+public:
+    void recordHit() { hits_++; }
+    void recordMiss() { misses_++; }
+    void recordWrite() { writes_++; }
+    void recordEviction() { evictions_++; }
+
+    void recordReadLatency(uint64_t latency_ns) {
+        read_latency_.record(latency_ns);
+    }
+
+    void recordWriteLatency(uint64_t latency_ns) {
+        write_latency_.record(latency_ns);
+    }
+
+    double getHitRate() const {
+        uint64_t total = hits_ + misses_;
+        return total > 0 ? static_cast<double>(hits_) / total : 0.0;
+    }
+
+    void report() {
+        std::cout << "Cache Metrics:" << std::endl;
+        std::cout << "  Hits: " << hits_ << std::endl;
+        std::cout << "  Misses: " << misses_ << std::endl;
+        std::cout << "  Hit Rate: " << (getHitRate() * 100) << "%" << std::endl;
+        std::cout << "  Writes: " << writes_ << std::endl;
+        std::cout << "  Evictions: " << evictions_ << std::endl;
+        std::cout << "  Read Latency P99: "
+                  << read_latency_.getPercentile(0.99) << " ns" << std::endl;
+        std::cout << "  Write Latency P99: "
+                  << write_latency_.getPercentile(0.99) << " ns" << std::endl;
+    }
+};
+
+5.2 REDIS INFO MONITORING
+--------------------------
+
+void monitorRedis(Redis* redis) {
+    auto info = redis->info("stats");
+
+    // Parse INFO output
+    std::istringstream stream(info);
+    std::string line;
+
+    std::unordered_map<std::string, std::string> metrics;
+
+    while (std::getline(stream, line)) {
+        if (line.empty() || line[0] == '#') continue;
+
+        size_t pos = line.find(':');
+        if (pos != std::string::npos) {
+            std::string key = line.substr(0, pos);
+            std::string value = line.substr(pos + 1);
+            metrics[key] = value;
+        }
+    }
+
+    // Extract key metrics
+    std::cout << "Redis Metrics:" << std::endl;
+    std::cout << "  Connected clients: " << metrics["connected_clients"] << std::endl;
+    std::cout << "  Used memory: " << metrics["used_memory_human"] << std::endl;
+    std::cout << "  Total commands: " << metrics["total_commands_processed"] << std::endl;
+    std::cout << "  Ops/sec: " << metrics["instantaneous_ops_per_sec"] << std::endl;
+    std::cout << "  Hit rate: " << metrics["keyspace_hits"] << " / "
+              << (std::stoll(metrics["keyspace_hits"]) +
+                  std::stoll(metrics["keyspace_misses"])) << std::endl;
+}
+
+================================================================================
+6. CACHE CONFIGURATION OPTIMIZATION
+================================================================================
+
+6.1 REDIS CONFIGURATION
+------------------------
+
+# redis.conf for HFT workloads
+
+# Memory Management
+maxmemory 16gb
+maxmemory-policy allkeys-lru
+maxmemory-samples 5
+
+# Persistence (disable for pure cache)
+save ""
+appendonly no
+
+# Network
+tcp-backlog 511
+timeout 0
+tcp-keepalive 300
+
+# Performance
+hz 10
+dynamic-hz yes
+
+# Latency
+lazyfree-lazy-eviction yes
+lazyfree-lazy-expire yes
+lazyfree-lazy-server-del yes
+
+# Threading
+io-threads 4
+io-threads-do-reads yes
+
+6.2 MEMCACHED CONFIGURATION
+----------------------------
+
+# memcached startup options
+
+-m 8192        # Memory limit (MB)
+-c 10000       # Max connections
+-t 8           # Threads
+-B binary      # Binary protocol
+-I 1m          # Max item size
+
+================================================================================
+END OF CACHE STRATEGY DOCUMENT
+================================================================================

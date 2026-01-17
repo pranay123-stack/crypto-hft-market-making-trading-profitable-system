@@ -1,0 +1,1037 @@
+================================================================================
+MOCK EXCHANGE FRAMEWORK FOR HFT TESTING
+Fake Exchange Implementation for Testing
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Mock Exchange Architecture
+2. Order Matching Engine Mock
+3. Market Data Simulator
+4. FIX Protocol Mock Server
+5. WebSocket Mock Server
+6. REST API Mock
+7. Realistic Behavior Simulation
+8. Test Scenarios
+9. Recording and Playback
+10. Integration with Test Suites
+
+================================================================================
+1. MOCK EXCHANGE ARCHITECTURE
+================================================================================
+
+1.1 Mock Exchange Overview
+---------------------------
+Purpose:
+- Test trading strategies without real exchange connection
+- Validate order handling logic
+- Test error conditions and edge cases
+- Simulate various market conditions
+- Provide deterministic testing environment
+
+Components:
+- Order matching engine
+- Market data generator
+- Fill simulator
+- Latency simulator
+- Rejection simulator
+
+
+1.2 Mock Exchange Interface
+----------------------------
+// include/testing/mock_exchange.h
+#ifndef MOCK_EXCHANGE_H
+#define MOCK_EXCHANGE_H
+
+#include <string>
+#include <map>
+#include <queue>
+#include <functional>
+#include "order.h"
+#include "market_data.h"
+
+enum class MockBehavior {
+    NORMAL,         // Accept all valid orders
+    SLOW,           // Add artificial latency
+    REJECT_ALL,     // Reject all orders
+    PARTIAL_FILLS,  // Only partial fills
+    RANDOM_FAILS    // Random failures
+};
+
+struct MockExchangeConfig {
+    MockBehavior behavior;
+    int latency_ms;
+    double fill_probability;
+    double rejection_rate;
+    bool enable_matching;
+    bool generate_market_data;
+};
+
+class MockExchange {
+public:
+    explicit MockExchange(const MockExchangeConfig& config);
+    ~MockExchange();
+
+    // Order operations
+    OrderAck submitOrder(const Order& order);
+    CancelAck cancelOrder(uint64_t order_id);
+    ModifyAck modifyOrder(uint64_t order_id, double new_price, int new_quantity);
+
+    // Market data
+    void setOrderBook(const std::string& symbol, const OrderBook& book);
+    void publishQuote(const Quote& quote);
+    void publishTrade(const Trade& trade);
+
+    // Callbacks
+    void setFillCallback(std::function<void(const Fill&)> callback);
+    void setQuoteCallback(std::function<void(const Quote&)> callback);
+    void setTradeCallback(std::function<void(const Trade&)> callback);
+
+    // Control
+    void start();
+    void stop();
+    void setBehavior(MockBehavior behavior);
+    void setLatency(int ms);
+
+    // Query
+    std::vector<Order> getPendingOrders() const;
+    std::vector<Fill> getExecutedFills() const;
+    ExchangeStatistics getStatistics() const;
+
+private:
+    void processOrders();
+    void generateMarketData();
+    Fill matchOrder(const Order& order);
+
+    MockExchangeConfig config_;
+    std::map<std::string, OrderBook> order_books_;
+    std::map<uint64_t, Order> pending_orders_;
+    std::vector<Fill> fills_;
+
+    std::function<void(const Fill&)> fill_callback_;
+    std::function<void(const Quote&)> quote_callback_;
+    std::function<void(const Trade&)> trade_callback_;
+
+    bool running_;
+    std::thread processing_thread_;
+    std::mutex order_mutex_;
+};
+
+#endif // MOCK_EXCHANGE_H
+
+
+1.3 Mock Exchange Implementation
+---------------------------------
+// src/testing/mock_exchange.cpp
+#include "mock_exchange.h"
+#include <iostream>
+#include <random>
+
+MockExchange::MockExchange(const MockExchangeConfig& config)
+    : config_(config), running_(false) {
+}
+
+MockExchange::~MockExchange() {
+    stop();
+}
+
+void MockExchange::start() {
+    if (running_) return;
+
+    running_ = true;
+    processing_thread_ = std::thread(&MockExchange::processOrders, this);
+
+    std::cout << "Mock exchange started" << std::endl;
+}
+
+void MockExchange::stop() {
+    if (!running_) return;
+
+    running_ = false;
+    if (processing_thread_.joinable()) {
+        processing_thread_.join();
+    }
+
+    std::cout << "Mock exchange stopped" << std::endl;
+}
+
+OrderAck MockExchange::submitOrder(const Order& order) {
+    OrderAck ack;
+    ack.order_id = order.order_id;
+    ack.timestamp = system_clock::now();
+
+    // Simulate latency
+    if (config_.latency_ms > 0) {
+        std::this_thread::sleep_for(milliseconds(config_.latency_ms));
+    }
+
+    // Check behavior mode
+    if (config_.behavior == MockBehavior::REJECT_ALL) {
+        ack.accepted = false;
+        ack.reject_reason = "Mock exchange rejecting all orders";
+        return ack;
+    }
+
+    // Random rejection
+    if (config_.behavior == MockBehavior::RANDOM_FAILS) {
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_real_distribution<> dis(0.0, 1.0);
+
+        if (dis(gen) < config_.rejection_rate) {
+            ack.accepted = false;
+            ack.reject_reason = "Random rejection";
+            return ack;
+        }
+    }
+
+    // Accept order
+    ack.accepted = true;
+
+    {
+        std::lock_guard<std::mutex> lock(order_mutex_);
+        pending_orders_[order.order_id] = order;
+    }
+
+    // Immediate matching if enabled
+    if (config_.enable_matching) {
+        Fill fill = matchOrder(order);
+        if (fill.quantity > 0 && fill_callback_) {
+            fill_callback_(fill);
+            fills_.push_back(fill);
+        }
+    }
+
+    return ack;
+}
+
+CancelAck MockExchange::cancelOrder(uint64_t order_id) {
+    CancelAck ack;
+    ack.order_id = order_id;
+    ack.timestamp = system_clock::now();
+
+    std::lock_guard<std::mutex> lock(order_mutex_);
+
+    auto it = pending_orders_.find(order_id);
+    if (it != pending_orders_.end()) {
+        pending_orders_.erase(it);
+        ack.success = true;
+    } else {
+        ack.success = false;
+        ack.reject_reason = "Order not found";
+    }
+
+    return ack;
+}
+
+Fill MockExchange::matchOrder(const Order& order) {
+    Fill fill;
+    fill.order_id = order.order_id;
+    fill.symbol = order.symbol;
+    fill.timestamp = system_clock::now();
+
+    // Check if we have order book for symbol
+    auto book_it = order_books_.find(order.symbol);
+    if (book_it == order_books_.end()) {
+        fill.quantity = 0;
+        return fill;
+    }
+
+    const OrderBook& book = book_it->second;
+
+    // Determine fill price
+    if (order.order_type == OrderType::MARKET) {
+        fill.price = (order.side == OrderSide::BUY) ? book.getBestAsk() : book.getBestBid();
+    } else {
+        fill.price = order.price;
+    }
+
+    // Determine fill quantity
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_real_distribution<> dis(0.0, 1.0);
+
+    if (dis(gen) < config_.fill_probability) {
+        if (config_.behavior == MockBehavior::PARTIAL_FILLS && dis(gen) < 0.5) {
+            fill.quantity = order.quantity / 2;  // Partial fill
+        } else {
+            fill.quantity = order.quantity;  // Full fill
+        }
+    } else {
+        fill.quantity = 0;  // No fill
+    }
+
+    return fill;
+}
+
+void MockExchange::processOrders() {
+    while (running_) {
+        std::this_thread::sleep_for(milliseconds(10));
+
+        std::lock_guard<std::mutex> lock(order_mutex_);
+
+        // Process pending orders
+        for (auto it = pending_orders_.begin(); it != pending_orders_.end(); ) {
+            const Order& order = it->second;
+
+            Fill fill = matchOrder(order);
+            if (fill.quantity > 0) {
+                if (fill_callback_) {
+                    fill_callback_(fill);
+                }
+                fills_.push_back(fill);
+
+                // Remove if fully filled
+                if (fill.quantity == order.quantity) {
+                    it = pending_orders_.erase(it);
+                } else {
+                    ++it;
+                }
+            } else {
+                ++it;
+            }
+        }
+    }
+}
+
+
+================================================================================
+2. ORDER MATCHING ENGINE MOCK
+================================================================================
+
+2.1 Simple Matching Engine
+---------------------------
+class SimpleMockMatchingEngine {
+public:
+    void addOrder(const Order& order) {
+        if (order.side == OrderSide::BUY) {
+            buy_orders_[order.price].push(order);
+        } else {
+            sell_orders_[order.price].push(order);
+        }
+    }
+
+    std::vector<Fill> matchOrders() {
+        std::vector<Fill> fills;
+
+        while (!buy_orders_.empty() && !sell_orders_.empty()) {
+            auto best_buy_it = buy_orders_.rbegin();  // Highest bid
+            auto best_sell_it = sell_orders_.begin(); // Lowest ask
+
+            if (best_buy_it->first >= best_sell_it->first) {
+                Order buy = best_buy_it->second.front();
+                Order sell = best_sell_it->second.front();
+
+                int match_qty = std::min(buy.quantity, sell.quantity);
+                double match_price = sell.price;  // Sell price takes priority
+
+                // Create fills
+                Fill buy_fill;
+                buy_fill.order_id = buy.order_id;
+                buy_fill.symbol = buy.symbol;
+                buy_fill.price = match_price;
+                buy_fill.quantity = match_qty;
+                fills.push_back(buy_fill);
+
+                Fill sell_fill;
+                sell_fill.order_id = sell.order_id;
+                sell_fill.symbol = sell.symbol;
+                sell_fill.price = match_price;
+                sell_fill.quantity = match_qty;
+                fills.push_back(sell_fill);
+
+                // Update orders
+                buy.quantity -= match_qty;
+                sell.quantity -= match_qty;
+
+                best_buy_it->second.pop();
+                best_sell_it->second.pop();
+
+                if (buy.quantity > 0) {
+                    buy_orders_[buy.price].push(buy);
+                }
+                if (sell.quantity > 0) {
+                    sell_orders_[sell.price].push(sell);
+                }
+
+                // Clean up empty price levels
+                if (best_buy_it->second.empty()) {
+                    buy_orders_.erase(best_buy_it->first);
+                }
+                if (best_sell_it->second.empty()) {
+                    sell_orders_.erase(best_sell_it->first);
+                }
+            } else {
+                break;  // No match possible
+            }
+        }
+
+        return fills;
+    }
+
+private:
+    std::map<double, std::queue<Order>, std::greater<>> buy_orders_;  // Highest first
+    std::map<double, std::queue<Order>> sell_orders_;                  // Lowest first
+};
+
+
+2.2 Priority Matching Engine
+-----------------------------
+class PriorityMockMatchingEngine {
+public:
+    enum class Priority {
+        TIME,       // First come, first served
+        SIZE,       // Larger orders first
+        PRO_RATA    // Proportional allocation
+    };
+
+    explicit PriorityMockMatchingEngine(Priority priority)
+        : priority_(priority) {}
+
+    void addOrder(const Order& order) {
+        OrderEntry entry;
+        entry.order = order;
+        entry.timestamp = high_resolution_clock::now();
+
+        if (order.side == OrderSide::BUY) {
+            buy_orders_[order.price].push_back(entry);
+        } else {
+            sell_orders_[order.price].push_back(entry);
+        }
+    }
+
+    std::vector<Fill> matchOrders() {
+        std::vector<Fill> fills;
+
+        // Sort orders based on priority
+        sortOrdersByPriority();
+
+        // Match orders
+        // ... implementation similar to above but respecting priority
+
+        return fills;
+    }
+
+private:
+    struct OrderEntry {
+        Order order;
+        high_resolution_clock::time_point timestamp;
+    };
+
+    void sortOrdersByPriority() {
+        auto comparator = [this](const OrderEntry& a, const OrderEntry& b) {
+            switch (priority_) {
+                case Priority::TIME:
+                    return a.timestamp < b.timestamp;
+                case Priority::SIZE:
+                    return a.order.quantity > b.order.quantity;
+                case Priority::PRO_RATA:
+                    // Pro-rata doesn't need sorting
+                    return false;
+                default:
+                    return false;
+            }
+        };
+
+        for (auto& [price, orders] : buy_orders_) {
+            std::sort(orders.begin(), orders.end(), comparator);
+        }
+
+        for (auto& [price, orders] : sell_orders_) {
+            std::sort(orders.begin(), orders.end(), comparator);
+        }
+    }
+
+    Priority priority_;
+    std::map<double, std::vector<OrderEntry>, std::greater<>> buy_orders_;
+    std::map<double, std::vector<OrderEntry>> sell_orders_;
+};
+
+
+================================================================================
+3. MARKET DATA SIMULATOR
+================================================================================
+
+3.1 Realistic Market Data Generator
+------------------------------------
+class MockMarketDataGenerator {
+public:
+    MockMarketDataGenerator(const std::string& symbol, double initial_price)
+        : symbol_(symbol), current_price_(initial_price), rng_(std::random_device{}()) {
+    }
+
+    void start(std::function<void(const Quote&)> quote_callback) {
+        quote_callback_ = quote_callback;
+        running_ = true;
+        generator_thread_ = std::thread(&MockMarketDataGenerator::generate, this);
+    }
+
+    void stop() {
+        running_ = false;
+        if (generator_thread_.joinable()) {
+            generator_thread_.join();
+        }
+    }
+
+    void setVolatility(double volatility) {
+        volatility_ = volatility;
+        price_change_dist_ = std::normal_distribution<>(0.0, volatility);
+    }
+
+    void setSpread(double spread_bps) {
+        spread_bps_ = spread_bps;
+    }
+
+private:
+    void generate() {
+        while (running_) {
+            // Update price with random walk
+            double change = price_change_dist_(rng_);
+            current_price_ += change;
+
+            // Generate quote
+            Quote quote;
+            quote.symbol = symbol_;
+            quote.timestamp = system_clock::now();
+
+            double spread = current_price_ * spread_bps_ / 10000.0;
+            quote.bid_price = current_price_ - spread / 2.0;
+            quote.ask_price = current_price_ + spread / 2.0;
+
+            std::uniform_int_distribution<> size_dist(100, 10000);
+            quote.bid_size = size_dist(rng_);
+            quote.ask_size = size_dist(rng_);
+
+            if (quote_callback_) {
+                quote_callback_(quote);
+            }
+
+            std::this_thread::sleep_for(milliseconds(10));
+        }
+    }
+
+    std::string symbol_;
+    double current_price_;
+    double volatility_ = 0.01;
+    double spread_bps_ = 5.0;
+
+    std::mt19937 rng_;
+    std::normal_distribution<> price_change_dist_{0.0, 0.01};
+
+    std::function<void(const Quote&)> quote_callback_;
+    bool running_ = false;
+    std::thread generator_thread_;
+};
+
+
+================================================================================
+4. FIX PROTOCOL MOCK SERVER
+================================================================================
+
+4.1 Mock FIX Server
+-------------------
+// include/testing/mock_fix_server.h
+#ifndef MOCK_FIX_SERVER_H
+#define MOCK_FIX_SERVER_H
+
+#include <string>
+#include <thread>
+#include <netinet/in.h>
+
+class MockFIXServer {
+public:
+    explicit MockFIXServer(int port);
+    ~MockFIXServer();
+
+    void start();
+    void stop();
+
+    void setShouldAcceptLogon(bool accept);
+    void setShouldAckOrders(bool ack);
+    void setResponseDelay(int ms);
+
+private:
+    void acceptConnections();
+    void handleClient(int client_socket);
+    void sendLogonResponse(int socket);
+    void sendExecutionReport(int socket, const std::string& order_msg);
+
+    int port_;
+    int server_socket_;
+    bool running_;
+    bool accept_logon_;
+    bool ack_orders_;
+    int response_delay_ms_;
+
+    std::thread server_thread_;
+};
+
+#endif // MOCK_FIX_SERVER_H
+
+
+4.2 Mock FIX Server Implementation
+-----------------------------------
+// src/testing/mock_fix_server.cpp
+#include "mock_fix_server.h"
+#include <iostream>
+#include <sys/socket.h>
+#include <unistd.h>
+
+MockFIXServer::MockFIXServer(int port)
+    : port_(port), running_(false), accept_logon_(true),
+      ack_orders_(true), response_delay_ms_(0) {
+}
+
+MockFIXServer::~MockFIXServer() {
+    stop();
+}
+
+void MockFIXServer::start() {
+    // Create socket
+    server_socket_ = socket(AF_INET, SOCK_STREAM, 0);
+
+    // Set socket options
+    int opt = 1;
+    setsockopt(server_socket_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    // Bind
+    struct sockaddr_in address;
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(port_);
+
+    bind(server_socket_, (struct sockaddr*)&address, sizeof(address));
+
+    // Listen
+    listen(server_socket_, 5);
+
+    running_ = true;
+    server_thread_ = std::thread(&MockFIXServer::acceptConnections, this);
+
+    std::cout << "Mock FIX server listening on port " << port_ << std::endl;
+}
+
+void MockFIXServer::stop() {
+    running_ = false;
+    close(server_socket_);
+
+    if (server_thread_.joinable()) {
+        server_thread_.join();
+    }
+}
+
+void MockFIXServer::acceptConnections() {
+    while (running_) {
+        struct sockaddr_in client_addr;
+        socklen_t client_len = sizeof(client_addr);
+
+        int client_socket = accept(server_socket_, (struct sockaddr*)&client_addr, &client_len);
+        if (client_socket < 0) {
+            continue;
+        }
+
+        std::cout << "Client connected" << std::endl;
+
+        // Handle client in new thread
+        std::thread([this, client_socket]() {
+            handleClient(client_socket);
+        }).detach();
+    }
+}
+
+void MockFIXServer::handleClient(int client_socket) {
+    char buffer[4096];
+
+    while (running_) {
+        int bytes_read = recv(client_socket, buffer, sizeof(buffer), 0);
+        if (bytes_read <= 0) {
+            break;
+        }
+
+        std::string message(buffer, bytes_read);
+
+        // Parse FIX message type
+        if (message.find("35=A") != std::string::npos) {
+            // Logon request
+            if (accept_logon_) {
+                sendLogonResponse(client_socket);
+            }
+        } else if (message.find("35=D") != std::string::npos) {
+            // New Order Single
+            if (ack_orders_) {
+                if (response_delay_ms_ > 0) {
+                    std::this_thread::sleep_for(milliseconds(response_delay_ms_));
+                }
+                sendExecutionReport(client_socket, message);
+            }
+        }
+        // Handle other message types...
+    }
+
+    close(client_socket);
+}
+
+
+================================================================================
+5. WEBSOCKET MOCK SERVER
+================================================================================
+
+5.1 Mock WebSocket Server
+--------------------------
+class MockWebSocketServer {
+public:
+    explicit MockWebSocketServer(int port);
+
+    void start();
+    void stop();
+
+    void broadcastQuote(const Quote& quote);
+    void broadcastTrade(const Trade& trade);
+
+    void setMessageDelay(int ms);
+    void simulateDisconnect();
+
+private:
+    void handleConnection(/* websocket connection */);
+    void processMessage(const std::string& msg);
+
+    int port_;
+    bool running_;
+    int message_delay_ms_;
+
+    // WebSocket library specifics (e.g., websocketpp)
+};
+
+
+================================================================================
+6. REST API MOCK
+================================================================================
+
+6.1 Mock REST API Server
+-------------------------
+class MockRESTAPIServer {
+public:
+    explicit MockRESTAPIServer(int port);
+
+    void start();
+    void stop();
+
+    // Configure responses
+    void setOrderResponse(int status_code, const std::string& body);
+    void setAccountResponse(const std::string& body);
+    void setLatency(int ms);
+
+private:
+    void handleRequest(/* HTTP request */);
+
+    int port_;
+    bool running_;
+    int latency_ms_;
+
+    std::map<std::string, std::string> mock_responses_;
+};
+
+
+================================================================================
+7. REALISTIC BEHAVIOR SIMULATION
+================================================================================
+
+7.1 Market Conditions Simulator
+--------------------------------
+class MarketConditionsSimulator {
+public:
+    enum class MarketState {
+        NORMAL,
+        HIGH_VOLATILITY,
+        FLASH_CRASH,
+        CIRCUIT_BREAKER,
+        ILLIQUID
+    };
+
+    void setMarketState(MarketState state) {
+        state_ = state;
+
+        switch (state) {
+            case MarketState::HIGH_VOLATILITY:
+                volatility_ = 0.05;  // 5%
+                spread_multiplier_ = 2.0;
+                break;
+
+            case MarketState::FLASH_CRASH:
+                price_shock_ = -0.10;  // -10%
+                volatility_ = 0.10;
+                break;
+
+            case MarketState::CIRCUIT_BREAKER:
+                halt_trading_ = true;
+                break;
+
+            case MarketState::ILLIQUID:
+                spread_multiplier_ = 10.0;
+                depth_multiplier_ = 0.1;
+                break;
+
+            default:
+                volatility_ = 0.01;
+                spread_multiplier_ = 1.0;
+                halt_trading_ = false;
+        }
+    }
+
+    Quote generateQuote(const std::string& symbol, double base_price) {
+        if (halt_trading_) {
+            throw std::runtime_error("Trading halted");
+        }
+
+        Quote quote;
+        quote.symbol = symbol;
+
+        double current_price = base_price * (1.0 + price_shock_);
+        double spread = current_price * 0.0005 * spread_multiplier_;
+
+        quote.bid_price = current_price - spread / 2.0;
+        quote.ask_price = current_price + spread / 2.0;
+        quote.bid_size = static_cast<int>(1000 * depth_multiplier_);
+        quote.ask_size = static_cast<int>(1000 * depth_multiplier_);
+
+        return quote;
+    }
+
+private:
+    MarketState state_ = MarketState::NORMAL;
+    double volatility_ = 0.01;
+    double spread_multiplier_ = 1.0;
+    double depth_multiplier_ = 1.0;
+    double price_shock_ = 0.0;
+    bool halt_trading_ = false;
+};
+
+
+================================================================================
+8. TEST SCENARIOS
+================================================================================
+
+8.1 Common Test Scenarios
+--------------------------
+TEST(MockExchange, NormalOrderFlow) {
+    MockExchangeConfig config;
+    config.behavior = MockBehavior::NORMAL;
+    config.fill_probability = 1.0;
+
+    MockExchange exchange(config);
+    exchange.start();
+
+    // Set up order book
+    OrderBook book("AAPL");
+    book.addBid(150.00, 1000);
+    book.addAsk(150.05, 1000);
+    exchange.setOrderBook("AAPL", book);
+
+    // Submit order
+    Order order;
+    order.order_id = 1;
+    order.symbol = "AAPL";
+    order.side = OrderSide::BUY;
+    order.price = 150.05;
+    order.quantity = 100;
+
+    auto ack = exchange.submitOrder(order);
+
+    EXPECT_TRUE(ack.accepted);
+
+    // Should get fill
+    auto fills = exchange.getExecutedFills();
+    ASSERT_EQ(fills.size(), 1);
+    EXPECT_EQ(fills[0].quantity, 100);
+
+    exchange.stop();
+}
+
+TEST(MockExchange, RejectionScenario) {
+    MockExchangeConfig config;
+    config.behavior = MockBehavior::REJECT_ALL;
+
+    MockExchange exchange(config);
+    exchange.start();
+
+    Order order = createTestOrder(1);
+    auto ack = exchange.submitOrder(order);
+
+    EXPECT_FALSE(ack.accepted);
+    EXPECT_FALSE(ack.reject_reason.empty());
+
+    exchange.stop();
+}
+
+
+================================================================================
+9. RECORDING AND PLAYBACK
+================================================================================
+
+9.1 Exchange Interaction Recorder
+----------------------------------
+class ExchangeRecorder {
+public:
+    void recordOrder(const Order& order, const OrderAck& ack) {
+        RecordedInteraction interaction;
+        interaction.timestamp = system_clock::now();
+        interaction.type = InteractionType::ORDER;
+        interaction.order = order;
+        interaction.ack = ack;
+
+        interactions_.push_back(interaction);
+    }
+
+    void recordFill(const Fill& fill) {
+        RecordedInteraction interaction;
+        interaction.timestamp = system_clock::now();
+        interaction.type = InteractionType::FILL;
+        interaction.fill = fill;
+
+        interactions_.push_back(interaction);
+    }
+
+    void saveToFile(const std::string& filename) {
+        std::ofstream file(filename, std::ios::binary);
+
+        for (const auto& interaction : interactions_) {
+            // Serialize interaction
+            file.write(reinterpret_cast<const char*>(&interaction), sizeof(interaction));
+        }
+    }
+
+    void loadFromFile(const std::string& filename) {
+        std::ifstream file(filename, std::ios::binary);
+
+        interactions_.clear();
+
+        RecordedInteraction interaction;
+        while (file.read(reinterpret_cast<char*>(&interaction), sizeof(interaction))) {
+            interactions_.push_back(interaction);
+        }
+    }
+
+    void replay(MockExchange& exchange) {
+        for (const auto& interaction : interactions_) {
+            switch (interaction.type) {
+                case InteractionType::ORDER:
+                    exchange.submitOrder(interaction.order);
+                    break;
+                // ... other types
+            }
+
+            std::this_thread::sleep_for(milliseconds(10));
+        }
+    }
+
+private:
+    enum class InteractionType {
+        ORDER,
+        CANCEL,
+        MODIFY,
+        FILL,
+        QUOTE
+    };
+
+    struct RecordedInteraction {
+        system_clock::time_point timestamp;
+        InteractionType type;
+        Order order;
+        OrderAck ack;
+        Fill fill;
+    };
+
+    std::vector<RecordedInteraction> interactions_;
+};
+
+
+================================================================================
+10. INTEGRATION WITH TEST SUITES
+================================================================================
+
+10.1 Google Test Integration
+-----------------------------
+class MockExchangeTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        MockExchangeConfig config;
+        config.behavior = MockBehavior::NORMAL;
+        config.fill_probability = 1.0;
+        config.enable_matching = true;
+
+        mock_exchange_ = std::make_unique<MockExchange>(config);
+        mock_exchange_->start();
+
+        // Set up order books
+        for (const auto& symbol : {"AAPL", "GOOGL", "MSFT"}) {
+            OrderBook book(symbol);
+            book.addBid(150.00, 1000);
+            book.addAsk(150.05, 1000);
+            mock_exchange_->setOrderBook(symbol, book);
+        }
+    }
+
+    void TearDown() override {
+        mock_exchange_->stop();
+    }
+
+    std::unique_ptr<MockExchange> mock_exchange_;
+};
+
+TEST_F(MockExchangeTest, MultipleOrders) {
+    std::vector<Order> orders;
+    for (int i = 0; i < 100; ++i) {
+        Order order = createTestOrder(i);
+        orders.push_back(order);
+
+        auto ack = mock_exchange_->submitOrder(order);
+        EXPECT_TRUE(ack.accepted);
+    }
+
+    auto fills = mock_exchange_->getExecutedFills();
+    EXPECT_EQ(fills.size(), 100);
+}
+
+
+10.2 Test Fixture with Mock Exchange
+-------------------------------------
+class TradingSystemWithMockExchange : public ::testing::Test {
+protected:
+    void SetUp() override {
+        // Set up mock exchange
+        mock_exchange_ = std::make_shared<MockExchange>(getMockConfig());
+        mock_exchange_->start();
+
+        // Create trading system using mock exchange
+        SystemConfig config;
+        config.exchange = mock_exchange_;
+
+        trading_system_ = std::make_unique<TradingSystem>(config);
+        trading_system_->initialize();
+    }
+
+    std::shared_ptr<MockExchange> mock_exchange_;
+    std::unique_ptr<TradingSystem> trading_system_;
+};
+
+TEST_F(TradingSystemWithMockExchange, EndToEndOrderFlow) {
+    // Inject market data
+    Quote quote;
+    quote.symbol = "AAPL";
+    quote.bid_price = 150.00;
+    quote.ask_price = 150.05;
+
+    trading_system_->onMarketData(quote);
+
+    // Wait for strategy to generate signal and submit order
+    std::this_thread::sleep_for(milliseconds(100));
+
+    // Verify order was submitted to mock exchange
+    auto orders = mock_exchange_->getPendingOrders();
+    EXPECT_GT(orders.size(), 0);
+}
+
+
+================================================================================
+END OF MOCK EXCHANGE FRAMEWORK
+================================================================================

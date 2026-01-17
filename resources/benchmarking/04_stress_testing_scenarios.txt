@@ -1,0 +1,972 @@
+================================================================================
+STRESS TESTING SCENARIOS FOR HFT SYSTEMS
+BREAKING POINT ANALYSIS AND FAILURE MODE TESTING
+================================================================================
+
+TABLE OF CONTENTS
+1. Stress Testing Framework
+2. CPU Saturation Scenarios
+3. Memory Pressure Testing
+4. Network Congestion Scenarios
+5. Disk I/O Stress Testing
+6. Lock Contention Scenarios
+7. Resource Exhaustion Tests
+8. Cascading Failure Simulation
+9. Recovery and Resilience Testing
+10. Chaos Engineering for HFT
+
+================================================================================
+1. STRESS TESTING FRAMEWORK
+================================================================================
+
+// Core Stress Testing Infrastructure
+// File: stress_test_framework.hpp
+
+#ifndef STRESS_TEST_FRAMEWORK_HPP
+#define STRESS_TEST_FRAMEWORK_HPP
+
+#include <atomic>
+#include <chrono>
+#include <vector>
+#include <thread>
+#include <functional>
+#include <iostream>
+#include <mutex>
+#include <condition_variable>
+
+namespace hft {
+namespace stress {
+
+// Stress test configuration
+struct StressTestConfig {
+    size_t num_threads;
+    size_t iterations_per_thread;
+    size_t memory_pressure_mb;
+    bool enable_cpu_stress;
+    bool enable_io_stress;
+    bool enable_network_stress;
+    double target_cpu_utilization;  // 0.0 to 1.0
+    size_t target_memory_mb;
+
+    // Failure injection
+    double error_injection_rate;     // Probability of injecting error
+    bool inject_timeouts;
+    bool inject_disconnects;
+    bool inject_corrupt_data;
+};
+
+// Metrics collected during stress test
+struct StressTestMetrics {
+    std::atomic<uint64_t> operations_attempted{0};
+    std::atomic<uint64_t> operations_successful{0};
+    std::atomic<uint64_t> operations_failed{0};
+    std::atomic<uint64_t> timeouts{0};
+    std::atomic<uint64_t> errors{0};
+
+    // Performance degradation tracking
+    std::vector<double> latency_samples;
+    std::mutex latency_mutex;
+
+    // Resource usage
+    std::atomic<size_t> peak_memory_mb{0};
+    std::atomic<double> peak_cpu_percent{0};
+    std::atomic<size_t> thread_count{0};
+
+    std::chrono::steady_clock::time_point start_time;
+    std::chrono::steady_clock::time_point failure_time;
+    bool system_failed{false};
+    std::string failure_reason;
+
+    void record_operation(bool success, double latency_ms) {
+        operations_attempted.fetch_add(1);
+
+        if (success) {
+            operations_successful.fetch_add(1);
+
+            std::lock_guard<std::mutex> lock(latency_mutex);
+            latency_samples.push_back(latency_ms);
+        } else {
+            operations_failed.fetch_add(1);
+        }
+    }
+
+    void record_timeout() {
+        timeouts.fetch_add(1);
+    }
+
+    void record_error() {
+        errors.fetch_add(1);
+    }
+
+    void record_system_failure(const std::string& reason) {
+        if (!system_failed) {
+            system_failed = true;
+            failure_time = std::chrono::steady_clock::now();
+            failure_reason = reason;
+        }
+    }
+
+    double get_success_rate() const {
+        uint64_t attempted = operations_attempted.load();
+        if (attempted == 0) return 0.0;
+        return (operations_successful.load() * 100.0) / attempted;
+    }
+
+    double get_time_to_failure_seconds() const {
+        if (!system_failed) return -1.0;
+
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+            failure_time - start_time).count();
+        return duration / 1000.0;
+    }
+};
+
+// Stress test controller
+class StressTestController {
+public:
+    using StressFunction = std::function<bool()>;
+
+    StressTestController(StressTestConfig config)
+        : config_(config) {}
+
+    StressTestMetrics run_stress_test(StressFunction stress_fn) {
+        std::cout << "=== Starting Stress Test ===\n";
+        std::cout << "Threads: " << config_.num_threads << "\n";
+        std::cout << "Iterations per thread: " << config_.iterations_per_thread << "\n";
+        std::cout << "Memory pressure: " << config_.memory_pressure_mb << " MB\n\n";
+
+        metrics_.start_time = std::chrono::steady_clock::now();
+
+        // Start monitoring thread
+        std::thread monitor_thread([this]() { monitor_system_health(); });
+
+        // Apply memory pressure if configured
+        std::vector<std::vector<char>> memory_ballast;
+        if (config_.memory_pressure_mb > 0) {
+            apply_memory_pressure(memory_ballast);
+        }
+
+        // Launch stress threads
+        std::vector<std::thread> threads;
+        for (size_t i = 0; i < config_.num_threads; ++i) {
+            threads.emplace_back([this, &stress_fn, i]() {
+                run_stress_worker(stress_fn, i);
+            });
+        }
+
+        // Wait for completion or failure
+        for (auto& thread : threads) {
+            thread.join();
+        }
+
+        stop_monitoring_ = true;
+        monitor_thread.join();
+
+        print_results();
+
+        return metrics_;
+    }
+
+private:
+    StressTestConfig config_;
+    StressTestMetrics metrics_;
+    std::atomic<bool> stop_monitoring_{false};
+
+    void run_stress_worker(StressFunction stress_fn, size_t worker_id) {
+        metrics_.thread_count.fetch_add(1);
+
+        for (size_t i = 0; i < config_.iterations_per_thread; ++i) {
+            if (metrics_.system_failed) {
+                break;
+            }
+
+            auto start = std::chrono::high_resolution_clock::now();
+
+            bool success = false;
+            try {
+                // Inject failures if configured
+                if (should_inject_failure()) {
+                    throw std::runtime_error("Injected failure");
+                }
+
+                success = stress_fn();
+
+            } catch (const std::exception& e) {
+                metrics_.record_error();
+                success = false;
+            }
+
+            auto end = std::chrono::high_resolution_clock::now();
+            auto latency_ms = std::chrono::duration_cast<std::chrono::microseconds>(
+                end - start).count() / 1000.0;
+
+            metrics_.record_operation(success, latency_ms);
+
+            // Check for performance degradation
+            if (latency_ms > 100.0) {  // 100ms threshold
+                metrics_.record_system_failure("Severe performance degradation");
+            }
+        }
+
+        metrics_.thread_count.fetch_sub(1);
+    }
+
+    void apply_memory_pressure(std::vector<std::vector<char>>& ballast) {
+        std::cout << "Applying memory pressure: "
+                  << config_.memory_pressure_mb << " MB\n";
+
+        const size_t mb = 1024 * 1024;
+        for (size_t i = 0; i < config_.memory_pressure_mb; ++i) {
+            ballast.emplace_back(mb, 0xFF);
+        }
+
+        metrics_.peak_memory_mb = config_.memory_pressure_mb;
+    }
+
+    void monitor_system_health() {
+        while (!stop_monitoring_) {
+            // Simulate system monitoring
+            check_cpu_usage();
+            check_memory_usage();
+            check_thread_pool();
+
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+    }
+
+    void check_cpu_usage() {
+        // In real implementation, read from /proc/stat or similar
+        double cpu_usage = 0.0;  // Placeholder
+
+        double current_peak = metrics_.peak_cpu_percent.load();
+        if (cpu_usage > current_peak) {
+            metrics_.peak_cpu_percent.store(cpu_usage);
+        }
+
+        if (cpu_usage > 95.0) {
+            metrics_.record_system_failure("CPU saturation > 95%");
+        }
+    }
+
+    void check_memory_usage() {
+        // In real implementation, read from /proc/meminfo
+        size_t memory_mb = 0;  // Placeholder
+
+        size_t current_peak = metrics_.peak_memory_mb.load();
+        if (memory_mb > current_peak) {
+            metrics_.peak_memory_mb.store(memory_mb);
+        }
+    }
+
+    void check_thread_pool() {
+        size_t active_threads = metrics_.thread_count.load();
+
+        if (active_threads > config_.num_threads * 2) {
+            metrics_.record_system_failure("Thread explosion detected");
+        }
+    }
+
+    bool should_inject_failure() {
+        if (config_.error_injection_rate <= 0.0) {
+            return false;
+        }
+
+        static std::random_device rd;
+        static std::mt19937 gen(rd());
+        static std::uniform_real_distribution<> dis(0.0, 1.0);
+
+        return dis(gen) < config_.error_injection_rate;
+    }
+
+    void print_results() {
+        std::cout << "\n=== Stress Test Results ===\n";
+        std::cout << "Operations Attempted: "
+                  << metrics_.operations_attempted.load() << "\n";
+        std::cout << "Operations Successful: "
+                  << metrics_.operations_successful.load() << "\n";
+        std::cout << "Operations Failed: "
+                  << metrics_.operations_failed.load() << "\n";
+        std::cout << "Success Rate: " << std::fixed << std::setprecision(2)
+                  << metrics_.get_success_rate() << "%\n";
+        std::cout << "Timeouts: " << metrics_.timeouts.load() << "\n";
+        std::cout << "Errors: " << metrics_.errors.load() << "\n";
+        std::cout << "Peak Memory: " << metrics_.peak_memory_mb.load() << " MB\n";
+        std::cout << "Peak CPU: " << metrics_.peak_cpu_percent.load() << "%\n";
+
+        if (metrics_.system_failed) {
+            std::cout << "\n*** SYSTEM FAILURE ***\n";
+            std::cout << "Reason: " << metrics_.failure_reason << "\n";
+            std::cout << "Time to failure: "
+                      << metrics_.get_time_to_failure_seconds() << " seconds\n";
+        } else {
+            std::cout << "\nSystem remained stable throughout test\n";
+        }
+    }
+};
+
+} // namespace stress
+} // namespace hft
+
+#endif // STRESS_TEST_FRAMEWORK_HPP
+
+================================================================================
+2. CPU SATURATION SCENARIOS
+================================================================================
+
+// CPU stress testing scenarios
+// File: cpu_stress_tests.cpp
+
+#include "stress_test_framework.hpp"
+#include <cmath>
+#include <numeric>
+
+namespace hft {
+namespace stress {
+
+class CPUStressTests {
+public:
+    // Test 1: Pure computational stress
+    void test_cpu_bound_operations() {
+        std::cout << "\n=== CPU-Bound Operations Stress Test ===\n";
+
+        StressTestConfig config;
+        config.num_threads = std::thread::hardware_concurrency() * 2;
+        config.iterations_per_thread = 100000;
+        config.memory_pressure_mb = 0;
+        config.enable_cpu_stress = true;
+        config.error_injection_rate = 0.0;
+
+        StressTestController controller(config);
+
+        auto cpu_intensive_work = []() -> bool {
+            // Simulate CPU-intensive calculation
+            volatile double result = 0.0;
+            for (int i = 0; i < 10000; ++i) {
+                result += std::sin(i) * std::cos(i);
+            }
+            return true;
+        };
+
+        controller.run_stress_test(cpu_intensive_work);
+    }
+
+    // Test 2: Thread contention with spinlocks
+    void test_spinlock_contention() {
+        std::cout << "\n=== Spinlock Contention Stress Test ===\n";
+
+        std::atomic_flag lock = ATOMIC_FLAG_INIT;
+        std::atomic<uint64_t> shared_counter{0};
+
+        StressTestConfig config;
+        config.num_threads = 32;
+        config.iterations_per_thread = 100000;
+        config.memory_pressure_mb = 0;
+
+        StressTestController controller(config);
+
+        auto contended_work = [&]() -> bool {
+            // Spinlock acquisition
+            while (lock.test_and_set(std::memory_order_acquire)) {
+                // Spin
+                std::this_thread::yield();
+            }
+
+            // Critical section
+            shared_counter.fetch_add(1);
+
+            // Release lock
+            lock.clear(std::memory_order_release);
+
+            return true;
+        };
+
+        controller.run_stress_test(contended_work);
+
+        std::cout << "Final counter value: " << shared_counter.load() << "\n";
+    }
+
+    // Test 3: Context switching stress
+    void test_context_switching() {
+        std::cout << "\n=== Context Switching Stress Test ===\n";
+
+        StressTestConfig config;
+        config.num_threads = 1000;  // Many threads on limited cores
+        config.iterations_per_thread = 1000;
+        config.memory_pressure_mb = 0;
+
+        StressTestController controller(config);
+
+        auto context_switch_work = []() -> bool {
+            // Yield to force context switch
+            std::this_thread::yield();
+
+            // Small amount of work
+            volatile int sum = 0;
+            for (int i = 0; i < 100; ++i) {
+                sum += i;
+            }
+
+            return true;
+        };
+
+        controller.run_stress_test(context_switch_work);
+    }
+
+    // Test 4: CPU cache thrashing
+    void test_cache_thrashing() {
+        std::cout << "\n=== CPU Cache Thrashing Stress Test ===\n";
+
+        const size_t array_size = 100 * 1024 * 1024;  // 100MB array
+        std::vector<int> shared_array(array_size, 0);
+
+        StressTestConfig config;
+        config.num_threads = std::thread::hardware_concurrency();
+        config.iterations_per_thread = 1000;
+        config.memory_pressure_mb = 0;
+
+        StressTestController controller(config);
+
+        auto cache_thrashing_work = [&]() -> bool {
+            // Random access pattern to thrash cache
+            std::random_device rd;
+            std::mt19937 gen(rd());
+            std::uniform_int_distribution<> dis(0, array_size - 1);
+
+            volatile int sum = 0;
+            for (int i = 0; i < 1000; ++i) {
+                size_t idx = dis(gen);
+                sum += shared_array[idx];
+                shared_array[idx]++;
+            }
+
+            return true;
+        };
+
+        controller.run_stress_test(cache_thrashing_work);
+    }
+
+    // Test 5: CPU frequency scaling impact
+    void test_frequency_scaling() {
+        std::cout << "\n=== CPU Frequency Scaling Impact Test ===\n";
+
+        StressTestConfig config;
+        config.num_threads = 4;
+        config.iterations_per_thread = 10000;
+        config.memory_pressure_mb = 0;
+
+        StressTestController controller(config);
+
+        auto varying_load_work = []() -> bool {
+            static thread_local int iteration = 0;
+            iteration++;
+
+            // Alternate between heavy and light load
+            if (iteration % 100 < 50) {
+                // Heavy load - should trigger turbo boost
+                volatile double result = 0.0;
+                for (int i = 0; i < 50000; ++i) {
+                    result += std::pow(i, 2.5);
+                }
+            } else {
+                // Light load - CPU may downclock
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+            }
+
+            return true;
+        };
+
+        controller.run_stress_test(varying_load_work);
+    }
+};
+
+} // namespace stress
+} // namespace hft
+
+================================================================================
+3. MEMORY PRESSURE TESTING
+================================================================================
+
+// Memory stress scenarios
+// File: memory_stress_tests.cpp
+
+namespace hft {
+namespace stress {
+
+class MemoryStressTests {
+public:
+    // Test 1: Gradual memory allocation until OOM
+    void test_memory_exhaustion() {
+        std::cout << "\n=== Memory Exhaustion Test ===\n";
+
+        std::vector<std::unique_ptr<std::vector<char>>> allocations;
+        const size_t chunk_size = 100 * 1024 * 1024;  // 100MB chunks
+        size_t total_allocated = 0;
+
+        try {
+            while (true) {
+                auto chunk = std::make_unique<std::vector<char>>(chunk_size, 0xFF);
+                allocations.push_back(std::move(chunk));
+                total_allocated += chunk_size;
+
+                std::cout << "Allocated: " << (total_allocated / (1024*1024))
+                          << " MB\n";
+
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+                // Safety limit
+                if (total_allocated > 50ULL * 1024 * 1024 * 1024) {
+                    std::cout << "Reached safety limit of 50GB\n";
+                    break;
+                }
+            }
+        } catch (const std::bad_alloc& e) {
+            std::cout << "Out of memory at " << (total_allocated / (1024*1024))
+                      << " MB\n";
+        }
+    }
+
+    // Test 2: Memory allocation/deallocation churn
+    void test_allocation_churn() {
+        std::cout << "\n=== Memory Allocation Churn Test ===\n";
+
+        StressTestConfig config;
+        config.num_threads = 16;
+        config.iterations_per_thread = 100000;
+        config.memory_pressure_mb = 0;
+
+        StressTestController controller(config);
+
+        auto allocation_work = []() -> bool {
+            // Allocate various sizes
+            std::vector<std::unique_ptr<char[]>> temp_allocs;
+
+            for (int i = 0; i < 100; ++i) {
+                size_t size = 1024 + (i * 1024);  // 1KB to 100KB
+                temp_allocs.push_back(std::make_unique<char[]>(size));
+
+                // Touch memory to ensure allocation
+                std::memset(temp_allocs.back().get(), 0xFF, size);
+            }
+
+            // Deallocations happen automatically
+            return true;
+        };
+
+        controller.run_stress_test(allocation_work);
+    }
+
+    // Test 3: Memory fragmentation
+    void test_memory_fragmentation() {
+        std::cout << "\n=== Memory Fragmentation Test ===\n";
+
+        std::vector<std::unique_ptr<char[]>> allocations;
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_int_distribution<> size_dis(100, 10000);
+
+        // Allocate many different sized blocks
+        for (int i = 0; i < 10000; ++i) {
+            size_t size = size_dis(gen);
+            allocations.push_back(std::make_unique<char[]>(size));
+        }
+
+        // Randomly deallocate half
+        std::uniform_int_distribution<> idx_dis(0, allocations.size() - 1);
+        for (int i = 0; i < 5000; ++i) {
+            size_t idx = idx_dis(gen);
+            allocations[idx].reset();
+        }
+
+        // Try to allocate large contiguous block
+        std::cout << "Attempting large contiguous allocation...\n";
+        try {
+            auto large_block = std::make_unique<char[]>(1024 * 1024 * 1024);  // 1GB
+            std::cout << "Successfully allocated 1GB contiguous block\n";
+        } catch (const std::bad_alloc& e) {
+            std::cout << "Failed to allocate 1GB - memory fragmentation detected\n";
+        }
+    }
+
+    // Test 4: Memory leak simulation
+    void test_memory_leak_detection() {
+        std::cout << "\n=== Memory Leak Detection Test ===\n";
+
+        std::atomic<size_t> leaked_bytes{0};
+        const size_t leak_rate_per_op = 1024;  // 1KB per operation
+
+        StressTestConfig config;
+        config.num_threads = 8;
+        config.iterations_per_thread = 10000;
+        config.memory_pressure_mb = 0;
+
+        StressTestController controller(config);
+
+        auto leaky_work = [&]() -> bool {
+            // Intentionally leak memory
+            char* leak = new char[leak_rate_per_op];
+            std::memset(leak, 0, leak_rate_per_op);
+            leaked_bytes.fetch_add(leak_rate_per_op);
+
+            // Do NOT delete
+
+            return true;
+        };
+
+        auto start_memory = get_process_memory_mb();
+        controller.run_stress_test(leaky_work);
+        auto end_memory = get_process_memory_mb();
+
+        std::cout << "Memory at start: " << start_memory << " MB\n";
+        std::cout << "Memory at end: " << end_memory << " MB\n";
+        std::cout << "Memory increase: " << (end_memory - start_memory) << " MB\n";
+        std::cout << "Expected leak: " << (leaked_bytes.load() / (1024*1024)) << " MB\n";
+    }
+
+    // Test 5: NUMA memory stress
+    void test_numa_memory_access() {
+        std::cout << "\n=== NUMA Memory Access Pattern Test ===\n";
+
+        const size_t array_size = 1024 * 1024 * 100;  // 100M elements
+        std::vector<int> data(array_size, 0);
+
+        StressTestConfig config;
+        config.num_threads = std::thread::hardware_concurrency();
+        config.iterations_per_thread = 100;
+        config.memory_pressure_mb = 0;
+
+        StressTestController controller(config);
+
+        auto numa_work = [&]() -> bool {
+            static thread_local std::random_device rd;
+            static thread_local std::mt19937 gen(rd());
+            static thread_local std::uniform_int_distribution<> dis(0, array_size - 1);
+
+            // Random memory access across NUMA nodes
+            volatile int sum = 0;
+            for (int i = 0; i < 10000; ++i) {
+                sum += data[dis(gen)];
+            }
+
+            return true;
+        };
+
+        controller.run_stress_test(numa_work);
+    }
+
+private:
+    size_t get_process_memory_mb() {
+        // Read from /proc/self/status on Linux
+        std::ifstream status("/proc/self/status");
+        std::string line;
+        while (std::getline(status, line)) {
+            if (line.find("VmRSS:") == 0) {
+                size_t kb = std::stoul(line.substr(line.find_last_of('\t') + 1));
+                return kb / 1024;
+            }
+        }
+        return 0;
+    }
+};
+
+} // namespace stress
+} // namespace hft
+
+================================================================================
+4. NETWORK CONGESTION SCENARIOS
+================================================================================
+
+// Network stress testing
+// File: network_stress_tests.cpp
+
+namespace hft {
+namespace stress {
+
+class NetworkStressTests {
+public:
+    // Test 1: Bandwidth saturation
+    void test_bandwidth_saturation() {
+        std::cout << "\n=== Network Bandwidth Saturation Test ===\n";
+
+        const size_t message_size = 1024 * 64;  // 64KB messages
+        const size_t target_bandwidth_mbps = 10000;  // 10 Gbps
+
+        StressTestConfig config;
+        config.num_threads = 16;
+        config.iterations_per_thread = 100000;
+        config.memory_pressure_mb = 0;
+
+        StressTestController controller(config);
+
+        std::atomic<uint64_t> bytes_sent{0};
+
+        auto send_work = [&]() -> bool {
+            // Simulate sending large message
+            std::vector<char> buffer(message_size, 0xFF);
+
+            // Simulate network send
+            simulate_network_send(buffer.data(), buffer.size());
+
+            bytes_sent.fetch_add(message_size);
+            return true;
+        };
+
+        auto start = std::chrono::high_resolution_clock::now();
+        controller.run_stress_test(send_work);
+        auto end = std::chrono::high_resolution_clock::now();
+
+        auto duration_sec = std::chrono::duration_cast<std::chrono::seconds>(
+            end - start).count();
+
+        double actual_mbps = (bytes_sent.load() * 8.0 / (1024*1024)) / duration_sec;
+
+        std::cout << "Actual bandwidth: " << actual_mbps << " Mbps\n";
+        std::cout << "Target bandwidth: " << target_bandwidth_mbps << " Mbps\n";
+    }
+
+    // Test 2: Packet loss simulation
+    void test_packet_loss_handling() {
+        std::cout << "\n=== Packet Loss Handling Test ===\n";
+
+        std::atomic<uint64_t> packets_sent{0};
+        std::atomic<uint64_t> packets_lost{0};
+        std::atomic<uint64_t> retransmissions{0};
+
+        const double packet_loss_rate = 0.05;  // 5% loss
+
+        StressTestConfig config;
+        config.num_threads = 8;
+        config.iterations_per_thread = 10000;
+        config.error_injection_rate = packet_loss_rate;
+
+        StressTestController controller(config);
+
+        auto send_with_retry = [&]() -> bool {
+            const int max_retries = 3;
+            int attempt = 0;
+
+            while (attempt < max_retries) {
+                packets_sent.fetch_add(1);
+
+                // Simulate packet loss
+                if (simulate_packet_loss(packet_loss_rate)) {
+                    packets_lost.fetch_add(1);
+                    retransmissions.fetch_add(1);
+                    attempt++;
+                    continue;
+                }
+
+                return true;  // Success
+            }
+
+            return false;  // Failed after retries
+        };
+
+        controller.run_stress_test(send_with_retry);
+
+        std::cout << "Packets sent: " << packets_sent.load() << "\n";
+        std::cout << "Packets lost: " << packets_lost.load() << "\n";
+        std::cout << "Retransmissions: " << retransmissions.load() << "\n";
+        std::cout << "Actual loss rate: "
+                  << (packets_lost.load() * 100.0 / packets_sent.load()) << "%\n";
+    }
+
+    // Test 3: Connection pool exhaustion
+    void test_connection_exhaustion() {
+        std::cout << "\n=== Connection Pool Exhaustion Test ===\n";
+
+        const size_t max_connections = 1000;
+        std::atomic<size_t> active_connections{0};
+        std::mutex conn_mutex;
+        std::condition_variable conn_cv;
+
+        StressTestConfig config;
+        config.num_threads = 2000;  // More threads than connections
+        config.iterations_per_thread = 10;
+        config.memory_pressure_mb = 0;
+
+        StressTestController controller(config);
+
+        auto connection_work = [&]() -> bool {
+            std::unique_lock<std::mutex> lock(conn_mutex);
+
+            // Wait for available connection
+            bool acquired = conn_cv.wait_for(lock, std::chrono::seconds(5), [&]() {
+                return active_connections.load() < max_connections;
+            });
+
+            if (!acquired) {
+                return false;  // Timeout waiting for connection
+            }
+
+            active_connections.fetch_add(1);
+            lock.unlock();
+
+            // Hold connection and do work
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+            // Release connection
+            active_connections.fetch_sub(1);
+            conn_cv.notify_one();
+
+            return true;
+        };
+
+        controller.run_stress_test(connection_work);
+    }
+
+    // Test 4: Network latency spike simulation
+    void test_latency_spikes() {
+        std::cout << "\n=== Network Latency Spike Test ===\n";
+
+        std::atomic<uint64_t> normal_latency_count{0};
+        std::atomic<uint64_t> spike_latency_count{0};
+
+        StressTestConfig config;
+        config.num_threads = 8;
+        config.iterations_per_thread = 10000;
+        config.memory_pressure_mb = 0;
+
+        StressTestController controller(config);
+
+        auto latency_work = [&]() -> bool {
+            static thread_local std::random_device rd;
+            static thread_local std::mt19937 gen(rd());
+            static thread_local std::uniform_real_distribution<> dis(0.0, 1.0);
+
+            // 10% chance of latency spike
+            if (dis(gen) < 0.10) {
+                // Spike: 50-200ms latency
+                std::uniform_int_distribution<> spike_dis(50, 200);
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(spike_dis(gen)));
+                spike_latency_count.fetch_add(1);
+            } else {
+                // Normal: 1-5ms latency
+                std::uniform_int_distribution<> normal_dis(1, 5);
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(normal_dis(gen)));
+                normal_latency_count.fetch_add(1);
+            }
+
+            return true;
+        };
+
+        controller.run_stress_test(latency_work);
+
+        std::cout << "Normal latency operations: "
+                  << normal_latency_count.load() << "\n";
+        std::cout << "Spike latency operations: "
+                  << spike_latency_count.load() << "\n";
+    }
+
+private:
+    void simulate_network_send(const char* data, size_t size) {
+        // Simulate network send delay
+        volatile size_t bytes = size;
+        (void)bytes;
+    }
+
+    bool simulate_packet_loss(double loss_rate) {
+        static std::random_device rd;
+        static std::mt19937 gen(rd());
+        static std::uniform_real_distribution<> dis(0.0, 1.0);
+
+        return dis(gen) < loss_rate;
+    }
+};
+
+} // namespace stress
+} // namespace hft
+
+================================================================================
+5. COMPREHENSIVE STRESS TEST SUITE
+================================================================================
+
+// Main stress test runner
+// File: run_stress_tests.cpp
+
+#include "cpu_stress_tests.cpp"
+#include "memory_stress_tests.cpp"
+#include "network_stress_tests.cpp"
+
+int main(int argc, char* argv[]) {
+    std::cout << "================================================\n";
+    std::cout << "HFT SYSTEM COMPREHENSIVE STRESS TEST SUITE\n";
+    std::cout << "================================================\n\n";
+
+    // CPU Stress Tests
+    hft::stress::CPUStressTests cpu_tests;
+    cpu_tests.test_cpu_bound_operations();
+    cpu_tests.test_spinlock_contention();
+    cpu_tests.test_context_switching();
+    cpu_tests.test_cache_thrashing();
+    cpu_tests.test_frequency_scaling();
+
+    // Memory Stress Tests
+    hft::stress::MemoryStressTests mem_tests;
+    // mem_tests.test_memory_exhaustion();  // Dangerous - may crash system
+    mem_tests.test_allocation_churn();
+    mem_tests.test_memory_fragmentation();
+    mem_tests.test_numa_memory_access();
+
+    // Network Stress Tests
+    hft::stress::NetworkStressTests net_tests;
+    net_tests.test_bandwidth_saturation();
+    net_tests.test_packet_loss_handling();
+    net_tests.test_connection_exhaustion();
+    net_tests.test_latency_spikes();
+
+    std::cout << "\n================================================\n";
+    std::cout << "STRESS TEST SUITE COMPLETED\n";
+    std::cout << "================================================\n";
+
+    return 0;
+}
+
+================================================================================
+STRESS TEST ACCEPTANCE CRITERIA
+================================================================================
+
+SYSTEM STABILITY REQUIREMENTS:
+==============================
+
+1. CPU Stress:
+   - System remains responsive under 100% CPU load
+   - No thread deadlocks or livelocks
+   - Performance degrades gracefully
+
+2. Memory Stress:
+   - Handles memory pressure up to 90% utilization
+   - No memory leaks during extended runs
+   - OOM handling is graceful (no crashes)
+
+3. Network Stress:
+   - Handles 95% bandwidth saturation
+   - Packet loss up to 10% with retry logic
+   - Connection pool exhaustion detected and queued
+
+4. Breaking Points:
+   - Document exact resource limits
+   - Identify first component to fail
+   - Measure time-to-failure under stress
+
+FAILURE MODES TO TEST:
+=====================
+- Out of memory
+- Thread pool exhaustion
+- File descriptor limits
+- Network buffer overflow
+- Lock convoy scenarios
+- Priority inversion
+- Resource starvation
+
+RECOVERY REQUIREMENTS:
+=====================
+- System recovers within 5 seconds
+- No data loss during recovery
+- All connections properly cleaned up
+- Metrics accurately reflect failure state
+
+================================================================================
+END OF STRESS TESTING SCENARIOS
+================================================================================

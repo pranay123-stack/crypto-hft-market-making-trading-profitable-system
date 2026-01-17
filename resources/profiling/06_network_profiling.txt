@@ -1,0 +1,621 @@
+================================================================================
+NETWORK PROFILING FOR HFT C++
+================================================================================
+
+THEORY:
+-------
+Network performance in HFT is critical - every microsecond counts.
+Key metrics:
+1. Latency: Time from send to receive (target: <10 microseconds local)
+2. Jitter: Variation in latency (must be minimal)
+3. Throughput: Packets/messages per second
+4. Packet loss: Must be zero in HFT networks
+5. Kernel bypass overhead: Userspace vs kernel networking
+
+Network stack latency breakdown:
+- Application to kernel: 1-5 microseconds
+- Kernel processing: 5-20 microseconds
+- NIC processing: 1-5 microseconds
+- Wire time: depends on distance/switch hops
+- Receive side: symmetric to send
+
+HFT networking approaches:
+- Kernel bypass (DPDK, Solarflare OpenOnload)
+- Kernel tuning (interrupt coalescing, polling)
+- TCP vs UDP (UDP preferred for low latency)
+- Multicast for market data
+
+TOOLS OVERVIEW:
+---------------
+1. tcpdump/tshark - Packet capture and analysis
+2. iperf3/netperf - Network bandwidth/latency testing
+3. ss/netstat - Socket statistics
+4. ethtool - NIC statistics and tuning
+5. perf - Network stack profiling
+6. bpftrace/bcc - eBPF-based network tracing
+7. Wireshark - GUI packet analysis
+
+================================================================================
+1. TCPDUMP/TSHARK - PACKET CAPTURE
+================================================================================
+
+THEORY:
+Capture and analyze network packets to:
+- Verify message format and correctness
+- Measure actual wire latency
+- Debug protocol issues
+- Analyze packet timing
+
+INSTALLATION:
+sudo apt-get install tcpdump tshark wireshark
+
+PROCESS:
+--------
+# Capture packets on interface
+sudo tcpdump -i eth0
+
+# Capture with timestamps (microsecond precision)
+sudo tcpdump -i eth0 -tttt -n
+
+# Capture to file for later analysis
+sudo tcpdump -i eth0 -w capture.pcap
+
+# Read from file
+tcpdump -r capture.pcap
+
+# Filter specific port (e.g., trading port 12345)
+sudo tcpdump -i eth0 port 12345
+
+# Filter specific host
+sudo tcpdump -i eth0 host 192.168.1.100
+
+# Show packet contents in hex and ASCII
+sudo tcpdump -i eth0 -XX port 12345
+
+# Use tshark for more detailed analysis
+sudo tshark -i eth0 -Y "tcp.port == 12345" -T fields -e frame.time -e ip.src -e ip.dst
+
+HFT C++ EXAMPLE (UDP Market Data Receiver):
+--------------------------------------------
+
+// udp_market_data.cpp
+#include <iostream>
+#include <cstring>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <chrono>
+
+struct MarketDataMsg {
+    uint64_t timestamp;
+    char symbol[8];
+    double price;
+    uint64_t volume;
+} __attribute__((packed));
+
+void receiveMarketData(int port, int num_messages) {
+    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd < 0) {
+        std::cerr << "Socket creation failed\n";
+        return;
+    }
+
+    struct sockaddr_in servaddr;
+    memset(&servaddr, 0, sizeof(servaddr));
+    servaddr.sin_family = AF_INET;
+    servaddr.sin_addr.s_addr = INADDR_ANY;
+    servaddr.sin_port = htons(port);
+
+    if (bind(sockfd, (const struct sockaddr*)&servaddr, sizeof(servaddr)) < 0) {
+        std::cerr << "Bind failed\n";
+        close(sockfd);
+        return;
+    }
+
+    MarketDataMsg msg;
+    int received = 0;
+
+    std::cout << "Listening on port " << port << "...\n";
+
+    while (received < num_messages) {
+        ssize_t n = recvfrom(sockfd, &msg, sizeof(msg), 0, nullptr, nullptr);
+
+        if (n > 0) {
+            auto now = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::system_clock::now().time_since_epoch()
+            ).count();
+
+            // Calculate latency (assumes sender timestamp is in message)
+            uint64_t latency_us = now - msg.timestamp;
+
+            std::cout << "Symbol: " << std::string(msg.symbol, 8)
+                      << ", Price: " << msg.price
+                      << ", Volume: " << msg.volume
+                      << ", Latency: " << latency_us << " us\n";
+
+            received++;
+        }
+    }
+
+    close(sockfd);
+}
+
+int main() {
+    receiveMarketData(12345, 100);
+    return 0;
+}
+
+WORKFLOW:
+---------
+# Compile
+g++ -O2 -g -std=c++17 udp_market_data.cpp -o market_data_recv
+
+# In one terminal, start capturing
+sudo tcpdump -i lo -tttt -n port 12345 -w market_data.pcap
+
+# In another terminal, run the receiver
+./market_data_recv
+
+# (In a third terminal, you'd run a sender - not shown here)
+
+# Analyze the capture
+tcpdump -r market_data.pcap -tttt -n
+
+# Or with tshark for detailed timing
+tshark -r market_data.pcap -T fields -e frame.time_relative -e udp.length
+
+# Calculate inter-packet gaps
+tshark -r market_data.pcap -T fields -e frame.time_delta
+
+================================================================================
+2. IPERF3 - NETWORK PERFORMANCE TESTING
+================================================================================
+
+THEORY:
+iperf3 measures:
+- Maximum bandwidth
+- Latency under load
+- Packet loss
+- Jitter
+
+INSTALLATION:
+sudo apt-get install iperf3
+
+PROCESS:
+--------
+# On server machine
+iperf3 -s
+
+# On client machine - TCP test
+iperf3 -c server_ip
+
+# UDP test with specific bandwidth
+iperf3 -c server_ip -u -b 1G
+
+# Measure latency (one-way)
+iperf3 -c server_ip --get-server-output
+
+# Reverse mode (server sends)
+iperf3 -c server_ip -R
+
+# Set packet size (important for HFT - small packets)
+iperf3 -c server_ip -M 512
+
+# Run for specific duration
+iperf3 -c server_ip -t 60
+
+# Multiple parallel streams
+iperf3 -c server_ip -P 4
+
+HFT-SPECIFIC TESTING:
+---------------------
+# Small packet UDP test (typical for HFT messages)
+iperf3 -c server_ip -u -l 128 -b 100M
+
+# Measure jitter (critical for HFT)
+iperf3 -c server_ip -u -b 100M --get-server-output
+
+INTERPRETING RESULTS:
+---------------------
+[ ID] Interval           Transfer     Bitrate         Jitter
+[  5]   0.00-1.00   sec  12.5 MBytes   105 Mbits/sec  0.015 ms
+
+For HFT:
+- Jitter should be <0.1 ms (preferably <0.01 ms)
+- No packet loss acceptable
+- Focus on latency, not just bandwidth
+
+================================================================================
+3. SS (SOCKET STATISTICS)
+================================================================================
+
+THEORY:
+ss is the modern replacement for netstat. Shows:
+- Active connections
+- Socket statistics
+- Queue depths (send/receive buffers)
+- Connection state
+
+PROCESS:
+--------
+# Show all TCP connections
+ss -tan
+
+# Show all UDP sockets
+ss -uan
+
+# Show listening sockets
+ss -tln
+
+# Show socket memory usage
+ss -tm
+
+# Show detailed socket info
+ss -tina
+
+# Monitor specific port
+ss -tan 'sport = :12345'
+
+# Show socket queue depths
+ss -tan -o
+
+HFT EXAMPLE:
+------------
+# Monitor order entry port
+watch -n 0.1 'ss -tan sport = :12345'
+
+# Check for dropped packets (queue overflows)
+ss -tan -m | grep -E "skmem|drops"
+
+INTERPRETING OUTPUT:
+--------------------
+State      Recv-Q Send-Q Local Address:Port  Peer Address:Port
+ESTAB      0      0      192.168.1.10:12345  192.168.1.20:54321
+
+Recv-Q: Bytes in receive queue (should be near 0 for low latency)
+Send-Q: Bytes in send queue (should be near 0 for low latency)
+
+If queues are building up:
+- Application not reading fast enough (Recv-Q)
+- Network congestion or slow receiver (Send-Q)
+
+================================================================================
+4. ETHTOOL - NIC CONFIGURATION & STATISTICS
+================================================================================
+
+THEORY:
+ethtool controls NIC parameters affecting latency:
+- Interrupt coalescing (batching interrupts)
+- Ring buffer sizes
+- Offloading features (TSO, GSO, GRO)
+- Link speed and duplex
+
+INSTALLATION:
+Usually pre-installed on Linux
+
+PROCESS:
+--------
+# Show NIC settings
+sudo ethtool eth0
+
+# Show NIC statistics
+sudo ethtool -S eth0
+
+# Show interrupt coalescing settings (critical for HFT!)
+sudo ethtool -c eth0
+
+# Disable interrupt coalescing (minimize latency)
+sudo ethtool -C eth0 rx-usecs 0 tx-usecs 0
+
+# Show ring buffer sizes
+sudo ethtool -g eth0
+
+# Increase ring buffer (reduce drops under load)
+sudo ethtool -G eth0 rx 4096 tx 4096
+
+# Disable offloading (for latency, not throughput)
+sudo ethtool -K eth0 gro off gso off tso off
+
+# Show driver info
+sudo ethtool -i eth0
+
+HFT TUNING:
+-----------
+# Disable all offloading for minimum latency
+sudo ethtool -K eth0 rx off tx off sg off tso off ufo off gso off gro off lro off
+
+# Set interrupt coalescing to 0 (interrupt per packet)
+sudo ethtool -C eth0 rx-usecs 0 rx-frames 1 tx-usecs 0 tx-frames 1
+
+# Monitor NIC errors and drops
+watch -n 1 'ethtool -S eth0 | grep -E "drop|error|miss"'
+
+INTERPRETING STATISTICS:
+------------------------
+sudo ethtool -S eth0
+
+Key metrics for HFT:
+rx_dropped: Packets dropped by NIC (should be 0)
+rx_errors: Receive errors (should be 0)
+rx_missed_errors: Packets NIC couldn't handle (should be 0)
+tx_dropped: Transmit drops (should be 0)
+
+If you see drops:
+- Increase ring buffer size
+- Check CPU affinity for IRQ handling
+- Consider NIC with more queues/better performance
+
+================================================================================
+5. PERF - NETWORK STACK PROFILING
+================================================================================
+
+THEORY:
+Profile Linux network stack to find bottlenecks:
+- Time spent in network syscalls
+- Kernel network processing overhead
+- Interrupt handling cost
+
+PROCESS:
+--------
+# Trace network syscalls
+sudo perf trace -e 'syscalls:sys_enter_send*,syscalls:sys_enter_recv*' ./your_app
+
+# Profile network-heavy application
+sudo perf record -e net:* -a ./your_app
+sudo perf report
+
+# Record network events
+sudo perf record -e skb:* -a ./your_app
+
+# Monitor network interrupts
+sudo perf stat -e 'irq:*' -a sleep 10
+
+HFT C++ EXAMPLE (Syscall Profiling):
+-------------------------------------
+
+// network_syscalls.cpp
+#include <iostream>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <cstring>
+#include <chrono>
+
+void sendMessages(const char* server_ip, int port, int num_messages) {
+    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+
+    struct sockaddr_in servaddr;
+    memset(&servaddr, 0, sizeof(servaddr));
+    servaddr.sin_family = AF_INET;
+    servaddr.sin_port = htons(port);
+    inet_pton(AF_INET, server_ip, &servaddr.sin_addr);
+
+    char message[128];
+    strcpy(message, "MARKET_DATA");
+
+    auto start = std::chrono::high_resolution_clock::now();
+
+    for (int i = 0; i < num_messages; ++i) {
+        sendto(sockfd, message, strlen(message), 0,
+               (const struct sockaddr*)&servaddr, sizeof(servaddr));
+    }
+
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+
+    std::cout << "Sent " << num_messages << " messages in "
+              << duration.count() << " us\n";
+    std::cout << "Average: " << (duration.count() / num_messages) << " us/msg\n";
+
+    close(sockfd);
+}
+
+int main() {
+    sendMessages("127.0.0.1", 12345, 100000);
+    return 0;
+}
+
+WORKFLOW:
+---------
+# Compile
+g++ -O2 -g -std=c++17 network_syscalls.cpp -o net_send
+
+# Profile with perf
+sudo perf record -e 'syscalls:sys_enter_sendto' -a ./net_send
+sudo perf report
+
+# Or trace all network activity
+sudo perf trace -e 'net:*' ./net_send
+
+================================================================================
+6. BPFTRACE/BCC - eBPF NETWORK TRACING
+================================================================================
+
+THEORY:
+eBPF allows low-overhead tracing of kernel network stack.
+Tools:
+- tcplife: TCP connection lifetimes
+- tcpretrans: TCP retransmissions
+- tcptop: TCP throughput by connection
+- udpconnect: UDP connection tracking
+
+INSTALLATION:
+sudo apt-get install bpftrace bpfcc-tools
+
+PROCESS:
+--------
+# Monitor TCP connections
+sudo tcplife
+
+# Track TCP retransmissions (BAD for HFT!)
+sudo tcpretrans
+
+# Top connections by throughput
+sudo tcptop
+
+# Trace UDP send latency
+sudo bpftrace -e 'kprobe:udp_sendmsg { @start[tid] = nsecs; }
+                   kretprobe:udp_sendmsg /@start[tid]/ {
+                     @latency_us = hist((nsecs - @start[tid]) / 1000);
+                     delete(@start[tid]);
+                   }'
+
+# Trace network packet processing time
+sudo bpftrace -e 'tracepoint:net:netif_receive_skb {
+                     @packets = count();
+                   }'
+
+================================================================================
+7. KERNEL NETWORK TUNING FOR HFT
+================================================================================
+
+CRITICAL SYSCTL SETTINGS:
+--------------------------
+
+# Increase socket buffer sizes
+sudo sysctl -w net.core.rmem_max=134217728
+sudo sysctl -w net.core.wmem_max=134217728
+sudo sysctl -w net.core.rmem_default=16777216
+sudo sysctl -w net.core.wmem_default=16777216
+
+# Increase network device backlog
+sudo sysctl -w net.core.netdev_max_backlog=5000
+
+# TCP tuning (if using TCP)
+sudo sysctl -w net.ipv4.tcp_rmem='4096 87380 134217728'
+sudo sysctl -w net.ipv4.tcp_wmem='4096 65536 134217728'
+sudo sysctl -w net.ipv4.tcp_timestamps=1
+sudo sysctl -w net.ipv4.tcp_sack=1
+sudo sysctl -w net.ipv4.tcp_no_metrics_save=1
+
+# Disable TCP slow start after idle (critical!)
+sudo sysctl -w net.ipv4.tcp_slow_start_after_idle=0
+
+# Enable low latency mode
+sudo sysctl -w net.ipv4.tcp_low_latency=1
+
+# UDP tuning
+sudo sysctl -w net.ipv4.udp_rmem_min=16384
+sudo sysctl -w net.ipv4.udp_wmem_min=16384
+
+MAKE PERMANENT:
+Add to /etc/sysctl.conf
+
+IRQ AFFINITY:
+-------------
+# Pin network IRQ to specific CPU
+# Find IRQ number
+grep eth0 /proc/interrupts
+
+# Set affinity (example: pin to CPU 2)
+echo 4 | sudo tee /proc/irq/IRQ_NUMBER/smp_affinity
+
+================================================================================
+8. TIMESTAMPING & LATENCY MEASUREMENT
+================================================================================
+
+HARDWARE TIMESTAMPING:
+----------------------
+Modern NICs support hardware timestamping for accurate latency measurement.
+
+HFT C++ EXAMPLE (Software Timestamping):
+-----------------------------------------
+
+// latency_measurement.cpp
+#include <iostream>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <linux/net_tstamp.h>
+#include <linux/errqueue.h>
+#include <unistd.h>
+#include <cstring>
+
+void enableTimestamping(int sockfd) {
+    int flags = SOF_TIMESTAMPING_TX_SOFTWARE |
+                SOF_TIMESTAMPING_RX_SOFTWARE |
+                SOF_TIMESTAMPING_SOFTWARE;
+
+    if (setsockopt(sockfd, SOL_SOCKET, SO_TIMESTAMPING,
+                   &flags, sizeof(flags)) < 0) {
+        std::cerr << "Failed to enable timestamping\n";
+    }
+}
+
+void sendWithTimestamp(int sockfd, const struct sockaddr_in* dest) {
+    char message[] = "TEST";
+
+    sendto(sockfd, message, sizeof(message), 0,
+           (struct sockaddr*)dest, sizeof(*dest));
+
+    // Retrieve TX timestamp from error queue
+    char control[512];
+    struct msghdr msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_control = control;
+    msg.msg_controllen = sizeof(control);
+
+    if (recvmsg(sockfd, &msg, MSG_ERRQUEUE) >= 0) {
+        struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+        if (cmsg && cmsg->cmsg_level == SOL_SOCKET &&
+            cmsg->cmsg_type == SO_TIMESTAMPING) {
+            struct timespec* ts = (struct timespec*)CMSG_DATA(cmsg);
+            std::cout << "TX timestamp: " << ts[0].tv_sec << "."
+                      << ts[0].tv_nsec << "\n";
+        }
+    }
+}
+
+int main() {
+    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    enableTimestamping(sockfd);
+
+    struct sockaddr_in dest;
+    memset(&dest, 0, sizeof(dest));
+    dest.sin_family = AF_INET;
+    dest.sin_port = htons(12345);
+    dest.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+    sendWithTimestamp(sockfd, &dest);
+
+    close(sockfd);
+    return 0;
+}
+
+================================================================================
+KERNEL BYPASS TECHNOLOGIES
+================================================================================
+
+For ultra-low latency, bypass kernel entirely:
+
+1. DPDK (Data Plane Development Kit)
+   - Userspace packet processing
+   - Poll-mode drivers (no interrupts)
+   - Latency: <1 microsecond
+
+2. Solarflare OpenOnload
+   - User-level TCP/UDP stack
+   - Kernel bypass with standard sockets API
+   - Latency: 1-2 microseconds
+
+3. Mellanox VMA (Voltaire Messaging Accelerator)
+   - Accelerated sockets library
+   - RDMA support
+
+These are beyond basic profiling but critical for HFT production systems.
+
+================================================================================
+BEST PRACTICES FOR HFT NETWORKING
+================================================================================
+
+1. Use UDP for market data (multicast where possible)
+2. Use TCP only where reliability is required (order entry)
+3. Disable interrupt coalescing
+4. Pin network IRQs to dedicated CPUs
+5. Use kernel bypass (DPDK/OpenOnload) for best latency
+6. Monitor packet drops continuously
+7. Measure jitter, not just average latency
+8. Test under load (realistic message rates)
+9. Use hardware timestamping for accurate measurement
+10. Tune kernel network stack parameters

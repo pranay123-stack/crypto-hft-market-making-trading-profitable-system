@@ -1,0 +1,1015 @@
+================================================================================
+                    MULTICAST PROTOCOLS DOCUMENTATION
+                  UDP Multicast for Market Data Distribution
+                      High-Performance One-to-Many Streaming
+================================================================================
+
+TABLE OF CONTENTS
+================================================================================
+1. Protocol Overview
+2. Multicast Fundamentals
+3. Feed Handler Architecture
+4. Gap Detection and Recovery
+5. C++ Implementation
+6. Performance Optimization
+7. Real-World Examples
+8. Troubleshooting
+
+================================================================================
+1. PROTOCOL OVERVIEW
+================================================================================
+
+1.1 INTRODUCTION
+----------------
+UDP multicast is the industry standard for distributing market data feeds from
+exchanges to multiple subscribers simultaneously. It provides the lowest
+possible latency for market data delivery.
+
+Key Characteristics:
+- One-to-many distribution (single packet reaches all subscribers)
+- UDP-based (no connection overhead, no acknowledgments)
+- Unreliable delivery (packets can be lost)
+- Extremely low latency (<10us additional overhead)
+- Requires gap detection and recovery mechanisms
+- Network infrastructure must support multicast (IGMP)
+
+Performance Profile:
+Metric                Value           Notes
+Latency overhead      5-15us          vs unicast UDP
+Packet loss rate      0.001%-0.1%     Depends on network quality
+Recovery latency      50-500us        Depends on mechanism
+Throughput           1M+ msgs/sec     Per feed
+Bandwidth savings    90%+             vs unicast to N subscribers
+
+Use Cases:
+- Exchange market data feeds
+- Order book updates
+- Trade tick data
+- Reference data distribution
+- Time synchronization (PTP)
+
+Not Suitable For:
+- Order entry (requires reliability)
+- Request-response patterns
+- Networks without multicast support
+- Public internet (blocked by most ISPs)
+
+1.2 MULTICAST vs UNICAST
+-------------------------
+Unicast (Point-to-Point):
+Exchange --> Subscriber 1
+Exchange --> Subscriber 2
+Exchange --> Subscriber 3
+N connections, N bandwidth usage
+
+Multicast (One-to-Many):
+Exchange --> (Multicast Group) --> Subscriber 1
+                                --> Subscriber 2
+                                --> Subscriber 3
+1 transmission, minimal bandwidth
+
+Bandwidth Comparison (1000 subscribers, 1 Mbps feed):
+Unicast: 1000 Mbps
+Multicast: 1 Mbps
+
+1.3 COMMON EXCHANGE FEEDS
+--------------------------
+Exchange    Feed Name       Protocol        Multicast Groups
+CME         MDP 3.0         SBE             224.0.28.x
+NASDAQ      ITCH            Binary          233.54.12.x
+NYSE        Pillar          Binary          224.0.130.x
+Eurex       EOBI            Binary          224.0.x.x
+LSE         Millennium      Binary          239.x.x.x
+
+Typical Feed Structure:
+- Incremental feed (real-time updates)
+- Snapshot feed (periodic full state)
+- Instrument definition feed (reference data)
+- Recovery feed (retransmission)
+
+================================================================================
+2. MULTICAST FUNDAMENTALS
+================================================================================
+
+2.1 MULTICAST ADDRESSING
+-------------------------
+IPv4 Multicast Range: 224.0.0.0 to 239.255.255.255
+
+Reserved Addresses:
+224.0.0.0 - 224.0.0.255    Local network control
+224.0.1.0 - 238.255.255.255  Administratively scoped
+239.0.0.0 - 239.255.255.255  Organization-local scope
+
+Example Market Data Groups:
+224.0.28.1:14310  - CME Equities Incremental Feed
+224.0.28.2:14311  - CME Equities Snapshot Feed
+233.54.12.1:26000 - NASDAQ TotalView ITCH
+
+2.2 IGMP (Internet Group Management Protocol)
+----------------------------------------------
+Used by hosts to join/leave multicast groups.
+
+Join Group:
+1. Application calls setsockopt(IP_ADD_MEMBERSHIP)
+2. Host sends IGMP Membership Report
+3. Router adds host to forwarding table
+4. Multicast packets forwarded to host
+
+Leave Group:
+1. Application calls setsockopt(IP_DROP_MEMBERSHIP)
+2. Host sends IGMP Leave Group
+3. Router removes host from forwarding table
+
+2.3 PACKET STRUCTURE
+--------------------
++------------------+
+| Ethernet Header  |  (14 bytes)
++------------------+
+| IP Header        |  (20 bytes, Destination = Multicast Group)
++------------------+
+| UDP Header       |  (8 bytes)
++------------------+
+| Application Data |  (Market data message)
++------------------+
+
+Total Overhead: 42 bytes per packet
+MTU: 1500 bytes (typical Ethernet)
+Max Payload: 1458 bytes
+
+2.4 PACKET SEQUENCING
+----------------------
+All market data feeds include sequence numbers for gap detection:
+
+Packet Structure:
++-----------------+
+| Packet Header   |  (Sequence number, timestamp)
++-----------------+
+| Message 1       |  (Market data message)
++-----------------+
+| Message 2       |  (Multiple messages per packet)
++-----------------+
+| ...             |
++-----------------+
+
+Sequence Number Management:
+- Monotonically increasing (starts at 1)
+- Increments by 1 per packet
+- Resets on session boundary
+- Used for gap detection
+
+Gap Detection:
+Expected: 100
+Received: 102
+Gap: Packets 100-101 missing
+Action: Request retransmission or snapshot
+
+================================================================================
+3. FEED HANDLER ARCHITECTURE
+================================================================================
+
+3.1 SYSTEM ARCHITECTURE
+------------------------
++----------------------+
+| Raw Packet Capture   |  (Kernel bypass, DPDK)
++----------------------+
+         |
+         v
++----------------------+
+| Packet Parser        |  (Decode UDP/IP headers)
++----------------------+
+         |
+         v
++----------------------+
+| Sequence Validator   |  (Detect gaps)
++----------------------+
+         |
+         v
++----------------------+
+| Message Decoder      |  (Parse market data)
++----------------------+
+         |
+    +----+----+
+    |         |
+    v         v
++--------+ +--------+
+| Gap    | | Order  |
+| Handler| | Book   |
++--------+ +--------+
+
+3.2 THREADING MODEL
+-------------------
+Model 1: Single Thread (Lowest Latency)
+Thread 1: Receive -> Parse -> Decode -> Process
+Latency: ~500ns
+Throughput: ~2M msgs/sec
+
+Model 2: Pipeline (Higher Throughput)
+Thread 1: Receive -> Parse
+Thread 2: Decode
+Thread 3: Process
+Latency: ~1-2us
+Throughput: ~5M msgs/sec
+
+Model 3: Per-Symbol (Scalable)
+Thread 1: Receive -> Parse -> Route by symbol
+Thread 2-N: Decode -> Process (per symbol group)
+Latency: ~2-3us
+Throughput: 10M+ msgs/sec
+
+3.3 BUFFER MANAGEMENT
+----------------------
+Ring Buffer Pattern:
++---+---+---+---+---+---+---+---+
+| 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
++---+---+---+---+---+---+---+---+
+  ^               ^
+  |               |
+ Read           Write
+
+Pre-allocated Buffers:
+- Avoid dynamic allocation
+- Huge pages for large buffers
+- Memory-mapped for kernel bypass
+- Lock-free queues between threads
+
+================================================================================
+4. GAP DETECTION AND RECOVERY
+================================================================================
+
+4.1 GAP DETECTION
+-----------------
+class SequenceValidator {
+private:
+    uint64_t expected_seq_num_;
+    std::vector<Gap> gaps_;
+
+    struct Gap {
+        uint64_t start;
+        uint64_t end;
+        std::chrono::steady_clock::time_point detected_time;
+    };
+
+public:
+    SequenceValidator() : expected_seq_num_(1) {}
+
+    bool validate(uint64_t seq_num) {
+        if (seq_num == expected_seq_num_) {
+            expected_seq_num_++;
+            return true;
+        } else if (seq_num > expected_seq_num_) {
+            // Gap detected
+            Gap gap;
+            gap.start = expected_seq_num_;
+            gap.end = seq_num - 1;
+            gap.detected_time = std::chrono::steady_clock::now();
+            gaps_.push_back(gap);
+
+            expected_seq_num_ = seq_num + 1;
+            return false;
+        } else {
+            // Out-of-order or duplicate
+            return handleOutOfOrder(seq_num);
+        }
+    }
+
+    const std::vector<Gap>& getGaps() const {
+        return gaps_;
+    }
+
+private:
+    bool handleOutOfOrder(uint64_t seq_num) {
+        // Check if this fills a gap
+        for (auto it = gaps_.begin(); it != gaps_.end(); ++it) {
+            if (seq_num >= it->start && seq_num <= it->end) {
+                // Fills part of gap
+                if (seq_num == it->start) {
+                    it->start++;
+                    if (it->start > it->end) {
+                        gaps_.erase(it);
+                    }
+                    return true;
+                } else if (seq_num == it->end) {
+                    it->end--;
+                    if (it->start > it->end) {
+                        gaps_.erase(it);
+                    }
+                    return true;
+                }
+                // Splits gap
+                return true;
+            }
+        }
+
+        // Duplicate or very old packet
+        return false;
+    }
+};
+
+4.2 RECOVERY MECHANISMS
+-----------------------
+Mechanism 1: Snapshot + Incremental
+- Subscribe to both snapshot and incremental feeds
+- Use snapshot as baseline
+- Apply incrementals with seq_num > snapshot seq_num
+- Recovery time: ~100-500ms
+
+Mechanism 2: Retransmission Request (Unicast)
+- Send TCP/UDP request for missing packets
+- Exchange retransmits via unicast
+- Recovery time: ~1-10ms (network RTT dependent)
+
+Mechanism 3: Secondary Multicast Feed
+- Exchange provides redundant multicast feed
+- Different network path
+- Switch on gap detection
+- Recovery time: ~100us-1ms
+
+Mechanism 4: Request-Response (Last Resort)
+- Request full snapshot via TCP
+- Rebuild order book
+- Recovery time: ~50-500ms
+
+4.3 RETRANSMISSION PROTOCOL
+----------------------------
+Request (TCP/UDP Unicast):
+struct RetransRequest {
+    char msg_type;           // 'R'
+    uint16_t channel_id;     // Feed channel
+    uint64_t start_seq_num;  // First missing sequence
+    uint64_t end_seq_num;    // Last missing sequence
+} __attribute__((packed));
+
+Response (UDP Unicast):
+Same packet format as original multicast, but via unicast.
+
+Example:
+Gap detected: Seq 1000-1005 missing
+Send RetransRequest: channel=1, start=1000, end=1005
+Receive: 6 packets via unicast (seq 1000, 1001, ..., 1005)
+Apply to order book
+
+4.4 BUFFER MANAGEMENT FOR GAPS
+-------------------------------
+class GapBuffer {
+private:
+    struct PacketBuffer {
+        uint64_t seq_num;
+        uint8_t data[1500];
+        size_t length;
+        bool occupied;
+    };
+
+    std::vector<PacketBuffer> buffers_;
+    const size_t buffer_size_ = 10000;  // ~15 MB
+
+public:
+    GapBuffer() : buffers_(buffer_size_) {
+        for (auto& buf : buffers_) {
+            buf.occupied = false;
+        }
+    }
+
+    void store(uint64_t seq_num, const uint8_t* data, size_t length) {
+        size_t index = seq_num % buffer_size_;
+
+        buffers_[index].seq_num = seq_num;
+        memcpy(buffers_[index].data, data, length);
+        buffers_[index].length = length;
+        buffers_[index].occupied = true;
+    }
+
+    bool retrieve(uint64_t seq_num, uint8_t* data, size_t& length) {
+        size_t index = seq_num % buffer_size_;
+
+        if (buffers_[index].occupied &&
+            buffers_[index].seq_num == seq_num) {
+            memcpy(data, buffers_[index].data, buffers_[index].length);
+            length = buffers_[index].length;
+            return true;
+        }
+
+        return false;
+    }
+};
+
+================================================================================
+5. C++ IMPLEMENTATION
+================================================================================
+
+5.1 BASIC MULTICAST RECEIVER
+-----------------------------
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <cstring>
+#include <iostream>
+
+class MulticastReceiver {
+private:
+    int socket_fd_;
+    std::string multicast_group_;
+    uint16_t port_;
+
+public:
+    MulticastReceiver(const std::string& group, uint16_t port)
+        : socket_fd_(-1)
+        , multicast_group_(group)
+        , port_(port) {
+    }
+
+    ~MulticastReceiver() {
+        if (socket_fd_ >= 0) {
+            close(socket_fd_);
+        }
+    }
+
+    bool init() {
+        // Create UDP socket
+        socket_fd_ = socket(AF_INET, SOCK_DGRAM, 0);
+        if (socket_fd_ < 0) {
+            perror("socket");
+            return false;
+        }
+
+        // Allow multiple sockets to bind to same port
+        int reuse = 1;
+        if (setsockopt(socket_fd_, SOL_SOCKET, SO_REUSEADDR,
+                      &reuse, sizeof(reuse)) < 0) {
+            perror("SO_REUSEADDR");
+            return false;
+        }
+
+        // Bind to port (any interface)
+        struct sockaddr_in local_addr;
+        memset(&local_addr, 0, sizeof(local_addr));
+        local_addr.sin_family = AF_INET;
+        local_addr.sin_addr.s_addr = INADDR_ANY;
+        local_addr.sin_port = htons(port_);
+
+        if (bind(socket_fd_, (struct sockaddr*)&local_addr,
+                sizeof(local_addr)) < 0) {
+            perror("bind");
+            return false;
+        }
+
+        // Join multicast group
+        struct ip_mreq mreq;
+        mreq.imr_multiaddr.s_addr = inet_addr(multicast_group_.c_str());
+        mreq.imr_interface.s_addr = INADDR_ANY;
+
+        if (setsockopt(socket_fd_, IPPROTO_IP, IP_ADD_MEMBERSHIP,
+                      &mreq, sizeof(mreq)) < 0) {
+            perror("IP_ADD_MEMBERSHIP");
+            return false;
+        }
+
+        // Set receive buffer size (important!)
+        int buf_size = 16 * 1024 * 1024;  // 16 MB
+        if (setsockopt(socket_fd_, SOL_SOCKET, SO_RCVBUF,
+                      &buf_size, sizeof(buf_size)) < 0) {
+            perror("SO_RCVBUF");
+        }
+
+        return true;
+    }
+
+    ssize_t receive(uint8_t* buffer, size_t buffer_size) {
+        struct sockaddr_in sender_addr;
+        socklen_t addr_len = sizeof(sender_addr);
+
+        ssize_t bytes = recvfrom(socket_fd_, buffer, buffer_size, 0,
+                                (struct sockaddr*)&sender_addr, &addr_len);
+
+        if (bytes < 0) {
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                perror("recvfrom");
+            }
+            return -1;
+        }
+
+        return bytes;
+    }
+
+    int getFd() const { return socket_fd_; }
+};
+
+5.2 HIGH-PERFORMANCE RECEIVER
+-------------------------------
+#include <sys/socket.h>
+#include <linux/if_packet.h>
+#include <net/ethernet.h>
+#include <net/if.h>
+#include <sys/ioctl.h>
+
+class HighPerfMulticastReceiver {
+private:
+    int socket_fd_;
+    uint8_t* ring_buffer_;
+    size_t ring_size_;
+    size_t ring_position_;
+
+public:
+    HighPerfMulticastReceiver()
+        : socket_fd_(-1)
+        , ring_buffer_(nullptr)
+        , ring_size_(256 * 1024 * 1024)  // 256 MB
+        , ring_position_(0) {
+    }
+
+    bool init(const std::string& interface,
+             const std::string& multicast_group,
+             uint16_t port) {
+        // Create raw socket
+        socket_fd_ = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+        if (socket_fd_ < 0) {
+            perror("socket");
+            return false;
+        }
+
+        // Get interface index
+        struct ifreq ifr;
+        strncpy(ifr.ifr_name, interface.c_str(), IFNAMSIZ);
+        if (ioctl(socket_fd_, SIOCGIFINDEX, &ifr) < 0) {
+            perror("SIOCGIFINDEX");
+            return false;
+        }
+
+        // Bind to interface
+        struct sockaddr_ll sll;
+        memset(&sll, 0, sizeof(sll));
+        sll.sll_family = AF_PACKET;
+        sll.sll_ifindex = ifr.ifr_ifindex;
+        sll.sll_protocol = htons(ETH_P_ALL);
+
+        if (bind(socket_fd_, (struct sockaddr*)&sll, sizeof(sll)) < 0) {
+            perror("bind");
+            return false;
+        }
+
+        // Allocate ring buffer (huge pages)
+        ring_buffer_ = (uint8_t*)mmap(nullptr, ring_size_,
+                                     PROT_READ | PROT_WRITE,
+                                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB,
+                                     -1, 0);
+
+        if (ring_buffer_ == MAP_FAILED) {
+            // Fallback to regular pages
+            ring_buffer_ = (uint8_t*)mmap(nullptr, ring_size_,
+                                         PROT_READ | PROT_WRITE,
+                                         MAP_PRIVATE | MAP_ANONYMOUS,
+                                         -1, 0);
+            if (ring_buffer_ == MAP_FAILED) {
+                perror("mmap");
+                return false;
+            }
+        }
+
+        // Lock pages in memory
+        if (mlock(ring_buffer_, ring_size_) < 0) {
+            perror("mlock");
+        }
+
+        return true;
+    }
+
+    ~HighPerfMulticastReceiver() {
+        if (ring_buffer_) {
+            munmap(ring_buffer_, ring_size_);
+        }
+        if (socket_fd_ >= 0) {
+            close(socket_fd_);
+        }
+    }
+
+    // Poll-based receiving (busy-wait)
+    ssize_t receivePolling(uint8_t*& packet_ptr) {
+        while (true) {
+            ssize_t bytes = recv(socket_fd_,
+                                ring_buffer_ + ring_position_,
+                                ring_size_ - ring_position_,
+                                MSG_DONTWAIT);
+
+            if (bytes > 0) {
+                packet_ptr = ring_buffer_ + ring_position_;
+                ring_position_ = (ring_position_ + bytes) % ring_size_;
+                return bytes;
+            } else if (bytes < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    // No data, keep polling
+                    _mm_pause();  // CPU hint for spin-wait
+                    continue;
+                }
+                perror("recv");
+                return -1;
+            }
+        }
+    }
+};
+
+5.3 FEED HANDLER
+----------------
+#include <thread>
+#include <atomic>
+#include <chrono>
+
+class FeedHandler {
+private:
+    MulticastReceiver receiver_;
+    SequenceValidator validator_;
+    std::atomic<bool> running_{false};
+    std::thread receive_thread_;
+
+    // Statistics
+    std::atomic<uint64_t> packets_received_{0};
+    std::atomic<uint64_t> packets_dropped_{0};
+    std::atomic<uint64_t> gaps_detected_{0};
+
+public:
+    FeedHandler(const std::string& group, uint16_t port)
+        : receiver_(group, port) {
+    }
+
+    bool start() {
+        if (!receiver_.init()) {
+            return false;
+        }
+
+        running_ = true;
+        receive_thread_ = std::thread(&FeedHandler::receiveLoop, this);
+
+        return true;
+    }
+
+    void stop() {
+        running_ = false;
+        if (receive_thread_.joinable()) {
+            receive_thread_.join();
+        }
+    }
+
+    void printStats() {
+        std::cout << "Packets received: " << packets_received_ << "\n";
+        std::cout << "Packets dropped: " << packets_dropped_ << "\n";
+        std::cout << "Gaps detected: " << gaps_detected_ << "\n";
+    }
+
+private:
+    void receiveLoop() {
+        uint8_t buffer[65536];
+
+        while (running_) {
+            ssize_t bytes = receiver_.receive(buffer, sizeof(buffer));
+
+            if (bytes > 0) {
+                processPacket(buffer, bytes);
+                packets_received_++;
+            }
+        }
+    }
+
+    void processPacket(const uint8_t* data, size_t length) {
+        // Parse packet header (example structure)
+        struct PacketHeader {
+            uint64_t seq_num;
+            uint64_t timestamp;
+            uint16_t msg_count;
+        } __attribute__((packed));
+
+        if (length < sizeof(PacketHeader)) {
+            return;
+        }
+
+        const PacketHeader* header = reinterpret_cast<const PacketHeader*>(data);
+
+        // Validate sequence
+        if (!validator_.validate(header->seq_num)) {
+            gaps_detected_++;
+            handleGap(validator_.getGaps().back());
+        }
+
+        // Parse messages
+        const uint8_t* msg_ptr = data + sizeof(PacketHeader);
+        size_t remaining = length - sizeof(PacketHeader);
+
+        for (uint16_t i = 0; i < header->msg_count && remaining > 0; ++i) {
+            size_t msg_len = processMessage(msg_ptr, remaining);
+            msg_ptr += msg_len;
+            remaining -= msg_len;
+        }
+    }
+
+    size_t processMessage(const uint8_t* data, size_t max_length) {
+        // Decode message (FAST, SBE, etc.)
+        // Update order book
+        // Trigger callbacks
+
+        // Example: Simple message with length prefix
+        if (max_length < 2) return 0;
+
+        uint16_t msg_len = *reinterpret_cast<const uint16_t*>(data);
+        if (msg_len > max_length) return 0;
+
+        // Process message content here
+        // ...
+
+        return msg_len;
+    }
+
+    void handleGap(const SequenceValidator::Gap& gap) {
+        // Request retransmission
+        // Or request snapshot
+        // Log gap for analysis
+        std::cerr << "Gap detected: " << gap.start << " to " << gap.end << "\n";
+    }
+};
+
+5.4 USAGE EXAMPLE
+-----------------
+int main() {
+    // CME MDP 3.0 example
+    FeedHandler handler("224.0.28.1", 14310);
+
+    if (!handler.start()) {
+        std::cerr << "Failed to start feed handler\n";
+        return 1;
+    }
+
+    std::cout << "Feed handler started. Press Enter to stop...\n";
+    std::cin.get();
+
+    handler.stop();
+    handler.printStats();
+
+    return 0;
+}
+
+================================================================================
+6. PERFORMANCE OPTIMIZATION
+================================================================================
+
+6.1 KERNEL BYPASS (DPDK)
+-------------------------
+#include <rte_eal.h>
+#include <rte_ethdev.h>
+#include <rte_mbuf.h>
+
+class DPDKMulticastReceiver {
+private:
+    uint16_t port_id_;
+    struct rte_mempool* mbuf_pool_;
+
+public:
+    bool init() {
+        // Initialize DPDK EAL
+        const char* argv[] = {"app", "-l", "0-3", "-n", "4"};
+        int argc = 5;
+        if (rte_eal_init(argc, (char**)argv) < 0) {
+            return false;
+        }
+
+        // Create mbuf pool
+        mbuf_pool_ = rte_pktmbuf_pool_create("mbuf_pool", 8192,
+                                             256, 0,
+                                             RTE_MBUF_DEFAULT_BUF_SIZE,
+                                             rte_socket_id());
+
+        // Configure port
+        struct rte_eth_conf port_conf = {};
+        port_id_ = 0;
+
+        if (rte_eth_dev_configure(port_id_, 1, 1, &port_conf) < 0) {
+            return false;
+        }
+
+        // Setup RX queue
+        if (rte_eth_rx_queue_setup(port_id_, 0, 1024,
+                                   rte_eth_dev_socket_id(port_id_),
+                                   nullptr, mbuf_pool_) < 0) {
+            return false;
+        }
+
+        // Start device
+        if (rte_eth_dev_start(port_id_) < 0) {
+            return false;
+        }
+
+        return true;
+    }
+
+    uint16_t receiveBatch(struct rte_mbuf** mbufs, uint16_t max_pkts) {
+        return rte_eth_rx_burst(port_id_, 0, mbufs, max_pkts);
+    }
+};
+
+Latency Improvement:
+Standard socket: ~10-15us
+Kernel bypass (DPDK): ~2-5us
+Reduction: 70-80%
+
+6.2 CPU AFFINITY
+----------------
+#include <pthread.h>
+#include <sched.h>
+
+void setThreadAffinity(int core_id) {
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(core_id, &cpuset);
+
+    pthread_t thread = pthread_self();
+    if (pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset) != 0) {
+        perror("pthread_setaffinity_np");
+    }
+}
+
+void setThreadPriority() {
+    struct sched_param param;
+    param.sched_priority = sched_get_priority_max(SCHED_FIFO);
+
+    if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &param) != 0) {
+        perror("pthread_setschedparam");
+    }
+}
+
+Usage:
+int main() {
+    // Pin to core 2
+    setThreadAffinity(2);
+    setThreadPriority();
+
+    // Run feed handler
+    FeedHandler handler("224.0.28.1", 14310);
+    handler.start();
+
+    return 0;
+}
+
+6.3 LOCK-FREE QUEUES
+--------------------
+template<typename T, size_t Size>
+class SPSCQueue {  // Single Producer Single Consumer
+private:
+    alignas(64) std::atomic<size_t> head_{0};
+    alignas(64) std::atomic<size_t> tail_{0};
+    alignas(64) T buffer_[Size];
+
+public:
+    bool push(const T& item) {
+        size_t head = head_.load(std::memory_order_relaxed);
+        size_t next_head = (head + 1) % Size;
+
+        if (next_head == tail_.load(std::memory_order_acquire)) {
+            return false;  // Queue full
+        }
+
+        buffer_[head] = item;
+        head_.store(next_head, std::memory_order_release);
+        return true;
+    }
+
+    bool pop(T& item) {
+        size_t tail = tail_.load(std::memory_order_relaxed);
+
+        if (tail == head_.load(std::memory_order_acquire)) {
+            return false;  // Queue empty
+        }
+
+        item = buffer_[tail];
+        tail_.store((tail + 1) % Size, std::memory_order_release);
+        return true;
+    }
+};
+
+6.4 BENCHMARK RESULTS
+---------------------
+Hardware: Intel Xeon E5-2690 v4, Mellanox 10GbE
+Network: Local multicast
+
+Configuration          Latency    Throughput    CPU Usage
+Standard socket        12us       500K pps      15%
+Socket + affinity      8us        800K pps      25%
+DPDK                   3us        2M pps        40%
+DPDK + polling         2us        3M pps        100%
+
+Packet Loss Rate:
+Standard socket (small buffer): 1%
+Standard socket (16MB buffer):  0.01%
+DPDK:                          <0.001%
+
+================================================================================
+7. REAL-WORLD EXAMPLES
+================================================================================
+
+7.1 CME MDP 3.0
+---------------
+Channels:
+- Channel 310: Incremental feed (real-time updates)
+- Channel 311: Snapshot feed (periodic full book)
+- Channel 312: Instrument definition
+
+Multicast Groups:
+224.0.28.1:14310  - Channel 310 A
+224.0.28.2:14310  - Channel 310 B (redundant)
+224.0.28.3:14311  - Channel 311 A
+224.0.28.4:14311  - Channel 311 B (redundant)
+
+Message Types (SBE):
+- Template 32: Incremental refresh
+- Template 38: Snapshot full refresh
+- Template 35: Instrument definition
+
+7.2 NASDAQ ITCH
+----------------
+Feed: TotalView ITCH 5.0
+
+Multicast: 233.54.12.0:26000
+
+Message Types:
+- 'A': Add Order
+- 'F': Add Order (MPID)
+- 'E': Order Executed
+- 'C': Order Executed with Price
+- 'X': Order Cancel
+- 'D': Order Delete
+- 'U': Order Replace
+- 'P': Trade (non-cross)
+- 'Q': Cross Trade
+
+Packet Header:
+struct ISSHeader {
+    char type[2];
+    uint16_t length;
+    char data[0];
+} __attribute__((packed));
+
+7.3 NYSE PILLAR
+---------------
+Feeds:
+- Integrated Feed: All market data
+- BBO Feed: Best bid/offer only
+- Trades Feed: Trade messages only
+
+Multicast Range: 224.0.130.0/24
+
+Binary Protocol:
+- Message length: 2 bytes
+- Message type: 1 byte
+- Message data: variable
+
+================================================================================
+8. TROUBLESHOOTING
+================================================================================
+
+8.1 PACKET LOSS DIAGNOSIS
+--------------------------
+Check System Stats:
+$ netstat -su | grep -i multicast
+$ netstat -su | grep -i "packet receive errors"
+$ ip -s maddr show
+
+Check Dropped Packets:
+$ ethtool -S eth0 | grep drop
+
+Increase Buffer Size:
+# sysctl -w net.core.rmem_max=134217728
+# sysctl -w net.core.rmem_default=134217728
+
+8.2 MULTICAST ROUTING
+----------------------
+Verify Multicast Route:
+$ ip mroute show
+$ route -n | grep 224
+
+Add Multicast Route:
+$ route add -net 224.0.0.0 netmask 240.0.0.0 dev eth0
+
+8.3 IGMP DEBUGGING
+------------------
+Check IGMP Membership:
+$ ip maddr show dev eth0
+
+Verify IGMP Messages:
+$ tcpdump -i eth0 igmp
+
+8.4 COMMON ISSUES
+-----------------
+Issue: No packets received
+Cause: Firewall blocking multicast
+Solution: iptables -A INPUT -d 224.0.0.0/4 -j ACCEPT
+
+Issue: High packet loss
+Cause: Small receive buffer
+Solution: Increase SO_RCVBUF to 16-128 MB
+
+Issue: Gaps despite no network loss
+Cause: Processing too slow
+Solution: Optimize decoder, use batching
+
+Issue: Cannot join multicast group
+Cause: No multicast route
+Solution: Add route to multicast network
+
+================================================================================
+END OF MULTICAST PROTOCOLS DOCUMENTATION
+================================================================================

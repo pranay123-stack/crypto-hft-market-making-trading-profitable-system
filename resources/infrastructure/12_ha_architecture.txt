@@ -1,0 +1,693 @@
+================================================================================
+                    HIGH AVAILABILITY ARCHITECTURE FOR HFT
+                    Failover, Redundancy, and Disaster Recovery
+================================================================================
+
+TABLE OF CONTENTS
+================================================================================
+1. HA Requirements for HFT
+2. Redundancy Strategies
+3. Failover Mechanisms
+4. State Replication
+5. Split-Brain Prevention
+6. Disaster Recovery
+7. Testing HA Systems
+8. Best Practices
+
+================================================================================
+1. HA REQUIREMENTS FOR HFT
+================================================================================
+
+AVAILABILITY TARGETS:
+
+Uptime SLA:
+- Target: 99.99% (52 minutes downtime/year)
+- Stretch: 99.999% (5.26 minutes downtime/year)
+
+Recovery Objectives:
+- RTO (Recovery Time Objective): < 1 minute
+- RPO (Recovery Point Objective): 0 seconds (no data loss)
+
+FAILURE SCENARIOS TO HANDLE:
+
+Hardware Failures:
+- Server crash
+- NIC failure
+- Switch failure
+- Power failure
+- Disk failure
+
+Software Failures:
+- Process crash
+- Memory leak
+- Deadlock
+- Configuration error
+
+Network Failures:
+- Link down
+- Switch failure
+- Network partition
+
+External Failures:
+- Exchange connectivity loss
+- Data feed failure
+- Market closure
+
+================================================================================
+2. REDUNDANCY STRATEGIES
+================================================================================
+
+ACTIVE-PASSIVE (HOT STANDBY):
+
+┌──────────────┐           ┌──────────────┐
+│   Primary    │           │  Secondary   │
+│   (Active)   │ ─────────>│  (Standby)   │
+│              │ Heartbeat │              │
+└──────┬───────┘           └──────────────┘
+       │
+       │ (Serving traffic)
+       │
+   ┌───▼────┐
+   │Clients │
+   └────────┘
+
+Failover on Primary Failure:
+
+┌──────────────┐           ┌──────────────┐
+│   Primary    │           │  Secondary   │
+│   (Failed)   │     X     │  (Promoted)  │
+│              │           │              │
+└──────────────┘           └──────┬───────┘
+                                  │
+                                  │ (Serving traffic)
+                                  │
+                              ┌───▼────┐
+                              │Clients │
+                              └────────┘
+
+Implementation:
+
+class HotStandbyService {
+    enum class Role { PRIMARY, SECONDARY };
+
+    Role role_;
+    std::atomic<bool> is_primary_{false};
+    std::string peer_address_;
+    std::thread heartbeat_thread_;
+
+public:
+    HotStandbyService(Role initial_role, const std::string& peer_addr)
+        : role_(initial_role)
+        , peer_address_(peer_addr) {
+
+        is_primary_ = (role_ == Role::PRIMARY);
+
+        // Start heartbeat monitoring
+        heartbeat_thread_ = std::thread([this]() {
+            monitorPeer();
+        });
+    }
+
+    void processOrder(const Order& order) {
+        if (!is_primary_) {
+            throw std::runtime_error("Not primary, cannot process orders");
+        }
+
+        // Process order normally
+        doProcessOrder(order);
+
+        // Replicate state to secondary
+        replicateToSecondary(order);
+    }
+
+private:
+    void monitorPeer() {
+        while (true) {
+            bool peer_alive = sendHeartbeat(peer_address_);
+
+            if (role_ == Role::SECONDARY && !peer_alive) {
+                // Primary is down, promote to primary
+                promoteToePrimary();
+            }
+
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+    }
+
+    void promoteToePrimary() {
+        std::cout << "Primary failed, promoting to primary" << std::endl;
+        is_primary_ = true;
+        role_ = Role::PRIMARY;
+
+        // Take over VIP
+        assignVirtualIP();
+
+        // Resume processing
+    }
+
+    bool sendHeartbeat(const std::string& peer) {
+        // Send heartbeat and check response
+        // Return true if peer responds, false otherwise
+        return checkPeerHealth(peer);
+    }
+
+    void replicateToSecondary(const Order& order) {
+        // Send state update to secondary (async)
+        asyncSendToSecondary(order);
+    }
+
+    void assignVirtualIP() {
+        // Use gratuitous ARP to take over VIP
+        // ip addr add 192.168.1.100/24 dev eth0
+        system("ip addr add 192.168.1.100/24 dev eth0");
+        system("arping -c 3 -S 192.168.1.100 192.168.1.1");
+    }
+};
+
+ACTIVE-ACTIVE (LOAD BALANCED):
+
+┌──────────────┐           ┌──────────────┐
+│  Instance 1  │           │  Instance 2  │
+│  (Active)    │◄─────────>│  (Active)    │
+│              │ Sync State│              │
+└──────┬───────┘           └──────┬───────┘
+       │                          │
+       └────────────┬─────────────┘
+                    │
+              ┌─────▼──────┐
+              │Load Balancer│
+              └─────┬──────┘
+                    │
+               ┌────▼────┐
+               │ Clients │
+               └─────────┘
+
+Benefits:
+- Better resource utilization
+- Higher throughput
+- No wasted standby capacity
+
+Challenges:
+- State synchronization complexity
+- Potential for conflicts
+- More complex failure handling
+
+Implementation:
+
+class ActiveActiveService {
+    std::string instance_id_;
+    Redis redis_;  // Shared state store
+
+public:
+    ActiveActiveService(const std::string& id)
+        : instance_id_(id)
+        , redis_("redis://localhost:6379") {}
+
+    void processOrder(const Order& order) {
+        // Distributed lock to prevent conflicts
+        auto lock = redis_.acquireLock("order:" + order.id(), 5000);  // 5s timeout
+
+        if (!lock) {
+            throw std::runtime_error("Failed to acquire lock");
+        }
+
+        // Process order
+        doProcessOrder(order);
+
+        // Update shared state
+        redis_.set("order:" + order.id(), serializeOrder(order));
+
+        // Release lock
+        redis_.releaseLock(lock);
+    }
+
+    // Get current position (from shared state)
+    int64_t getPosition(const std::string& symbol) {
+        auto val = redis_.get("position:" + symbol);
+        return val ? std::stoll(*val) : 0;
+    }
+};
+
+N+1 REDUNDANCY:
+
+N active instances + 1 standby for any failure
+
+┌────────┐ ┌────────┐ ┌────────┐      ┌────────┐
+│Active 1│ │Active 2│ │Active 3│      │Standby │
+└────────┘ └────────┘ └────────┘      └────────┘
+
+Failure scenario:
+┌────────┐ ┌────────┐ ┌────────┐      ┌────────┐
+│Active 1│ │ Failed │ │Active 3│      │Active 2│
+│        │ │   X    │ │        │      │(Standby│
+│        │ │        │ │        │      │promoted)│
+└────────┘ └────────┘ └────────┘      └────────┘
+
+================================================================================
+3. FAILOVER MECHANISMS
+================================================================================
+
+AUTOMATIC FAILOVER WITH KEEPALIVED:
+
+# /etc/keepalived/keepalived.conf
+
+vrrp_script chk_trading_service {
+    script "/usr/local/bin/check_trading_service.sh"
+    interval 2  # Check every 2 seconds
+    weight -20
+}
+
+vrrp_instance VI_1 {
+    state MASTER
+    interface eth0
+    virtual_router_id 51
+    priority 100  # Higher = preferred master
+    advert_int 1
+
+    virtual_ipaddress {
+        192.168.1.100/24  # Virtual IP
+    }
+
+    track_script {
+        chk_trading_service
+    }
+
+    notify_master "/usr/local/bin/become_master.sh"
+    notify_backup "/usr/local/bin/become_backup.sh"
+}
+
+Health Check Script:
+
+#!/bin/bash
+# /usr/local/bin/check_trading_service.sh
+
+# Check if service is running
+if ! pgrep -f trading_service > /dev/null; then
+    exit 1
+fi
+
+# Check if service is responsive
+if ! curl -f -s http://localhost:8080/health > /dev/null; then
+    exit 1
+fi
+
+# Check latency (optional)
+latency=$(curl -s http://localhost:8080/metrics | grep latency_p99)
+if [ $? -ne 0 ]; then
+    exit 1
+fi
+
+exit 0
+
+Failover Scripts:
+
+#!/bin/bash
+# /usr/local/bin/become_master.sh
+
+echo "Becoming MASTER"
+
+# Start trading service
+systemctl start trading_service
+
+# Send alert
+curl -X POST https://hooks.slack.com/... \
+  -d '{"text":"Trading service promoted to MASTER"}'
+
+#!/bin/bash
+# /usr/local/bin/become_backup.sh
+
+echo "Becoming BACKUP"
+
+# Stop trading service (or keep in standby mode)
+systemctl stop trading_service
+
+DNS FAILOVER:
+
+TTL: 5 seconds (very low for fast failover)
+
+Primary: trading.example.com -> 192.168.1.10
+Failover: trading.example.com -> 192.168.1.11
+
+Health Check -> Update DNS -> Clients resolve to new IP
+
+Limitation: DNS caching, slower failover
+
+DATABASE REPLICATION FOR STATE:
+
+Primary DB -> Secondary DB (sync replication)
+
+PostgreSQL Streaming Replication:
+
+# Primary: postgresql.conf
+wal_level = replica
+max_wal_senders = 3
+wal_keep_segments = 64
+
+# Secondary: recovery.conf
+standby_mode = 'on'
+primary_conninfo = 'host=primary port=5432 user=replicator'
+trigger_file = '/tmp/postgresql.trigger.5432'
+
+Failover: Create trigger file -> Secondary becomes primary
+
+================================================================================
+4. STATE REPLICATION
+================================================================================
+
+SYNCHRONOUS REPLICATION (Strong Consistency):
+
+Order submitted -> Write to primary AND secondary -> Acknowledge
+
+Latency: +5-20ms (waiting for secondary)
+Consistency: Strong (no data loss)
+
+ASYNCHRONOUS REPLICATION (Eventual Consistency):
+
+Order submitted -> Write to primary -> Acknowledge -> Replicate to secondary
+
+Latency: +0.5-2ms (primary only)
+Consistency: Eventual (potential data loss)
+
+REDIS REPLICATION:
+
+# redis.conf (Primary)
+bind 0.0.0.0
+port 6379
+
+# redis.conf (Replica)
+replicaof 192.168.1.10 6379
+replica-read-only yes
+
+Wait for replication:
+
+WAIT 1 1000  # Wait for 1 replica, timeout 1000ms
+
+RAFT CONSENSUS (for critical state):
+
+┌────────┐     ┌────────┐     ┌────────┐
+│ Node 1 │◄───►│ Node 2 │◄───►│ Node 3 │
+│(Leader)│     │(Follower)│   │(Follower)│
+└────────┘     └────────┘     └────────┘
+
+Write: Leader -> Majority (2/3) -> Commit
+
+Ensures: Consistency even with failures
+
+C++ Raft Implementation (using raft-cpp):
+
+#include <raft/raft.h>
+
+class RaftStateMachine {
+    raft::Server server_;
+
+public:
+    RaftStateMachine(const std::vector<std::string>& peers) {
+        // Initialize Raft server
+        server_.init(peers);
+    }
+
+    void updatePosition(const std::string& symbol, int64_t quantity) {
+        // Propose update through Raft
+        std::string command = "UPDATE_POSITION " + symbol + " " +
+                             std::to_string(quantity);
+
+        server_.propose(command);
+    }
+
+    int64_t getPosition(const std::string& symbol) {
+        // Read from committed state
+        return state_.getPosition(symbol);
+    }
+};
+
+================================================================================
+5. SPLIT-BRAIN PREVENTION
+================================================================================
+
+Split-brain: Both instances think they are primary
+
+CONSEQUENCES:
+- Duplicate orders sent to exchange
+- Inconsistent state
+- Potential losses
+
+PREVENTION MECHANISMS:
+
+1. QUORUM-BASED:
+
+Require majority (N/2 + 1) for leader election
+
+3 nodes: Need 2 votes
+5 nodes: Need 3 votes
+
+Network partition:
+Partition A (2 nodes): Can elect leader
+Partition B (1 node): Cannot elect leader (minority)
+
+2. FENCING:
+
+Prevent old primary from accessing resources
+
+STONITH (Shoot The Other Node In The Head):
+- Power off old primary
+- Disconnect from network
+- Revoke credentials
+
+Implementation:
+
+class FencingManager {
+public:
+    void fencePeer(const std::string& peer_address) {
+        // Power off via IPMI
+        std::string cmd = "ipmitool -H " + peer_address +
+                         " -U admin -P password power off";
+        system(cmd.c_str());
+
+        // Disable network port on switch (via SNMP)
+        disableSwitchPort(peer_address);
+    }
+};
+
+3. WITNESS/TIEBREAKER:
+
+Third node decides which instance is primary
+
+┌─────────┐           ┌─────────┐
+│Primary  │    X      │Secondary│
+└────┬────┘           └────┬────┘
+     │                     │
+     │   ┌──────────┐      │
+     └──►│ Witness  │◄─────┘
+         └──────────┘
+
+Witness votes for one instance based on:
+- Which instance it can reach
+- Priority configuration
+- Timestamp of last update
+
+================================================================================
+6. DISASTER RECOVERY
+================================================================================
+
+BACKUP STRATEGIES:
+
+1. Real-time State Replication:
+   - Primary DC -> Secondary DC (continuous)
+   - RPO: 0 seconds
+   - RTO: 1-5 minutes
+
+2. Periodic Snapshots:
+   - Hourly/Daily snapshots
+   - RPO: 1 hour - 1 day
+   - RTO: Hours
+
+3. Transaction Log Shipping:
+   - Ship order log to DR site
+   - RPO: Seconds to minutes
+   - RTO: Minutes
+
+DR ARCHITECTURE:
+
+Primary DC (NYC):
+┌────────────────────────────────┐
+│ Trading Services               │
+│ Market Data                    │
+│ OMS                            │
+│ Redis (Primary)                │
+└────────┬───────────────────────┘
+         │ Replication
+         │
+DR Site (Chicago):
+┌────────▼───────────────────────┐
+│ Trading Services (Standby)     │
+│ Market Data (Standby)          │
+│ OMS (Standby)                  │
+│ Redis (Replica)                │
+└────────────────────────────────┘
+
+FAILOVER TO DR:
+
+1. Detect primary DC failure
+2. Promote DR site to primary
+3. Update DNS/routing
+4. Resume trading operations
+
+DR Failover Script:
+
+#!/bin/bash
+# dr_failover.sh
+
+echo "Initiating DR failover..."
+
+# Promote Redis replica to primary
+redis-cli -h dr-redis slaveof no one
+
+# Start trading services
+systemctl start trading_service
+systemctl start oms_service
+systemctl start risk_service
+
+# Update DNS
+aws route53 change-resource-record-sets \
+  --hosted-zone-id Z123 \
+  --change-batch file://dns_update.json
+
+# Send notifications
+curl -X POST https://hooks.slack.com/... \
+  -d '{"text":"DR FAILOVER ACTIVATED"}'
+
+echo "DR failover complete"
+
+TESTING DR:
+
+✓ Regular DR drills (monthly)
+✓ Automated failover testing
+✓ Measure RTO/RPO
+✓ Document procedures
+✓ Train team on DR process
+
+================================================================================
+7. TESTING HA SYSTEMS
+================================================================================
+
+CHAOS ENGINEERING:
+
+Intentionally inject failures to test resilience
+
+Test Scenarios:
+
+1. Kill Primary Process:
+   kill -9 $(pgrep trading_service)
+
+2. Network Partition:
+   iptables -A INPUT -s 192.168.1.10 -j DROP
+
+3. Disk Full:
+   dd if=/dev/zero of=/tmp/fill bs=1M count=10000
+
+4. High Latency:
+   tc qdisc add dev eth0 root netem delay 100ms
+
+5. Packet Loss:
+   tc qdisc add dev eth0 root netem loss 10%
+
+Automated Chaos Testing:
+
+class ChaosTest {
+public:
+    void runChaosScenario(const std::string& scenario) {
+        if (scenario == "kill_primary") {
+            killPrimaryNode();
+            verifyFailover();
+        }
+        else if (scenario == "network_partition") {
+            createNetworkPartition();
+            verifyQuorumBehavior();
+        }
+    }
+
+private:
+    void killPrimaryNode() {
+        system("ssh primary-node 'systemctl stop trading_service'");
+    }
+
+    void verifyFailover() {
+        // Wait for failover
+        std::this_thread::sleep_for(std::chrono::seconds(10));
+
+        // Check secondary is now primary
+        bool is_primary = checkNodeIsPrimary("secondary-node");
+        assert(is_primary);
+
+        // Verify service is operational
+        bool is_healthy = checkServiceHealth("secondary-node");
+        assert(is_healthy);
+    }
+};
+
+================================================================================
+8. BEST PRACTICES
+================================================================================
+
+DESIGN PRINCIPLES:
+
+✓ Design for failure (assume everything will fail)
+✓ Eliminate single points of failure
+✓ Implement circuit breakers
+✓ Use timeouts everywhere
+✓ Implement exponential backoff
+✓ Log all state changes
+✓ Monitor continuously
+✓ Test failure scenarios regularly
+
+DEPLOYMENT:
+
+✓ Deploy primary and secondary in different racks
+✓ Use different power circuits
+✓ Use different network switches
+✓ Consider different availability zones/DCs
+✓ Automate deployment and configuration
+✓ Use infrastructure as code
+
+MONITORING:
+
+✓ Monitor failover events
+✓ Alert on split-brain conditions
+✓ Track replication lag
+✓ Monitor heartbeat status
+✓ Dashboard for HA status
+
+DOCUMENTATION:
+
+✓ Document failover procedures
+✓ Maintain runbooks
+✓ Document dependencies
+✓ Keep contact list updated
+✓ Post-mortem after incidents
+
+COMMON PITFALLS:
+
+✗ Untested failover mechanisms
+✗ Split-brain scenarios
+✗ Slow replication
+✗ Forgotten standby systems
+✗ No regular DR drills
+✗ Inadequate monitoring
+✗ Manual failover only
+
+CHECKLIST FOR HA SYSTEM:
+
+□ Redundant hardware (N+1)
+□ Automatic failover configured
+□ State replication working
+□ Split-brain prevention
+□ DR site configured
+□ Monitoring & alerting
+□ Regular testing schedule
+□ Documented procedures
+□ Team trained on procedures
+□ Tested under load
+
+================================================================================
+END OF HIGH AVAILABILITY ARCHITECTURE
+================================================================================

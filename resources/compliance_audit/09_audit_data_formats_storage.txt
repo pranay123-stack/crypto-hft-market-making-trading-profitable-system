@@ -1,0 +1,973 @@
+================================================================================
+AUDIT DATA FORMATS AND STORAGE SYSTEMS
+Structured Data Management for Compliance
+High-Frequency Trading System
+================================================================================
+
+OVERVIEW
+--------
+Comprehensive specifications for audit data formats, storage systems, indexing
+strategies, and retrieval mechanisms. Ensures efficient storage, fast querying,
+and regulatory compliance for all trading data.
+
+================================================================================
+SECTION 1: DATA FORMAT SPECIFICATIONS
+================================================================================
+
+1.1 BINARY LOG FORMAT (OPTIMIZED FOR PERFORMANCE)
+--------------------------------------------------
+
+Primary Storage Format for Hot Data (Real-time logging)
+
+File Header:
+------------
+struct BinaryLogHeader {
+    uint32_t magic_number;                // 0x54524445 ("TRDE")
+    uint16_t version_major;               // Format version
+    uint16_t version_minor;
+    uint64_t file_creation_timestamp_ns;
+    uint64_t first_event_timestamp_ns;
+    uint64_t last_event_timestamp_ns;
+    uint32_t record_count;
+    uint32_t file_sequence_number;
+    char hostname[64];
+    char process_name[32];
+    uint32_t process_id;
+    uint32_t header_size;                 // Bytes
+    uint32_t index_offset;                // Offset to index section
+    uint32_t compression_type;            // 0=None, 1=LZ4, 2=ZSTD
+    uint8_t encryption_type;              // 0=None, 1=AES-256
+    uint8_t reserved[256];                // Future use
+    char checksum[32];                    // SHA-256 of header
+} __attribute__((packed));
+
+Size: 512 bytes (aligned for direct I/O)
+
+
+Record Structure:
+-----------------
+struct BinaryLogRecord {
+    // Record Header (32 bytes)
+    uint32_t record_size;                 // Total record size
+    uint16_t record_type;                 // Event type code
+    uint16_t record_version;
+    uint64_t timestamp_ns;                // Event timestamp
+    uint64_t sequence_number;             // Global sequence
+    uint32_t thread_id;
+    uint32_t flags;                       // Bit flags
+
+    // Record Payload (variable size)
+    uint8_t payload[/* variable */];
+
+    // Record Footer (32 bytes)
+    uint32_t payload_checksum;            // CRC32 of payload
+    uint32_t record_checksum;             // CRC32 of entire record
+    uint64_t prev_record_offset;          // Chain to previous record
+    uint64_t next_record_offset;          // Chain to next record
+    uint8_t reserved[8];
+} __attribute__((packed));
+
+
+Record Type Codes:
+------------------
+#define RECORD_TYPE_ORDER_NEW           0x0001
+#define RECORD_TYPE_ORDER_MODIFY        0x0002
+#define RECORD_TYPE_ORDER_CANCEL        0x0003
+#define RECORD_TYPE_ORDER_FILL          0x0004
+#define RECORD_TYPE_ORDER_REJECT        0x0005
+#define RECORD_TYPE_MARKET_DATA_QUOTE   0x0100
+#define RECORD_TYPE_MARKET_DATA_TRADE   0x0101
+#define RECORD_TYPE_RISK_CHECK          0x0200
+#define RECORD_TYPE_COMPLIANCE_ALERT    0x0300
+#define RECORD_TYPE_SYSTEM_EVENT        0x0400
+
+
+Order Event Payload Format:
+----------------------------
+struct OrderEventPayload {
+    // Identifiers (96 bytes)
+    char order_id[36];
+    char parent_order_id[36];
+    char execution_id[36];
+    char client_order_id[36];
+
+    // Timestamps (64 bytes)
+    uint64_t gateway_timestamp_ns;
+    uint64_t strategy_timestamp_ns;
+    uint64_t oms_timestamp_ns;
+    uint64_t exchange_timestamp_ns;
+    uint64_t ack_timestamp_ns;
+    uint64_t fill_timestamp_ns;
+    uint64_t reserved_timestamp_1;
+    uint64_t reserved_timestamp_2;
+
+    // Instrument (32 bytes)
+    char symbol[16];
+    char exchange[8];
+    char currency[4];
+    uint32_t symbol_id;
+
+    // Order Details (64 bytes)
+    char side;                            // 'B', 'S', 'SS'
+    char order_type[4];                   // LMT, MKT, STP, etc.
+    char time_in_force[4];                // DAY, GTC, IOC, FOK
+    uint8_t reserved_1[3];
+    int64_t order_quantity;
+    int64_t filled_quantity;
+    int64_t remaining_quantity;
+    double limit_price;
+    double stop_price;
+    double average_fill_price;
+    uint32_t partial_fill_count;
+    uint32_t reserved_2;
+
+    // Account and Trader Info (128 bytes)
+    char account_id[32];
+    char trader_id[16];
+    char algo_id[32];
+    char client_id[32];
+    char portfolio_id[16];
+
+    // Regulatory Fields (128 bytes)
+    char investment_decision_maker[32];
+    char execution_decision_maker[32];
+    char regulatory_algo_id[32];
+    uint16_t mifid_flags;
+    uint8_t short_sale_indicator;
+    uint8_t reserved_3[29];
+
+    // Risk and Compliance (64 bytes)
+    bool pre_trade_risk_passed;
+    bool post_trade_risk_passed;
+    bool compliance_approved;
+    uint8_t risk_level;
+    char risk_flags[60];
+
+    // Market Context (64 bytes)
+    double market_bid;
+    double market_ask;
+    int64_t market_bid_size;
+    int64_t market_ask_size;
+    double vwap;
+    double market_volatility;
+    uint32_t market_depth_levels;
+    uint32_t reserved_4;
+
+    // Routing Information (64 bytes)
+    char routing_strategy[32];
+    char destination_venue[16];
+    uint32_t routing_priority;
+    uint32_t venue_latency_ns;
+    uint64_t reserved_5;
+
+    // Event Status (64 bytes)
+    char event_type[32];
+    char event_status[32];
+
+    // Error Information (256 bytes)
+    uint32_t error_code;
+    char error_message[128];
+    char rejection_reason[124];
+
+    // Metadata (64 bytes)
+    char hostname[32];
+    uint32_t process_id;
+    uint32_t thread_id;
+    char component_name[24];
+
+} __attribute__((packed));
+
+Total Payload Size: ~1200 bytes
+
+
+1.2 COLUMNAR STORAGE FORMAT (OPTIMIZED FOR ANALYTICS)
+------------------------------------------------------
+
+Used for warm/cold storage and analytics queries
+
+File Structure:
+---------------
+- Data organized by columns rather than rows
+- Each column stored separately
+- Compression applied per column
+- Column statistics for query optimization
+
+Column File Format:
+-------------------
+struct ColumnFileHeader {
+    uint32_t magic_number;                // 0x434F4C53 ("COLS")
+    uint16_t version;
+    char column_name[64];
+    uint32_t data_type;                   // INT64, DOUBLE, STRING, etc.
+    uint32_t compression_codec;           // None, LZ4, ZSTD, etc.
+    uint64_t row_count;
+    uint64_t compressed_size;
+    uint64_t uncompressed_size;
+
+    // Column statistics
+    int64_t min_value_int;
+    int64_t max_value_int;
+    double min_value_double;
+    double max_value_double;
+    bool has_nulls;
+    uint32_t distinct_count;
+    uint32_t null_count;
+
+    // Index information
+    uint32_t index_type;                  // None, Hash, BTree
+    uint64_t index_offset;
+    uint64_t index_size;
+
+    uint8_t reserved[128];
+    char checksum[32];
+} __attribute__((packed));
+
+
+Data Encoding Schemes:
+----------------------
+
+1. Run-Length Encoding (RLE):
+   - For columns with many repeated values
+   - Format: [value, count, value, count, ...]
+   - Example: AAPL repeated 1000 times = [AAPL, 1000]
+
+2. Dictionary Encoding:
+   - For low-cardinality string columns
+   - Format: Dictionary + Encoded values
+   - Example: Symbols -> [0:AAPL, 1:GOOGL, 2:MSFT] + [0,0,0,1,2,1,0,...]
+
+3. Delta Encoding:
+   - For monotonically increasing values (timestamps, sequence numbers)
+   - Format: Base value + [delta1, delta2, delta3, ...]
+   - Example: [1000000, +1, +1, +2, +1, +1] instead of full timestamps
+
+4. Bit Packing:
+   - For small integer ranges
+   - Pack multiple values into fewer bytes
+   - Example: Values 0-255 can use 1 byte instead of 4
+
+5. Frame of Reference (FOR):
+   - Subtract minimum value, store deltas
+   - Reduces storage for bounded ranges
+
+
+Column Groups (for related columns):
+-------------------------------------
+struct ColumnGroup {
+    char group_name[64];
+    uint32_t column_count;
+    char column_names[32][64];
+
+    // Shared compression
+    uint32_t compression_codec;
+    uint64_t compressed_size;
+
+    // Column offsets within group
+    uint64_t column_offsets[32];
+};
+
+Example Column Groups:
+- order_identifiers: [order_id, parent_order_id, execution_id]
+- timestamps: [gateway_ts, oms_ts, exchange_ts, fill_ts]
+- prices: [limit_price, stop_price, fill_price]
+- quantities: [order_qty, filled_qty, remaining_qty]
+
+
+================================================================================
+SECTION 2: STORAGE ARCHITECTURE
+================================================================================
+
+2.1 TIERED STORAGE SYSTEM
+--------------------------
+
+Hot Tier (0-7 days):
+--------------------
+Storage:    NVMe SSD RAID 10
+Format:     Binary logs (uncompressed)
+Access:     Direct memory-mapped I/O
+Indexing:   In-memory hash tables
+Latency:    < 1ms (p99)
+Capacity:   10 TB
+Cost:       $500/TB/month
+
+Directory Structure:
+/hot_storage/
+  /YYYYMMDD/
+    /logs/
+      order_events_YYYYMMDD_HH_seq.bin
+      executions_YYYYMMDD_HH_seq.bin
+      market_data_YYYYMMDD_HH_seq.bin
+      risk_events_YYYYMMDD_HH_seq.bin
+    /indexes/
+      order_id.idx
+      symbol.idx
+      account.idx
+      timestamp.idx
+
+
+Warm Tier (8-90 days):
+-----------------------
+Storage:    SSD RAID 5
+Format:     Columnar with LZ4 compression
+Access:     Buffered I/O
+Indexing:   B-tree indexes on disk
+Latency:    < 100ms (p99)
+Capacity:   100 TB
+Cost:       $100/TB/month
+
+Directory Structure:
+/warm_storage/
+  /YYYYMM/
+    /columnar/
+      orders.parquet
+      executions.parquet
+      market_data.parquet
+    /indexes/
+      orders.idx
+      executions.idx
+
+
+Cold Tier (91 days - 7 years):
+-------------------------------
+Storage:    HDD RAID 6
+Format:     Columnar with ZSTD compression (level 9)
+Access:     Sequential reads
+Indexing:   Sparse indexes
+Latency:    < 10 seconds (p99)
+Capacity:   1 PB
+Cost:       $10/TB/month
+
+Directory Structure:
+/cold_storage/
+  /YYYY/
+    /QQ/
+      orders_YYYYQQ.parquet.zst
+      executions_YYYYQQ.parquet.zst
+      metadata_YYYYQQ.json
+
+
+Archive Tier (7+ years):
+-------------------------
+Storage:    LTO-8 Tape / Glacier Deep Archive
+Format:     Compressed archives with metadata
+Access:     Retrieval request (hours)
+Indexing:   Metadata catalog only
+Latency:    < 12 hours
+Capacity:   10 PB
+Cost:       $1/TB/month
+
+Archive Format:
+archive_YYYY_QQ.tar.zst
+├── orders/
+│   ├── orders_part_001.parquet.zst
+│   ├── orders_part_002.parquet.zst
+│   └── ...
+├── executions/
+│   ├── executions_part_001.parquet.zst
+│   └── ...
+├── metadata.json
+└── manifest.txt
+
+
+2.2 DATABASE SCHEMA FOR METADATA
+---------------------------------
+
+PostgreSQL Schema for Audit Trail Metadata:
+
+CREATE TABLE audit_files (
+    file_id             BIGSERIAL PRIMARY KEY,
+    file_path           TEXT NOT NULL,
+    file_type           VARCHAR(32) NOT NULL,  -- orders, executions, etc.
+    storage_tier        VARCHAR(16) NOT NULL,  -- hot, warm, cold, archive
+    file_size_bytes     BIGINT NOT NULL,
+    record_count        BIGINT NOT NULL,
+    compression_ratio   REAL,
+
+    -- Time range
+    start_timestamp_ns  BIGINT NOT NULL,
+    end_timestamp_ns    BIGINT NOT NULL,
+
+    -- Integrity
+    checksum_sha256     CHAR(64) NOT NULL,
+    checksum_verified   BOOLEAN DEFAULT FALSE,
+    last_verification   TIMESTAMPTZ,
+
+    -- Metadata
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    archived_at         TIMESTAMPTZ,
+    retention_until     TIMESTAMPTZ NOT NULL,
+
+    -- Indexing
+    indexed             BOOLEAN DEFAULT FALSE,
+    index_path          TEXT,
+
+    CONSTRAINT valid_time_range CHECK (end_timestamp_ns >= start_timestamp_ns)
+);
+
+CREATE INDEX idx_audit_files_time_range
+    ON audit_files USING BRIN (start_timestamp_ns, end_timestamp_ns);
+CREATE INDEX idx_audit_files_storage_tier
+    ON audit_files (storage_tier);
+CREATE INDEX idx_audit_files_file_type
+    ON audit_files (file_type);
+
+
+CREATE TABLE audit_records_index (
+    index_id            BIGSERIAL PRIMARY KEY,
+    file_id             BIGINT REFERENCES audit_files(file_id),
+
+    -- Record identification
+    record_type         VARCHAR(32) NOT NULL,
+    record_offset       BIGINT NOT NULL,      -- Byte offset in file
+    record_size         INTEGER NOT NULL,
+
+    -- Common indexed fields
+    timestamp_ns        BIGINT NOT NULL,
+    order_id            VARCHAR(36),
+    execution_id        VARCHAR(36),
+    symbol              VARCHAR(16),
+    account_id          VARCHAR(32),
+    trader_id           VARCHAR(16),
+
+    -- Quick retrieval
+    record_data         JSONB                 -- Denormalized key fields
+);
+
+CREATE INDEX idx_audit_records_timestamp
+    ON audit_records_index USING BRIN (timestamp_ns);
+CREATE INDEX idx_audit_records_order_id
+    ON audit_records_index USING HASH (order_id);
+CREATE INDEX idx_audit_records_symbol
+    ON audit_records_index (symbol);
+CREATE INDEX idx_audit_records_account
+    ON audit_records_index (account_id);
+
+
+CREATE TABLE data_lineage (
+    lineage_id          BIGSERIAL PRIMARY KEY,
+    source_file_id      BIGINT REFERENCES audit_files(file_id),
+    derived_file_id     BIGINT REFERENCES audit_files(file_id),
+    transformation      VARCHAR(64) NOT NULL,  -- compression, tiering, etc.
+    transformation_time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    metadata            JSONB
+);
+
+
+CREATE TABLE retention_policies (
+    policy_id           SERIAL PRIMARY KEY,
+    record_type         VARCHAR(32) NOT NULL,
+    retention_years     INTEGER NOT NULL,
+    regulation          VARCHAR(64) NOT NULL,
+    worm_required       BOOLEAN NOT NULL DEFAULT FALSE,
+    auto_delete_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    effective_date      DATE NOT NULL,
+    expiration_date     DATE
+);
+
+
+CREATE TABLE legal_holds (
+    hold_id             SERIAL PRIMARY KEY,
+    case_number         VARCHAR(64) NOT NULL,
+    description         TEXT,
+    custodian           VARCHAR(128) NOT NULL,
+    hold_start_date     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    hold_end_date       TIMESTAMPTZ,
+    active              BOOLEAN NOT NULL DEFAULT TRUE,
+
+    -- Scope
+    record_types        VARCHAR(32)[],
+    accounts            VARCHAR(32)[],
+    symbols             VARCHAR(16)[],
+    date_range_start    DATE,
+    date_range_end      DATE
+);
+
+
+CREATE TABLE affected_records_holds (
+    hold_id             INTEGER REFERENCES legal_holds(hold_id),
+    file_id             BIGINT REFERENCES audit_files(file_id),
+    applied_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    PRIMARY KEY (hold_id, file_id)
+);
+
+
+================================================================================
+SECTION 3: INDEXING STRATEGIES
+================================================================================
+
+3.1 MULTI-LEVEL INDEXING
+-------------------------
+
+Level 1: File-Level Index
+--------------------------
+- Maps time ranges to files
+- Enables quick file selection for queries
+- Stored in PostgreSQL (audit_files table)
+
+Example Query:
+SELECT file_path FROM audit_files
+WHERE file_type = 'orders'
+  AND start_timestamp_ns <= 1700000000000000000
+  AND end_timestamp_ns >= 1699900000000000000
+ORDER BY start_timestamp_ns;
+
+
+Level 2: Block-Level Index
+---------------------------
+- Divides files into blocks (e.g., 64MB blocks)
+- Stores min/max values for indexed columns per block
+- Enables block skipping during scan
+
+struct BlockIndex {
+    uint64_t block_number;
+    uint64_t block_offset;
+    uint64_t block_size;
+
+    // Statistics
+    uint64_t record_count;
+    uint64_t min_timestamp_ns;
+    uint64_t max_timestamp_ns;
+
+    // Column statistics
+    std::map<std::string, ColumnStatistics> column_stats;
+};
+
+struct ColumnStatistics {
+    bool has_min_max;
+    std::variant<int64_t, double, std::string> min_value;
+    std::variant<int64_t, double, std::string> max_value;
+    uint32_t distinct_count;
+    bool has_nulls;
+};
+
+
+Level 3: Record-Level Index
+----------------------------
+- Full index of individual records
+- Stored in PostgreSQL (audit_records_index table)
+- Used for point lookups
+
+Example: Find all events for order_id
+SELECT file_id, record_offset, record_size
+FROM audit_records_index
+WHERE order_id = 'ORD-123456789';
+
+
+3.2 SPECIALIZED INDEXES
+------------------------
+
+Time-Series Index (BRIN):
+-------------------------
+- Block Range INdex for timestamp columns
+- Efficient for time-based queries
+- Low storage overhead
+- Optimized for sequential writes
+
+CREATE INDEX idx_timestamp_brin
+    ON audit_records_index USING BRIN (timestamp_ns)
+    WITH (pages_per_range = 128);
+
+
+Hash Index:
+-----------
+- For exact-match lookups (order_id, execution_id)
+- Faster than B-tree for equality
+- No range scan support
+
+CREATE INDEX idx_order_id_hash
+    ON audit_records_index USING HASH (order_id);
+
+
+B-tree Index:
+-------------
+- For range queries and sorting
+- Supports <, <=, >, >=, BETWEEN
+- Used for symbols, accounts
+
+CREATE INDEX idx_symbol_btree
+    ON audit_records_index (symbol);
+
+
+GIN Index (for JSONB):
+----------------------
+- Generalized Inverted Index
+- For flexible querying of JSONB fields
+- Supports containment operators (@>, @?)
+
+CREATE INDEX idx_record_data_gin
+    ON audit_records_index USING GIN (record_data);
+
+
+Full-Text Search Index:
+------------------------
+- For searching text fields (error messages, descriptions)
+- Supports natural language queries
+
+CREATE INDEX idx_error_message_fts
+    ON audit_records_index USING GIN (to_tsvector('english', error_message));
+
+
+3.3 BLOOM FILTER INDEX
+-----------------------
+
+Probabilistic data structure for membership testing
+- Used to quickly eliminate files that don't contain a value
+- Very space-efficient
+- False positives possible, false negatives impossible
+
+class BloomFilterIndex {
+public:
+    BloomFilterIndex(size_t expected_elements, double false_positive_rate) {
+        // Calculate optimal size and hash function count
+        size_t m = CalculateOptimalSize(expected_elements, false_positive_rate);
+        size_t k = CalculateOptimalHashCount(m, expected_elements);
+
+        bit_array_.resize((m + 7) / 8, 0);
+        num_bits_ = m;
+        num_hash_functions_ = k;
+    }
+
+    void Add(const std::string& value) {
+        for (size_t i = 0; i < num_hash_functions_; i++) {
+            size_t hash = Hash(value, i);
+            size_t bit_pos = hash % num_bits_;
+            bit_array_[bit_pos / 8] |= (1 << (bit_pos % 8));
+        }
+    }
+
+    bool MayContain(const std::string& value) const {
+        for (size_t i = 0; i < num_hash_functions_; i++) {
+            size_t hash = Hash(value, i);
+            size_t bit_pos = hash % num_bits_;
+            if (!(bit_array_[bit_pos / 8] & (1 << (bit_pos % 8)))) {
+                return false;  // Definitely not present
+            }
+        }
+        return true;  // Probably present
+    }
+
+private:
+    std::vector<uint8_t> bit_array_;
+    size_t num_bits_;
+    size_t num_hash_functions_;
+};
+
+Usage:
+- Create bloom filter per file for order_ids
+- Check bloom filter before opening file
+- Reduces unnecessary file opens by 90%+
+
+
+================================================================================
+SECTION 4: QUERY ENGINE
+================================================================================
+
+4.1 QUERY OPTIMIZATION
+-----------------------
+
+class AuditQueryEngine {
+public:
+    struct Query {
+        std::string record_type;
+        uint64_t start_timestamp_ns;
+        uint64_t end_timestamp_ns;
+        std::map<std::string, std::string> filters;  // field -> value
+        std::vector<std::string> projection;         // columns to return
+        std::string order_by;
+        uint32_t limit;
+    };
+
+    struct QueryPlan {
+        std::vector<std::string> files_to_scan;
+        std::vector<std::string> blocks_to_skip;
+        std::vector<std::string> indexes_to_use;
+        uint64_t estimated_records;
+        uint64_t estimated_io_bytes;
+        std::chrono::milliseconds estimated_duration;
+    };
+
+    QueryPlan OptimizeQuery(const Query& query) {
+        QueryPlan plan;
+
+        // Step 1: File selection using time range
+        plan.files_to_scan = SelectFiles(query.start_timestamp_ns,
+                                         query.end_timestamp_ns,
+                                         query.record_type);
+
+        LOG_INFO("Selected " << plan.files_to_scan.size() << " files");
+
+        // Step 2: Filter using bloom filters
+        if (!query.filters.empty()) {
+            auto filtered_files = FilterWithBloomFilters(
+                plan.files_to_scan, query.filters);
+            plan.files_to_scan = filtered_files;
+
+            LOG_INFO("Bloom filter reduced to " << plan.files_to_scan.size()
+                    << " files");
+        }
+
+        // Step 3: Select indexes
+        plan.indexes_to_use = SelectIndexes(query);
+
+        // Step 4: Estimate cost
+        plan.estimated_records = EstimateRecordCount(plan.files_to_scan, query);
+        plan.estimated_io_bytes = EstimateIOBytes(plan.files_to_scan);
+        plan.estimated_duration = EstimateDuration(plan);
+
+        return plan;
+    }
+
+    std::vector<Record> ExecuteQuery(const Query& query) {
+        // Optimize query
+        auto plan = OptimizeQuery(query);
+
+        LOG_INFO("Executing query: " << plan.files_to_scan.size() << " files, "
+                << "estimated " << plan.estimated_records << " records");
+
+        std::vector<Record> results;
+        results.reserve(std::min(plan.estimated_records, query.limit));
+
+        // Execute in parallel
+        std::vector<std::future<std::vector<Record>>> futures;
+
+        for (const auto& file_path : plan.files_to_scan) {
+            futures.push_back(std::async(std::launch::async,
+                &AuditQueryEngine::ScanFile, this, file_path, query));
+        }
+
+        // Collect results
+        for (auto& future : futures) {
+            auto file_results = future.get();
+            results.insert(results.end(),
+                          file_results.begin(),
+                          file_results.end());
+
+            // Early termination if limit reached
+            if (query.limit > 0 && results.size() >= query.limit) {
+                break;
+            }
+        }
+
+        // Sort if requested
+        if (!query.order_by.empty()) {
+            SortResults(results, query.order_by);
+        }
+
+        // Apply limit
+        if (query.limit > 0 && results.size() > query.limit) {
+            results.resize(query.limit);
+        }
+
+        return results;
+    }
+
+private:
+    std::vector<std::string> SelectFiles(uint64_t start_ns,
+                                         uint64_t end_ns,
+                                         const std::string& record_type) {
+        // Query file metadata database
+        std::string sql = R"(
+            SELECT file_path FROM audit_files
+            WHERE file_type = $1
+              AND start_timestamp_ns <= $2
+              AND end_timestamp_ns >= $3
+            ORDER BY start_timestamp_ns
+        )";
+
+        return ExecuteSQL(sql, {record_type,
+                               std::to_string(end_ns),
+                               std::to_string(start_ns)});
+    }
+
+    std::vector<Record> ScanFile(const std::string& file_path,
+                                 const Query& query) {
+        std::vector<Record> results;
+
+        // Open file
+        BinaryLogReader reader(file_path);
+
+        // Read and filter records
+        while (auto record = reader.ReadNextRecord()) {
+            if (MatchesQuery(*record, query)) {
+                results.push_back(*record);
+            }
+        }
+
+        return results;
+    }
+};
+
+
+4.2 CACHING STRATEGY
+--------------------
+
+class QueryCache {
+public:
+    struct CacheKey {
+        std::string query_hash;
+        uint64_t start_timestamp_ns;
+        uint64_t end_timestamp_ns;
+    };
+
+    struct CacheEntry {
+        std::vector<Record> results;
+        uint64_t cached_at_ns;
+        uint64_t access_count;
+        uint64_t last_access_ns;
+    };
+
+    std::optional<std::vector<Record>> Get(const CacheKey& key) {
+        std::shared_lock lock(cache_mutex_);
+
+        auto it = cache_.find(key);
+        if (it != cache_.end()) {
+            // Check if entry is still valid (< 1 hour old)
+            uint64_t now_ns = GetNanosecondTimestamp();
+            if (now_ns - it->second.cached_at_ns < 3600ULL * 1000000000ULL) {
+                // Update access statistics
+                it->second.access_count++;
+                it->second.last_access_ns = now_ns;
+
+                return it->second.results;
+            } else {
+                // Expired, remove from cache
+                cache_.erase(it);
+            }
+        }
+
+        return std::nullopt;
+    }
+
+    void Put(const CacheKey& key, const std::vector<Record>& results) {
+        std::unique_lock lock(cache_mutex_);
+
+        // Check cache size limit
+        if (cache_.size() >= MAX_CACHE_ENTRIES) {
+            EvictLRU();
+        }
+
+        CacheEntry entry;
+        entry.results = results;
+        entry.cached_at_ns = GetNanosecondTimestamp();
+        entry.access_count = 1;
+        entry.last_access_ns = entry.cached_at_ns;
+
+        cache_[key] = entry;
+    }
+
+private:
+    static constexpr size_t MAX_CACHE_ENTRIES = 1000;
+
+    std::unordered_map<CacheKey, CacheEntry> cache_;
+    std::shared_mutex cache_mutex_;
+
+    void EvictLRU() {
+        // Find least recently used entry
+        auto lru_it = std::min_element(cache_.begin(), cache_.end(),
+            [](const auto& a, const auto& b) {
+                return a.second.last_access_ns < b.second.last_access_ns;
+            });
+
+        if (lru_it != cache_.end()) {
+            cache_.erase(lru_it);
+        }
+    }
+};
+
+
+================================================================================
+SECTION 5: DATA EXPORT AND REPORTING
+================================================================================
+
+5.1 EXPORT FORMATS
+-------------------
+
+CSV Export:
+-----------
+class CSVExporter {
+public:
+    void ExportToCSV(const std::vector<Record>& records,
+                    const std::string& output_path) {
+        std::ofstream csv(output_path);
+
+        // Write header
+        csv << "timestamp,order_id,symbol,side,quantity,price,status\n";
+
+        // Write records
+        for (const auto& record : records) {
+            csv << record.timestamp_ns << ","
+                << record.order_id << ","
+                << record.symbol << ","
+                << record.side << ","
+                << record.quantity << ","
+                << record.price << ","
+                << record.status << "\n";
+        }
+
+        csv.close();
+        LOG_INFO("Exported " << records.size() << " records to " << output_path);
+    }
+};
+
+
+JSON Export:
+------------
+class JSONExporter {
+public:
+    void ExportToJSON(const std::vector<Record>& records,
+                     const std::string& output_path) {
+        json j = json::array();
+
+        for (const auto& record : records) {
+            json record_json;
+            record_json["timestamp"] = record.timestamp_ns;
+            record_json["order_id"] = record.order_id;
+            record_json["symbol"] = record.symbol;
+            record_json["side"] = std::string(1, record.side);
+            record_json["quantity"] = record.quantity;
+            record_json["price"] = record.price;
+            record_json["status"] = record.status;
+
+            j.push_back(record_json);
+        }
+
+        std::ofstream out(output_path);
+        out << j.dump(2);  // Pretty print with 2-space indent
+        out.close();
+
+        LOG_INFO("Exported " << records.size() << " records to " << output_path);
+    }
+};
+
+
+Parquet Export:
+---------------
+class ParquetExporter {
+public:
+    void ExportToParquet(const std::vector<Record>& records,
+                        const std::string& output_path) {
+        // Create schema
+        auto schema = arrow::schema({
+            arrow::field("timestamp", arrow::int64()),
+            arrow::field("order_id", arrow::utf8()),
+            arrow::field("symbol", arrow::utf8()),
+            arrow::field("side", arrow::utf8()),
+            arrow::field("quantity", arrow::int64()),
+            arrow::field("price", arrow::float64()),
+            arrow::field("status", arrow::utf8())
+        });
+
+        // Build arrays
+        // ... (Arrow array building code)
+
+        // Write to Parquet
+        // ... (Parquet writer code)
+
+        LOG_INFO("Exported " << records.size() << " records to " << output_path);
+    }
+};
+
+================================================================================
+END OF DOCUMENT
+================================================================================

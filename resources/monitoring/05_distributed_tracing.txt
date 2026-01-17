@@ -1,0 +1,1182 @@
+DISTRIBUTED TRACING FOR HFT SYSTEMS
+====================================
+
+TABLE OF CONTENTS
+-----------------
+1. Overview & Architecture
+2. OpenTelemetry Setup
+3. Jaeger Configuration
+4. C++ Instrumentation
+5. Span Context Propagation
+6. Trace Sampling Strategies
+7. Performance Optimization
+8. Custom Span Processors
+9. Baggage & Context Management
+10. Production Deployment
+11. Trace Analysis & Queries
+
+============================================
+1. OVERVIEW & ARCHITECTURE
+============================================
+
+Distributed Tracing Architecture:
+----------------------------------
+┌────────────────────────────────────────────────────────────┐
+│                    Trading Request Flow                     │
+│                                                             │
+│  Client → Gateway → Order Router → Risk → Exchange         │
+│    │         │           │           │         │           │
+│  Span1    Span2       Span3       Span4     Span5          │
+│    └─────────┴───────────┴───────────┴─────────┘           │
+│                     Trace ID: abc123                        │
+└────────────────────────────────────────────────────────────┘
+                             │
+                             ▼
+┌────────────────────────────────────────────────────────────┐
+│              OpenTelemetry Collector                        │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐    │
+│  │  Receivers   │→ │  Processors  │→ │  Exporters   │    │
+│  │   (gRPC/     │  │  (Sampling,  │  │  (Jaeger,    │    │
+│  │   HTTP)      │  │   Batching)  │  │   Zipkin)    │    │
+│  └──────────────┘  └──────────────┘  └──────────────┘    │
+└────────────────────────────────────────────────────────────┘
+                             │
+                ┌────────────┼────────────┐
+                │            │            │
+         ┌──────▼──────┐ ┌──▼──────┐ ┌──▼──────┐
+         │   Jaeger    │ │ Zipkin  │ │ Custom  │
+         │   Backend   │ │ Backend │ │ Storage │
+         └──────┬──────┘ └─────────┘ └─────────┘
+                │
+         ┌──────▼──────┐
+         │   Jaeger    │
+         │     UI      │
+         └─────────────┘
+
+Trace Components:
+-----------------
+1. TRACE: Complete request lifecycle (unique trace ID)
+2. SPAN: Individual operation within a trace
+3. CONTEXT: Metadata propagated across services
+4. BAGGAGE: Key-value pairs for cross-cutting concerns
+5. EVENTS: Point-in-time events within a span
+6. LINKS: Relationships between spans
+
+Critical Tracing Scenarios:
+----------------------------
+1. Order lifecycle from submission to fill
+2. Market data flow from exchange to strategy
+3. Risk check pipeline
+4. Position update propagation
+5. Error/rejection flow analysis
+6. Latency breakdown by component
+
+============================================
+2. OPENTELEMETRY SETUP
+============================================
+
+CMakeLists.txt Configuration:
+------------------------------
+cmake_minimum_required(VERSION 3.15)
+project(hft_tracing)
+
+set(CMAKE_CXX_STANDARD 17)
+
+# Find OpenTelemetry
+find_package(opentelemetry-cpp CONFIG REQUIRED)
+
+add_executable(trading_engine
+    src/main.cpp
+    src/tracing/tracer_provider.cpp
+    src/tracing/span_processor.cpp
+)
+
+target_link_libraries(trading_engine
+    opentelemetry-cpp::trace
+    opentelemetry-cpp::otlp_http_exporter
+    opentelemetry-cpp::otlp_grpc_exporter
+    opentelemetry-cpp::jaeger_trace_exporter
+    opentelemetry-cpp::api
+    opentelemetry-cpp::sdk
+    opentelemetry-cpp::resources
+)
+
+OpenTelemetry Collector Configuration:
+---------------------------------------
+# otel-collector-config.yaml
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+  # Jaeger receiver for backward compatibility
+  jaeger:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:14250
+      thrift_http:
+        endpoint: 0.0.0.0:14268
+
+processors:
+  # Batch spans for efficiency
+  batch:
+    timeout: 100ms
+    send_batch_size: 1024
+    send_batch_max_size: 2048
+
+  # Sample high-frequency traces
+  probabilistic_sampler:
+    sampling_percentage: 1.0  # 1% sampling for production
+
+  # Tail-based sampling (keep slow/error traces)
+  tail_sampling:
+    decision_wait: 10s
+    num_traces: 10000
+    expected_new_traces_per_sec: 1000
+    policies:
+      # Always keep error traces
+      - name: error-traces
+        type: status_code
+        status_code:
+          status_codes:
+            - ERROR
+
+      # Keep slow traces (>100ms)
+      - name: slow-traces
+        type: latency
+        latency:
+          threshold_ms: 100
+
+      # Sample normal traces at 1%
+      - name: probabilistic
+        type: probabilistic
+        probabilistic:
+          sampling_percentage: 1.0
+
+  # Add resource attributes
+  resource:
+    attributes:
+      - key: service.name
+        value: hft-trading-engine
+        action: insert
+      - key: service.version
+        value: 1.0.0
+        action: insert
+      - key: deployment.environment
+        value: production
+        action: insert
+
+  # Span name remapping
+  span:
+    name:
+      from_attributes:
+        - operation
+        - component
+
+exporters:
+  # Jaeger exporter
+  jaeger:
+    endpoint: jaeger-collector:14250
+    tls:
+      insecure: true
+
+  # OTLP exporter (for other backends)
+  otlp:
+    endpoint: otel-backend:4317
+    tls:
+      insecure: false
+      cert_file: /certs/server.crt
+      key_file: /certs/server.key
+
+  # Logging for debugging
+  logging:
+    loglevel: info
+    sampling_initial: 5
+    sampling_thereafter: 200
+
+  # Prometheus metrics from traces
+  prometheusremotewrite:
+    endpoint: http://prometheus:9090/api/v1/write
+    resource_to_telemetry_conversion:
+      enabled: true
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp, jaeger]
+      processors: [batch, tail_sampling, resource, span]
+      exporters: [jaeger, otlp, logging]
+
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      level: detailed
+      address: 0.0.0.0:8888
+
+============================================
+3. JAEGER CONFIGURATION
+============================================
+
+Jaeger All-in-One Deployment:
+------------------------------
+version: '3.8'
+
+services:
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: hft-jaeger
+    environment:
+      - COLLECTOR_ZIPKIN_HOST_PORT=:9411
+      - COLLECTOR_OTLP_ENABLED=true
+      - SPAN_STORAGE_TYPE=elasticsearch
+      - ES_SERVER_URLS=http://elasticsearch:9200
+      - ES_NUM_SHARDS=5
+      - ES_NUM_REPLICAS=1
+    ports:
+      - "5775:5775/udp"    # Zipkin compact thrift
+      - "6831:6831/udp"    # Jaeger compact thrift
+      - "6832:6832/udp"    # Jaeger binary thrift
+      - "5778:5778"        # Serve configs
+      - "16686:16686"      # Jaeger UI
+      - "14250:14250"      # gRPC
+      - "14268:14268"      # HTTP
+      - "14269:14269"      # Admin port
+      - "9411:9411"        # Zipkin
+    networks:
+      - hft-tracing
+    restart: unless-stopped
+
+  # OpenTelemetry Collector
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    container_name: hft-otel-collector
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+      - "8888:8888"   # Prometheus metrics
+    networks:
+      - hft-tracing
+    depends_on:
+      - jaeger
+    restart: unless-stopped
+
+  # Elasticsearch for trace storage
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.17.0
+    container_name: hft-elasticsearch
+    environment:
+      - discovery.type=single-node
+      - "ES_JAVA_OPTS=-Xms2g -Xmx2g"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+    networks:
+      - hft-tracing
+    restart: unless-stopped
+
+volumes:
+  es_data:
+
+networks:
+  hft-tracing:
+    driver: bridge
+
+============================================
+4. C++ INSTRUMENTATION
+============================================
+
+Tracer Provider Initialization:
+--------------------------------
+#include <opentelemetry/sdk/trace/tracer_provider.h>
+#include <opentelemetry/sdk/trace/simple_processor.h>
+#include <opentelemetry/sdk/trace/batch_span_processor.h>
+#include <opentelemetry/exporters/otlp/otlp_grpc_exporter.h>
+#include <opentelemetry/exporters/jaeger/jaeger_exporter.h>
+#include <opentelemetry/sdk/resource/resource.h>
+#include <opentelemetry/trace/provider.h>
+
+namespace trace_api = opentelemetry::trace;
+namespace trace_sdk = opentelemetry::sdk::trace;
+namespace otlp = opentelemetry::exporter::otlp;
+namespace jaeger = opentelemetry::exporter::jaeger;
+namespace resource = opentelemetry::sdk::resource;
+
+class TracingInitializer {
+public:
+    static void initialize(const std::string& service_name,
+                          const std::string& collector_endpoint) {
+        // Create resource attributes
+        auto resource_attributes = resource::ResourceAttributes{
+            {"service.name", service_name},
+            {"service.version", "1.0.0"},
+            {"deployment.environment", "production"},
+            {"host.name", getHostname()},
+            {"process.pid", std::to_string(getpid())}
+        };
+
+        auto resource = resource::Resource::Create(resource_attributes);
+
+        // Create OTLP exporter
+        otlp::OtlpGrpcExporterOptions exporter_options;
+        exporter_options.endpoint = collector_endpoint;
+        exporter_options.use_ssl_credentials = false;
+
+        auto exporter = std::make_unique<otlp::OtlpGrpcExporter>(exporter_options);
+
+        // Create batch span processor for performance
+        trace_sdk::BatchSpanProcessorOptions processor_options;
+        processor_options.max_queue_size = 2048;
+        processor_options.schedule_delay_millis = std::chrono::milliseconds(100);
+        processor_options.max_export_batch_size = 512;
+
+        auto processor = std::make_unique<trace_sdk::BatchSpanProcessor>(
+            std::move(exporter), processor_options);
+
+        // Create tracer provider
+        auto provider = std::make_shared<trace_sdk::TracerProvider>(
+            std::move(processor), resource);
+
+        // Set global tracer provider
+        trace_api::Provider::SetTracerProvider(provider);
+    }
+
+    static std::shared_ptr<trace_api::Tracer> getTracer(
+        const std::string& name = "hft-trading") {
+        auto provider = trace_api::Provider::GetTracerProvider();
+        return provider->GetTracer(name, "1.0.0");
+    }
+
+private:
+    static std::string getHostname() {
+        char hostname[256];
+        gethostname(hostname, sizeof(hostname));
+        return std::string(hostname);
+    }
+};
+
+High-Performance Span Helper:
+------------------------------
+#include <opentelemetry/trace/span.h>
+#include <opentelemetry/trace/scope.h>
+#include <opentelemetry/context/propagation/global_propagator.h>
+#include <opentelemetry/context/propagation/text_map_propagator.h>
+
+using namespace opentelemetry;
+
+class SpanHelper {
+public:
+    // Start a new span
+    static nostd::shared_ptr<trace::Span> startSpan(
+        const std::string& operation_name,
+        const trace::StartSpanOptions& options = {}) {
+
+        auto tracer = TracingInitializer::getTracer();
+        return tracer->StartSpan(operation_name, options);
+    }
+
+    // RAII span scope
+    class SpanScope {
+    private:
+        nostd::shared_ptr<trace::Span> span_;
+        trace::Scope scope_;
+
+    public:
+        explicit SpanScope(const std::string& operation_name)
+            : span_(startSpan(operation_name)),
+              scope_(span_) {}
+
+        SpanScope(const std::string& operation_name,
+                 const trace::StartSpanOptions& options)
+            : span_(startSpan(operation_name, options)),
+              scope_(span_) {}
+
+        ~SpanScope() {
+            span_->End();
+        }
+
+        // Add attributes
+        template<typename T>
+        void setAttribute(const std::string& key, const T& value) {
+            span_->SetAttribute(key, value);
+        }
+
+        // Add event
+        void addEvent(const std::string& name) {
+            span_->AddEvent(name);
+        }
+
+        void addEvent(const std::string& name,
+                     const common::KeyValueIterable& attributes) {
+            span_->AddEvent(name, attributes);
+        }
+
+        // Set status
+        void setStatus(trace::StatusCode code,
+                      const std::string& description = "") {
+            span_->SetStatus(code, description);
+        }
+
+        // Record exception
+        void recordException(const std::exception& ex) {
+            span_->AddEvent("exception", {
+                {"exception.type", typeid(ex).name()},
+                {"exception.message", ex.what()}
+            });
+            setStatus(trace::StatusCode::kError, ex.what());
+        }
+
+        nostd::shared_ptr<trace::Span> getSpan() const {
+            return span_;
+        }
+    };
+
+    // Create child span
+    static SpanScope createChildSpan(
+        const std::string& operation_name,
+        nostd::shared_ptr<trace::Span> parent) {
+
+        trace::StartSpanOptions options;
+        options.parent = parent->GetContext();
+
+        return SpanScope(operation_name, options);
+    }
+};
+
+// Macro for automatic span creation
+#define TRACE_SPAN(name) \
+    SpanHelper::SpanScope __trace_span_##__LINE__(name)
+
+#define TRACE_SPAN_WITH_PARENT(name, parent) \
+    SpanHelper::createChildSpan(name, parent)
+
+Trading Engine with Tracing:
+-----------------------------
+class TradingEngine {
+private:
+    std::shared_ptr<trace_api::Tracer> tracer_;
+
+public:
+    TradingEngine() {
+        TracingInitializer::initialize("hft-trading-engine",
+                                      "otel-collector:4317");
+        tracer_ = TracingInitializer::getTracer();
+    }
+
+    void processOrder(const Order& order) {
+        // Start root span for order processing
+        TRACE_SPAN("process_order");
+        __trace_span_process_order.setAttribute("order.id", order.id);
+        __trace_span_process_order.setAttribute("order.symbol", order.symbol);
+        __trace_span_process_order.setAttribute("order.exchange", order.exchange);
+        __trace_span_process_order.setAttribute("order.type", order.type);
+        __trace_span_process_order.setAttribute("order.quantity", order.quantity);
+
+        try {
+            // Validation span
+            {
+                TRACE_SPAN("validate_order");
+                validateOrder(order);
+                __trace_span_validate_order.addEvent("order_validated");
+            }
+
+            // Risk check span
+            {
+                TRACE_SPAN("risk_check");
+                __trace_span_risk_check.setAttribute("strategy", order.strategy);
+
+                bool risk_approved = checkRiskLimits(order);
+
+                __trace_span_risk_check.setAttribute("risk.approved", risk_approved);
+
+                if (!risk_approved) {
+                    __trace_span_risk_check.setStatus(
+                        trace::StatusCode::kError,
+                        "Risk limits exceeded");
+                    throw std::runtime_error("Risk limits exceeded");
+                }
+            }
+
+            // Route to exchange span
+            {
+                TRACE_SPAN("route_to_exchange");
+                __trace_span_route_to_exchange.setAttribute("exchange", order.exchange);
+
+                auto start = std::chrono::high_resolution_clock::now();
+
+                bool sent = sendToExchange(order);
+
+                auto end = std::chrono::high_resolution_clock::now();
+                auto latency_us = std::chrono::duration_cast<
+                    std::chrono::microseconds>(end - start).count();
+
+                __trace_span_route_to_exchange.setAttribute("latency_us", latency_us);
+                __trace_span_route_to_exchange.setAttribute("sent", sent);
+
+                if (sent) {
+                    __trace_span_route_to_exchange.addEvent("order_sent");
+                }
+            }
+
+            __trace_span_process_order.setStatus(trace::StatusCode::kOk);
+
+        } catch (const std::exception& ex) {
+            __trace_span_process_order.recordException(ex);
+            throw;
+        }
+    }
+
+    void onOrderFill(const Fill& fill) {
+        TRACE_SPAN("handle_fill");
+        __trace_span_handle_fill.setAttribute("order.id", fill.order_id);
+        __trace_span_handle_fill.setAttribute("fill.quantity", fill.quantity);
+        __trace_span_handle_fill.setAttribute("fill.price", fill.price);
+        __trace_span_handle_fill.setAttribute("exchange", fill.exchange);
+
+        // Link to original order span if available
+        auto order_trace_id = getOrderTraceId(fill.order_id);
+        if (!order_trace_id.empty()) {
+            // Add link to original order span
+            trace::SpanContext linked_context(
+                trace::TraceId(reinterpret_cast<const uint8_t*>(
+                    order_trace_id.data())),
+                trace::SpanId(),
+                trace::TraceFlags(),
+                false
+            );
+
+            __trace_span_handle_fill.getSpan()->AddLink(linked_context);
+        }
+
+        // Update position
+        {
+            TRACE_SPAN("update_position");
+            updatePosition(fill);
+        }
+
+        // Calculate PnL
+        {
+            TRACE_SPAN("calculate_pnl");
+            double pnl = calculatePnL(fill);
+            __trace_span_calculate_pnl.setAttribute("pnl", pnl);
+        }
+    }
+
+private:
+    void validateOrder(const Order& order) {
+        // Validation logic with detailed tracing
+        auto span = trace_api::Tracer::GetCurrentSpan();
+
+        if (order.quantity <= 0) {
+            span->AddEvent("validation_failed", {
+                {"reason", "invalid_quantity"},
+                {"quantity", order.quantity}
+            });
+            throw std::invalid_argument("Invalid quantity");
+        }
+
+        if (order.symbol.empty()) {
+            span->AddEvent("validation_failed", {
+                {"reason", "missing_symbol"}
+            });
+            throw std::invalid_argument("Missing symbol");
+        }
+
+        span->AddEvent("validation_passed");
+    }
+
+    bool checkRiskLimits(const Order& order) {
+        auto span = trace_api::Tracer::GetCurrentSpan();
+
+        // Check position limit
+        {
+            TRACE_SPAN("check_position_limit");
+            double current_position = getPosition(order.symbol);
+            double position_limit = getPositionLimit(order.symbol);
+
+            __trace_span_check_position_limit.setAttribute(
+                "current_position", current_position);
+            __trace_span_check_position_limit.setAttribute(
+                "position_limit", position_limit);
+
+            if (std::abs(current_position + order.quantity) > position_limit) {
+                return false;
+            }
+        }
+
+        // Check daily loss limit
+        {
+            TRACE_SPAN("check_loss_limit");
+            double daily_pnl = getDailyPnL(order.strategy);
+            double loss_limit = getLossLimit(order.strategy);
+
+            __trace_span_check_loss_limit.setAttribute("daily_pnl", daily_pnl);
+            __trace_span_check_loss_limit.setAttribute("loss_limit", loss_limit);
+
+            if (daily_pnl < loss_limit) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    bool sendToExchange(const Order& order) {
+        // Exchange communication with tracing
+        return true;
+    }
+
+    void updatePosition(const Fill& fill) {}
+    double calculatePnL(const Fill& fill) { return 0.0; }
+    double getPosition(const std::string& symbol) { return 0.0; }
+    double getPositionLimit(const std::string& symbol) { return 1000.0; }
+    double getDailyPnL(const std::string& strategy) { return 0.0; }
+    double getLossLimit(const std::string& strategy) { return -100000.0; }
+    std::string getOrderTraceId(const std::string& order_id) { return ""; }
+};
+
+============================================
+5. SPAN CONTEXT PROPAGATION
+============================================
+
+W3C Trace Context Propagation:
+-------------------------------
+#include <opentelemetry/context/propagation/text_map_propagator.h>
+#include <opentelemetry/trace/propagation/http_trace_context.h>
+
+namespace propagation = opentelemetry::context::propagation;
+namespace http_propagation = opentelemetry::trace::propagation;
+
+// HTTP Header carrier for context propagation
+class HTTPHeaderCarrier : public propagation::TextMapCarrier {
+private:
+    std::map<std::string, std::string> headers_;
+
+public:
+    HTTPHeaderCarrier() = default;
+
+    // Get header value
+    nostd::string_view Get(nostd::string_view key) const noexcept override {
+        auto it = headers_.find(std::string(key));
+        if (it != headers_.end()) {
+            return nostd::string_view(it->second);
+        }
+        return "";
+    }
+
+    // Set header value
+    void Set(nostd::string_view key, nostd::string_view value) noexcept override {
+        headers_[std::string(key)] = std::string(value);
+    }
+
+    // Get all headers
+    const std::map<std::string, std::string>& getHeaders() const {
+        return headers_;
+    }
+
+    // Set headers from map
+    void setHeaders(const std::map<std::string, std::string>& headers) {
+        headers_ = headers;
+    }
+};
+
+// Context propagation helper
+class ContextPropagator {
+public:
+    // Inject current context into carrier
+    static void inject(HTTPHeaderCarrier& carrier) {
+        auto propagator = context::propagation::GlobalTextMapPropagator::GetGlobalPropagator();
+        auto current_ctx = context::RuntimeContext::GetCurrent();
+        propagator->Inject(carrier, current_ctx);
+    }
+
+    // Extract context from carrier
+    static context::Context extract(const HTTPHeaderCarrier& carrier) {
+        auto propagator = context::propagation::GlobalTextMapPropagator::GetGlobalPropagator();
+        return propagator->Extract(carrier, context::RuntimeContext::GetCurrent());
+    }
+
+    // Create span with extracted context
+    static nostd::shared_ptr<trace::Span> startSpanWithExtractedContext(
+        const std::string& operation_name,
+        const HTTPHeaderCarrier& carrier) {
+
+        auto extracted_ctx = extract(carrier);
+
+        auto tracer = TracingInitializer::getTracer();
+
+        trace::StartSpanOptions options;
+        options.parent = trace::GetSpan(extracted_ctx)->GetContext();
+
+        return tracer->StartSpan(operation_name, options);
+    }
+};
+
+// Example: HTTP Request Handler
+class HTTPRequestHandler {
+public:
+    void handleRequest(const HTTPRequest& request) {
+        // Extract trace context from incoming headers
+        HTTPHeaderCarrier carrier;
+        carrier.setHeaders(request.headers);
+
+        auto span = ContextPropagator::startSpanWithExtractedContext(
+            "handle_http_request", carrier);
+
+        trace::Scope scope(span);
+
+        // Process request
+        processRequest(request);
+
+        span->End();
+    }
+
+private:
+    void processRequest(const HTTPRequest& request) {
+        // Request processing logic
+    }
+};
+
+// Example: Message Queue Consumer
+class MessageQueueConsumer {
+public:
+    void consumeMessage(const Message& msg) {
+        // Extract trace context from message metadata
+        HTTPHeaderCarrier carrier;
+        for (const auto& [key, value] : msg.metadata) {
+            carrier.Set(key, value);
+        }
+
+        auto span = ContextPropagator::startSpanWithExtractedContext(
+            "consume_message", carrier);
+
+        trace::Scope scope(span);
+
+        span->SetAttribute("message.id", msg.id);
+        span->SetAttribute("message.topic", msg.topic);
+
+        // Process message
+        handleMessage(msg);
+
+        span->End();
+    }
+
+private:
+    void handleMessage(const Message& msg) {}
+};
+
+============================================
+6. TRACE SAMPLING STRATEGIES
+============================================
+
+Custom Sampler Implementation:
+-------------------------------
+#include <opentelemetry/sdk/trace/sampler.h>
+
+namespace trace_sdk = opentelemetry::sdk::trace;
+
+// Latency-based sampler (always sample slow requests)
+class LatencyBasedSampler : public trace_sdk::Sampler {
+private:
+    double sample_rate_;
+    uint64_t latency_threshold_us_;
+
+public:
+    LatencyBasedSampler(double sample_rate, uint64_t latency_threshold_us)
+        : sample_rate_(sample_rate),
+          latency_threshold_us_(latency_threshold_us) {}
+
+    nostd::string_view GetDescription() const noexcept override {
+        return "LatencyBasedSampler";
+    }
+
+    trace_sdk::SamplingResult ShouldSample(
+        const trace::SpanContext& parent_context,
+        trace::TraceId trace_id,
+        nostd::string_view name,
+        trace::SpanKind span_kind,
+        const common::KeyValueIterable& attributes,
+        const trace::SpanContextKeyValueIterable& links) noexcept override {
+
+        // Check if latency attribute exists
+        uint64_t latency = 0;
+        attributes.ForEachKeyValue([&](nostd::string_view key, common::AttributeValue value) {
+            if (key == "latency_us") {
+                latency = nostd::get<uint64_t>(value);
+                return false;  // Stop iteration
+            }
+            return true;  // Continue iteration
+        });
+
+        // Always sample if latency exceeds threshold
+        if (latency > latency_threshold_us_) {
+            return {trace_sdk::Decision::RECORD_AND_SAMPLE,
+                    nullptr,
+                    trace::TraceState::GetDefault()};
+        }
+
+        // Otherwise, use probabilistic sampling
+        double random = static_cast<double>(rand()) / RAND_MAX;
+        if (random < sample_rate_) {
+            return {trace_sdk::Decision::RECORD_AND_SAMPLE,
+                    nullptr,
+                    trace::TraceState::GetDefault()};
+        }
+
+        return {trace_sdk::Decision::DROP,
+                nullptr,
+                trace::TraceState::GetDefault()};
+    }
+};
+
+// Error-based sampler (always sample errors)
+class ErrorBasedSampler : public trace_sdk::Sampler {
+private:
+    double sample_rate_;
+
+public:
+    explicit ErrorBasedSampler(double sample_rate)
+        : sample_rate_(sample_rate) {}
+
+    nostd::string_view GetDescription() const noexcept override {
+        return "ErrorBasedSampler";
+    }
+
+    trace_sdk::SamplingResult ShouldSample(
+        const trace::SpanContext& parent_context,
+        trace::TraceId trace_id,
+        nostd::string_view name,
+        trace::SpanKind span_kind,
+        const common::KeyValueIterable& attributes,
+        const trace::SpanContextKeyValueIterable& links) noexcept override {
+
+        // Check if error attribute exists
+        bool has_error = false;
+        attributes.ForEachKeyValue([&](nostd::string_view key, common::AttributeValue value) {
+            if (key == "error" || key == "exception") {
+                has_error = true;
+                return false;
+            }
+            return true;
+        });
+
+        // Always sample errors
+        if (has_error) {
+            return {trace_sdk::Decision::RECORD_AND_SAMPLE,
+                    nullptr,
+                    trace::TraceState::GetDefault()};
+        }
+
+        // Use probabilistic sampling for normal traces
+        double random = static_cast<double>(rand()) / RAND_MAX;
+        if (random < sample_rate_) {
+            return {trace_sdk::Decision::RECORD_AND_SAMPLE,
+                    nullptr,
+                    trace::TraceState::GetDefault()};
+        }
+
+        return {trace_sdk::Decision::DROP,
+                nullptr,
+                trace::TraceState::GetDefault()};
+    }
+};
+
+// Composite sampler
+class Compositesampler : public trace_sdk::Sampler {
+private:
+    std::vector<std::unique_ptr<trace_sdk::Sampler>> samplers_;
+
+public:
+    void addSampler(std::unique_ptr<trace_sdk::Sampler> sampler) {
+        samplers_.push_back(std::move(sampler));
+    }
+
+    nostd::string_view GetDescription() const noexcept override {
+        return "CompositeSampler";
+    }
+
+    trace_sdk::SamplingResult ShouldSample(
+        const trace::SpanContext& parent_context,
+        trace::TraceId trace_id,
+        nostd::string_view name,
+        trace::SpanKind span_kind,
+        const common::KeyValueIterable& attributes,
+        const trace::SpanContextKeyValueIterable& links) noexcept override {
+
+        // If any sampler decides to sample, then sample
+        for (const auto& sampler : samplers_) {
+            auto result = sampler->ShouldSample(
+                parent_context, trace_id, name, span_kind, attributes, links);
+
+            if (result.decision == trace_sdk::Decision::RECORD_AND_SAMPLE) {
+                return result;
+            }
+        }
+
+        return {trace_sdk::Decision::DROP,
+                nullptr,
+                trace::TraceState::GetDefault()};
+    }
+};
+
+// Sampler factory
+class SamplerFactory {
+public:
+    static std::unique_ptr<trace_sdk::Sampler> createHFTSampler() {
+        auto composite = std::make_unique<CompositeSampler>();
+
+        // Always sample errors
+        composite->addSampler(std::make_unique<ErrorBasedSampler>(0.01));
+
+        // Always sample slow requests (>5ms)
+        composite->addSampler(std::make_unique<LatencyBasedSampler>(0.01, 5000));
+
+        // Sample 1% of normal requests
+        composite->addSampler(
+            std::make_unique<trace_sdk::ProbabilitySampler>(0.01));
+
+        return composite;
+    }
+};
+
+============================================
+7. CUSTOM SPAN PROCESSORS
+============================================
+
+Low-Latency Span Processor:
+----------------------------
+#include <opentelemetry/sdk/trace/processor.h>
+#include <queue>
+#include <atomic>
+#include <thread>
+
+class LowLatencySpanProcessor : public trace_sdk::SpanProcessor {
+private:
+    std::unique_ptr<trace_sdk::SpanExporter> exporter_;
+    std::queue<std::unique_ptr<trace_sdk::Recordable>> span_queue_;
+    std::mutex queue_mutex_;
+    std::condition_variable queue_cv_;
+    std::thread export_thread_;
+    std::atomic<bool> running_{true};
+
+    size_t max_queue_size_;
+    size_t batch_size_;
+    std::chrono::milliseconds export_interval_;
+
+public:
+    LowLatencySpanProcessor(
+        std::unique_ptr<trace_sdk::SpanExporter> exporter,
+        size_t max_queue_size = 4096,
+        size_t batch_size = 512,
+        std::chrono::milliseconds export_interval = std::chrono::milliseconds(50))
+        : exporter_(std::move(exporter)),
+          max_queue_size_(max_queue_size),
+          batch_size_(batch_size),
+          export_interval_(export_interval) {
+
+        export_thread_ = std::thread(&LowLatencySpanProcessor::exportWorker, this);
+    }
+
+    ~LowLatencySpanProcessor() override {
+        running_ = false;
+        queue_cv_.notify_one();
+        if (export_thread_.joinable()) {
+            export_thread_.join();
+        }
+        forceFlush();
+    }
+
+    std::unique_ptr<trace_sdk::Recordable> MakeRecordable() noexcept override {
+        return exporter_->MakeRecordable();
+    }
+
+    void OnStart(trace_sdk::Recordable& span,
+                 const trace::SpanContext& parent_context) noexcept override {
+        // No-op for low latency
+    }
+
+    void OnEnd(std::unique_ptr<trace_sdk::Recordable>&& span) noexcept override {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+
+        // Drop oldest span if queue is full (to avoid blocking)
+        if (span_queue_.size() >= max_queue_size_) {
+            span_queue_.pop();
+        }
+
+        span_queue_.push(std::move(span));
+
+        // Wake up export thread if batch size reached
+        if (span_queue_.size() >= batch_size_) {
+            queue_cv_.notify_one();
+        }
+    }
+
+    bool ForceFlush(std::chrono::microseconds timeout) noexcept override {
+        forceFlush();
+        return true;
+    }
+
+    bool Shutdown(std::chrono::microseconds timeout) noexcept override {
+        running_ = false;
+        queue_cv_.notify_one();
+        return exporter_->Shutdown(timeout);
+    }
+
+private:
+    void exportWorker() {
+        while (running_) {
+            std::unique_lock<std::mutex> lock(queue_mutex_);
+
+            // Wait for batch size or timeout
+            queue_cv_.wait_for(lock, export_interval_, [this] {
+                return !running_ || span_queue_.size() >= batch_size_;
+            });
+
+            if (!span_queue_.empty()) {
+                exportBatch(lock);
+            }
+        }
+    }
+
+    void exportBatch(std::unique_lock<std::mutex>& lock) {
+        nostd::span<std::unique_ptr<trace_sdk::Recordable>> batch;
+        std::vector<std::unique_ptr<trace_sdk::Recordable>> batch_vec;
+
+        size_t export_count = std::min(span_queue_.size(), batch_size_);
+        batch_vec.reserve(export_count);
+
+        for (size_t i = 0; i < export_count; ++i) {
+            batch_vec.push_back(std::move(span_queue_.front()));
+            span_queue_.pop();
+        }
+
+        lock.unlock();
+
+        // Export without holding lock
+        batch = nostd::span<std::unique_ptr<trace_sdk::Recordable>>(
+            batch_vec.data(), batch_vec.size());
+
+        exporter_->Export(batch);
+    }
+
+    void forceFlush() {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+
+        while (!span_queue_.empty()) {
+            std::vector<std::unique_ptr<trace_sdk::Recordable>> batch_vec;
+            batch_vec.push_back(std::move(span_queue_.front()));
+            span_queue_.pop();
+
+            nostd::span<std::unique_ptr<trace_sdk::Recordable>> batch(
+                batch_vec.data(), batch_vec.size());
+
+            exporter_->Export(batch);
+        }
+    }
+};
+
+============================================
+8. TRACE ANALYSIS & QUERIES
+============================================
+
+Jaeger Query Examples:
+----------------------
+# Find slow order processing traces
+service=hft-trading-engine operation=process_order duration>100ms
+
+# Find error traces
+service=hft-trading-engine tags={"error": "true"}
+
+# Find traces for specific symbol
+service=hft-trading-engine tags={"order.symbol": "BTC-USD"}
+
+# Find traces with high latency in risk check
+service=hft-trading-engine operation=risk_check duration>50ms
+
+# Find all traces for a specific order
+service=hft-trading-engine tags={"order.id": "ORD-123456"}
+
+Trace Analysis Script:
+----------------------
+#!/usr/bin/env python3
+
+import requests
+import json
+from datetime import datetime, timedelta
+
+JAEGER_URL = "http://localhost:16686"
+
+def query_traces(service, operation=None, tags=None, lookback_hours=1):
+    """Query traces from Jaeger"""
+
+    end_time = datetime.now()
+    start_time = end_time - timedelta(hours=lookback_hours)
+
+    params = {
+        "service": service,
+        "start": int(start_time.timestamp() * 1000000),
+        "end": int(end_time.timestamp() * 1000000),
+        "limit": 1000
+    }
+
+    if operation:
+        params["operation"] = operation
+
+    if tags:
+        params["tags"] = json.dumps(tags)
+
+    response = requests.get(f"{JAEGER_URL}/api/traces", params=params)
+    return response.json()
+
+def analyze_latency(traces):
+    """Analyze latency distribution"""
+
+    latencies = []
+    for trace in traces["data"]:
+        duration_us = trace["spans"][0]["duration"]
+        latencies.append(duration_us)
+
+    latencies.sort()
+
+    p50 = latencies[len(latencies) // 2]
+    p95 = latencies[int(len(latencies) * 0.95)]
+    p99 = latencies[int(len(latencies) * 0.99)]
+
+    print(f"Latency Analysis:")
+    print(f"  P50: {p50}us")
+    print(f"  P95: {p95}us")
+    print(f"  P99: {p99}us")
+    print(f"  Max: {max(latencies)}us")
+
+# Example usage
+traces = query_traces("hft-trading-engine", operation="process_order")
+analyze_latency(traces)
+
+Production Deployment:
+----------------------
+#!/bin/bash
+
+# Deploy tracing stack
+
+docker-compose up -d jaeger otel-collector elasticsearch
+
+# Wait for services to be ready
+sleep 30
+
+# Initialize tracer in application
+export OTEL_EXPORTER_OTLP_ENDPOINT="http://localhost:4317"
+export OTEL_SERVICE_NAME="hft-trading-engine"
+export OTEL_TRACES_SAMPLER="parentbased_traceidratio"
+export OTEL_TRACES_SAMPLER_ARG="0.01"
+
+# Start trading engine with tracing enabled
+./trading_engine --enable-tracing
+
+echo "Tracing stack deployed. Access Jaeger UI at http://localhost:16686"

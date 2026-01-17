@@ -1,0 +1,1083 @@
+================================================================================
+DEPLOYMENT STRATEGIES FOR HFT SYSTEMS
+================================================================================
+Complete guide for zero-downtime deployments including blue-green, canary,
+and rolling deployment strategies for high-frequency trading systems.
+
+Last Updated: 2025-11-25
+================================================================================
+
+TABLE OF CONTENTS
+================================================================================
+1. Blue-Green Deployment
+2. Canary Deployment
+3. Rolling Deployment
+4. A/B Testing Deployment
+5. Shadow Deployment
+6. Feature Flags
+7. Rollback Procedures
+8. Health Checks and Validation
+9. Traffic Management
+
+================================================================================
+1. BLUE-GREEN DEPLOYMENT
+================================================================================
+
+# scripts/deploy-blue-green.sh
+#!/bin/bash
+set -e
+
+ENVIRONMENT=$1
+TARGET_COLOR=$2  # blue or green
+IMAGE=$3
+
+if [ -z "$ENVIRONMENT" ] || [ -z "$TARGET_COLOR" ] || [ -z "$IMAGE" ]; then
+    echo "Usage: $0 <environment> <blue|green> <image>"
+    exit 1
+fi
+
+NAMESPACE="hft-trading-${ENVIRONMENT}"
+CURRENT_COLOR=$(kubectl get service trading-engine -n ${NAMESPACE} \
+    -o jsonpath='{.spec.selector.version}')
+
+if [ "$CURRENT_COLOR" == "$TARGET_COLOR" ]; then
+    echo "ERROR: Target color $TARGET_COLOR is already active"
+    exit 1
+fi
+
+echo "========================================"
+echo "Blue-Green Deployment"
+echo "========================================"
+echo "Environment: ${ENVIRONMENT}"
+echo "Current: ${CURRENT_COLOR}"
+echo "Target: ${TARGET_COLOR}"
+echo "Image: ${IMAGE}"
+echo "========================================"
+
+# Step 1: Deploy to inactive environment
+echo "Step 1/5: Deploying to ${TARGET_COLOR} environment..."
+kubectl set image statefulset/trading-engine-${TARGET_COLOR} \
+    trading-engine=${IMAGE} \
+    -n ${NAMESPACE}
+
+# Step 2: Wait for rollout
+echo "Step 2/5: Waiting for rollout to complete..."
+kubectl rollout status statefulset/trading-engine-${TARGET_COLOR} \
+    -n ${NAMESPACE} \
+    --timeout=600s
+
+# Step 3: Run health checks
+echo "Step 3/5: Running health checks on ${TARGET_COLOR}..."
+./scripts/health-check.sh ${NAMESPACE} ${TARGET_COLOR}
+
+# Step 4: Run smoke tests
+echo "Step 4/5: Running smoke tests on ${TARGET_COLOR}..."
+./scripts/smoke-test.sh ${NAMESPACE} ${TARGET_COLOR}
+
+# Step 5: Switch traffic
+echo "Step 5/5: Switching traffic to ${TARGET_COLOR}..."
+kubectl patch service trading-engine -n ${NAMESPACE} \
+    -p "{\"spec\":{\"selector\":{\"version\":\"${TARGET_COLOR}\"}}}"
+
+echo "========================================"
+echo "Deployment completed successfully!"
+echo "Active: ${TARGET_COLOR}"
+echo "Inactive: ${CURRENT_COLOR} (ready for rollback)"
+echo "========================================"
+
+# Save deployment metadata
+cat > /tmp/deployment-${ENVIRONMENT}.json <<EOF
+{
+  "timestamp": "$(date -Iseconds)",
+  "environment": "${ENVIRONMENT}",
+  "active_color": "${TARGET_COLOR}",
+  "inactive_color": "${CURRENT_COLOR}",
+  "image": "${IMAGE}",
+  "deployed_by": "${USER}"
+}
+EOF
+
+---
+# k8s/blue-green/statefulset-blue.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: trading-engine-blue
+  namespace: hft-trading
+  labels:
+    app: trading-engine
+    version: blue
+spec:
+  serviceName: trading-engine-headless
+  replicas: 3
+  selector:
+    matchLabels:
+      app: trading-engine
+      version: blue
+  template:
+    metadata:
+      labels:
+        app: trading-engine
+        version: blue
+    spec:
+      containers:
+      - name: trading-engine
+        image: registry.example.com/hft-trading-engine:latest
+        ports:
+        - containerPort: 8080
+          name: http
+        - containerPort: 9090
+          name: metrics
+        env:
+        - name: DEPLOYMENT_COLOR
+          value: "blue"
+        resources:
+          requests:
+            cpu: 4000m
+            memory: 8Gi
+          limits:
+            cpu: 8000m
+            memory: 16Gi
+        livenessProbe:
+          httpGet:
+            path: /health/live
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 5
+
+---
+# k8s/blue-green/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: trading-engine
+  namespace: hft-trading
+  labels:
+    app: trading-engine
+spec:
+  type: ClusterIP
+  selector:
+    app: trading-engine
+    version: blue  # This selector determines active deployment
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
+  - name: metrics
+    port: 9090
+    targetPort: 9090
+  sessionAffinity: ClientIP
+
+---
+# k8s/blue-green/service-preview.yaml
+# Services for testing inactive deployments
+apiVersion: v1
+kind: Service
+metadata:
+  name: trading-engine-blue-preview
+  namespace: hft-trading
+spec:
+  type: ClusterIP
+  selector:
+    app: trading-engine
+    version: blue
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: trading-engine-green-preview
+  namespace: hft-trading
+spec:
+  type: ClusterIP
+  selector:
+    app: trading-engine
+    version: green
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
+
+================================================================================
+2. CANARY DEPLOYMENT
+================================================================================
+
+# scripts/deploy-canary.sh
+#!/bin/bash
+set -e
+
+ENVIRONMENT=$1
+CANARY_PERCENT=$2  # 0-100
+IMAGE=$3
+
+if [ -z "$ENVIRONMENT" ] || [ -z "$CANARY_PERCENT" ] || [ -z "$IMAGE" ]; then
+    echo "Usage: $0 <environment> <canary_percent> <image>"
+    exit 1
+fi
+
+NAMESPACE="hft-trading-${ENVIRONMENT}"
+
+echo "========================================"
+echo "Canary Deployment"
+echo "========================================"
+echo "Environment: ${ENVIRONMENT}"
+echo "Canary %: ${CANARY_PERCENT}%"
+echo "Image: ${IMAGE}"
+echo "========================================"
+
+# Calculate replica counts
+TOTAL_REPLICAS=$(kubectl get statefulset trading-engine-stable -n ${NAMESPACE} \
+    -o jsonpath='{.spec.replicas}')
+CANARY_REPLICAS=$(( TOTAL_REPLICAS * CANARY_PERCENT / 100 ))
+STABLE_REPLICAS=$(( TOTAL_REPLICAS - CANARY_REPLICAS ))
+
+echo "Total replicas: ${TOTAL_REPLICAS}"
+echo "Stable replicas: ${STABLE_REPLICAS}"
+echo "Canary replicas: ${CANARY_REPLICAS}"
+
+# Step 1: Deploy canary
+echo "Step 1/4: Deploying canary version..."
+kubectl set image statefulset/trading-engine-canary \
+    trading-engine=${IMAGE} \
+    -n ${NAMESPACE}
+
+kubectl scale statefulset/trading-engine-canary \
+    --replicas=${CANARY_REPLICAS} \
+    -n ${NAMESPACE}
+
+# Step 2: Wait for canary rollout
+echo "Step 2/4: Waiting for canary rollout..."
+kubectl rollout status statefulset/trading-engine-canary \
+    -n ${NAMESPACE} \
+    --timeout=300s
+
+# Step 3: Monitor canary metrics
+echo "Step 3/4: Monitoring canary metrics..."
+./scripts/monitor-canary.sh ${NAMESPACE} 60
+
+# Step 4: Check for errors
+CANARY_ERROR_RATE=$(kubectl exec -n ${NAMESPACE} \
+    $(kubectl get pod -n ${NAMESPACE} -l version=canary -o jsonpath='{.items[0].metadata.name}') \
+    -- curl -s http://localhost:9090/metrics | grep error_rate | awk '{print $2}')
+
+STABLE_ERROR_RATE=$(kubectl exec -n ${NAMESPACE} \
+    $(kubectl get pod -n ${NAMESPACE} -l version=stable -o jsonpath='{.items[0].metadata.name}') \
+    -- curl -s http://localhost:9090/metrics | grep error_rate | awk '{print $2}')
+
+echo "Canary error rate: ${CANARY_ERROR_RATE}"
+echo "Stable error rate: ${STABLE_ERROR_RATE}"
+
+# Automatic rollback if error rate is too high
+if (( $(echo "${CANARY_ERROR_RATE} > ${STABLE_ERROR_RATE} * 1.5" | bc -l) )); then
+    echo "ERROR: Canary error rate too high! Rolling back..."
+    kubectl scale statefulset/trading-engine-canary --replicas=0 -n ${NAMESPACE}
+    exit 1
+fi
+
+echo "========================================"
+echo "Canary deployment successful!"
+echo "Canary: ${CANARY_REPLICAS} replicas (${CANARY_PERCENT}%)"
+echo "Stable: ${STABLE_REPLICAS} replicas ($(( 100 - CANARY_PERCENT ))%)"
+echo "========================================"
+
+---
+# scripts/monitor-canary.sh
+#!/bin/bash
+set -e
+
+NAMESPACE=$1
+DURATION=${2:-300}  # seconds
+
+echo "Monitoring canary deployment for ${DURATION} seconds..."
+
+START_TIME=$(date +%s)
+END_TIME=$(( START_TIME + DURATION ))
+
+while [ $(date +%s) -lt ${END_TIME} ]; do
+    CURRENT_TIME=$(date +%s)
+    ELAPSED=$(( CURRENT_TIME - START_TIME ))
+
+    echo "========================================"
+    echo "Time elapsed: ${ELAPSED}s / ${DURATION}s"
+
+    # Get metrics from Prometheus
+    CANARY_LATENCY_P99=$(curl -s "http://prometheus:9090/api/v1/query?query=histogram_quantile(0.99,rate(latency_seconds_bucket{version=\"canary\"}[1m]))" | jq -r '.data.result[0].value[1]')
+    STABLE_LATENCY_P99=$(curl -s "http://prometheus:9090/api/v1/query?query=histogram_quantile(0.99,rate(latency_seconds_bucket{version=\"stable\"}[1m]))" | jq -r '.data.result[0].value[1]')
+
+    CANARY_ERROR_RATE=$(curl -s "http://prometheus:9090/api/v1/query?query=rate(errors_total{version=\"canary\"}[1m])" | jq -r '.data.result[0].value[1]')
+    STABLE_ERROR_RATE=$(curl -s "http://prometheus:9090/api/v1/query?query=rate(errors_total{version=\"stable\"}[1m])" | jq -r '.data.result[0].value[1]')
+
+    echo "Latency P99:"
+    echo "  Canary: ${CANARY_LATENCY_P99}ms"
+    echo "  Stable: ${STABLE_LATENCY_P99}ms"
+
+    echo "Error Rate:"
+    echo "  Canary: ${CANARY_ERROR_RATE}/s"
+    echo "  Stable: ${STABLE_ERROR_RATE}/s"
+
+    # Check for anomalies
+    if (( $(echo "${CANARY_LATENCY_P99} > ${STABLE_LATENCY_P99} * 1.2" | bc -l) )); then
+        echo "WARNING: Canary latency is 20% higher than stable!"
+    fi
+
+    if (( $(echo "${CANARY_ERROR_RATE} > ${STABLE_ERROR_RATE} * 1.5" | bc -l) )); then
+        echo "ERROR: Canary error rate is 50% higher than stable!"
+        exit 1
+    fi
+
+    sleep 10
+done
+
+echo "Monitoring completed successfully"
+
+---
+# k8s/canary/statefulset-canary.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: trading-engine-canary
+  namespace: hft-trading
+  labels:
+    app: trading-engine
+    version: canary
+spec:
+  serviceName: trading-engine-headless
+  replicas: 0  # Start with 0, scale up during canary deployment
+  selector:
+    matchLabels:
+      app: trading-engine
+      version: canary
+  template:
+    metadata:
+      labels:
+        app: trading-engine
+        version: canary
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: "/metrics"
+        prometheus.io/port: "9090"
+    spec:
+      containers:
+      - name: trading-engine
+        image: registry.example.com/hft-trading-engine:latest
+        env:
+        - name: DEPLOYMENT_VERSION
+          value: "canary"
+        resources:
+          requests:
+            cpu: 4000m
+            memory: 8Gi
+          limits:
+            cpu: 8000m
+            memory: 16Gi
+
+---
+# k8s/canary/service.yaml
+# Service routing to both stable and canary
+apiVersion: v1
+kind: Service
+metadata:
+  name: trading-engine
+  namespace: hft-trading
+spec:
+  type: ClusterIP
+  selector:
+    app: trading-engine
+    # No version label - routes to both stable and canary
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
+
+---
+# Istio VirtualService for weighted routing
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: trading-engine
+  namespace: hft-trading
+spec:
+  hosts:
+  - trading-engine
+  http:
+  - match:
+    - headers:
+        x-canary:
+          exact: "true"
+    route:
+    - destination:
+        host: trading-engine
+        subset: canary
+  - route:
+    - destination:
+        host: trading-engine
+        subset: stable
+      weight: 90
+    - destination:
+        host: trading-engine
+        subset: canary
+      weight: 10
+
+---
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: trading-engine
+  namespace: hft-trading
+spec:
+  host: trading-engine
+  subsets:
+  - name: stable
+    labels:
+      version: stable
+  - name: canary
+    labels:
+      version: canary
+
+================================================================================
+3. ROLLING DEPLOYMENT
+================================================================================
+
+# scripts/deploy-rolling.sh
+#!/bin/bash
+set -e
+
+ENVIRONMENT=$1
+IMAGE=$2
+MAX_UNAVAILABLE=${3:-1}
+MAX_SURGE=${4:-1}
+
+if [ -z "$ENVIRONMENT" ] || [ -z "$IMAGE" ]; then
+    echo "Usage: $0 <environment> <image> [max_unavailable] [max_surge]"
+    exit 1
+fi
+
+NAMESPACE="hft-trading-${ENVIRONMENT}"
+
+echo "========================================"
+echo "Rolling Deployment"
+echo "========================================"
+echo "Environment: ${ENVIRONMENT}"
+echo "Image: ${IMAGE}"
+echo "Max Unavailable: ${MAX_UNAVAILABLE}"
+echo "Max Surge: ${MAX_SURGE}"
+echo "========================================"
+
+# Update StatefulSet update strategy
+kubectl patch statefulset trading-engine -n ${NAMESPACE} -p "{
+  \"spec\": {
+    \"updateStrategy\": {
+      \"type\": \"RollingUpdate\",
+      \"rollingUpdate\": {
+        \"partition\": 0,
+        \"maxUnavailable\": ${MAX_UNAVAILABLE}
+      }
+    }
+  }
+}"
+
+# Update image
+kubectl set image statefulset/trading-engine \
+    trading-engine=${IMAGE} \
+    -n ${NAMESPACE}
+
+# Monitor rollout
+TOTAL_REPLICAS=$(kubectl get statefulset trading-engine -n ${NAMESPACE} \
+    -o jsonpath='{.spec.replicas}')
+
+for (( i=TOTAL_REPLICAS-1; i>=0; i-- )); do
+    echo "Updating pod ${i}..."
+
+    # Wait for pod to be updated
+    kubectl wait --for=condition=Ready \
+        pod/trading-engine-${i} \
+        -n ${NAMESPACE} \
+        --timeout=300s
+
+    # Health check
+    POD_IP=$(kubectl get pod trading-engine-${i} -n ${NAMESPACE} \
+        -o jsonpath='{.status.podIP}')
+
+    for retry in {1..5}; do
+        if curl -f http://${POD_IP}:8080/health; then
+            echo "Pod ${i} is healthy"
+            break
+        fi
+        echo "Health check failed, retry ${retry}/5..."
+        sleep 5
+    done
+
+    # Wait before proceeding to next pod
+    if [ $i -gt 0 ]; then
+        echo "Waiting 30s before updating next pod..."
+        sleep 30
+    fi
+done
+
+echo "========================================"
+echo "Rolling deployment completed!"
+echo "========================================"
+
+---
+# k8s/rolling/statefulset.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: trading-engine
+  namespace: hft-trading
+spec:
+  serviceName: trading-engine-headless
+  replicas: 5
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      partition: 0  # 0 = update all pods
+  podManagementPolicy: OrderedReady  # Update one at a time
+  selector:
+    matchLabels:
+      app: trading-engine
+  template:
+    metadata:
+      labels:
+        app: trading-engine
+    spec:
+      containers:
+      - name: trading-engine
+        image: registry.example.com/hft-trading-engine:latest
+        lifecycle:
+          preStop:
+            exec:
+              command:
+              - /bin/sh
+              - -c
+              - |
+                # Graceful shutdown
+                kill -TERM 1
+                # Wait for connections to drain
+                sleep 15
+        resources:
+          requests:
+            cpu: 4000m
+            memory: 8Gi
+      terminationGracePeriodSeconds: 30
+
+================================================================================
+4. A/B TESTING DEPLOYMENT
+================================================================================
+
+# scripts/deploy-ab-test.sh
+#!/bin/bash
+set -e
+
+ENVIRONMENT=$1
+VERSION_A=$2
+VERSION_B=$3
+TRAFFIC_SPLIT=${4:-50}  # Percentage to version B
+
+NAMESPACE="hft-trading-${ENVIRONMENT}"
+
+echo "========================================"
+echo "A/B Testing Deployment"
+echo "========================================"
+echo "Version A: ${VERSION_A} ($(( 100 - TRAFFIC_SPLIT ))%)"
+echo "Version B: ${VERSION_B} (${TRAFFIC_SPLIT}%)"
+echo "========================================"
+
+# Deploy version A
+kubectl set image statefulset/trading-engine-a \
+    trading-engine=${VERSION_A} \
+    -n ${NAMESPACE}
+
+# Deploy version B
+kubectl set image statefulset/trading-engine-b \
+    trading-engine=${VERSION_B} \
+    -n ${NAMESPACE}
+
+# Wait for both deployments
+kubectl rollout status statefulset/trading-engine-a -n ${NAMESPACE}
+kubectl rollout status statefulset/trading-engine-b -n ${NAMESPACE}
+
+# Update traffic split via Istio
+kubectl apply -f - <<EOF
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: trading-engine-ab
+  namespace: ${NAMESPACE}
+spec:
+  hosts:
+  - trading-engine
+  http:
+  - match:
+    - headers:
+        x-version:
+          exact: "b"
+    route:
+    - destination:
+        host: trading-engine-b
+  - route:
+    - destination:
+        host: trading-engine-a
+      weight: $(( 100 - TRAFFIC_SPLIT ))
+    - destination:
+        host: trading-engine-b
+      weight: ${TRAFFIC_SPLIT}
+EOF
+
+echo "A/B test deployment completed"
+
+# Start metrics collection
+./scripts/collect-ab-metrics.sh ${NAMESPACE} 3600 > ab-test-results.json &
+
+---
+# scripts/collect-ab-metrics.sh
+#!/bin/bash
+
+NAMESPACE=$1
+DURATION=$2
+
+START_TIME=$(date +%s)
+END_TIME=$(( START_TIME + DURATION ))
+
+echo "{"
+echo "  \"test_start\": \"$(date -Iseconds)\","
+echo "  \"duration\": ${DURATION},"
+echo "  \"metrics\": ["
+
+FIRST=true
+while [ $(date +%s) -lt ${END_TIME} ]; do
+    if [ "$FIRST" = false ]; then
+        echo ","
+    fi
+    FIRST=false
+
+    # Collect metrics for version A
+    VERSION_A_LATENCY=$(curl -s "http://prometheus:9090/api/v1/query?query=histogram_quantile(0.99,latency_seconds_bucket{version=\"a\"})" | jq -r '.data.result[0].value[1]')
+    VERSION_A_THROUGHPUT=$(curl -s "http://prometheus:9090/api/v1/query?query=rate(requests_total{version=\"a\"}[1m])" | jq -r '.data.result[0].value[1]')
+    VERSION_A_ERRORS=$(curl -s "http://prometheus:9090/api/v1/query?query=rate(errors_total{version=\"a\"}[1m])" | jq -r '.data.result[0].value[1]')
+
+    # Collect metrics for version B
+    VERSION_B_LATENCY=$(curl -s "http://prometheus:9090/api/v1/query?query=histogram_quantile(0.99,latency_seconds_bucket{version=\"b\"})" | jq -r '.data.result[0].value[1]')
+    VERSION_B_THROUGHPUT=$(curl -s "http://prometheus:9090/api/v1/query?query=rate(requests_total{version=\"b\"}[1m])" | jq -r '.data.result[0].value[1]')
+    VERSION_B_ERRORS=$(curl -s "http://prometheus:9090/api/v1/query?query=rate(errors_total{version=\"b\"}[1m])" | jq -r '.data.result[0].value[1]')
+
+    cat <<EOF
+    {
+      "timestamp": "$(date -Iseconds)",
+      "version_a": {
+        "latency_p99": ${VERSION_A_LATENCY},
+        "throughput": ${VERSION_A_THROUGHPUT},
+        "error_rate": ${VERSION_A_ERRORS}
+      },
+      "version_b": {
+        "latency_p99": ${VERSION_B_LATENCY},
+        "throughput": ${VERSION_B_THROUGHPUT},
+        "error_rate": ${VERSION_B_ERRORS}
+      }
+    }
+EOF
+
+    sleep 60
+done
+
+echo "  ]"
+echo "}"
+
+================================================================================
+5. SHADOW DEPLOYMENT (DARK LAUNCH)
+================================================================================
+
+# scripts/deploy-shadow.sh
+#!/bin/bash
+set -e
+
+ENVIRONMENT=$1
+SHADOW_IMAGE=$2
+
+NAMESPACE="hft-trading-${ENVIRONMENT}"
+
+echo "Deploying shadow version for testing..."
+
+# Deploy shadow deployment
+kubectl apply -f - <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trading-engine-shadow
+  namespace: ${NAMESPACE}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: trading-engine
+      version: shadow
+  template:
+    metadata:
+      labels:
+        app: trading-engine
+        version: shadow
+    spec:
+      containers:
+      - name: trading-engine
+        image: ${SHADOW_IMAGE}
+        env:
+        - name: SHADOW_MODE
+          value: "true"
+        - name: DISCARD_RESULTS
+          value: "true"
+EOF
+
+# Configure traffic mirroring via Istio
+kubectl apply -f - <<EOF
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: trading-engine-mirror
+  namespace: ${NAMESPACE}
+spec:
+  hosts:
+  - trading-engine
+  http:
+  - route:
+    - destination:
+        host: trading-engine
+        subset: stable
+    mirror:
+      host: trading-engine
+      subset: shadow
+    mirrorPercentage:
+      value: 100.0
+EOF
+
+echo "Shadow deployment active. Monitoring for issues..."
+./scripts/monitor-shadow.sh ${NAMESPACE}
+
+================================================================================
+6. FEATURE FLAGS
+================================================================================
+
+# config/feature-flags.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: feature-flags
+  namespace: hft-trading
+data:
+  flags.json: |
+    {
+      "features": {
+        "new_order_algorithm": {
+          "enabled": false,
+          "rollout_percentage": 0,
+          "whitelist": ["user1", "user2"]
+        },
+        "improved_risk_model": {
+          "enabled": true,
+          "rollout_percentage": 50,
+          "whitelist": []
+        },
+        "websocket_v2": {
+          "enabled": false,
+          "rollout_percentage": 0,
+          "whitelist": []
+        }
+      },
+      "kill_switches": {
+        "trading_enabled": true,
+        "order_routing_enabled": true,
+        "market_data_enabled": true
+      }
+    }
+
+---
+# Feature flag client code (C++)
+// feature_flags.hpp
+#pragma once
+#include <nlohmann/json.hpp>
+#include <string>
+#include <optional>
+
+class FeatureFlags {
+public:
+    static FeatureFlags& getInstance();
+
+    bool isEnabled(const std::string& feature_name,
+                   const std::string& user_id = "");
+
+    int getRolloutPercentage(const std::string& feature_name);
+
+    void reload();
+
+private:
+    FeatureFlags();
+    nlohmann::json flags_;
+    std::chrono::steady_clock::time_point last_reload_;
+
+    bool checkWhitelist(const nlohmann::json& feature,
+                       const std::string& user_id);
+    bool checkRolloutPercentage(const nlohmann::json& feature,
+                               const std::string& user_id);
+};
+
+================================================================================
+7. ROLLBACK PROCEDURES
+================================================================================
+
+# scripts/rollback.sh
+#!/bin/bash
+set -e
+
+ENVIRONMENT=$1
+STRATEGY=${2:-blue-green}  # blue-green, canary, or rolling
+
+NAMESPACE="hft-trading-${ENVIRONMENT}"
+
+echo "========================================"
+echo "ROLLBACK INITIATED"
+echo "========================================"
+echo "Environment: ${ENVIRONMENT}"
+echo "Strategy: ${STRATEGY}"
+echo "========================================"
+
+case ${STRATEGY} in
+    blue-green)
+        # Switch traffic back to previous color
+        DEPLOYMENT_INFO=$(cat /tmp/deployment-${ENVIRONMENT}.json)
+        INACTIVE_COLOR=$(echo ${DEPLOYMENT_INFO} | jq -r '.inactive_color')
+
+        echo "Rolling back to ${INACTIVE_COLOR}..."
+
+        # Verify inactive deployment is ready
+        kubectl get statefulset trading-engine-${INACTIVE_COLOR} -n ${NAMESPACE}
+
+        # Switch traffic
+        kubectl patch service trading-engine -n ${NAMESPACE} \
+            -p "{\"spec\":{\"selector\":{\"version\":\"${INACTIVE_COLOR}\"}}}"
+
+        echo "Rollback completed! Active: ${INACTIVE_COLOR}"
+        ;;
+
+    canary)
+        # Scale down canary to 0
+        echo "Scaling down canary deployment..."
+        kubectl scale statefulset/trading-engine-canary \
+            --replicas=0 \
+            -n ${NAMESPACE}
+
+        echo "Rollback completed! Canary removed."
+        ;;
+
+    rolling)
+        # Rollback to previous revision
+        echo "Rolling back to previous revision..."
+        kubectl rollout undo statefulset/trading-engine -n ${NAMESPACE}
+
+        kubectl rollout status statefulset/trading-engine -n ${NAMESPACE}
+
+        echo "Rollback completed!"
+        ;;
+
+    *)
+        echo "Unknown strategy: ${STRATEGY}"
+        exit 1
+        ;;
+esac
+
+# Send notification
+./scripts/send-notification.sh "Rollback completed for ${ENVIRONMENT}"
+
+echo "========================================"
+
+---
+# scripts/automatic-rollback.sh
+#!/bin/bash
+set -e
+
+NAMESPACE=$1
+DEPLOYMENT=$2
+METRIC_THRESHOLD=$3
+
+echo "Monitoring for automatic rollback conditions..."
+
+while true; do
+    # Check error rate
+    ERROR_RATE=$(kubectl exec -n ${NAMESPACE} \
+        $(kubectl get pod -n ${NAMESPACE} -l app=${DEPLOYMENT} -o jsonpath='{.items[0].metadata.name}') \
+        -- curl -s http://localhost:9090/metrics | grep error_rate | awk '{print $2}')
+
+    # Check latency
+    LATENCY_P99=$(kubectl exec -n ${NAMESPACE} \
+        $(kubectl get pod -n ${NAMESPACE} -l app=${DEPLOYMENT} -o jsonpath='{.items[0].metadata.name}') \
+        -- curl -s http://localhost:9090/metrics | grep latency_p99 | awk '{print $2}')
+
+    echo "Current metrics: Error Rate=${ERROR_RATE}, Latency P99=${LATENCY_P99}ms"
+
+    # Automatic rollback conditions
+    if (( $(echo "${ERROR_RATE} > ${METRIC_THRESHOLD}" | bc -l) )); then
+        echo "ALERT: Error rate exceeded threshold! Initiating rollback..."
+        ./scripts/rollback.sh ${NAMESPACE}
+        exit 1
+    fi
+
+    if (( $(echo "${LATENCY_P99} > 1000" | bc -l) )); then
+        echo "ALERT: Latency exceeded 1000ms! Initiating rollback..."
+        ./scripts/rollback.sh ${NAMESPACE}
+        exit 1
+    fi
+
+    sleep 10
+done
+
+================================================================================
+8. HEALTH CHECKS AND VALIDATION
+================================================================================
+
+# scripts/health-check.sh
+#!/bin/bash
+set -e
+
+NAMESPACE=$1
+VERSION=${2:-stable}
+
+POD_NAME=$(kubectl get pod -n ${NAMESPACE} -l version=${VERSION} \
+    -o jsonpath='{.items[0].metadata.name}')
+
+echo "Running health checks on ${POD_NAME}..."
+
+# HTTP health check
+if ! kubectl exec -n ${NAMESPACE} ${POD_NAME} -- \
+    curl -f http://localhost:8080/health/live; then
+    echo "ERROR: Liveness check failed"
+    exit 1
+fi
+
+if ! kubectl exec -n ${NAMESPACE} ${POD_NAME} -- \
+    curl -f http://localhost:8080/health/ready; then
+    echo "ERROR: Readiness check failed"
+    exit 1
+fi
+
+# Check critical metrics
+METRICS=$(kubectl exec -n ${NAMESPACE} ${POD_NAME} -- \
+    curl -s http://localhost:9090/metrics)
+
+LATENCY=$(echo "${METRICS}" | grep latency_p99 | awk '{print $2}')
+ERROR_RATE=$(echo "${METRICS}" | grep error_rate | awk '{print $2}')
+
+echo "Latency P99: ${LATENCY}ms"
+echo "Error Rate: ${ERROR_RATE}"
+
+if (( $(echo "${LATENCY} > 1000" | bc -l) )); then
+    echo "ERROR: Latency too high"
+    exit 1
+fi
+
+if (( $(echo "${ERROR_RATE} > 0.01" | bc -l) )); then
+    echo "ERROR: Error rate too high"
+    exit 1
+fi
+
+echo "All health checks passed!"
+
+---
+# scripts/smoke-test.sh
+#!/bin/bash
+set -e
+
+NAMESPACE=$1
+VERSION=$2
+
+SERVICE_URL="http://trading-engine-${VERSION}-preview.${NAMESPACE}.svc.cluster.local:8080"
+
+echo "Running smoke tests against ${SERVICE_URL}..."
+
+# Test 1: Place order
+echo "Test 1: Place order..."
+ORDER_RESPONSE=$(curl -X POST "${SERVICE_URL}/api/orders" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "symbol": "TEST",
+    "quantity": 100,
+    "side": "BUY",
+    "type": "LIMIT",
+    "price": 100.00
+  }')
+
+ORDER_ID=$(echo ${ORDER_RESPONSE} | jq -r '.order_id')
+if [ -z "$ORDER_ID" ]; then
+    echo "ERROR: Failed to place order"
+    exit 1
+fi
+echo "Order placed successfully: ${ORDER_ID}"
+
+# Test 2: Get order status
+echo "Test 2: Get order status..."
+STATUS_RESPONSE=$(curl "${SERVICE_URL}/api/orders/${ORDER_ID}")
+ORDER_STATUS=$(echo ${STATUS_RESPONSE} | jq -r '.status')
+if [ "$ORDER_STATUS" != "PENDING" ] && [ "$ORDER_STATUS" != "FILLED" ]; then
+    echo "ERROR: Unexpected order status: ${ORDER_STATUS}"
+    exit 1
+fi
+echo "Order status: ${ORDER_STATUS}"
+
+# Test 3: Cancel order
+echo "Test 3: Cancel order..."
+curl -X DELETE "${SERVICE_URL}/api/orders/${ORDER_ID}"
+echo "Order cancelled successfully"
+
+# Test 4: Get market data
+echo "Test 4: Get market data..."
+MARKET_DATA=$(curl "${SERVICE_URL}/api/marketdata/TEST")
+BID=$(echo ${MARKET_DATA} | jq -r '.bid')
+ASK=$(echo ${MARKET_DATA} | jq -r '.ask')
+echo "Market data: BID=${BID}, ASK=${ASK}"
+
+echo "All smoke tests passed!"
+
+================================================================================
+DEPLOYMENT BEST PRACTICES
+================================================================================
+
+1. ZERO-DOWNTIME DEPLOYMENTS
+   - Always use rolling or blue-green deployments
+   - Implement graceful shutdown (SIGTERM handling)
+   - Configure proper readiness/liveness probes
+   - Set appropriate terminationGracePeriodSeconds
+
+2. GRADUAL ROLLOUTS
+   - Start with canary (10% traffic)
+   - Monitor metrics for anomalies
+   - Gradually increase traffic (10% → 50% → 100%)
+   - Keep previous version ready for rollback
+
+3. AUTOMATED VALIDATION
+   - Run health checks after each deployment
+   - Execute smoke tests automatically
+   - Monitor key metrics (latency, error rate)
+   - Automatic rollback on threshold violations
+
+4. ROLLBACK READINESS
+   - Keep previous version deployed and ready
+   - Document rollback procedures
+   - Practice rollback regularly
+   - Monitor rollback metrics
+
+5. OBSERVABILITY
+   - Comprehensive logging
+   - Distributed tracing
+   - Real-time metrics
+   - Alerting on anomalies
+
+================================================================================
+END OF DEPLOYMENT STRATEGIES GUIDE
+================================================================================

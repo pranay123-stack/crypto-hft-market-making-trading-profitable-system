@@ -1,0 +1,804 @@
+================================================================================
+HFT EXCHANGE CONFIGURATION - EXCHANGE CONNECTION SETTINGS
+================================================================================
+Version: 1.0.0
+Last Updated: 2025-11-25
+Description: Multi-exchange connectivity configuration for HFT system
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Exchange Connection Standards
+2. FIX Protocol Configuration
+3. Native Protocol Configuration
+4. WebSocket Configuration
+5. Market Data Feeds
+6. Order Entry Gateways
+7. Session Management
+8. Failover and Redundancy
+9. Exchange-Specific Settings
+10. C++ Implementation
+11. Validation and Testing
+
+================================================================================
+1. EXCHANGE CONNECTION STANDARDS
+================================================================================
+
+EXCHANGE OVERVIEW:
+------------------
+```yaml
+exchanges:
+  enabled:
+    - "NYSE"
+    - "NASDAQ"
+    - "CME"
+    - "CBOE"
+    - "ICE"
+    - "BINANCE"
+    - "COINBASE"
+
+  connection_mode: "colocation"  # colocation, remote, hybrid
+
+  global_settings:
+    max_connections_per_exchange: 10
+    connection_timeout_ms: 5000
+    heartbeat_interval_ms: 1000
+    reconnect_delay_ms: 100
+    max_reconnect_attempts: 100
+
+  protocols:
+    fix_version: "4.4"  # FIX 4.2, 4.4, 5.0
+    binary_protocols: ["OUCH", "ITCH", "BATS", "SBE"]
+    websocket_enabled: true
+```
+
+MULTI-EXCHANGE ROUTER:
+-----------------------
+```yaml
+routing:
+  strategy: "best_execution"  # best_execution, latency_based, cost_based
+
+  smart_order_routing:
+    enabled: true
+    liquidity_aggregation: true
+    price_improvement_threshold: 0.0001
+
+  exchange_selection:
+    primary: "NYSE"
+    secondary: ["NASDAQ", "BATS"]
+    fallback: "CBOE"
+
+  load_balancing:
+    method: "round_robin"  # round_robin, least_latency, weighted
+    health_check_interval_ms: 100
+```
+
+================================================================================
+2. FIX PROTOCOL CONFIGURATION
+================================================================================
+
+FIX SESSION CONFIGURATION:
+--------------------------
+```yaml
+fix_protocol:
+  version: "4.4"
+
+  sessions:
+    nyse_equities:
+      session_id: "NYSE_EQ_01"
+      sender_comp_id: "HFT_FIRM"
+      target_comp_id: "NYSE"
+
+      connection:
+        host: "fix-gateway.nyse.com"
+        port: 9876
+        ssl_enabled: true
+        ssl_cert: "/etc/hft/certs/nyse.crt"
+        ssl_key: "/etc/hft/keys/nyse.key"
+
+      timing:
+        heartbeat_interval: 30
+        logon_timeout: 30
+        logout_timeout: 10
+
+      sequence:
+        reset_on_logon: false
+        reset_on_logout: false
+        persist_sequence_numbers: true
+        sequence_file: "/var/hft/fix/nyse_seq.dat"
+
+      message_settings:
+        validate_checksum: true
+        validate_length: true
+        validate_required_fields: true
+        max_message_size: 8192
+
+      performance:
+        tcp_nodelay: true
+        send_buffer_size: 262144
+        recv_buffer_size: 262144
+        zero_copy: true
+
+    cme_futures:
+      session_id: "CME_FUT_01"
+      sender_comp_id: "HFT_FIRM"
+      target_comp_id: "CME"
+
+      connection:
+        host: "fix-gateway.cme.com"
+        port: 9877
+        ssl_enabled: true
+
+      market_data:
+        subscribe_on_logon: true
+        instruments:
+          - "ESZ5"  # E-mini S&P 500
+          - "NQZ5"  # E-mini NASDAQ
+          - "YMZ5"  # E-mini Dow
+```
+
+FIX MESSAGE TEMPLATES:
+----------------------
+```yaml
+fix_messages:
+  new_order_single:
+    template: |
+      35=D|49={sender}|56={target}|11={clordid}|
+      55={symbol}|54={side}|60={time}|38={quantity}|
+      40={ordtype}|44={price}|59={tif}|
+
+    fields:
+      ClOrdID: "generated"
+      Symbol: "required"
+      Side: "required"  # 1=Buy, 2=Sell
+      OrderQty: "required"
+      OrdType: "required"  # 1=Market, 2=Limit
+      Price: "conditional"
+      TimeInForce: "optional"  # 0=Day, 3=IOC, 4=FOK
+
+  order_cancel_request:
+    template: |
+      35=F|49={sender}|56={target}|41={origclordid}|
+      11={clordid}|55={symbol}|54={side}|
+
+  execution_report:
+    template: |
+      35=8|49={sender}|56={target}|37={orderid}|
+      11={clordid}|17={execid}|150={exectype}|
+      39={ordstatus}|55={symbol}|54={side}|
+      38={orderqty}|14={cumqty}|6={avgpx}|
+```
+
+C++ FIX ENGINE IMPLEMENTATION:
+-------------------------------
+```cpp
+#include <quickfix/Application.h>
+#include <quickfix/MessageCracker.h>
+#include <quickfix/SocketInitiator.h>
+
+class FIXEngine : public FIX::Application,
+                  public FIX::MessageCracker {
+private:
+    std::unique_ptr<FIX::SocketInitiator> initiator_;
+    FIX::SessionSettings settings_;
+    OrderManager& order_manager_;
+
+public:
+    FIXEngine(const std::string& config_file,
+              OrderManager& om)
+        : order_manager_(om) {
+
+        settings_ = FIX::SessionSettings(config_file);
+
+        auto storeFactory =
+            std::make_unique<FIX::FileStoreFactory>(settings_);
+        auto logFactory =
+            std::make_unique<FIX::FileLogFactory>(settings_);
+
+        initiator_ = std::make_unique<FIX::SocketInitiator>(
+            *this, *storeFactory, settings_, *logFactory);
+    }
+
+    void Start() {
+        initiator_->start();
+    }
+
+    void SendNewOrder(const Order& order) {
+        FIX44::NewOrderSingle nos;
+
+        nos.setField(FIX::ClOrdID(order.client_order_id));
+        nos.setField(FIX::Symbol(order.symbol));
+        nos.setField(FIX::Side(order.side == Side::BUY ?
+                              FIX::Side_BUY : FIX::Side_SELL));
+        nos.setField(FIX::OrderQty(order.quantity));
+        nos.setField(FIX::OrdType(order.type == OrderType::LIMIT ?
+                                  FIX::OrdType_LIMIT :
+                                  FIX::OrdType_MARKET));
+
+        if (order.type == OrderType::LIMIT) {
+            nos.setField(FIX::Price(order.price));
+        }
+
+        nos.setField(FIX::TransactTime());
+
+        FIX::Session::sendToTarget(nos, session_id_);
+    }
+
+    // Callback: Execution Report
+    void onMessage(const FIX44::ExecutionReport& er,
+                   const FIX::SessionID& session_id) override {
+
+        FIX::ClOrdID clordid;
+        FIX::ExecType exec_type;
+        FIX::OrdStatus ord_status;
+
+        er.get(clordid);
+        er.get(exec_type);
+        er.get(ord_status);
+
+        // Update order manager
+        order_manager_.OnExecutionReport(
+            clordid.getValue(),
+            ConvertExecType(exec_type),
+            ConvertOrdStatus(ord_status));
+    }
+
+    void onCreate(const FIX::SessionID& session_id) override {
+        LOG_INFO("FIX session created: {}", session_id.toString());
+    }
+
+    void onLogon(const FIX::SessionID& session_id) override {
+        LOG_INFO("FIX session logged on: {}", session_id.toString());
+        session_id_ = session_id;
+        is_logged_on_ = true;
+    }
+
+    void onLogout(const FIX::SessionID& session_id) override {
+        LOG_WARN("FIX session logged out: {}", session_id.toString());
+        is_logged_on_ = false;
+    }
+
+private:
+    FIX::SessionID session_id_;
+    std::atomic<bool> is_logged_on_{false};
+};
+```
+
+================================================================================
+3. NATIVE PROTOCOL CONFIGURATION
+================================================================================
+
+NASDAQ OUCH PROTOCOL:
+---------------------
+```yaml
+ouch_protocol:
+  version: "4.2"
+
+  connection:
+    host: "ouch.nasdaq.com"
+    port: 9200
+    protocol: "tcp"
+
+  session:
+    username: "HFT_FIRM_001"
+    password_file: "/etc/hft/secrets/nasdaq.pwd"
+    session_id: "OUCH001"
+
+  messages:
+    enter_order:
+      message_type: "O"
+      fields:
+        - token: 14  # Order token
+        - buy_sell: 1  # B/S
+        - shares: 4  # Quantity
+        - stock: 8  # Symbol
+        - price: 4  # Price in cents
+        - time_in_force: 4  # 0=Day, 99999=IOC
+        - firm: 4  # Firm ID
+
+    replace_order:
+      message_type: "U"
+
+    cancel_order:
+      message_type: "X"
+```
+
+C++ OUCH IMPLEMENTATION:
+------------------------
+```cpp
+#pragma pack(push, 1)
+struct OUCHEnterOrder {
+    char message_type;           // 'O'
+    char order_token[14];        // Unique order token
+    char buy_sell_indicator;     // 'B' or 'S'
+    uint32_t shares;             // Share quantity
+    char stock[8];               // Stock symbol (right-padded)
+    uint32_t price;              // Price in 1/10000 dollars
+    uint32_t time_in_force;      // 0=Day, 99999=IOC, 99998=Market hours
+    char firm[4];                // Firm ID
+    char display;                // 'Y' or 'N'
+    char capacity;               // 'A'=Agency, 'P'=Principal
+    char intermarket_sweep;      // 'Y' or 'N'
+    uint32_t minimum_quantity;   // Min execution quantity
+    char cross_type;             // 'N'=No cross
+    char customer_type;          // 'R'=Retail
+};
+
+struct OUCHOrderAccepted {
+    char message_type;           // 'A'
+    uint64_t timestamp;          // Nanoseconds since midnight
+    char order_token[14];        // Order token
+    char buy_sell_indicator;     // 'B' or 'S'
+    uint32_t shares;             // Share quantity
+    char stock[8];               // Stock symbol
+    uint32_t price;              // Price
+    uint32_t time_in_force;      // TIF
+    char firm[4];                // Firm
+    char display;                // Display
+    uint64_t order_reference_number;  // Order ID
+    char capacity;               // Capacity
+    char intermarket_sweep;      // ISO
+    uint32_t minimum_quantity;   // Min qty
+    char cross_type;             // Cross
+    char order_state;            // Order state
+};
+#pragma pack(pop)
+
+class OUCHClient {
+private:
+    int socket_fd_;
+    std::array<char, 8192> send_buffer_;
+    std::array<char, 8192> recv_buffer_;
+
+public:
+    void SendEnterOrder(const Order& order) {
+        OUCHEnterOrder msg{};
+        msg.message_type = 'O';
+
+        // Generate unique token
+        GenerateOrderToken(msg.order_token, order.client_order_id);
+
+        msg.buy_sell_indicator =
+            (order.side == Side::BUY) ? 'B' : 'S';
+        msg.shares = htonl(order.quantity);
+
+        // Right-pad symbol with spaces
+        std::memset(msg.stock, ' ', 8);
+        std::memcpy(msg.stock, order.symbol.c_str(),
+                   std::min(order.symbol.size(), 8UL));
+
+        msg.price = htonl(
+            static_cast<uint32_t>(order.price * 10000));
+
+        msg.time_in_force = htonl(
+            order.tif == TimeInForce::IOC ? 99999 : 0);
+
+        // Send message
+        ssize_t sent = send(socket_fd_, &msg, sizeof(msg), 0);
+        if (sent != sizeof(msg)) {
+            throw std::runtime_error("Failed to send OUCH message");
+        }
+
+        LOG_DEBUG("OUCH order sent: token={}",
+                 std::string(msg.order_token, 14));
+    }
+
+    void ProcessInboundMessages() {
+        ssize_t received = recv(socket_fd_, recv_buffer_.data(),
+                               recv_buffer_.size(), MSG_DONTWAIT);
+
+        if (received > 0) {
+            size_t offset = 0;
+            while (offset < static_cast<size_t>(received)) {
+                char msg_type = recv_buffer_[offset];
+
+                switch (msg_type) {
+                    case 'A':  // Order Accepted
+                        HandleOrderAccepted(
+                            reinterpret_cast<OUCHOrderAccepted*>(
+                                &recv_buffer_[offset]));
+                        offset += sizeof(OUCHOrderAccepted);
+                        break;
+
+                    case 'U':  // Order Replaced
+                        // Handle...
+                        break;
+
+                    case 'C':  // Order Canceled
+                        // Handle...
+                        break;
+
+                    case 'E':  // Order Executed
+                        // Handle...
+                        break;
+                }
+            }
+        }
+    }
+
+private:
+    void GenerateOrderToken(char* token, uint64_t order_id) {
+        std::snprintf(token, 15, "%014lu", order_id);
+    }
+};
+```
+
+BATS PITCH PROTOCOL:
+--------------------
+```yaml
+bats_pitch:
+  version: "2.41"
+
+  connection:
+    host: "pitch.bats.com"
+    port: 30001
+    multicast_group: "224.0.62.1"
+
+  market_data:
+    feed_type: "multicast"
+    sequence_number_reset: "daily"
+
+  messages:
+    add_order:
+      type: 0x21
+      length: 34
+
+    order_executed:
+      type: 0x23
+      length: 30
+
+    trade:
+      type: 0x50
+      length: 44
+```
+
+================================================================================
+4. WEBSOCKET CONFIGURATION
+================================================================================
+
+WEBSOCKET SETTINGS:
+-------------------
+```yaml
+websocket:
+  crypto_exchanges:
+    binance:
+      enabled: true
+
+      spot:
+        url: "wss://stream.binance.com:9443/ws"
+        backup_url: "wss://stream.binance.us:9443/ws"
+
+      futures:
+        url: "wss://fstream.binance.com/ws"
+
+      streams:
+        trades:
+          - "btcusdt@trade"
+          - "ethusdt@trade"
+
+        orderbook:
+          - "btcusdt@depth20@100ms"
+          - "ethusdt@depth20@100ms"
+
+        klines:
+          - "btcusdt@kline_1m"
+
+      connection:
+        compression: true
+        ping_interval_s: 30
+        pong_timeout_s: 10
+        reconnect_delay_ms: 1000
+
+    coinbase:
+      enabled: true
+      url: "wss://ws-feed.pro.coinbase.com"
+
+      channels:
+        - name: "level2"
+          product_ids: ["BTC-USD", "ETH-USD"]
+
+        - name: "matches"
+          product_ids: ["BTC-USD", "ETH-USD"]
+
+        - name: "ticker"
+          product_ids: ["BTC-USD"]
+```
+
+C++ WEBSOCKET CLIENT:
+---------------------
+```cpp
+#include <websocketpp/config/asio_client.hpp>
+#include <websocketpp/client.hpp>
+
+using websocketpp::client;
+using websocketpp::connection_hdl;
+
+class WebSocketClient {
+private:
+    using Client = client<websocketpp::config::asio_tls_client>;
+
+    Client client_;
+    connection_hdl handle_;
+    std::string url_;
+    MarketDataHandler& md_handler_;
+
+public:
+    WebSocketClient(const std::string& url,
+                   MarketDataHandler& handler)
+        : url_(url), md_handler_(handler) {
+
+        client_.init_asio();
+
+        // Set callbacks
+        client_.set_open_handler(
+            [this](connection_hdl hdl) { OnOpen(hdl); });
+
+        client_.set_message_handler(
+            [this](connection_hdl hdl, Client::message_ptr msg) {
+                OnMessage(hdl, msg);
+            });
+
+        client_.set_close_handler(
+            [this](connection_hdl hdl) { OnClose(hdl); });
+
+        client_.set_fail_handler(
+            [this](connection_hdl hdl) { OnFail(hdl); });
+
+        // TLS settings
+        client_.set_tls_init_handler(
+            [](connection_hdl) {
+                return websocketpp::lib::make_shared<
+                    asio::ssl::context>(asio::ssl::context::tlsv12);
+            });
+    }
+
+    void Connect() {
+        websocketpp::lib::error_code ec;
+        Client::connection_ptr con = client_.get_connection(url_, ec);
+
+        if (ec) {
+            throw std::runtime_error("Connection failed: " +
+                                    ec.message());
+        }
+
+        client_.connect(con);
+
+        // Run in separate thread
+        std::thread([this]() {
+            client_.run();
+        }).detach();
+    }
+
+    void Subscribe(const std::string& channel,
+                   const std::vector<std::string>& symbols) {
+        nlohmann::json sub_msg = {
+            {"method", "SUBSCRIBE"},
+            {"params", symbols},
+            {"id", 1}
+        };
+
+        client_.send(handle_, sub_msg.dump(),
+                    websocketpp::frame::opcode::text);
+    }
+
+private:
+    void OnOpen(connection_hdl hdl) {
+        LOG_INFO("WebSocket connected: {}", url_);
+        handle_ = hdl;
+
+        // Subscribe to streams
+        Subscribe("trade", {"btcusdt@trade", "ethusdt@trade"});
+    }
+
+    void OnMessage(connection_hdl hdl, Client::message_ptr msg) {
+        try {
+            auto j = nlohmann::json::parse(msg->get_payload());
+
+            if (j.contains("e")) {
+                std::string event_type = j["e"];
+
+                if (event_type == "trade") {
+                    ProcessTrade(j);
+                } else if (event_type == "depthUpdate") {
+                    ProcessOrderBook(j);
+                }
+            }
+
+        } catch (const std::exception& e) {
+            LOG_ERROR("Message parse error: {}", e.what());
+        }
+    }
+
+    void ProcessTrade(const nlohmann::json& j) {
+        Trade trade;
+        trade.symbol = j["s"];
+        trade.price = std::stod(j["p"].get<std::string>());
+        trade.quantity = std::stod(j["q"].get<std::string>());
+        trade.timestamp = j["T"];
+        trade.is_buyer_maker = j["m"];
+
+        md_handler_.OnTrade(trade);
+    }
+
+    void OnClose(connection_hdl hdl) {
+        LOG_WARN("WebSocket closed: {}", url_);
+        // Implement reconnection logic
+        Reconnect();
+    }
+
+    void OnFail(connection_hdl hdl) {
+        LOG_ERROR("WebSocket failed: {}", url_);
+        Reconnect();
+    }
+
+    void Reconnect() {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        Connect();
+    }
+};
+```
+
+================================================================================
+5. MARKET DATA FEED CONFIGURATION
+================================================================================
+
+MULTICAST MARKET DATA:
+----------------------
+```yaml
+market_data_feeds:
+  nyse_pillar:
+    feed_type: "multicast"
+
+    channel_a:
+      ip: "224.0.150.1"
+      port: 20001
+      interface: "eth0"
+
+    channel_b:
+      ip: "224.0.150.2"
+      port: 20001
+      interface: "eth1"
+
+    gap_detection:
+      enabled: true
+      sequence_check: true
+      gap_fill_timeout_ms: 100
+
+    recovery:
+      enabled: true
+      server: "gap.nyse.com"
+      port: 30001
+
+  nasdaq_totalview:
+    feed_type: "multicast"
+    protocol: "ITCH 5.0"
+
+    primary:
+      ip: "233.43.202.1"
+      port: 26477
+
+    secondary:
+      ip: "233.43.202.2"
+      port: 26477
+
+  cme_mdp3:
+    feed_type: "multicast"
+    protocol: "MDP 3.0"
+
+    incremental:
+      channel: 310
+      ip: "224.0.31.0"
+      port: 14310
+
+    snapshot:
+      channel: 311
+      ip: "224.0.31.1"
+      port: 14311
+```
+
+================================================================================
+6. ORDER ENTRY GATEWAY CONFIGURATION
+================================================================================
+
+ORDER ROUTING:
+--------------
+```yaml
+order_gateways:
+  nyse_equity:
+    gateway_type: "fix"
+    session_id: "NYSE_OE_01"
+
+    limits:
+      max_orders_per_second: 1000
+      max_order_size: 1000000
+      max_notional_per_order: 10000000
+
+    throttling:
+      enabled: true
+      window_ms: 1000
+      max_messages: 1000
+
+  nasdaq_equity:
+    gateway_type: "ouch"
+    session_id: "NASDAQ_OE_01"
+
+    port_config:
+      mp_id: "FIRM"
+      mpid_suffix: "01"
+
+  cme_futures:
+    gateway_type: "fix"
+    session_id: "CME_FUT_01"
+
+    ilink3:
+      enabled: true
+      uuid: "HFT-FIRM-UUID-001"
+      firm_id: "FIRM"
+
+    drop_copy:
+      enabled: true
+      session_id: "CME_DC_01"
+```
+
+================================================================================
+7. SESSION MANAGEMENT
+================================================================================
+
+SESSION LIFECYCLE:
+------------------
+```yaml
+session_management:
+  startup:
+    sequence: ["connect", "authenticate", "logon", "sync"]
+    max_startup_time_s: 30
+
+  authentication:
+    method: "hmac_sha256"  # hmac_sha256, oauth2, certificate
+    credentials_file: "/etc/hft/secrets/exchange_creds.enc"
+    rotate_credentials: true
+    rotation_period_days: 90
+
+  heartbeats:
+    enabled: true
+    interval_s: 30
+    timeout_multiplier: 3
+
+  graceful_shutdown:
+    cancel_open_orders: true
+    wait_for_responses: true
+    max_wait_time_s: 10
+```
+
+================================================================================
+8. FAILOVER AND REDUNDANCY
+================================================================================
+
+HIGH AVAILABILITY:
+------------------
+```yaml
+failover:
+  mode: "active_active"  # active_passive, active_active
+
+  connections:
+    primary:
+      datacenter: "NY4"
+      host: "fix-ny4.exchange.com"
+
+    secondary:
+      datacenter: "LD4"
+      host: "fix-ld4.exchange.com"
+
+  health_checks:
+    interval_ms: 100
+    failure_threshold: 3
+    recovery_threshold: 10
+
+  automatic_failover:
+    enabled: true
+    detection_time_ms: 500
+    switchover_time_ms: 100
+```
+
+================================================================================
+END OF EXCHANGE CONFIGURATION
+================================================================================

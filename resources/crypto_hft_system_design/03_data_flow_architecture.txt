@@ -1,0 +1,970 @@
+================================================================================
+DATA FLOW ARCHITECTURE - COMPLETE DATA FLOW DESIGN
+================================================================================
+
+FILE: 03_data_flow_architecture.txt
+PURPOSE: Detailed data flow patterns, message formats, and event sequences
+AUDIENCE: Developers, system architects
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+
+1. DATA FLOW OVERVIEW
+2. MARKET DATA FLOW
+3. ORDER EXECUTION FLOW
+4. POSITION UPDATE FLOW
+5. RISK CHECK FLOW
+6. CONFIGURATION UPDATE FLOW
+7. MESSAGE FORMATS
+8. SEQUENCE DIAGRAMS
+9. PERFORMANCE OPTIMIZATION
+
+================================================================================
+1. DATA FLOW OVERVIEW
+================================================================================
+
+The system has five primary data flows:
+
+1. MARKET DATA FLOW (Continuous, high-volume)
+   Exchange -> Connector -> MarketData -> OrderBook -> Strategy
+
+2. ORDER FLOW (Event-driven, low-latency critical)
+   Strategy -> OMS -> Risk -> Execution -> Connector -> Exchange
+
+3. FILL FLOW (Event-driven, position-critical)
+   Exchange -> Connector -> Execution -> OMS -> Position -> Strategy
+
+4. POSITION FLOW (Continuous, real-time)
+   Position -> Risk -> Strategy -> Database
+
+5. CONTROL FLOW (Infrequent, configuration)
+   Config -> Components -> Acknowledgment
+
+LATENCY BUDGET (Target < 1ms end-to-end):
+┌────────────────────────────────────────────────────────────────┐
+│ Market Data Flow Latency Budget:                              │
+│ ┌─────────────────────┬──────────┬──────────────────────────┐ │
+│ │ Stage               │ Budget   │ Optimization            │ │
+│ ├─────────────────────┼──────────┼──────────────────────────┤ │
+│ │ Network (exchange)  │ 10-50ms  │ Colocation              │ │
+│ │ WebSocket decode    │ 10μs     │ Zero-copy parsing       │ │
+│ │ JSON parse          │ 20μs     │ simdjson                │ │
+│ │ Normalization       │ 5μs      │ In-place transform      │ │
+│ │ Queue enqueue       │ 2μs      │ Lock-free SPSC          │ │
+│ │ Queue dequeue       │ 2μs      │ Lock-free SPSC          │ │
+│ │ OrderBook update    │ 10μs     │ Cache-optimized map     │ │
+│ │ Strategy callback   │ 50μs     │ Inline processing       │ │
+│ │ Total (local)       │ ~99μs    │ <100μs target           │ │
+│ └─────────────────────┴──────────┴──────────────────────────┘ │
+└────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────┐
+│ Order Execution Flow Latency Budget:                          │
+│ ┌─────────────────────┬──────────┬──────────────────────────┐ │
+│ │ Stage               │ Budget   │ Optimization            │ │
+│ ├─────────────────────┼──────────┼──────────────────────────┤ │
+│ │ Strategy decision   │ 50μs     │ Optimized logic         │ │
+│ │ Risk check          │ 5μs      │ Atomic counters         │ │
+│ │ OMS processing      │ 10μs     │ Lock-free updates       │ │
+│ │ Queue enqueue       │ 2μs      │ Lock-free MPSC          │ │
+│ │ Execution prep      │ 15μs     │ Pre-allocated buffers   │ │
+│ │ JSON serialization  │ 10μs     │ Pre-formatted templates │ │
+│ │ Network send        │ 10μs     │ TCP_NODELAY             │ │
+│ │ Total (local)       │ ~102μs   │ <150μs target           │ │
+│ │ Exchange RTT        │ 20-100ms │ Colocation              │ │
+│ └─────────────────────┴──────────┴──────────────────────────┘ │
+└────────────────────────────────────────────────────────────────┘
+
+================================================================================
+2. MARKET DATA FLOW
+================================================================================
+
+2.1 DETAILED FLOW DIAGRAM
+--------------------------
+
+┌──────────────┐
+│   Exchange   │ (Binance, Coinbase, etc.)
+└──────┬───────┘
+       │ WebSocket: {"e":"depthUpdate","s":"BTCUSDT",...}
+       ▼
+┌──────────────────────────────────────────────────────────────┐
+│ Market Data Thread (Dedicated, CPU pinned, Real-time)       │
+│                                                              │
+│  ┌────────────────────────────────────────────────────────┐ │
+│  │ 1. WebSocket Receive (kernel -> userspace)            │ │
+│  │    - Batched read (up to 64KB)                        │ │
+│  │    - Timestamp immediately: T0                        │ │
+│  └────────────────────────────────────────────────────────┘ │
+│                         │                                    │
+│  ┌────────────────────────────────────────────────────────┐ │
+│  │ 2. JSON Parse (simdjson on-demand)                    │ │
+│  │    - Zero-copy parsing                                │ │
+│  │    - Extract: type, symbol, data                      │ │
+│  │    - Latency: ~20μs                                   │ │
+│  └────────────────────────────────────────────────────────┘ │
+│                         │                                    │
+│  ┌────────────────────────────────────────────────────────┐ │
+│  │ 3. Create MarketDataEvent                             │ │
+│  │    struct MarketDataEvent {                           │ │
+│  │      uint64_t timestamp_ns;  // T0                    │ │
+│  │      uint32_t symbol_id;     // Hashed                │ │
+│  │      MarketDataType type;                             │ │
+│  │      union {                                          │ │
+│  │        OrderBookUpdate book_update;                   │ │
+│  │        Trade trade;                                   │ │
+│  │      } data;                                          │ │
+│  │    };                                                 │ │
+│  └────────────────────────────────────────────────────────┘ │
+│                         │                                    │
+│  ┌────────────────────────────────────────────────────────┐ │
+│  │ 4. Enqueue to Lock-free Queue                         │ │
+│  │    - SPSC queue (Single Producer, Single Consumer)    │ │
+│  │    - Ring buffer, power-of-2 size                     │ │
+│  │    - Memory order: release on write                   │ │
+│  │    - Latency: ~2μs                                    │ │
+│  └────────────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────────┘
+                         │
+                         ▼ (Lock-free SPSC Queue)
+┌──────────────────────────────────────────────────────────────┐
+│ Market Data Handler Thread (CPU pinned)                     │
+│                                                              │
+│  ┌────────────────────────────────────────────────────────┐ │
+│  │ 5. Dequeue Event                                       │ │
+│  │    - Memory order: acquire on read                     │ │
+│  │    - Timestamp: T1                                     │ │
+│  │    - Latency: ~2μs                                    │ │
+│  └────────────────────────────────────────────────────────┘ │
+│                         │                                    │
+│  ┌────────────────────────────────────────────────────────┐ │
+│  │ 6. Normalize Data                                      │ │
+│  │    - Convert exchange format -> internal format        │ │
+│  │    - Price: double -> fixed-point int64               │ │
+│  │    - Symbol: string -> uint32_t hash                  │ │
+│  │    - Latency: ~5μs                                    │ │
+│  └────────────────────────────────────────────────────────┘ │
+│                         │                                    │
+│  ┌────────────────────────────────────────────────────────┐ │
+│  │ 7. Update Order Book                                   │ │
+│  │    - Lock-free for reads (SeqLock)                    │ │
+│  │    - Single writer (this thread)                      │ │
+│  │    - Cache-optimized data structure                   │ │
+│  │    - Latency: ~10μs                                   │ │
+│  └────────────────────────────────────────────────────────┘ │
+│                         │                                    │
+│  ┌────────────────────────────────────────────────────────┐ │
+│  │ 8. Publish to Strategy Subscribers                     │ │
+│  │    - Direct function call (inlined)                    │ │
+│  │    - Or enqueue to strategy queue                      │ │
+│  │    - Timestamp: T2                                     │ │
+│  └────────────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────────┘
+                         │
+                         ▼ (Direct callback or queue)
+┌──────────────────────────────────────────────────────────────┐
+│ Strategy Thread (CPU pinned)                                │
+│                                                              │
+│  ┌────────────────────────────────────────────────────────┐ │
+│  │ 9. Process Market Data                                 │ │
+│  │    - Update internal state                             │ │
+│  │    - Calculate signals                                 │ │
+│  │    - Make trading decisions                            │ │
+│  │    - Timestamp: T3                                     │ │
+│  │    - Latency: ~50μs                                   │ │
+│  └────────────────────────────────────────────────────────┘ │
+│                         │                                    │
+│  ┌────────────────────────────────────────────────────────┐ │
+│  │ 10. Generate Orders (if needed)                        │ │
+│  │     -> Proceed to ORDER FLOW                           │ │
+│  └────────────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────────┘
+
+TOTAL LATENCY: T3 - T0 = ~99μs (target: <100μs)
+
+2.2 MARKET DATA STRUCTURES
+---------------------------
+
+// Ultra-compact market data event (cache-line aligned)
+struct alignas(64) MarketDataEvent {
+    uint64_t timestamp_ns;      // 8 bytes - Nanosecond timestamp
+    uint32_t symbol_id;         // 4 bytes - Hashed symbol ID
+    uint16_t exchange_id;       // 2 bytes - Exchange enum
+    uint8_t type;               // 1 byte - Event type
+    uint8_t flags;              // 1 byte - Flags
+
+    // 48 bytes remaining in cache line for data
+    union {
+        struct {
+            int64_t price;      // Fixed-point price
+            int64_t quantity;   // Fixed-point quantity
+            uint32_t num_orders;
+            int32_t side;       // 1 = bid, -1 = ask
+        } book_level;
+
+        struct {
+            int64_t price;
+            int64_t quantity;
+            int32_t side;
+            uint32_t trade_id;
+        } trade;
+
+        struct {
+            int64_t bid_price;
+            int64_t ask_price;
+            int64_t last_price;
+            int64_t volume_24h;
+        } ticker;
+    } data;
+
+    // Total: 64 bytes (one cache line)
+};
+
+// Order book update (incremental)
+struct OrderBookUpdate {
+    uint64_t sequence_number;
+    std::vector<PriceLevel> bid_changes;
+    std::vector<PriceLevel> ask_changes;
+    Timestamp timestamp;
+};
+
+struct PriceLevel {
+    int64_t price;      // Fixed-point
+    int64_t quantity;   // Fixed-point
+
+    PriceLevel() = default;
+    PriceLevel(double p, double q)
+        : price(static_cast<int64_t>(p * PRICE_SCALE)),
+          quantity(static_cast<int64_t>(q * QUANTITY_SCALE)) {}
+};
+
+2.3 LOCK-FREE MARKET DATA QUEUE
+--------------------------------
+
+template<typename T, size_t Size>
+class SPSCQueue {
+    static_assert((Size & (Size - 1)) == 0, "Size must be power of 2");
+
+public:
+    SPSCQueue() : head_(0), tail_(0) {}
+
+    // Producer side (market data thread)
+    bool try_push(const T& item) {
+        const size_t current_tail = tail_.load(std::memory_order_relaxed);
+        const size_t next_tail = (current_tail + 1) & (Size - 1);
+
+        // Check if full
+        if (next_tail == head_.load(std::memory_order_acquire)) {
+            return false;
+        }
+
+        // Write data
+        buffer_[current_tail] = item;
+
+        // Publish
+        tail_.store(next_tail, std::memory_order_release);
+        return true;
+    }
+
+    // Consumer side (handler thread)
+    bool try_pop(T& item) {
+        const size_t current_head = head_.load(std::memory_order_relaxed);
+
+        // Check if empty
+        if (current_head == tail_.load(std::memory_order_acquire)) {
+            return false;
+        }
+
+        // Read data
+        item = buffer_[current_head];
+
+        // Consume
+        const size_t next_head = (current_head + 1) & (Size - 1);
+        head_.store(next_head, std::memory_order_release);
+        return true;
+    }
+
+    size_t size() const {
+        const size_t current_head = head_.load(std::memory_order_acquire);
+        const size_t current_tail = tail_.load(std::memory_order_acquire);
+        return (current_tail - current_head) & (Size - 1);
+    }
+
+private:
+    alignas(64) std::atomic<size_t> head_;
+    alignas(64) std::atomic<size_t> tail_;
+    std::array<T, Size> buffer_;
+};
+
+// Usage
+SPSCQueue<MarketDataEvent, 65536> md_queue;  // 64K events
+
+// Producer (market data thread)
+MarketDataEvent event = parse_message(raw_data);
+if (!md_queue.try_push(event)) {
+    // Queue full - log and drop or resize
+    metrics.increment("md_queue_full");
+}
+
+// Consumer (handler thread)
+MarketDataEvent event;
+while (md_queue.try_pop(event)) {
+    process_market_data(event);
+}
+
+2.4 ORDER BOOK UPDATE OPTIMIZATION
+-----------------------------------
+
+// Cache-optimized order book using flat maps
+class FastOrderBook {
+public:
+    void update(const OrderBookUpdate& update) {
+        // Single-threaded, no lock needed
+
+        // Apply bid changes
+        for (const auto& level : update.bid_changes) {
+            if (level.quantity == 0) {
+                bids_.erase(level.price);
+            } else {
+                bids_[level.price] = level.quantity;
+            }
+        }
+
+        // Apply ask changes
+        for (const auto& level : update.ask_changes) {
+            if (level.quantity == 0) {
+                asks_.erase(level.price);
+            } else {
+                asks_[level.price] = level.quantity;
+            }
+        }
+
+        ++sequence_;
+
+        // Update cached values
+        update_cache();
+    }
+
+    // Lock-free read with SeqLock
+    struct Snapshot {
+        int64_t best_bid;
+        int64_t best_ask;
+        int64_t bid_volume;
+        int64_t ask_volume;
+        uint64_t sequence;
+    };
+
+    Snapshot get_snapshot() const {
+        Snapshot snap;
+        uint64_t seq1, seq2;
+
+        do {
+            seq1 = sequence_.load(std::memory_order_acquire);
+            snap.best_bid = best_bid_.load(std::memory_order_relaxed);
+            snap.best_ask = best_ask_.load(std::memory_order_relaxed);
+            snap.bid_volume = bid_volume_.load(std::memory_order_relaxed);
+            snap.ask_volume = ask_volume_.load(std::memory_order_relaxed);
+            snap.sequence = seq1;
+            seq2 = sequence_.load(std::memory_order_acquire);
+        } while (seq1 != seq2 || (seq1 & 1));  // Retry if write in progress
+
+        return snap;
+    }
+
+private:
+    void update_cache() {
+        // Increment sequence (odd = write in progress)
+        sequence_.fetch_add(1, std::memory_order_release);
+
+        // Update cached values
+        if (!bids_.empty()) {
+            best_bid_.store(bids_.rbegin()->first, std::memory_order_relaxed);
+            bid_volume_.store(calculate_volume(bids_), std::memory_order_relaxed);
+        }
+
+        if (!asks_.empty()) {
+            best_ask_.store(asks_.begin()->first, std::memory_order_relaxed);
+            ask_volume_.store(calculate_volume(asks_), std::memory_order_relaxed);
+        }
+
+        // Increment sequence (even = write complete)
+        sequence_.fetch_add(1, std::memory_order_release);
+    }
+
+    int64_t calculate_volume(const auto& levels) const {
+        int64_t total = 0;
+        int count = 0;
+        for (const auto& [price, qty] : levels) {
+            total += qty;
+            if (++count >= 10) break;  // Top 10 levels
+        }
+        return total;
+    }
+
+    // Order book data (single writer)
+    absl::btree_map<int64_t, int64_t> bids_;  // Sorted descending
+    absl::btree_map<int64_t, int64_t> asks_;  // Sorted ascending
+
+    // Cached values for lock-free reads (SeqLock)
+    alignas(64) std::atomic<uint64_t> sequence_{0};
+    std::atomic<int64_t> best_bid_{0};
+    std::atomic<int64_t> best_ask_{0};
+    std::atomic<int64_t> bid_volume_{0};
+    std::atomic<int64_t> ask_volume_{0};
+};
+
+================================================================================
+3. ORDER EXECUTION FLOW
+================================================================================
+
+3.1 DETAILED FLOW DIAGRAM
+--------------------------
+
+┌──────────────┐
+│  Strategy    │
+└──────┬───────┘
+       │ CreateOrder: {symbol, side, quantity, price}
+       │ Timestamp: T0
+       ▼
+┌────────────────────────────────────────────────────────────────┐
+│ Order Management System (OMS)                                  │
+│                                                                │
+│  ┌──────────────────────────────────────────────────────────┐ │
+│  │ 1. Generate Order ID                                     │ │
+│  │    - Format: YYYYMMDD-HHMMSS-NNNNN                      │ │
+│  │    - Atomic counter                                      │ │
+│  │    - Latency: ~1μs                                      │ │
+│  └──────────────────────────────────────────────────────────┘ │
+│                         │                                      │
+│  ┌──────────────────────────────────────────────────────────┐ │
+│  │ 2. Validate Order                                        │ │
+│  │    - Symbol exists                                       │ │
+│  │    - Price/quantity > 0                                  │ │
+│  │    - Order type valid                                    │ │
+│  │    - Latency: ~2μs                                      │ │
+│  └──────────────────────────────────────────────────────────┘ │
+│                         │                                      │
+│  ┌──────────────────────────────────────────────────────────┐ │
+│  │ 3. Store Order (Status: NEW)                             │ │
+│  │    - Lock-free hash map insert                           │ │
+│  │    - Add to active orders set                            │ │
+│  │    - Latency: ~3μs                                      │ │
+│  └──────────────────────────────────────────────────────────┘ │
+│                         │                                      │
+│  ┌──────────────────────────────────────────────────────────┐ │
+│  │ 4. Notify Observers                                      │ │
+│  │    - Risk Manager                                        │ │
+│  │    - Position Manager                                    │ │
+│  │    - Audit Logger                                        │ │
+│  │    - Latency: ~4μs                                      │ │
+│  └──────────────────────────────────────────────────────────┘ │
+└────────────────────────────────────────────────────────────────┘
+                         │
+                         ▼
+┌────────────────────────────────────────────────────────────────┐
+│ Risk Manager                                                   │
+│                                                                │
+│  ┌──────────────────────────────────────────────────────────┐ │
+│  │ 5. Pre-Trade Risk Checks (CRITICAL PATH)                 │ │
+│  │    ┌──────────────────────────────────────────────────┐ │ │
+│  │    │ a) Position Limit Check                          │ │ │
+│  │    │    current_pos + order_qty <= max_position       │ │ │
+│  │    │    Atomic load, simple comparison                │ │ │
+│  │    │    Latency: ~1μs                                │ │ │
+│  │    └──────────────────────────────────────────────────┘ │ │
+│  │    ┌──────────────────────────────────────────────────┐ │ │
+│  │    │ b) Order Size Limit                              │ │ │
+│  │    │    order_qty <= max_order_size                   │ │ │
+│  │    │    Latency: ~0.5μs                              │ │ │
+│  │    └──────────────────────────────────────────────────┘ │ │
+│  │    ┌──────────────────────────────────────────────────┐ │ │
+│  │    │ c) Price Collar Check                            │ │ │
+│  │    │    reference_price * (1-collar) <= order_price   │ │ │
+│  │    │    <= reference_price * (1+collar)               │ │ │
+│  │    │    Latency: ~1μs                                │ │ │
+│  │    └──────────────────────────────────────────────────┘ │ │
+│  │    ┌──────────────────────────────────────────────────┐ │ │
+│  │    │ d) Trading Velocity Check                        │ │ │
+│  │    │    orders_last_second < max_velocity             │ │ │
+│  │    │    Token bucket algorithm                        │ │ │
+│  │    │    Latency: ~1μs                                │ │ │
+│  │    └──────────────────────────────────────────────────┘ │ │
+│  │    ┌──────────────────────────────────────────────────┐ │ │
+│  │    │ e) Circuit Breaker Check                         │ │ │
+│  │    │    !circuit_breaker_triggered                    │ │ │
+│  │    │    Atomic flag check                             │ │ │
+│  │    │    Latency: ~0.5μs                              │ │ │
+│  │    └──────────────────────────────────────────────────┘ │ │
+│  │                                                          │ │
+│  │    Total Risk Check Latency: ~5μs                       │ │
+│  │                                                          │ │
+│  │    If REJECT -> Cancel order, notify strategy           │ │
+│  │    If ACCEPT -> Continue to execution                   │ │
+│  └──────────────────────────────────────────────────────────┘ │
+└────────────────────────────────────────────────────────────────┘
+                         │ ACCEPT
+                         ▼
+┌────────────────────────────────────────────────────────────────┐
+│ Execution Engine                                               │
+│                                                                │
+│  ┌──────────────────────────────────────────────────────────┐ │
+│  │ 6. Enqueue to Execution Queue                            │ │
+│  │    - MPSC queue (Multi-Producer, Single-Consumer)        │ │
+│  │    - Per-exchange queue                                  │ │
+│  │    - Latency: ~2μs                                      │ │
+│  └──────────────────────────────────────────────────────────┘ │
+└────────────────────────────────────────────────────────────────┘
+                         │
+                         ▼ (Per-exchange queue)
+┌────────────────────────────────────────────────────────────────┐
+│ Execution Thread (Dedicated per exchange)                      │
+│                                                                │
+│  ┌──────────────────────────────────────────────────────────┐ │
+│  │ 7. Dequeue Order                                         │ │
+│  │    - Batch dequeue (up to 10 orders)                     │ │
+│  │    - Latency: ~2μs per order                            │ │
+│  └──────────────────────────────────────────────────────────┘ │
+│                         │                                      │
+│  ┌──────────────────────────────────────────────────────────┐ │
+│  │ 8. Format Order for Exchange                             │ │
+│  │    - Convert to exchange JSON format                     │ │
+│  │    - Generate signature (HMAC-SHA256)                    │ │
+│  │    - Add timestamp, nonce                                │ │
+│  │    - Latency: ~10μs                                     │ │
+│  └──────────────────────────────────────────────────────────┘ │
+│                         │                                      │
+│  ┌──────────────────────────────────────────────────────────┐ │
+│  │ 9. Rate Limit Check                                      │ │
+│  │    - Token bucket per exchange                           │ │
+│  │    - May wait if limit exceeded                          │ │
+│  │    - Latency: ~1μs (no wait)                            │ │
+│  └──────────────────────────────────────────────────────────┘ │
+│                         │                                      │
+│  ┌──────────────────────────────────────────────────────────┐ │
+│  │ 10. Send to Exchange                                     │ │
+│  │     - REST POST (most reliable)                          │ │
+│  │     - Or WebSocket (if supported)                        │ │
+│  │     - TCP_NODELAY, TCP_QUICKACK                         │ │
+│  │     - Latency: ~10μs (local)                            │ │
+│  │     - Update order status: PENDING                       │ │
+│  │     - Timestamp: T1                                      │ │
+│  └──────────────────────────────────────────────────────────┘ │
+└────────────────────────────────────────────────────────────────┘
+                         │
+                         ▼ (Network)
+┌────────────────────────────────────────────────────────────────┐
+│ Exchange (20-100ms round trip)                                 │
+│  - Receives order                                              │
+│  - Validates                                                   │
+│  - Matches                                                     │
+│  - Sends acknowledgment                                        │
+└────────────────────────────────────────────────────────────────┘
+                         │
+                         ▼ (WebSocket or REST response)
+┌────────────────────────────────────────────────────────────────┐
+│ Execution Thread                                               │
+│                                                                │
+│  ┌──────────────────────────────────────────────────────────┐ │
+│  │ 11. Receive Acknowledgment                               │ │
+│  │     - Parse JSON response                                │ │
+│  │     - Extract: exchange_order_id, status                 │ │
+│  │     - Timestamp: T2                                      │ │
+│  │     - Latency: ~20μs                                    │ │
+│  └──────────────────────────────────────────────────────────┘ │
+│                         │                                      │
+│  ┌──────────────────────────────────────────────────────────┐ │
+│  │ 12. Notify OMS                                           │ │
+│  │     - Update order status: ACKNOWLEDGED                  │ │
+│  │     - Store exchange_order_id                            │ │
+│  │     - Latency: ~5μs                                     │ │
+│  └──────────────────────────────────────────────────────────┘ │
+└────────────────────────────────────────────────────────────────┘
+                         │
+                         ▼
+┌────────────────────────────────────────────────────────────────┐
+│ Strategy Notification                                          │
+│  - on_order_acknowledged()                                     │
+│  - Update strategy state                                       │
+└────────────────────────────────────────────────────────────────┘
+
+TOTAL LATENCY (T1 - T0):
+  Strategy -> Exchange send: ~102μs
+
+ROUND TRIP (T2 - T0):
+  Full acknowledgment: ~102μs + network (20-100ms)
+
+================================================================================
+4. FILL NOTIFICATION FLOW
+================================================================================
+
+┌──────────────┐
+│   Exchange   │ - Order fills on exchange
+└──────┬───────┘
+       │ WebSocket: {"e":"executionReport","s":"BTCUSDT","x":"TRADE",...}
+       ▼
+┌────────────────────────────────────────────────────────────────┐
+│ Market Data Thread (WebSocket dedicated to order updates)      │
+│                                                                │
+│  1. Receive fill notification                                 │
+│  2. Parse JSON (simdjson)                                     │
+│  3. Create FillEvent                                          │
+│  4. Enqueue to execution queue                                │
+│                                                                │
+│  Latency: ~30μs                                              │
+└────────────────────────────────────────────────────────────────┘
+                         │
+                         ▼
+┌────────────────────────────────────────────────────────────────┐
+│ Execution Thread                                               │
+│                                                                │
+│  5. Dequeue FillEvent                                         │
+│  6. Validate (order exists, fill amount valid)                │
+│  7. Update OMS                                                │
+│                                                                │
+│  Latency: ~10μs                                              │
+└────────────────────────────────────────────────────────────────┘
+                         │
+                         ├─────────────┬─────────────┐
+                         ▼             ▼             ▼
+              ┌────────────────┐ ┌──────────┐ ┌──────────────┐
+              │ Position Mgr   │ │ Risk Mgr │ │  Strategy    │
+              │                │ │          │ │              │
+              │ 8. Update pos  │ │ 9. Check │ │ 10. Notify   │
+              │    Atomic add  │ │    limits│ │     callback │
+              │    Latency:1μs │ │    ~2μs  │ │     ~10μs    │
+              └────────────────┘ └──────────┘ └──────────────┘
+                         │             │             │
+                         ▼             ▼             ▼
+              ┌──────────────────────────────────────────────┐
+              │ Database (Async write)                       │
+              │  - Write fill to PostgreSQL                  │
+              │  - Update position in Redis                  │
+              │  - Non-blocking                              │
+              └──────────────────────────────────────────────┘
+
+CRITICAL PATH LATENCY: ~51μs (WebSocket -> Strategy notification)
+
+struct FillEvent {
+    uint64_t timestamp_ns;
+    OrderId order_id;
+    std::string exchange_order_id;
+    int64_t fill_price;      // Fixed-point
+    int64_t fill_quantity;   // Fixed-point
+    int32_t side;            // Buy/Sell
+    int64_t fee;             // Fixed-point
+    std::string fee_currency;
+    bool is_maker;           // Maker or taker
+};
+
+================================================================================
+5. RISK CHECK FLOW (DETAILED)
+================================================================================
+
+class RiskManager {
+public:
+    // Fast path: inline risk checks
+    [[gnu::always_inline]]
+    bool check_order_fast(const Order& order) {
+        // All checks use atomic loads (very fast)
+
+        // 1. Circuit breaker (global kill switch)
+        if (circuit_breaker_.load(std::memory_order_relaxed)) {
+            return false;
+        }
+
+        // 2. Position limit
+        auto current_pos = positions_[order.symbol].load(std::memory_order_relaxed);
+        auto new_pos = current_pos + (order.side == Side::BUY ?
+                                      order.quantity : -order.quantity);
+        if (std::abs(new_pos) > max_position_) {
+            return false;
+        }
+
+        // 3. Order size
+        if (order.quantity > max_order_size_) {
+            return false;
+        }
+
+        // 4. Price collar
+        auto ref_price = reference_prices_[order.symbol].load(std::memory_order_relaxed);
+        if (order.price < ref_price * (1.0 - price_collar_) ||
+            order.price > ref_price * (1.0 + price_collar_)) {
+            return false;
+        }
+
+        // 5. Velocity (token bucket)
+        if (!velocity_limiter_.try_acquire()) {
+            return false;
+        }
+
+        return true;  // All checks passed
+    }
+
+    // Called on fill
+    void on_fill(const Fill& fill) {
+        // Update position atomically
+        auto& pos = positions_[fill.symbol];
+        int64_t change = (fill.side == Side::BUY ? fill.quantity : -fill.quantity);
+        pos.fetch_add(change, std::memory_order_relaxed);
+
+        // Update PnL
+        update_pnl(fill);
+
+        // Check post-trade limits
+        check_post_trade_limits();
+    }
+
+private:
+    std::atomic<bool> circuit_breaker_{false};
+    std::unordered_map<std::string, std::atomic<int64_t>> positions_;
+    std::unordered_map<std::string, std::atomic<int64_t>> reference_prices_;
+    int64_t max_position_ = 1000000;  // 1M units
+    int64_t max_order_size_ = 100000;  // 100K units
+    double price_collar_ = 0.01;  // 1%
+    TokenBucket velocity_limiter_{100};  // 100 orders/sec
+};
+
+================================================================================
+6. CONFIGURATION UPDATE FLOW
+================================================================================
+
+Hot Configuration Reload (no restart required):
+
+┌──────────────┐
+│ Config File  │ (YAML/JSON on disk)
+│ Modified     │
+└──────┬───────┘
+       │ inotify event
+       ▼
+┌────────────────────────────────────────────────────────────────┐
+│ Configuration Manager (Admin thread)                          │
+│                                                                │
+│  1. Detect file change (inotify)                              │
+│  2. Parse new configuration                                   │
+│  3. Validate (schema check)                                   │
+│  4. Create diff (what changed)                                │
+│  5. Publish ConfigUpdate event                                │
+└────────────────────────────────────────────────────────────────┘
+                         │
+                         ▼ (Broadcast to all components)
+       ┌─────────────────┼─────────────────┬─────────────┐
+       ▼                 ▼                 ▼             ▼
+┌────────────┐  ┌──────────────┐  ┌────────────┐  ┌────────────┐
+│ Risk Mgr   │  │ Strategy     │  │ Connector  │  │ OMS        │
+│ Update     │  │ Reconfigure  │  │ Reconnect  │  │ Update     │
+│ limits     │  │ parameters   │  │ if needed  │  │ settings   │
+└────────────┘  └──────────────┘  └────────────┘  └────────────┘
+       │                 │                 │             │
+       └─────────────────┴─────────────────┴─────────────┘
+                         │
+                         ▼
+┌────────────────────────────────────────────────────────────────┐
+│ All components ACK config update                               │
+│ Configuration Manager waits for all ACKs (timeout: 5s)         │
+│ Log successful reload                                          │
+└────────────────────────────────────────────────────────────────┘
+
+// Configuration with versioning
+struct Config {
+    uint64_t version;
+
+    struct RiskConfig {
+        int64_t max_position;
+        int64_t max_order_size;
+        double price_collar;
+        int orders_per_second;
+    } risk;
+
+    struct StrategyConfig {
+        std::string type;
+        std::map<std::string, double> parameters;
+    } strategy;
+
+    // ... other config sections
+};
+
+// RCU for lock-free config reads
+class ConfigManager {
+public:
+    std::shared_ptr<const Config> get_config() const {
+        return config_.load(std::memory_order_acquire);
+    }
+
+    void update_config(std::shared_ptr<Config> new_config) {
+        // Atomic pointer swap (RCU)
+        auto old_config = config_.exchange(new_config, std::memory_order_release);
+
+        // Old config will be deleted when last reader releases it
+        // (shared_ptr ref count goes to zero)
+    }
+
+private:
+    std::atomic<std::shared_ptr<const Config>> config_;
+};
+
+================================================================================
+7. MESSAGE FORMATS
+================================================================================
+
+7.1 INTERNAL MESSAGE FORMATS
+-----------------------------
+
+All internal messages use fixed-size structs for cache efficiency.
+
+// Market data event (64 bytes, cache-line aligned)
+struct alignas(64) MarketDataEvent {
+    uint64_t timestamp_ns;
+    uint32_t symbol_id;
+    uint16_t exchange_id;
+    uint8_t type;
+    uint8_t flags;
+    union {
+        struct { int64_t price, qty; int32_t side; } level;
+        struct { int64_t price, qty; int32_t side; uint32_t id; } trade;
+    } data;
+};
+
+// Order event (128 bytes, two cache lines)
+struct alignas(128) OrderEvent {
+    char order_id[32];
+    char symbol[16];
+    uint64_t timestamp_ns;
+    int64_t price;
+    int64_t quantity;
+    int64_t filled;
+    uint16_t exchange_id;
+    uint8_t side;
+    uint8_t type;
+    uint8_t status;
+    uint8_t flags;
+    char padding[42];  // Pad to 128 bytes
+};
+
+7.2 EXCHANGE MESSAGE FORMATS
+-----------------------------
+
+// Binance Order Book Update
+{
+  "e": "depthUpdate",
+  "E": 1234567890123,
+  "s": "BTCUSDT",
+  "U": 157,
+  "u": 160,
+  "b": [["9000.00", "1.5"], ["8999.00", "2.0"]],
+  "a": [["9001.00", "1.2"], ["9002.00", "0.8"]]
+}
+
+// Binance Trade
+{
+  "e": "trade",
+  "E": 1234567890123,
+  "s": "BTCUSDT",
+  "t": 12345,
+  "p": "9000.00",
+  "q": "1.5",
+  "T": 1234567890120,
+  "m": true
+}
+
+// Binance Order Response
+{
+  "symbol": "BTCUSDT",
+  "orderId": 28,
+  "clientOrderId": "6gCrw2kRUAF9CvJDGP16IP",
+  "transactTime": 1507725176595,
+  "price": "1.00000000",
+  "origQty": "10.00000000",
+  "executedQty": "10.00000000",
+  "status": "FILLED",
+  "type": "LIMIT",
+  "side": "SELL"
+}
+
+================================================================================
+8. PERFORMANCE OPTIMIZATION
+================================================================================
+
+8.1 ZERO-COPY TECHNIQUES
+-------------------------
+
+// Parse JSON in-place with simdjson
+simdjson::ondemand::parser parser;
+auto doc = parser.iterate(json_string);  // No copy
+
+// Extract fields directly
+uint64_t timestamp = doc["E"].get_uint64();
+std::string_view symbol = doc["s"].get_string();  // String view, no copy
+
+// Access nested arrays
+auto bids = doc["b"];
+for (auto bid : bids) {
+    auto bid_array = bid.get_array();
+    // Parse directly from original buffer
+}
+
+8.2 BATCHING
+------------
+
+// Batch dequeue from queue
+std::array<MarketDataEvent, 64> batch;
+size_t count = md_queue.try_pop_batch(batch.data(), batch.size());
+
+for (size_t i = 0; i < count; ++i) {
+    process_market_data(batch[i]);
+}
+
+// Batch database writes
+class BatchedWriter {
+    void write(const Fill& fill) {
+        buffer_.push_back(fill);
+
+        if (buffer_.size() >= BATCH_SIZE || should_flush()) {
+            flush();
+        }
+    }
+
+    void flush() {
+        db_->bulk_insert(buffer_);
+        buffer_.clear();
+    }
+
+    static constexpr size_t BATCH_SIZE = 1000;
+    std::vector<Fill> buffer_;
+};
+
+8.3 PREFETCHING
+---------------
+
+// Prefetch next event while processing current
+for (size_t i = 0; i < events.size(); ++i) {
+    if (i + 1 < events.size()) {
+        __builtin_prefetch(&events[i + 1]);
+    }
+    process_event(events[i]);
+}
+
+// Prefetch order book levels
+void calculate_vwap(const OrderBook& book, int depth) {
+    auto levels = book.get_bids(depth);
+
+    for (size_t i = 0; i < levels.size(); ++i) {
+        if (i + 2 < levels.size()) {
+            __builtin_prefetch(&levels[i + 2]);
+        }
+        // Process level[i]
+    }
+}
+
+================================================================================
+DOCUMENT END
+================================================================================
+
+This data flow architecture provides:
+- Complete end-to-end flow diagrams
+- Latency budgets for each stage
+- Lock-free data structures
+- Zero-copy optimizations
+- Batch processing techniques
+- Real-world message formats
+
+Next: See 04_codebase_folder_structure.txt for directory organization

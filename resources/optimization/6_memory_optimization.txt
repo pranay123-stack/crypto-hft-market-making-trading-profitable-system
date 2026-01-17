@@ -1,0 +1,1047 @@
+================================================================================
+HFT MEMORY OPTIMIZATION TECHNIQUES
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Theory and Fundamental Concepts
+2. Cache Optimization Strategies
+3. Memory Pools and Custom Allocators
+4. NUMA-Aware Programming
+5. Memory Access Patterns
+6. TLB Optimization
+7. Huge Pages and Large Pages
+8. Memory Prefetching
+9. Memory Alignment
+10. Benchmarking and Measurement
+11. Expected Improvements
+
+================================================================================
+1. THEORY AND FUNDAMENTAL CONCEPTS
+================================================================================
+
+Memory Hierarchy:
+-----------------
+Level    | Size      | Latency    | Bandwidth
+---------|-----------|------------|------------
+L1 Cache | 32-64 KB  | 1-2 ns     | 500 GB/s
+L2 Cache | 256KB-1MB | 3-10 ns    | 200 GB/s
+L3 Cache | 8-64 MB   | 10-40 ns   | 100 GB/s
+RAM      | 16-512 GB | 60-100 ns  | 50-100 GB/s
+SSD      | 256GB-4TB | 100-500 μs | 2-7 GB/s
+HDD      | 1-16 TB   | 5-10 ms    | 100-200 MB/s
+
+Cache Line Size: 64 bytes (typical)
+Page Size: 4 KB (standard), 2 MB or 1 GB (huge pages)
+TLB Entries: 64-1536 entries
+
+HFT Memory Optimization Goals:
+-------------------------------
+1. Maximize L1 cache hit rate (> 99%)
+2. Minimize cache line invalidations
+3. Eliminate dynamic allocations in critical path
+4. Ensure NUMA locality
+5. Use huge pages to reduce TLB misses
+6. Align data structures to cache lines
+7. Prevent false sharing
+8. Optimize memory access patterns
+
+Memory Access Patterns Performance:
+------------------------------------
+Sequential access: 100-200 GB/s (optimal)
+Random access (L1): 50-100 GB/s
+Random access (L2): 20-40 GB/s
+Random access (L3): 10-20 GB/s
+Random access (RAM): 5-10 GB/s
+Strided access: Depends on stride size
+
+================================================================================
+2. CACHE OPTIMIZATION STRATEGIES
+================================================================================
+
+2.1 Cache Line Alignment
+-------------------------
+
+```cpp
+#include <cstddef>
+
+// Optimal cache line size (typically 64 bytes)
+constexpr size_t CACHE_LINE_SIZE = 64;
+
+// Align hot data to cache lines
+struct alignas(CACHE_LINE_SIZE) HotData {
+    uint64_t timestamp;     // 8 bytes
+    double price;           // 8 bytes
+    uint32_t quantity;      // 4 bytes
+    uint32_t orderId;       // 4 bytes
+    uint16_t symbolId;      // 2 bytes
+    uint8_t side;           // 1 byte
+    uint8_t type;           // 1 byte
+    char padding[36];       // Pad to 64 bytes
+};
+
+static_assert(sizeof(HotData) == 64);
+
+// Benefit: One cache line per object, no partial cache line loads
+```
+
+2.2 Structure Padding for Cache Efficiency
+-------------------------------------------
+
+```cpp
+// BAD: Crosses cache line boundary
+struct UnoptimizedOrder {
+    char header[60];    // 60 bytes
+    double price;       // 8 bytes - crosses to next cache line!
+    uint32_t quantity;  // 4 bytes
+};
+// Size: 72 bytes, spans 2 cache lines
+// Cache lines loaded: 2 per access
+
+// GOOD: Properly aligned
+struct alignas(64) OptimizedOrder {
+    double price;       // 8 bytes (frequently accessed first)
+    uint32_t quantity;  // 4 bytes
+    char header[52];    // 52 bytes
+};
+// Size: 64 bytes, exactly 1 cache line
+// Cache lines loaded: 1 per access
+// 2x cache efficiency
+```
+
+2.3 Data Structure Reorganization
+----------------------------------
+
+```cpp
+// BAD: Mixed hot and cold data
+struct InefficicientTrade {
+    // Hot data (accessed frequently)
+    double price;
+    uint32_t quantity;
+    uint64_t timestamp;
+
+    // Cold data (accessed rarely)
+    char counterparty[64];
+    char exchangeRef[32];
+    char notes[128];
+};
+// Hot data spread across cache lines mixed with cold data
+
+// GOOD: Separate hot and cold data
+struct alignas(64) EfficientTrade {
+    // Hot data in first cache line
+    double price;
+    uint32_t quantity;
+    uint64_t timestamp;
+    uint32_t tradeId;
+    char padding[36];
+
+    // Cold data in separate structure (pointer)
+    struct ColdData* coldData;  // Rarely accessed
+};
+
+struct TradeeColdData {
+    char counterparty[64];
+    char exchangeRef[32];
+    char notes[128];
+};
+
+// Hot data: 1 cache line
+// Cold data: Only loaded when needed
+// 3-5x faster for hot path
+```
+
+2.4 Cache-Conscious Data Structures
+------------------------------------
+
+```cpp
+// Array of Structures (AoS) - Poor cache utilization
+struct MarketDataAoS {
+    struct Quote {
+        uint32_t symbolId;
+        double bid;
+        double ask;
+        uint32_t bidSize;
+        uint32_t askSize;
+    };
+
+    std::vector<Quote> quotes;  // 28 bytes per quote
+
+    double calculateSpread(size_t index) {
+        return quotes[index].ask - quotes[index].bid;
+    }
+};
+// Access pattern: Load entire Quote (28 bytes)
+// Cache efficiency: Medium (loads unused fields)
+
+// Structure of Arrays (SoA) - Excellent cache utilization
+struct MarketDataSoA {
+    std::vector<uint32_t> symbolIds;
+    std::vector<double> bids;
+    std::vector<double> asks;
+    std::vector<uint32_t> bidSizes;
+    std::vector<uint32_t> askSizes;
+
+    double calculateSpread(size_t index) {
+        return asks[index] - bids[index];
+    }
+
+    // SIMD-friendly batch calculation
+    void calculateAllSpreads(std::vector<double>& spreads) {
+        spreads.resize(bids.size());
+        for (size_t i = 0; i < bids.size(); ++i) {
+            spreads[i] = asks[i] - bids[i];
+        }
+        // Auto-vectorizable, excellent cache locality
+    }
+};
+// Access pattern: Load only needed data (16 bytes for 2 doubles)
+// Cache efficiency: Excellent
+// SIMD-friendly: Yes
+// 2-4x faster for batch operations
+```
+
+================================================================================
+3. MEMORY POOLS AND CUSTOM ALLOCATORS
+================================================================================
+
+3.1 Fixed-Size Memory Pool
+---------------------------
+
+```cpp
+template<typename T, size_t PoolSize>
+class FixedMemoryPool {
+    union Node {
+        T data;
+        Node* next;
+    };
+
+    alignas(64) std::array<Node, PoolSize> pool;
+    Node* freeList;
+    size_t allocated;
+
+public:
+    FixedMemoryPool() : freeList(nullptr), allocated(0) {
+        // Initialize free list
+        for (size_t i = 0; i < PoolSize - 1; ++i) {
+            pool[i].next = &pool[i + 1];
+        }
+        pool[PoolSize - 1].next = nullptr;
+        freeList = &pool[0];
+    }
+
+    T* allocate() {
+        if (freeList == nullptr) {
+            return nullptr;  // Pool exhausted
+        }
+
+        Node* node = freeList;
+        freeList = freeList->next;
+        ++allocated;
+
+        return &node->data;
+    }
+
+    void deallocate(T* ptr) {
+        if (ptr == nullptr) return;
+
+        Node* node = reinterpret_cast<Node*>(ptr);
+        node->next = freeList;
+        freeList = node;
+        --allocated;
+    }
+
+    size_t size() const { return allocated; }
+    size_t capacity() const { return PoolSize; }
+};
+
+// Usage for HFT orders
+class OrderAllocator {
+    static constexpr size_t MAX_ORDERS = 1000000;
+    FixedMemoryPool<Order, MAX_ORDERS> pool;
+
+public:
+    Order* createOrder() {
+        return pool.allocate();  // ~10-20 ns (vs 100-500 ns for malloc)
+    }
+
+    void destroyOrder(Order* order) {
+        pool.deallocate(order);  // ~5-10 ns (vs 50-200 ns for free)
+    }
+};
+
+// Benefit: 10-50x faster than malloc/free
+// No fragmentation
+// Deterministic allocation time
+```
+
+3.2 Lock-Free Memory Pool
+--------------------------
+
+```cpp
+template<typename T, size_t PoolSize>
+class LockFreeMemoryPool {
+    struct alignas(16) Node {
+        T data;
+        std::atomic<Node*> next;
+    };
+
+    alignas(64) std::array<Node, PoolSize> pool;
+    alignas(64) std::atomic<Node*> freeList;
+
+public:
+    LockFreeMemoryPool() {
+        // Initialize free list
+        for (size_t i = 0; i < PoolSize - 1; ++i) {
+            pool[i].next.store(&pool[i + 1], std::memory_order_relaxed);
+        }
+        pool[PoolSize - 1].next.store(nullptr, std::memory_order_relaxed);
+        freeList.store(&pool[0], std::memory_order_release);
+    }
+
+    T* allocate() {
+        Node* head = freeList.load(std::memory_order_acquire);
+
+        while (head != nullptr) {
+            Node* next = head->next.load(std::memory_order_acquire);
+
+            if (freeList.compare_exchange_weak(head, next,
+                                               std::memory_order_release,
+                                               std::memory_order_acquire)) {
+                return &head->data;
+            }
+            // CAS failed, retry with updated head
+        }
+
+        return nullptr;  // Pool exhausted
+    }
+
+    void deallocate(T* ptr) {
+        if (ptr == nullptr) return;
+
+        Node* node = reinterpret_cast<Node*>(ptr);
+        Node* head = freeList.load(std::memory_order_acquire);
+
+        do {
+            node->next.store(head, std::memory_order_relaxed);
+        } while (!freeList.compare_exchange_weak(head, node,
+                                                 std::memory_order_release,
+                                                 std::memory_order_acquire));
+    }
+};
+
+// Thread-safe without locks
+// Latency: ~15-30 ns (still much faster than malloc)
+```
+
+3.3 NUMA-Aware Allocator
+-------------------------
+
+```cpp
+#include <numa.h>
+#include <numaif.h>
+
+class NUMAAllocator {
+public:
+    static void* allocateOnNode(size_t size, int node) {
+        void* ptr = numa_alloc_onnode(size, node);
+        if (ptr == nullptr) {
+            throw std::bad_alloc();
+        }
+        return ptr;
+    }
+
+    static void deallocate(void* ptr, size_t size) {
+        numa_free(ptr, size);
+    }
+
+    static int getCurrentNode() {
+        return numa_node_of_cpu(sched_getcpu());
+    }
+
+    static void bindToNode(int node) {
+        struct bitmask* mask = numa_allocate_nodemask();
+        numa_bitmask_setbit(mask, node);
+        numa_bind(mask);
+        numa_free_nodemask(mask);
+    }
+};
+
+// NUMA-aware order book
+class NUMAOrderBook {
+    void* data;
+    size_t dataSize;
+    int numaNode;
+
+public:
+    NUMAOrderBook(size_t size, int node) : dataSize(size), numaNode(node) {
+        // Allocate on specific NUMA node
+        data = NUMAAllocator::allocateOnNode(size, node);
+
+        // Touch pages to ensure allocation on correct node
+        memset(data, 0, size);
+    }
+
+    ~NUMAOrderBook() {
+        NUMAAllocator::deallocate(data, dataSize);
+    }
+};
+
+// Benefit: 2-5x faster memory access on NUMA systems
+```
+
+================================================================================
+4. NUMA-AWARE PROGRAMMING
+================================================================================
+
+4.1 NUMA Architecture Understanding
+------------------------------------
+
+```bash
+# Check NUMA configuration
+numactl --hardware
+
+# Output example:
+# available: 2 nodes (0-1)
+# node 0 cpus: 0 1 2 3
+# node 0 size: 32768 MB
+# node 0 free: 28456 MB
+# node 1 cpus: 4 5 6 7
+# node 1 size: 32768 MB
+# node 1 free: 30124 MB
+# node distances:
+# node   0   1
+#   0:  10  21
+#   1:  21  10
+
+# Distance 10 = local access
+# Distance 21 = remote access (2x slower)
+```
+
+4.2 NUMA-Aware Thread Placement
+--------------------------------
+
+```cpp
+class NUMAThreadManager {
+public:
+    static void pinThreadToNode(int node) {
+        // Get CPUs for this NUMA node
+        struct bitmask* cpus = numa_allocate_cpumask();
+        numa_node_to_cpus(node, cpus);
+
+        // Pin thread to first CPU on node
+        int cpu = numa_bitmask_firstbit(cpus);
+        numa_free_cpumask(cpus);
+
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(cpu, &cpuset);
+
+        pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+
+        // Bind memory allocations to this node
+        NUMAAllocator::bindToNode(node);
+
+        printf("Thread pinned to NUMA node %d, CPU %d\n", node, cpu);
+    }
+
+    static void initializeNUMAThread(int node) {
+        pinThreadToNode(node);
+
+        // Set memory policy for this thread
+        numa_set_preferred(node);
+
+        // Touch stack to ensure it's on correct node
+        volatile char stack[8192];
+        memset((void*)stack, 0, sizeof(stack));
+    }
+};
+
+// HFT application with NUMA awareness
+void tradingThreadMain(int numaNode) {
+    // Initialize NUMA affinity
+    NUMAThreadManager::initializeNUMAThread(numaNode);
+
+    // Allocate data structures on local node
+    void* orderBookData = NUMAAllocator::allocateOnNode(ORDER_BOOK_SIZE, numaNode);
+
+    // Main trading loop
+    while (running) {
+        processOrders();  // All data access is local to NUMA node
+    }
+}
+```
+
+4.3 NUMA Performance Comparison
+--------------------------------
+
+```cpp
+// Benchmark NUMA locality
+void benchmarkNUMALocality() {
+    constexpr size_t SIZE = 1024 * 1024 * 100;  // 100 MB
+    constexpr size_t ITERATIONS = 1000;
+
+    // Allocate on remote node
+    void* remoteData = numa_alloc_onnode(SIZE, 1);
+    numa_run_on_node(0);  // Run on node 0
+
+    // Benchmark remote access
+    auto start = std::chrono::high_resolution_clock::now();
+    for (size_t i = 0; i < ITERATIONS; ++i) {
+        volatile uint64_t sum = 0;
+        uint64_t* data = (uint64_t*)remoteData;
+        for (size_t j = 0; j < SIZE / sizeof(uint64_t); ++j) {
+            sum += data[j];
+        }
+    }
+    auto end = std::chrono::high_resolution_clock::now();
+    auto remoteTime = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+
+    // Allocate on local node
+    void* localData = numa_alloc_onnode(SIZE, 0);
+
+    // Benchmark local access
+    start = std::chrono::high_resolution_clock::now();
+    for (size_t i = 0; i < ITERATIONS; ++i) {
+        volatile uint64_t sum = 0;
+        uint64_t* data = (uint64_t*)localData;
+        for (size_t j = 0; j < SIZE / sizeof(uint64_t); ++j) {
+            sum += data[j];
+        }
+    }
+    end = std::chrono::high_resolution_clock::now();
+    auto localTime = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+
+    printf("Remote access: %ld μs\n", remoteTime.count());
+    printf("Local access: %ld μs\n", localTime.count());
+    printf("Slowdown: %.2fx\n", (double)remoteTime.count() / localTime.count());
+
+    numa_free(remoteData, SIZE);
+    numa_free(localData, SIZE);
+}
+
+// Typical result: 1.5-3x slowdown for remote NUMA access
+```
+
+================================================================================
+5. MEMORY ACCESS PATTERNS
+================================================================================
+
+5.1 Sequential vs Random Access
+--------------------------------
+
+```cpp
+#include <random>
+#include <algorithm>
+
+// Benchmark memory access patterns
+class MemoryAccessBenchmark {
+public:
+    static void sequentialAccess(uint64_t* data, size_t size) {
+        volatile uint64_t sum = 0;
+        for (size_t i = 0; i < size; ++i) {
+            sum += data[i];
+        }
+        // Excellent cache locality
+        // Bandwidth: ~100-200 GB/s
+        // Prefetcher works perfectly
+    }
+
+    static void randomAccess(uint64_t* data, size_t size) {
+        // Create random indices
+        std::vector<size_t> indices(size);
+        std::iota(indices.begin(), indices.end(), 0);
+        std::shuffle(indices.begin(), indices.end(), std::mt19937{});
+
+        volatile uint64_t sum = 0;
+        for (size_t i = 0; i < size; ++i) {
+            sum += data[indices[i]];
+        }
+        // Poor cache locality
+        // Bandwidth: ~5-10 GB/s (20-40x slower)
+        // Prefetcher ineffective
+    }
+
+    static void stridedAccess(uint64_t* data, size_t size, size_t stride) {
+        volatile uint64_t sum = 0;
+        for (size_t i = 0; i < size; i += stride) {
+            sum += data[i];
+        }
+        // Performance depends on stride
+        // Stride = 1: Optimal
+        // Stride = 8: Good (within cache line)
+        // Stride = 16: Moderate (crosses cache lines)
+        // Stride = 1024: Poor (crosses pages)
+    }
+};
+```
+
+5.2 Cache-Friendly Iteration
+-----------------------------
+
+```cpp
+// BAD: Column-major iteration (poor cache locality)
+void processMatrixBad(double matrix[1000][1000]) {
+    for (size_t col = 0; col < 1000; ++col) {
+        for (size_t row = 0; row < 1000; ++row) {
+            matrix[row][col] *= 2.0;  // Non-sequential access
+        }
+    }
+}
+// Cache miss rate: 30-50%
+// Performance: Poor
+
+// GOOD: Row-major iteration (excellent cache locality)
+void processMatrixGood(double matrix[1000][1000]) {
+    for (size_t row = 0; row < 1000; ++row) {
+        for (size_t col = 0; col < 1000; ++col) {
+            matrix[row][col] *= 2.0;  // Sequential access
+        }
+    }
+}
+// Cache miss rate: <1%
+// Performance: 10-20x faster
+```
+
+5.3 Blocking for Cache Efficiency
+----------------------------------
+
+```cpp
+// Matrix multiplication with cache blocking
+void matrixMultiplyBlocked(const double* A, const double* B, double* C,
+                          size_t N, size_t blockSize = 64) {
+    for (size_t i = 0; i < N; i += blockSize) {
+        for (size_t j = 0; j < N; j += blockSize) {
+            for (size_t k = 0; k < N; k += blockSize) {
+                // Multiply block
+                size_t maxI = std::min(i + blockSize, N);
+                size_t maxJ = std::min(j + blockSize, N);
+                size_t maxK = std::min(k + blockSize, N);
+
+                for (size_t ii = i; ii < maxI; ++ii) {
+                    for (size_t jj = j; jj < maxJ; ++jj) {
+                        double sum = C[ii * N + jj];
+                        for (size_t kk = k; kk < maxK; ++kk) {
+                            sum += A[ii * N + kk] * B[kk * N + jj];
+                        }
+                        C[ii * N + jj] = sum;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Benefit: Blocks fit in cache, reuse data
+// Performance: 5-10x faster than naive implementation
+```
+
+================================================================================
+6. TLB OPTIMIZATION
+================================================================================
+
+6.1 Understanding TLB
+---------------------
+
+TLB (Translation Lookaside Buffer):
+- Caches virtual-to-physical address translations
+- Size: 64-1536 entries (CPU dependent)
+- TLB miss: 10-100 cycles penalty
+
+Page sizes:
+- 4 KB: 1 TLB entry per 4 KB
+- 2 MB: 1 TLB entry per 2 MB (512x more coverage)
+- 1 GB: 1 TLB entry per 1 GB (262,144x more coverage)
+
+6.2 TLB Miss Measurement
+-------------------------
+
+```cpp
+// Measure TLB misses
+void measureTLBMisses() {
+    // Small dataset (fits in TLB)
+    constexpr size_t SMALL_SIZE = 64 * 4096;  // 256 KB (64 pages)
+    void* smallData = malloc(SMALL_SIZE);
+
+    // Large dataset (doesn't fit in TLB)
+    constexpr size_t LARGE_SIZE = 10000 * 4096;  // ~40 MB (10,000 pages)
+    void* largeData = malloc(LARGE_SIZE);
+
+    // Touch all pages
+    for (size_t i = 0; i < SMALL_SIZE; i += 4096) {
+        ((char*)smallData)[i] = 0;
+    }
+    for (size_t i = 0; i < LARGE_SIZE; i += 4096) {
+        ((char*)largeData)[i] = 0;
+    }
+
+    // Benchmark small dataset (no TLB misses)
+    auto start = rdtsc();
+    for (size_t i = 0; i < SMALL_SIZE; i += 4096) {
+        volatile char x = ((char*)smallData)[i];
+    }
+    auto smallTime = rdtsc() - start;
+
+    // Benchmark large dataset (many TLB misses)
+    start = rdtsc();
+    for (size_t i = 0; i < LARGE_SIZE; i += 4096) {
+        volatile char x = ((char*)largeData)[i];
+    }
+    auto largeTime = rdtsc() - start;
+
+    printf("Small dataset: %lu cycles\n", smallTime);
+    printf("Large dataset: %lu cycles\n", largeTime);
+    printf("Per-page cost: %.2f cycles\n", (double)largeTime / 10000);
+
+    free(smallData);
+    free(largeData);
+}
+
+// Typical result: 50-100 cycles per TLB miss
+```
+
+================================================================================
+7. HUGE PAGES AND LARGE PAGES
+================================================================================
+
+7.1 Transparent Huge Pages (THP)
+---------------------------------
+
+```bash
+# Check THP status
+cat /sys/kernel/mm/transparent_hugepage/enabled
+
+# Enable THP
+echo always > /sys/kernel/mm/transparent_hugepage/enabled
+
+# Disable THP (recommended for HFT - determinism)
+echo never > /sys/kernel/mm/transparent_hugepage/enabled
+
+# Check THP usage
+grep AnonHugePages /proc/meminfo
+```
+
+7.2 Explicit Huge Pages
+------------------------
+
+```cpp
+#include <sys/mman.h>
+
+class HugePageAllocator {
+public:
+    static constexpr size_t HUGE_PAGE_SIZE = 2 * 1024 * 1024;  // 2 MB
+
+    static void* allocate(size_t size) {
+        // Round up to huge page boundary
+        size_t allocSize = ((size + HUGE_PAGE_SIZE - 1) / HUGE_PAGE_SIZE) * HUGE_PAGE_SIZE;
+
+        void* ptr = mmap(nullptr, allocSize,
+                        PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB,
+                        -1, 0);
+
+        if (ptr == MAP_FAILED) {
+            perror("mmap huge page failed");
+            return nullptr;
+        }
+
+        // Touch pages to ensure allocation
+        memset(ptr, 0, allocSize);
+
+        printf("Allocated %zu bytes on huge pages\n", allocSize);
+        return ptr;
+    }
+
+    static void deallocate(void* ptr, size_t size) {
+        size_t allocSize = ((size + HUGE_PAGE_SIZE - 1) / HUGE_PAGE_SIZE) * HUGE_PAGE_SIZE;
+        munmap(ptr, allocSize);
+    }
+};
+
+// Usage for order book
+class HugePageOrderBook {
+    void* data;
+    size_t size;
+
+public:
+    HugePageOrderBook(size_t dataSize) : size(dataSize) {
+        data = HugePageAllocator::allocate(dataSize);
+        if (data == nullptr) {
+            throw std::runtime_error("Failed to allocate huge pages");
+        }
+    }
+
+    ~HugePageOrderBook() {
+        HugePageAllocator::deallocate(data, size);
+    }
+};
+
+// Benefit:
+// - TLB coverage: 2 MB per entry vs 4 KB (512x improvement)
+// - TLB misses: Reduced by 99%+
+// - Performance: 10-30% faster for large data structures
+```
+
+7.3 1 GB Huge Pages
+--------------------
+
+```bash
+# Configure 1 GB huge pages (requires boot parameter)
+# Add to kernel command line: hugepagesz=1G hugepages=4
+
+# Check 1 GB huge pages
+cat /proc/meminfo | grep HugePages_1GB
+
+# Mount hugetlbfs for 1 GB pages
+mkdir -p /mnt/huge_1gb
+mount -t hugetlbfs -o pagesize=1G none /mnt/huge_1gb
+```
+
+```cpp
+// Allocate 1 GB huge pages
+void* allocate1GBHugePage() {
+    constexpr size_t ONE_GB = 1024 * 1024 * 1024;
+
+    void* ptr = mmap(nullptr, ONE_GB,
+                    PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | (30 << MAP_HUGE_SHIFT),
+                    -1, 0);
+
+    if (ptr == MAP_FAILED) {
+        perror("1 GB huge page allocation failed");
+        return nullptr;
+    }
+
+    return ptr;
+}
+
+// Benefit:
+// - TLB coverage: 1 GB per entry vs 4 KB (262,144x improvement)
+// - Perfect for large market data structures
+// - Near-zero TLB misses
+```
+
+================================================================================
+8. MEMORY PREFETCHING
+================================================================================
+
+8.1 Software Prefetching Strategies
+------------------------------------
+
+```cpp
+#include <xmmintrin.h>
+
+// Prefetch linked list
+void traverseLinkedListWithPrefetch(Node* head) {
+    constexpr int PREFETCH_DISTANCE = 4;
+    Node* prefetchNode = head;
+
+    // Advance prefetch pointer
+    for (int i = 0; i < PREFETCH_DISTANCE && prefetchNode; ++i) {
+        prefetchNode = prefetchNode->next;
+    }
+
+    Node* current = head;
+    while (current) {
+        // Prefetch future node
+        if (prefetchNode) {
+            _mm_prefetch((const char*)prefetchNode, _MM_HINT_T0);
+            prefetchNode = prefetchNode->next;
+        }
+
+        // Process current node
+        processNode(current);
+
+        current = current->next;
+    }
+}
+
+// Improvement: 20-40% faster for pointer-chasing workloads
+```
+
+8.2 Prefetching for Order Book
+-------------------------------
+
+```cpp
+class PrefetchingOrderBook {
+    static constexpr size_t PREFETCH_DISTANCE = 8;
+
+public:
+    void processOrders(const std::vector<Order*>& orders) {
+        size_t n = orders.size();
+
+        for (size_t i = 0; i < n; ++i) {
+            // Prefetch future orders
+            if (i + PREFETCH_DISTANCE < n) {
+                _mm_prefetch((const char*)orders[i + PREFETCH_DISTANCE], _MM_HINT_T0);
+            }
+
+            // Process current order
+            processOrder(orders[i]);
+        }
+    }
+};
+```
+
+================================================================================
+9. MEMORY ALIGNMENT
+================================================================================
+
+9.1 Alignment Requirements
+---------------------------
+
+```cpp
+// Check alignment
+template<typename T>
+void checkAlignment(const T* ptr) {
+    uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
+    printf("Address: 0x%lx\n", addr);
+    printf("Alignment: %zu bytes\n", addr % alignof(T));
+
+    if (addr % 64 == 0) {
+        printf("Cache-line aligned\n");
+    }
+}
+
+// Ensure alignment
+alignas(64) double alignedData[1000];
+
+// Allocate aligned memory
+void* aligned_ptr = aligned_alloc(64, 64000);
+
+// Posix memalign
+void* ptr;
+posix_memalign(&ptr, 64, 64000);
+```
+
+9.2 SIMD Alignment
+------------------
+
+```cpp
+// Aligned allocation for SIMD
+class SIMDAlignedVector {
+    double* data;
+    size_t size;
+
+public:
+    SIMDAlignedVector(size_t n) : size(n) {
+        // Align to 32 bytes for AVX, 64 bytes for AVX-512
+        posix_memalign((void**)&data, 64, n * sizeof(double));
+    }
+
+    ~SIMDAlignedVector() {
+        free(data);
+    }
+
+    double* get() { return data; }
+};
+
+// Use with aligned loads
+void processAlignedData(const SIMDAlignedVector& vec) {
+    const double* data = vec.get();
+
+    for (size_t i = 0; i < vec.size(); i += 4) {
+        __m256d v = _mm256_load_pd(&data[i]);  // Aligned load (faster)
+        // vs _mm256_loadu_pd for unaligned load
+    }
+}
+
+// Aligned load: 1-2 cycles
+// Unaligned load: 2-4 cycles
+// Benefit: 2x faster loads
+```
+
+================================================================================
+10. BENCHMARKING AND MEASUREMENT
+================================================================================
+
+10.1 Cache Miss Measurement
+----------------------------
+
+```bash
+# Measure cache misses with perf
+perf stat -e L1-dcache-loads,L1-dcache-load-misses,LLC-loads,LLC-load-misses \
+    ./trading_engine
+
+# Output:
+#   10,000,000 L1-dcache-loads
+#      100,000 L1-dcache-load-misses     # 1% miss rate (good)
+#    1,000,000 LLC-loads
+#       50,000 LLC-load-misses           # 5% miss rate (acceptable)
+```
+
+10.2 Memory Bandwidth Measurement
+----------------------------------
+
+```cpp
+void measureMemoryBandwidth() {
+    constexpr size_t SIZE = 1024 * 1024 * 100;  // 100 MB
+    constexpr size_t ITERATIONS = 100;
+
+    double* data = (double*)aligned_alloc(64, SIZE * sizeof(double));
+
+    // Sequential write
+    auto start = std::chrono::high_resolution_clock::now();
+    for (size_t iter = 0; iter < ITERATIONS; ++iter) {
+        for (size_t i = 0; i < SIZE; ++i) {
+            data[i] = i * 1.5;
+        }
+    }
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+
+    double totalGB = (SIZE * sizeof(double) * ITERATIONS) / (1024.0 * 1024.0 * 1024.0);
+    double bandwidth = totalGB / (duration.count() / 1000.0);
+
+    printf("Memory Bandwidth: %.2f GB/s\n", bandwidth);
+
+    free(data);
+}
+
+// Expected: 50-200 GB/s depending on CPU
+```
+
+================================================================================
+11. EXPECTED IMPROVEMENTS
+================================================================================
+
+Optimization Technique                    | Performance Gain | Complexity
+------------------------------------------|------------------|-------------
+Cache line alignment                      | 1.5-3x          | Low
+Memory pools                              | 10-50x          | Medium
+NUMA locality                             | 2-5x            | Medium
+Huge pages (2 MB)                         | 1.1-1.3x        | Low
+Huge pages (1 GB)                         | 1.2-1.5x        | Low
+SoA layout                                | 2-4x            | Medium
+Software prefetching                      | 1.2-1.5x        | Medium
+Custom allocators                         | 5-20x           | High
+False sharing elimination                 | 2-10x           | Low
+Memory access pattern optimization        | 3-20x           | High
+
+Combined Effect: 50-500x improvement for memory-intensive workloads
+
+Real-World HFT Example:
+-----------------------
+Order Book Operations:
+
+BEFORE memory optimization:
+- Allocation time: 200 ns (malloc)
+- Cache miss rate: 35%
+- TLB miss rate: 15%
+- Access latency: 150 ns
+- Throughput: 6M ops/sec
+
+AFTER memory optimization:
+- Allocation time: 15 ns (pool)
+- Cache miss rate: 2%
+- TLB miss rate: 0.1%
+- Access latency: 8 ns
+- Throughput: 120M ops/sec (20x improvement)
+
+Latency savings: 142 ns per operation
+At 10M operations/day: 1.42 seconds saved
+Competitive advantage: 20x more operations in same time
+
+================================================================================
+END OF MEMORY OPTIMIZATION GUIDE
+================================================================================

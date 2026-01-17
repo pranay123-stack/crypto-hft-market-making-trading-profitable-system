@@ -1,0 +1,783 @@
+================================================================================
+LATENCY PROFILING FOR HFT C++
+================================================================================
+
+THEORY:
+-------
+Latency in HFT context means:
+- Order-to-execution time: <100 microseconds target
+- Market data processing: <10 microseconds target
+- Internal processing: <1 microsecond per operation
+
+Types of latency:
+1. Average latency: Mean time (less important in HFT)
+2. Tail latency: 99th, 99.9th, 99.99th percentile (CRITICAL)
+3. Maximum latency: Worst case (can kill profitability)
+4. Jitter: Variation in latency (must be minimal)
+
+Latency sources:
+- CPU execution time
+- Memory access (cache misses)
+- Lock contention
+- Context switches
+- Interrupts
+- System calls
+- Network stack
+- Kernel scheduler
+
+Goal: Achieve consistent, predictable latency with minimal tail latency.
+
+TOOLS OVERVIEW:
+---------------
+1. RDTSC (Read Time-Stamp Counter) - CPU cycle counting
+2. clock_gettime() - Nanosecond precision timing
+3. perf - Hardware performance counters
+4. ftrace - Function-level tracing
+5. LTTng - Low-overhead tracing
+6. eBPF/bpftrace - Custom latency probes
+7. Intel VTune - Commercial profiler
+
+================================================================================
+1. RDTSC - CYCLE-ACCURATE TIMING
+================================================================================
+
+THEORY:
+RDTSC reads the CPU's Time Stamp Counter (TSC) - counts CPU cycles.
+- Lowest overhead timing method (~20-30 CPU cycles)
+- Best for measuring very short durations (<1 microsecond)
+- Requires TSC synchronization across cores
+
+IMPORTANT: Modern CPUs have "constant TSC" which is independent of CPU
+frequency scaling. Always check CPU flags for "constant_tsc".
+
+HFT C++ EXAMPLE (RDTSC Wrapper):
+---------------------------------
+
+// rdtsc_timing.cpp
+#include <iostream>
+#include <x86intrin.h>
+#include <vector>
+#include <algorithm>
+#include <iomanip>
+
+class TSCTimer {
+    uint64_t tsc_frequency;
+
+    uint64_t calibrate() {
+        // Calibrate TSC frequency using clock_gettime
+        struct timespec start, end;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        uint64_t tsc_start = __rdtsc();
+
+        // Wait ~100ms
+        struct timespec sleep_time = {0, 100000000};
+        nanosleep(&sleep_time, nullptr);
+
+        uint64_t tsc_end = __rdtsc();
+        clock_gettime(CLOCK_MONOTONIC, &end);
+
+        uint64_t tsc_delta = tsc_end - tsc_start;
+        uint64_t ns_delta = (end.tv_sec - start.tv_sec) * 1000000000UL +
+                            (end.tv_nsec - start.tv_nsec);
+
+        return (tsc_delta * 1000000000UL) / ns_delta;
+    }
+
+public:
+    TSCTimer() : tsc_frequency(calibrate()) {
+        std::cout << "TSC frequency: " << (tsc_frequency / 1000000.0)
+                  << " MHz\n";
+    }
+
+    inline uint64_t cycles() const {
+        return __rdtsc();
+    }
+
+    inline uint64_t nanoseconds(uint64_t cycles) const {
+        return (cycles * 1000000000UL) / tsc_frequency;
+    }
+
+    inline double microseconds(uint64_t cycles) const {
+        return (cycles * 1000000.0) / tsc_frequency;
+    }
+};
+
+// Latency statistics tracker
+class LatencyStats {
+    std::vector<uint64_t> samples;
+
+public:
+    void addSample(uint64_t latency_cycles) {
+        samples.push_back(latency_cycles);
+    }
+
+    void printStats(const TSCTimer& timer) const {
+        if (samples.empty()) return;
+
+        std::vector<uint64_t> sorted = samples;
+        std::sort(sorted.begin(), sorted.end());
+
+        uint64_t min = sorted.front();
+        uint64_t max = sorted.back();
+        uint64_t sum = 0;
+        for (auto s : sorted) sum += s;
+        uint64_t avg = sum / sorted.size();
+
+        auto percentile = [&](double p) {
+            size_t idx = static_cast<size_t>(sorted.size() * p / 100.0);
+            return sorted[idx];
+        };
+
+        std::cout << std::fixed << std::setprecision(3);
+        std::cout << "\nLatency Statistics (microseconds):\n";
+        std::cout << "  Samples:  " << sorted.size() << "\n";
+        std::cout << "  Min:      " << timer.microseconds(min) << "\n";
+        std::cout << "  Max:      " << timer.microseconds(max) << "\n";
+        std::cout << "  Average:  " << timer.microseconds(avg) << "\n";
+        std::cout << "  Median:   " << timer.microseconds(percentile(50)) << "\n";
+        std::cout << "  P95:      " << timer.microseconds(percentile(95)) << "\n";
+        std::cout << "  P99:      " << timer.microseconds(percentile(99)) << "\n";
+        std::cout << "  P99.9:    " << timer.microseconds(percentile(99.9)) << "\n";
+        std::cout << "  P99.99:   " << timer.microseconds(percentile(99.99)) << "\n";
+    }
+};
+
+// Example: Measure order processing latency
+struct Order {
+    uint64_t id;
+    double price;
+    uint64_t quantity;
+};
+
+bool validateOrder(const Order& order) {
+    // Simulate validation
+    return order.price > 0 && order.quantity > 0;
+}
+
+void processOrder(const Order& order) {
+    // Simulate processing
+    volatile double temp = order.price * order.quantity;
+    (void)temp;
+}
+
+int main() {
+    TSCTimer timer;
+    LatencyStats stats;
+
+    const int num_orders = 100000;
+
+    // Warmup (important for accurate measurements)
+    for (int i = 0; i < 1000; ++i) {
+        Order order{static_cast<uint64_t>(i), 100.0 + i * 0.01, 100};
+        validateOrder(order);
+        processOrder(order);
+    }
+
+    // Actual measurement
+    for (int i = 0; i < num_orders; ++i) {
+        Order order{static_cast<uint64_t>(i), 100.0 + i * 0.01, 100};
+
+        uint64_t start = timer.cycles();
+
+        if (validateOrder(order)) {
+            processOrder(order);
+        }
+
+        uint64_t end = timer.cycles();
+
+        stats.addSample(end - start);
+    }
+
+    stats.printStats(timer);
+
+    return 0;
+}
+
+WORKFLOW:
+---------
+# Compile with optimizations
+g++ -O3 -march=native -std=c++17 rdtsc_timing.cpp -o rdtsc_test
+
+# Run
+./rdtsc_test
+
+# Important: Pin to single core for consistent TSC
+taskset -c 0 ./rdtsc_test
+
+# Check for constant_tsc feature
+grep constant_tsc /proc/cpuinfo
+
+BEST PRACTICES:
+- Always warmup before measurement
+- Pin to single core or verify TSC sync
+- Measure many samples for statistics
+- Focus on tail latencies (P99, P99.9)
+- Avoid measuring during system activity
+
+================================================================================
+2. CLOCK_GETTIME - NANOSECOND TIMING
+================================================================================
+
+THEORY:
+clock_gettime() provides nanosecond resolution timing.
+Clocks:
+- CLOCK_MONOTONIC: Monotonic time, not affected by NTP
+- CLOCK_MONOTONIC_RAW: No NTP adjustment (more stable)
+- CLOCK_REALTIME: Wall-clock time (can jump with NTP)
+
+Overhead: ~20-50 nanoseconds per call (more than RDTSC)
+
+HFT C++ EXAMPLE (clock_gettime):
+---------------------------------
+
+// clock_timing.cpp
+#include <iostream>
+#include <time.h>
+#include <vector>
+#include <algorithm>
+#include <iomanip>
+#include <cmath>
+
+class NanoTimer {
+public:
+    static inline uint64_t nanos() {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+        return ts.tv_sec * 1000000000UL + ts.tv_nsec;
+    }
+
+    static inline double micros(uint64_t nanos) {
+        return nanos / 1000.0;
+    }
+};
+
+// Measure clock_gettime overhead
+void measureClockOverhead() {
+    const int samples = 10000;
+    std::vector<uint64_t> overheads;
+
+    for (int i = 0; i < samples; ++i) {
+        uint64_t t1 = NanoTimer::nanos();
+        uint64_t t2 = NanoTimer::nanos();
+        overheads.push_back(t2 - t1);
+    }
+
+    std::sort(overheads.begin(), overheads.end());
+
+    std::cout << "clock_gettime overhead (nanoseconds):\n";
+    std::cout << "  Min:    " << overheads.front() << "\n";
+    std::cout << "  Median: " << overheads[samples/2] << "\n";
+    std::cout << "  P99:    " << overheads[static_cast<size_t>(samples * 0.99)] << "\n";
+    std::cout << "  Max:    " << overheads.back() << "\n\n";
+}
+
+// End-to-end latency measurement
+void measureEndToEndLatency() {
+    struct Message {
+        uint64_t timestamp;
+        double price;
+        uint64_t volume;
+    };
+
+    std::vector<uint64_t> latencies;
+    const int num_messages = 100000;
+
+    for (int i = 0; i < num_messages; ++i) {
+        // Message arrives with timestamp
+        Message msg;
+        msg.timestamp = NanoTimer::nanos();
+        msg.price = 100.0 + i * 0.01;
+        msg.volume = 1000;
+
+        // Simulate processing
+        volatile double value = msg.price * msg.volume;
+        (void)value;
+
+        // Measure latency
+        uint64_t process_end = NanoTimer::nanos();
+        latencies.push_back(process_end - msg.timestamp);
+    }
+
+    std::sort(latencies.begin(), latencies.end());
+
+    std::cout << "End-to-end latency (microseconds):\n";
+    std::cout << std::fixed << std::setprecision(3);
+    std::cout << "  Average: " << NanoTimer::micros(latencies[num_messages/2]) << "\n";
+    std::cout << "  P50:     " << NanoTimer::micros(latencies[num_messages/2]) << "\n";
+    std::cout << "  P95:     " << NanoTimer::micros(latencies[static_cast<size_t>(num_messages*0.95)]) << "\n";
+    std::cout << "  P99:     " << NanoTimer::micros(latencies[static_cast<size_t>(num_messages*0.99)]) << "\n";
+    std::cout << "  P99.9:   " << NanoTimer::micros(latencies[static_cast<size_t>(num_messages*0.999)]) << "\n";
+    std::cout << "  Max:     " << NanoTimer::micros(latencies.back()) << "\n";
+}
+
+int main() {
+    measureClockOverhead();
+    measureEndToEndLatency();
+    return 0;
+}
+
+WORKFLOW:
+---------
+g++ -O3 -std=c++17 clock_timing.cpp -o clock_test
+./clock_test
+
+================================================================================
+3. PERF FOR LATENCY ANALYSIS
+================================================================================
+
+THEORY:
+Use perf to identify latency sources:
+- Cache misses (each L3 miss = ~40ns)
+- Branch mispredictions (~20 cycles = ~7ns at 3GHz)
+- TLB misses (~100 cycles = ~33ns)
+- Page faults (thousands of cycles)
+
+PROCESS:
+--------
+# Record with precise events
+perf record -e cycles:pp,instructions:pp,cache-misses:pp ./your_app
+
+# Analyze latency-inducing events
+perf stat -e cycles,instructions,cache-misses,branch-misses,\
+page-faults,L1-dcache-load-misses ./your_app
+
+# Precise event sampling
+perf record -e cpu/event=0xd1,umask=0x01,name=mem_load_retired_l3_miss/pp ./your_app
+
+HFT C++ EXAMPLE (Cache-Sensitive Latency):
+-------------------------------------------
+
+// cache_latency.cpp
+#include <iostream>
+#include <vector>
+#include <random>
+#include <algorithm>
+
+// Cache-friendly: Sequential access
+uint64_t sumSequential(const std::vector<int>& data) {
+    uint64_t sum = 0;
+    for (size_t i = 0; i < data.size(); ++i) {
+        sum += data[i];  // Predictable, cache-friendly
+    }
+    return sum;
+}
+
+// Cache-unfriendly: Random access
+uint64_t sumRandom(const std::vector<int>& data, const std::vector<size_t>& indices) {
+    uint64_t sum = 0;
+    for (size_t i = 0; i < indices.size(); ++i) {
+        sum += data[indices[i]];  // Cache misses
+    }
+    return sum;
+}
+
+int main() {
+    const size_t SIZE = 10 * 1024 * 1024;  // 10M elements (40MB)
+
+    std::vector<int> data(SIZE);
+    std::vector<size_t> indices(SIZE);
+
+    for (size_t i = 0; i < SIZE; ++i) {
+        data[i] = i;
+        indices[i] = i;
+    }
+
+    // Shuffle for random access
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::shuffle(indices.begin(), indices.end(), gen);
+
+    std::cout << "Sequential access...\n";
+    volatile uint64_t result1 = sumSequential(data);
+
+    std::cout << "Random access...\n";
+    volatile uint64_t result2 = sumRandom(data, indices);
+
+    return 0;
+}
+
+WORKFLOW:
+---------
+# Compile
+g++ -O2 -g -std=c++17 cache_latency.cpp -o cache_lat
+
+# Profile cache behavior
+perf stat -e cycles,cache-references,cache-misses,L1-dcache-loads,L1-dcache-load-misses \
+    ./cache_lat
+
+# Expected: Random access has 10-100x more cache misses
+
+================================================================================
+4. FTRACE - FUNCTION LATENCY TRACING
+================================================================================
+
+THEORY:
+ftrace is the Linux kernel's built-in tracer.
+Can measure:
+- Function execution time
+- Interrupt latency
+- Scheduling latency
+- Wake-up latency
+
+PROCESS:
+--------
+# Enable function graph tracer
+sudo sh -c 'echo function_graph > /sys/kernel/debug/tracing/current_tracer'
+
+# Set process to trace
+sudo sh -c 'echo PID > /sys/kernel/debug/tracing/set_ftrace_pid'
+
+# Start tracing
+sudo sh -c 'echo 1 > /sys/kernel/debug/tracing/tracing_on'
+
+# Run your application
+./your_hft_app
+
+# Stop tracing
+sudo sh -c 'echo 0 > /sys/kernel/debug/tracing/tracing_on'
+
+# View trace
+sudo cat /sys/kernel/debug/tracing/trace
+
+# Measure specific functions
+sudo sh -c 'echo your_function > /sys/kernel/debug/tracing/set_ftrace_filter'
+
+WORKFLOW FOR SYSCALL LATENCY:
+------------------------------
+# Trace all syscalls
+sudo trace-cmd record -e 'syscalls:sys_enter_*' -e 'syscalls:sys_exit_*' ./your_app
+
+# Analyze
+sudo trace-cmd report
+
+# Example: Measure send() latency
+sudo trace-cmd record -e 'syscalls:sys_enter_sendto' -e 'syscalls:sys_exit_sendto' ./your_app
+
+================================================================================
+5. LATENCY HISTOGRAMS
+================================================================================
+
+THEORY:
+Visualize latency distribution to identify:
+- Multi-modal distributions (different code paths)
+- Outliers (garbage collection, page faults)
+- Tail behavior
+
+HFT C++ EXAMPLE (Latency Histogram):
+-------------------------------------
+
+// latency_histogram.cpp
+#include <iostream>
+#include <vector>
+#include <map>
+#include <algorithm>
+#include <x86intrin.h>
+
+class LatencyHistogram {
+    std::map<uint64_t, uint64_t> buckets;  // latency_ns -> count
+    uint64_t bucket_width;
+
+public:
+    LatencyHistogram(uint64_t width_ns = 100) : bucket_width(width_ns) {}
+
+    void addSample(uint64_t latency_ns) {
+        uint64_t bucket = (latency_ns / bucket_width) * bucket_width;
+        buckets[bucket]++;
+    }
+
+    void print() const {
+        uint64_t total = 0;
+        for (const auto& [_, count] : buckets) {
+            total += count;
+        }
+
+        std::cout << "\nLatency Histogram:\n";
+        std::cout << "Latency (ns)  | Count      | Percentage | Bar\n";
+        std::cout << "--------------------------------------------------------\n";
+
+        for (const auto& [bucket, count] : buckets) {
+            double percentage = (count * 100.0) / total;
+            int bar_length = static_cast<int>(percentage);
+
+            std::cout << std::setw(13) << bucket << " | "
+                      << std::setw(10) << count << " | "
+                      << std::setw(9) << std::fixed << std::setprecision(2)
+                      << percentage << "% | "
+                      << std::string(bar_length, '#') << "\n";
+        }
+    }
+};
+
+int main() {
+    LatencyHistogram hist(100);  // 100ns buckets
+
+    // Simulate operations with varying latency
+    for (int i = 0; i < 10000; ++i) {
+        uint64_t start = __rdtsc();
+
+        // Simulate work (most take ~200-300 cycles)
+        for (volatile int j = 0; j < 100; ++j) {}
+
+        // Occasionally simulate cache miss (takes longer)
+        if (i % 100 == 0) {
+            for (volatile int j = 0; j < 1000; ++j) {}
+        }
+
+        uint64_t end = __rdtsc();
+
+        // Convert cycles to nanoseconds (assume 3GHz)
+        uint64_t latency_ns = ((end - start) * 1000) / 3000;
+
+        hist.addSample(latency_ns);
+    }
+
+    hist.print();
+
+    return 0;
+}
+
+WORKFLOW:
+---------
+g++ -O2 -std=c++17 latency_histogram.cpp -o hist_test
+./hist_test
+
+================================================================================
+6. SYSTEM-WIDE LATENCY SOURCES
+================================================================================
+
+INTERRUPTS:
+-----------
+# Monitor interrupt frequency (high = bad for latency)
+watch -n 1 'cat /proc/interrupts'
+
+# Disable unnecessary interrupts
+# Isolate CPUs from interrupts
+sudo sh -c 'echo 0 > /proc/irq/DEFAULT_SMP_AFFINITY'
+
+SCHEDULER:
+----------
+# Monitor context switches
+perf stat -e context-switches -a -I 1000
+
+# Set real-time scheduling
+# In code:
+struct sched_param param;
+param.sched_priority = 99;
+sched_setscheduler(0, SCHED_FIFO, &param);
+
+PAGE FAULTS:
+------------
+# Monitor page faults
+perf stat -e page-faults ./your_app
+
+# Pre-fault all memory
+mlock(addr, size);  // Lock pages in RAM
+
+# Use huge pages to reduce TLB misses
+madvise(addr, size, MADV_HUGEPAGE);
+
+POWER MANAGEMENT:
+-----------------
+# Disable CPU frequency scaling (critical!)
+sudo cpupower frequency-set -g performance
+
+# Disable C-states (CPU idle states)
+sudo cpupower idle-set -d 2  # Disable C-states > C1
+
+# Disable turbo boost (for consistency)
+echo 1 | sudo tee /sys/devices/system/cpu/intel_pstate/no_turbo
+
+================================================================================
+7. COMPLETE HFT LATENCY PROFILING EXAMPLE
+================================================================================
+
+// hft_latency_profiling.cpp
+#include <iostream>
+#include <x86intrin.h>
+#include <vector>
+#include <algorithm>
+#include <sys/mman.h>
+#include <sched.h>
+
+// Comprehensive latency tracker
+class HFTLatencyTracker {
+    struct Sample {
+        uint64_t receive_time;
+        uint64_t process_start;
+        uint64_t process_end;
+        uint64_t send_time;
+    };
+
+    std::vector<Sample> samples;
+    uint64_t tsc_freq;
+
+public:
+    HFTLatencyTracker(size_t reserve_size = 1000000) {
+        samples.reserve(reserve_size);
+        tsc_freq = calibrateTSC();
+
+        // Lock memory to prevent page faults
+        mlockall(MCL_CURRENT | MCL_FUTURE);
+    }
+
+    uint64_t calibrateTSC() {
+        struct timespec start, end;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        uint64_t tsc_start = __rdtsc();
+
+        struct timespec sleep_time = {0, 100000000};
+        nanosleep(&sleep_time, nullptr);
+
+        uint64_t tsc_end = __rdtsc();
+        clock_gettime(CLOCK_MONOTONIC, &end);
+
+        uint64_t tsc_delta = tsc_end - tsc_start;
+        uint64_t ns_delta = (end.tv_sec - start.tv_sec) * 1000000000UL +
+                            (end.tv_nsec - start.tv_nsec);
+
+        return (tsc_delta * 1000000000UL) / ns_delta;
+    }
+
+    void recordReceive(uint64_t timestamp) {
+        samples.push_back({timestamp, 0, 0, 0});
+    }
+
+    void recordProcessStart() {
+        if (!samples.empty()) {
+            samples.back().process_start = __rdtsc();
+        }
+    }
+
+    void recordProcessEnd() {
+        if (!samples.empty()) {
+            samples.back().process_end = __rdtsc();
+        }
+    }
+
+    void recordSend() {
+        if (!samples.empty()) {
+            samples.back().send_time = __rdtsc();
+        }
+    }
+
+    void printStats() {
+        std::vector<uint64_t> total_latencies;
+        std::vector<uint64_t> processing_latencies;
+
+        for (const auto& s : samples) {
+            if (s.send_time > s.receive_time) {
+                total_latencies.push_back(s.send_time - s.receive_time);
+            }
+            if (s.process_end > s.process_start) {
+                processing_latencies.push_back(s.process_end - s.process_start);
+            }
+        }
+
+        auto printPercentiles = [this](const std::vector<uint64_t>& data,
+                                        const std::string& name) {
+            if (data.empty()) return;
+
+            std::vector<uint64_t> sorted = data;
+            std::sort(sorted.begin(), sorted.end());
+
+            auto toMicros = [this](uint64_t cycles) {
+                return (cycles * 1000000.0) / tsc_freq;
+            };
+
+            std::cout << "\n" << name << " (microseconds):\n";
+            std::cout << "  P50:   " << toMicros(sorted[sorted.size()/2]) << "\n";
+            std::cout << "  P95:   " << toMicros(sorted[(size_t)(sorted.size()*0.95)]) << "\n";
+            std::cout << "  P99:   " << toMicros(sorted[(size_t)(sorted.size()*0.99)]) << "\n";
+            std::cout << "  P99.9: " << toMicros(sorted[(size_t)(sorted.size()*0.999)]) << "\n";
+            std::cout << "  Max:   " << toMicros(sorted.back()) << "\n";
+        };
+
+        printPercentiles(total_latencies, "Total Latency");
+        printPercentiles(processing_latencies, "Processing Latency");
+    }
+};
+
+int main() {
+    // Pin to CPU 0
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(0, &cpuset);
+    sched_setaffinity(0, sizeof(cpuset), &cpuset);
+
+    // Set real-time priority
+    struct sched_param param;
+    param.sched_priority = 99;
+    sched_setscheduler(0, SCHED_FIFO, &param);
+
+    HFTLatencyTracker tracker;
+
+    // Warmup
+    for (int i = 0; i < 10000; ++i) {
+        volatile int x = i * i;
+        (void)x;
+    }
+
+    // Simulate order processing
+    for (int i = 0; i < 100000; ++i) {
+        tracker.recordReceive(__rdtsc());
+        tracker.recordProcessStart();
+
+        // Simulate processing
+        volatile double price = 100.0 + i * 0.01;
+        volatile uint64_t quantity = 1000;
+        volatile double value = price * quantity;
+        (void)value;
+
+        tracker.recordProcessEnd();
+        tracker.recordSend();
+    }
+
+    tracker.printStats();
+
+    return 0;
+}
+
+WORKFLOW:
+---------
+# Compile
+g++ -O3 -march=native -std=c++17 hft_latency_profiling.cpp -o hft_lat
+
+# Run with elevated priority (requires root)
+sudo ./hft_lat
+
+================================================================================
+BEST PRACTICES FOR HFT LATENCY PROFILING
+================================================================================
+
+1. MEASUREMENT:
+   - Use RDTSC for <1us measurements
+   - Use clock_gettime for longer durations
+   - Always measure tail latencies (P99, P99.9, P99.99)
+   - Track maximum latency over time
+
+2. SYSTEM CONFIGURATION:
+   - Disable CPU frequency scaling
+   - Disable C-states
+   - Isolate CPUs (isolcpus kernel parameter)
+   - Use real-time scheduling (SCHED_FIFO)
+   - Lock memory (mlockall)
+
+3. CODE OPTIMIZATION:
+   - Minimize allocations
+   - Avoid locks in hot path
+   - Use cache-friendly data structures
+   - Pre-fault all memory
+   - Pin threads to cores
+
+4. PROFILING WORKFLOW:
+   - Establish baseline latency
+   - Identify top latency sources
+   - Optimize highest impact items
+   - Re-measure and verify improvement
+   - Test under realistic load
+
+5. MONITORING:
+   - Continuous latency tracking in production
+   - Alert on tail latency degradation
+   - Track latency percentiles over time
+   - Correlate with system events

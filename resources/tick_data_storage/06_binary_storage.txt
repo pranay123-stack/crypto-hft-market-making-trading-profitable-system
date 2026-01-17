@@ -1,0 +1,868 @@
+================================================================================
+                      CUSTOM BINARY TICK STORAGE
+                 Memory-Mapped Files for Maximum Performance
+================================================================================
+
+PURPOSE: Custom binary storage provides the fastest possible read/write
+performance for tick data. No database overhead, direct memory access.
+
+================================================================================
+                         TABLE OF CONTENTS
+================================================================================
+
+1. Why Custom Binary Storage
+2. Binary Format Design
+3. Memory-Mapped File Implementation
+4. Write Path Optimization
+5. Read Path Optimization
+6. Index Structures
+7. File Organization
+8. Production Considerations
+
+================================================================================
+                   1. WHY CUSTOM BINARY STORAGE
+================================================================================
+
+WHEN TO USE CUSTOM BINARY:
+--------------------------
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    CUSTOM BINARY vs DATABASES                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  USE CUSTOM BINARY WHEN:                                                   │
+│  ✓ Maximum read/write speed is critical                                    │
+│  ✓ Simple sequential access patterns                                       │
+│  ✓ You control the entire stack                                            │
+│  ✓ Data format is fixed and known                                          │
+│  ✓ Replaying in order (no random access needed)                           │
+│                                                                             │
+│  USE DATABASE WHEN:                                                         │
+│  ✓ Need SQL queries                                                         │
+│  ✓ Multiple applications access data                                       │
+│  ✓ Need complex aggregations                                                │
+│  ✓ Schema may change                                                        │
+│  ✓ Don't want to maintain storage code                                     │
+│                                                                             │
+│  PERFORMANCE COMPARISON (1M ticks):                                        │
+│  ─────────────────────────────────────────────────────────────────────────│
+│  Operation          │ Custom Binary │ QuestDB    │ TimescaleDB            │
+│  Write              │ 50ms          │ 250ms      │ 5000ms                 │
+│  Sequential Read    │ 20ms          │ 100ms      │ 500ms                  │
+│  Compression        │ Manual        │ Automatic  │ Automatic              │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+================================================================================
+                   2. BINARY FORMAT DESIGN
+================================================================================
+
+TICK STRUCTURE:
+---------------
+
+```cpp
+#pragma pack(push, 1)  // No padding
+
+// Fixed-size tick record: 64 bytes (cache-line aligned)
+struct alignas(64) Tick {
+    // Timestamps (16 bytes)
+    int64_t timestamp_ns;        // Exchange timestamp (nanoseconds since epoch)
+    int64_t receive_time_ns;     // Local receive time
+
+    // Identifiers (8 bytes)
+    uint32_t symbol_id;          // Interned symbol ID
+    uint16_t exchange_id;        // Exchange enum
+    uint8_t tick_type;           // Quote=0, Trade=1, BookUpdate=2
+    uint8_t flags;               // Bitfield for various flags
+
+    // Quote data (24 bytes)
+    int64_t bid_price;           // Fixed-point: price * 1e8
+    int64_t ask_price;
+    uint32_t bid_size;           // In base units
+    uint32_t ask_size;
+
+    // Trade data (16 bytes) - overlaps with book update
+    union {
+        struct {
+            int64_t trade_price;
+            uint32_t trade_size;
+            uint32_t trade_id;
+        } trade;
+        struct {
+            int64_t book_price;
+            uint32_t book_size;
+            uint16_t book_level;
+            uint8_t book_side;
+            uint8_t book_action;  // Add=0, Modify=1, Delete=2
+        } book;
+    };
+};
+
+static_assert(sizeof(Tick) == 64, "Tick must be 64 bytes");
+
+#pragma pack(pop)
+```
+
+FILE HEADER:
+------------
+
+```cpp
+#pragma pack(push, 1)
+
+struct FileHeader {
+    char magic[8];           // "TICKDATA"
+    uint32_t version;        // Format version
+    uint32_t header_size;    // Size of this header
+    uint64_t tick_count;     // Number of ticks in file
+    uint64_t first_timestamp;// First tick timestamp
+    uint64_t last_timestamp; // Last tick timestamp
+    uint32_t symbol_count;   // Number of symbols
+    uint32_t flags;          // Compression, etc.
+    uint8_t reserved[64];    // Future use
+    // Symbol table follows header
+};
+
+struct SymbolEntry {
+    uint32_t symbol_id;
+    char symbol[16];         // Null-terminated
+    char exchange[8];        // Null-terminated
+};
+
+#pragma pack(pop)
+```
+
+FIXED-POINT PRICING:
+--------------------
+
+```cpp
+// Use fixed-point for prices to avoid floating-point issues
+class FixedPoint {
+public:
+    static constexpr int64_t SCALE = 100000000;  // 1e8
+
+    static int64_t from_double(double price) {
+        return static_cast<int64_t>(price * SCALE + 0.5);
+    }
+
+    static double to_double(int64_t fixed) {
+        return static_cast<double>(fixed) / SCALE;
+    }
+
+    // Fast multiplication without overflow
+    static int64_t multiply(int64_t a, int64_t b) {
+        __int128 result = static_cast<__int128>(a) * b;
+        return static_cast<int64_t>(result / SCALE);
+    }
+};
+```
+
+================================================================================
+                   3. MEMORY-MAPPED FILE IMPLEMENTATION
+================================================================================
+
+MEMORY-MAPPED WRITER:
+---------------------
+
+```cpp
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+class MMapTickWriter {
+public:
+    struct Config {
+        std::string directory = "/data/ticks";
+        size_t initial_file_size = 1ULL << 30;  // 1GB
+        size_t grow_size = 256ULL << 20;        // 256MB growth
+        bool use_huge_pages = true;
+        bool use_direct_io = false;
+    };
+
+    MMapTickWriter(const Config& config) : config_(config) {}
+
+    bool open(const std::string& date, const std::string& symbol) {
+        filename_ = config_.directory + "/" + date + "/" + symbol + ".bin";
+
+        // Create directory if needed
+        std::filesystem::create_directories(
+            std::filesystem::path(filename_).parent_path()
+        );
+
+        // Open or create file
+        int flags = O_RDWR | O_CREAT;
+        if (config_.use_direct_io) {
+            flags |= O_DIRECT;
+        }
+
+        fd_ = ::open(filename_.c_str(), flags, 0644);
+        if (fd_ < 0) return false;
+
+        // Get current file size
+        struct stat st;
+        fstat(fd_, &st);
+        file_size_ = st.st_size;
+
+        // Initialize new file
+        if (file_size_ == 0) {
+            file_size_ = config_.initial_file_size;
+            if (ftruncate(fd_, file_size_) < 0) {
+                close(fd_);
+                return false;
+            }
+            write_position_ = sizeof(FileHeader);
+        } else {
+            // Read header to get write position
+            FileHeader header;
+            pread(fd_, &header, sizeof(header), 0);
+            write_position_ = sizeof(FileHeader) +
+                              header.tick_count * sizeof(Tick);
+        }
+
+        // Map file to memory
+        int mmap_flags = MAP_SHARED;
+        if (config_.use_huge_pages) {
+            mmap_flags |= MAP_HUGETLB;
+        }
+
+        base_ = static_cast<char*>(
+            mmap(nullptr, file_size_, PROT_READ | PROT_WRITE,
+                 mmap_flags, fd_, 0)
+        );
+
+        if (base_ == MAP_FAILED) {
+            // Fall back without huge pages
+            base_ = static_cast<char*>(
+                mmap(nullptr, file_size_, PROT_READ | PROT_WRITE,
+                     MAP_SHARED, fd_, 0)
+            );
+        }
+
+        return base_ != MAP_FAILED;
+    }
+
+    // Write single tick (very fast)
+    void write(const Tick& tick) {
+        // Check if we need to grow file
+        if (write_position_ + sizeof(Tick) > file_size_) {
+            grow_file();
+        }
+
+        // Direct memory write
+        *reinterpret_cast<Tick*>(base_ + write_position_) = tick;
+        write_position_ += sizeof(Tick);
+        tick_count_++;
+    }
+
+    // Batch write (even faster)
+    void write_batch(const Tick* ticks, size_t count) {
+        size_t bytes_needed = count * sizeof(Tick);
+
+        while (write_position_ + bytes_needed > file_size_) {
+            grow_file();
+        }
+
+        // Single memcpy for entire batch
+        std::memcpy(base_ + write_position_, ticks, bytes_needed);
+        write_position_ += bytes_needed;
+        tick_count_ += count;
+    }
+
+    // Sync to disk
+    void sync() {
+        msync(base_, file_size_, MS_SYNC);
+        update_header();
+    }
+
+    void close() {
+        if (base_) {
+            update_header();
+            munmap(base_, file_size_);
+            base_ = nullptr;
+        }
+        if (fd_ >= 0) {
+            ::close(fd_);
+            fd_ = -1;
+        }
+    }
+
+    ~MMapTickWriter() {
+        close();
+    }
+
+private:
+    void grow_file() {
+        // Unmap current mapping
+        munmap(base_, file_size_);
+
+        // Grow file
+        file_size_ += config_.grow_size;
+        ftruncate(fd_, file_size_);
+
+        // Remap
+        base_ = static_cast<char*>(
+            mmap(nullptr, file_size_, PROT_READ | PROT_WRITE,
+                 MAP_SHARED, fd_, 0)
+        );
+    }
+
+    void update_header() {
+        FileHeader* header = reinterpret_cast<FileHeader*>(base_);
+        std::memcpy(header->magic, "TICKDATA", 8);
+        header->version = 1;
+        header->header_size = sizeof(FileHeader);
+        header->tick_count = tick_count_;
+    }
+
+    Config config_;
+    std::string filename_;
+    int fd_ = -1;
+    char* base_ = nullptr;
+    size_t file_size_ = 0;
+    size_t write_position_ = 0;
+    uint64_t tick_count_ = 0;
+};
+```
+
+MEMORY-MAPPED READER:
+---------------------
+
+```cpp
+class MMapTickReader {
+public:
+    bool open(const std::string& filename) {
+        fd_ = ::open(filename.c_str(), O_RDONLY);
+        if (fd_ < 0) return false;
+
+        struct stat st;
+        fstat(fd_, &st);
+        file_size_ = st.st_size;
+
+        // Map read-only
+        base_ = static_cast<const char*>(
+            mmap(nullptr, file_size_, PROT_READ, MAP_SHARED, fd_, 0)
+        );
+
+        if (base_ == MAP_FAILED) return false;
+
+        // Advise kernel about sequential access
+        madvise(const_cast<char*>(base_), file_size_, MADV_SEQUENTIAL);
+
+        // Parse header
+        header_ = reinterpret_cast<const FileHeader*>(base_);
+        ticks_ = reinterpret_cast<const Tick*>(base_ + header_->header_size);
+
+        return true;
+    }
+
+    // Direct access to tick (zero-copy)
+    const Tick& operator[](size_t index) const {
+        return ticks_[index];
+    }
+
+    // Iterator support
+    const Tick* begin() const { return ticks_; }
+    const Tick* end() const { return ticks_ + header_->tick_count; }
+
+    size_t size() const { return header_->tick_count; }
+
+    // Prefetch for upcoming reads
+    void prefetch(size_t start_index, size_t count) {
+        const char* start = reinterpret_cast<const char*>(&ticks_[start_index]);
+        size_t bytes = count * sizeof(Tick);
+        madvise(const_cast<char*>(start), bytes, MADV_WILLNEED);
+    }
+
+    void close() {
+        if (base_) {
+            munmap(const_cast<char*>(base_), file_size_);
+            base_ = nullptr;
+        }
+        if (fd_ >= 0) {
+            ::close(fd_);
+            fd_ = -1;
+        }
+    }
+
+    ~MMapTickReader() {
+        close();
+    }
+
+private:
+    int fd_ = -1;
+    const char* base_ = nullptr;
+    size_t file_size_ = 0;
+    const FileHeader* header_ = nullptr;
+    const Tick* ticks_ = nullptr;
+};
+```
+
+================================================================================
+                   4. WRITE PATH OPTIMIZATION
+================================================================================
+
+ZERO-COPY WRITE FROM NETWORK:
+-----------------------------
+
+```cpp
+class ZeroCopyTickCapture {
+public:
+    ZeroCopyTickCapture(MMapTickWriter& writer)
+        : writer_(writer) {}
+
+    // Capture directly from network buffer
+    void capture_from_network(const void* network_buffer, size_t len) {
+        // Parse network data directly into tick struct
+        Tick tick;
+
+        // Example: Parse from exchange binary format
+        const auto* msg = static_cast<const ExchangeMessage*>(network_buffer);
+
+        tick.timestamp_ns = msg->exchange_timestamp;
+        tick.receive_time_ns = get_rdtsc_ns();
+        tick.symbol_id = symbol_to_id(msg->symbol);
+        tick.exchange_id = EXCHANGE_BINANCE;
+
+        // ... populate other fields
+
+        writer_.write(tick);
+    }
+
+    // Batch capture with ring buffer
+    void capture_batch() {
+        // Write all buffered ticks at once
+        writer_.write_batch(buffer_.data(), buffer_.size());
+        buffer_.clear();
+    }
+
+private:
+    MMapTickWriter& writer_;
+    std::vector<Tick> buffer_;
+};
+```
+
+ASYNC WRITE WITH IO_URING:
+--------------------------
+
+```cpp
+#include <liburing.h>
+
+class AsyncTickWriter {
+public:
+    AsyncTickWriter(const std::string& filename, size_t queue_depth = 64)
+        : queue_depth_(queue_depth) {
+
+        fd_ = open(filename.c_str(), O_WRONLY | O_CREAT | O_DIRECT, 0644);
+
+        io_uring_params params = {};
+        io_uring_queue_init_params(queue_depth_, &ring_, &params);
+
+        // Pre-allocate aligned buffers
+        for (size_t i = 0; i < queue_depth_; i++) {
+            void* buf;
+            posix_memalign(&buf, 4096, BUFFER_SIZE);
+            buffers_.push_back(static_cast<char*>(buf));
+        }
+    }
+
+    void write_async(const Tick* ticks, size_t count) {
+        char* buffer = get_buffer();
+        size_t bytes = count * sizeof(Tick);
+
+        memcpy(buffer, ticks, bytes);
+
+        struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
+        io_uring_prep_write(sqe, fd_, buffer, bytes, write_offset_);
+        io_uring_sqe_set_data(sqe, buffer);
+
+        io_uring_submit(&ring_);
+
+        write_offset_ += bytes;
+        pending_++;
+    }
+
+    void wait_completion(int min_complete = 1) {
+        struct io_uring_cqe* cqe;
+
+        while (pending_ > 0 && pending_ >= queue_depth_ - 4) {
+            io_uring_wait_cqe(&ring_, &cqe);
+            char* buffer = static_cast<char*>(io_uring_cqe_get_data(cqe));
+            return_buffer(buffer);
+            io_uring_cqe_seen(&ring_, cqe);
+            pending_--;
+        }
+    }
+
+    ~AsyncTickWriter() {
+        // Wait for all pending writes
+        while (pending_ > 0) {
+            wait_completion();
+        }
+        io_uring_queue_exit(&ring_);
+        close(fd_);
+        for (auto* buf : buffers_) {
+            free(buf);
+        }
+    }
+
+private:
+    static constexpr size_t BUFFER_SIZE = 1 << 20;  // 1MB
+
+    char* get_buffer() {
+        if (free_buffers_.empty()) {
+            wait_completion();
+        }
+        char* buf = free_buffers_.back();
+        free_buffers_.pop_back();
+        return buf;
+    }
+
+    void return_buffer(char* buf) {
+        free_buffers_.push_back(buf);
+    }
+
+    int fd_;
+    struct io_uring ring_;
+    size_t queue_depth_;
+    std::vector<char*> buffers_;
+    std::vector<char*> free_buffers_;
+    off_t write_offset_ = 0;
+    size_t pending_ = 0;
+};
+```
+
+================================================================================
+                   5. READ PATH OPTIMIZATION
+================================================================================
+
+SIMD-ACCELERATED FILTERING:
+---------------------------
+
+```cpp
+#include <immintrin.h>
+
+class SimdTickFilter {
+public:
+    // Filter ticks by symbol using AVX2
+    std::vector<const Tick*> filter_by_symbol(
+        const Tick* ticks,
+        size_t count,
+        uint32_t symbol_id
+    ) {
+        std::vector<const Tick*> result;
+        result.reserve(count / 10);  // Estimate 10% match rate
+
+        // Broadcast symbol_id to all lanes
+        __m256i target = _mm256_set1_epi32(symbol_id);
+
+        // Process 8 ticks at a time
+        size_t i = 0;
+        for (; i + 8 <= count; i += 8) {
+            // Load symbol_ids from 8 ticks
+            // (symbol_id is at offset 16 in Tick struct)
+            __m256i symbols = _mm256_i32gather_epi32(
+                reinterpret_cast<const int*>(&ticks[i].symbol_id),
+                _mm256_setr_epi32(0, 16, 32, 48, 64, 80, 96, 112),
+                1
+            );
+
+            // Compare
+            __m256i matches = _mm256_cmpeq_epi32(symbols, target);
+            int mask = _mm256_movemask_ps(_mm256_castsi256_ps(matches));
+
+            // Extract matching indices
+            while (mask) {
+                int idx = __builtin_ctz(mask);
+                result.push_back(&ticks[i + idx]);
+                mask &= mask - 1;
+            }
+        }
+
+        // Handle remaining
+        for (; i < count; i++) {
+            if (ticks[i].symbol_id == symbol_id) {
+                result.push_back(&ticks[i]);
+            }
+        }
+
+        return result;
+    }
+
+    // Filter by time range using binary search
+    std::pair<const Tick*, const Tick*> filter_by_time(
+        const Tick* ticks,
+        size_t count,
+        int64_t start_ns,
+        int64_t end_ns
+    ) {
+        // Binary search for start
+        const Tick* begin = std::lower_bound(
+            ticks, ticks + count, start_ns,
+            [](const Tick& t, int64_t ts) { return t.timestamp_ns < ts; }
+        );
+
+        // Binary search for end
+        const Tick* end = std::upper_bound(
+            begin, ticks + count, end_ns,
+            [](int64_t ts, const Tick& t) { return ts < t.timestamp_ns; }
+        );
+
+        return {begin, end};
+    }
+};
+```
+
+PARALLEL READING:
+-----------------
+
+```cpp
+class ParallelTickReader {
+public:
+    ParallelTickReader(int num_threads = 8) : num_threads_(num_threads) {}
+
+    // Read multiple files in parallel
+    std::vector<std::vector<Tick>> read_parallel(
+        const std::vector<std::string>& files
+    ) {
+        std::vector<std::vector<Tick>> results(files.size());
+
+        #pragma omp parallel for num_threads(num_threads_)
+        for (size_t i = 0; i < files.size(); i++) {
+            MMapTickReader reader;
+            if (reader.open(files[i])) {
+                results[i].reserve(reader.size());
+                for (const auto& tick : reader) {
+                    results[i].push_back(tick);
+                }
+            }
+        }
+
+        return results;
+    }
+
+    // Process single file with parallel filtering
+    template<typename FilterFn>
+    std::vector<Tick> filter_parallel(
+        const MMapTickReader& reader,
+        FilterFn filter
+    ) {
+        size_t total = reader.size();
+        size_t chunk_size = total / num_threads_;
+
+        std::vector<std::vector<Tick>> partial_results(num_threads_);
+
+        #pragma omp parallel for num_threads(num_threads_)
+        for (int t = 0; t < num_threads_; t++) {
+            size_t start = t * chunk_size;
+            size_t end = (t == num_threads_ - 1) ? total : (t + 1) * chunk_size;
+
+            for (size_t i = start; i < end; i++) {
+                if (filter(reader[i])) {
+                    partial_results[t].push_back(reader[i]);
+                }
+            }
+        }
+
+        // Merge results
+        std::vector<Tick> result;
+        for (auto& partial : partial_results) {
+            result.insert(result.end(), partial.begin(), partial.end());
+        }
+
+        return result;
+    }
+
+private:
+    int num_threads_;
+};
+```
+
+================================================================================
+                   6. INDEX STRUCTURES
+================================================================================
+
+TIME INDEX:
+-----------
+
+```cpp
+// Sparse index: one entry per N ticks
+struct TimeIndex {
+    static constexpr size_t INDEX_INTERVAL = 10000;
+
+    struct Entry {
+        int64_t timestamp_ns;
+        uint64_t file_offset;
+    };
+
+    std::vector<Entry> entries;
+
+    void build(const MMapTickReader& reader) {
+        entries.clear();
+        entries.reserve(reader.size() / INDEX_INTERVAL + 1);
+
+        for (size_t i = 0; i < reader.size(); i += INDEX_INTERVAL) {
+            entries.push_back({
+                reader[i].timestamp_ns,
+                i * sizeof(Tick) + sizeof(FileHeader)
+            });
+        }
+    }
+
+    // Find approximate position for timestamp
+    size_t find(int64_t timestamp_ns) const {
+        auto it = std::lower_bound(
+            entries.begin(), entries.end(), timestamp_ns,
+            [](const Entry& e, int64_t ts) { return e.timestamp_ns < ts; }
+        );
+
+        if (it == entries.begin()) return 0;
+        --it;
+        return (it->file_offset - sizeof(FileHeader)) / sizeof(Tick);
+    }
+
+    void save(const std::string& filename) const {
+        std::ofstream f(filename, std::ios::binary);
+        size_t count = entries.size();
+        f.write(reinterpret_cast<const char*>(&count), sizeof(count));
+        f.write(reinterpret_cast<const char*>(entries.data()),
+                entries.size() * sizeof(Entry));
+    }
+
+    void load(const std::string& filename) {
+        std::ifstream f(filename, std::ios::binary);
+        size_t count;
+        f.read(reinterpret_cast<char*>(&count), sizeof(count));
+        entries.resize(count);
+        f.read(reinterpret_cast<char*>(entries.data()),
+               count * sizeof(Entry));
+    }
+};
+```
+
+SYMBOL INDEX:
+-------------
+
+```cpp
+// Index by symbol for quick symbol-specific queries
+struct SymbolIndex {
+    std::unordered_map<uint32_t, std::vector<uint64_t>> symbol_offsets;
+
+    void build(const MMapTickReader& reader) {
+        symbol_offsets.clear();
+
+        for (size_t i = 0; i < reader.size(); i++) {
+            symbol_offsets[reader[i].symbol_id].push_back(i);
+        }
+    }
+
+    const std::vector<uint64_t>& get_offsets(uint32_t symbol_id) const {
+        static const std::vector<uint64_t> empty;
+        auto it = symbol_offsets.find(symbol_id);
+        return it != symbol_offsets.end() ? it->second : empty;
+    }
+};
+```
+
+================================================================================
+                   7. FILE ORGANIZATION
+================================================================================
+
+DIRECTORY STRUCTURE:
+--------------------
+
+```
+/data/ticks/
+├── 2025/
+│   └── 11/
+│       ├── 26/
+│       │   ├── BTCUSDT.bin           # Tick data
+│       │   ├── BTCUSDT.idx           # Time index
+│       │   ├── ETHUSDT.bin
+│       │   ├── ETHUSDT.idx
+│       │   └── manifest.json         # Day metadata
+│       └── 27/
+│           └── ...
+└── symbols.json                       # Symbol ID mapping
+```
+
+MANIFEST FILE:
+--------------
+
+```json
+{
+  "date": "2025-11-26",
+  "files": [
+    {
+      "symbol": "BTCUSDT",
+      "filename": "BTCUSDT.bin",
+      "tick_count": 15234567,
+      "first_timestamp": 1732579200000000000,
+      "last_timestamp": 1732665599999999999,
+      "file_size": 975012288,
+      "checksum": "sha256:abc123..."
+    }
+  ],
+  "total_ticks": 89234567,
+  "created_at": "2025-11-27T00:05:23Z"
+}
+```
+
+================================================================================
+                   8. PRODUCTION CONSIDERATIONS
+================================================================================
+
+DATA INTEGRITY:
+---------------
+
+```cpp
+class IntegrityChecker {
+public:
+    // Verify file integrity
+    bool verify(const std::string& filename) {
+        MMapTickReader reader;
+        if (!reader.open(filename)) return false;
+
+        // Check header magic
+        // Check tick ordering
+        int64_t prev_ts = 0;
+        for (const auto& tick : reader) {
+            if (tick.timestamp_ns < prev_ts) {
+                std::cerr << "Out of order tick at " << tick.timestamp_ns << "\n";
+                return false;
+            }
+            prev_ts = tick.timestamp_ns;
+        }
+
+        return true;
+    }
+
+    // Compute checksum
+    std::string compute_checksum(const std::string& filename) {
+        // Use SHA256 or XXH3
+        // ...
+    }
+};
+```
+
+BACKUP AND RECOVERY:
+--------------------
+
+```cpp
+class TickBackup {
+public:
+    // Incremental backup to remote storage
+    void backup_to_s3(const std::string& local_path, const std::string& s3_path) {
+        // Use aws s3 sync or SDK
+    }
+
+    // Verify backup integrity
+    bool verify_backup(const std::string& local_path, const std::string& remote_path) {
+        // Compare checksums
+        return true;
+    }
+};
+```
+
+================================================================================
+                         END OF DOCUMENT
+================================================================================

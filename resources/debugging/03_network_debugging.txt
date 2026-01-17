@@ -1,0 +1,1534 @@
+================================================================================
+                    HFT NETWORK DEBUGGING GUIDE
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Theory and Common Network Issues in HFT
+2. Network Debugging Tools
+3. Packet Loss Detection
+4. Latency Spike Investigation
+5. Connection Issues and Timeouts
+6. Step-by-Step Debugging Workflows
+7. Real HFT C++ Code Examples
+8. Debugging Commands and Interpretation
+9. Solutions and Fixes
+10. Best Practices for HFT Network Programming
+
+================================================================================
+1. THEORY AND COMMON NETWORK ISSUES IN HFT
+================================================================================
+
+OVERVIEW
+--------
+Network issues in HFT systems can cause:
+- Missed market opportunities due to delayed data
+- Order execution failures
+- Inconsistent market data views
+- Regulatory violations (market making obligations)
+- Financial losses from stale quotes
+
+CRITICAL NETWORK ISSUES IN HFT
+-------------------------------
+
+A) Packet Loss
+   - Exchange market data drops
+   - Order gateway packet drops
+   - Switch/NIC buffer overflows
+   - Network congestion
+   - Multicast packet loss
+
+B) Latency Spikes
+   - Kernel network stack delays
+   - Context switches during I/O
+   - Interrupt coalescing issues
+   - NIC ring buffer full
+   - TCP retransmissions
+   - CPU frequency scaling
+
+C) Connection Issues
+   - Socket disconnections
+   - TCP connection resets
+   - Half-open connections
+   - Listen queue overflows
+   - Ephemeral port exhaustion
+
+D) Ordering Issues
+   - Out-of-order packet delivery
+   - Sequence number gaps
+   - TCP head-of-line blocking
+   - Multicast ordering problems
+
+E) Bandwidth Saturation
+   - Market data bursts
+   - Burst buffer exhaustion
+   - Incast problems
+
+================================================================================
+2. NETWORK DEBUGGING TOOLS
+================================================================================
+
+ESSENTIAL NETWORK DEBUGGING TOOLS
+----------------------------------
+
+1. TCPDUMP / TSHARK
+   Purpose: Packet capture and analysis
+
+   Basic capture:
+   sudo tcpdump -i eth0 -w capture.pcap
+
+   Filter by port:
+   sudo tcpdump -i eth0 port 12345 -w capture.pcap
+
+   Capture with timestamps:
+   sudo tcpdump -i eth0 -tt -n port 12345
+
+   Pros:
+   - Standard tool, widely available
+   - Powerful filtering
+   - Can capture at wire speed with proper setup
+
+   Cons:
+   - Kernel overhead
+   - Packet drops under high load
+   - Post-capture analysis needed
+
+2. WIRESHARK
+   Purpose: GUI packet analyzer
+
+   Features:
+   - Visual packet inspection
+   - Protocol dissectors
+   - Statistics and graphs
+   - Follow TCP streams
+   - Expert analysis
+
+3. STRACE
+   Purpose: System call tracing
+
+   Trace network calls:
+   strace -e trace=network -f -p <pid>
+
+   Trace specific syscalls:
+   strace -e trace=send,recv,sendto,recvfrom -p <pid>
+
+   With timestamps:
+   strace -tt -e trace=network -p <pid>
+
+4. NETSTAT / SS
+   Purpose: Network connection monitoring
+
+   Show all connections:
+   netstat -antp
+
+   Socket statistics:
+   ss -s
+
+   Show listening sockets:
+   ss -lntp
+
+   Show socket memory:
+   ss -m
+
+5. ETHTOOL
+   Purpose: NIC statistics and configuration
+
+   Show statistics:
+   ethtool -S eth0
+
+   Show NIC settings:
+   ethtool -g eth0  # Ring buffer sizes
+   ethtool -c eth0  # Interrupt coalescing
+   ethtool -k eth0  # Offload settings
+
+6. IP COMMAND
+   Purpose: Network interface management
+
+   Show link statistics:
+   ip -s link show eth0
+
+   Show routes:
+   ip route show
+
+   Monitor link changes:
+   ip monitor link
+
+7. PERF FOR NETWORK
+   Purpose: Network stack profiling
+
+   Profile network events:
+   perf record -e net:* -g ./program
+   perf report
+
+   Profile network latency:
+   perf probe --add 'tcp_v4_rcv'
+   perf record -e probe:tcp_v4_rcv -g
+
+8. NETDATA / PROMETHEUS
+   Purpose: Real-time network monitoring
+
+   Metrics:
+   - Bandwidth utilization
+   - Packet rates
+   - Error rates
+   - Queue depths
+
+9. IPERF3
+   Purpose: Network performance testing
+
+   Server:
+   iperf3 -s
+
+   Client:
+   iperf3 -c <server> -t 60 -i 1
+
+10. SOCKPERF
+    Purpose: Low-latency network testing
+
+    Server:
+    sockperf sr --tcp
+
+    Client:
+    sockperf pp --tcp -i <server> -p 11111
+
+================================================================================
+3. PACKET LOSS DETECTION
+================================================================================
+
+TYPES OF PACKET LOSS IN HFT
+----------------------------
+
+A) NIC-Level Drops
+   - RX ring buffer overrun
+   - TX ring buffer full
+   - DMA errors
+
+B) Kernel-Level Drops
+   - Socket buffer overflow
+   - Backlog queue full
+   - UDP receive buffer too small
+
+C) Application-Level Drops
+   - Processing too slow
+   - Not reading socket fast enough
+   - User-space buffer full
+
+DETECTING NIC DROPS
+--------------------
+
+Command:
+ethtool -S eth0 | grep -i drop
+
+Output:
+```
+rx_dropped: 12543
+tx_dropped: 0
+rx_fifo_errors: 8234
+rx_missed_errors: 4309
+```
+
+Interpretation:
+- rx_dropped: Packets dropped by NIC
+- rx_fifo_errors: NIC FIFO overflow
+- rx_missed_errors: Driver couldn't allocate buffer
+
+Check ring buffer size:
+ethtool -g eth0
+
+Output:
+```
+Ring parameters for eth0:
+Pre-set maximums:
+RX:             4096
+TX:             4096
+Current hardware settings:
+RX:             512   <- TOO SMALL!
+TX:             512
+```
+
+Increase ring buffer:
+sudo ethtool -G eth0 rx 4096 tx 4096
+
+DETECTING KERNEL DROPS
+-----------------------
+
+Command:
+netstat -su
+
+Output:
+```
+Udp:
+    1234567 packets received
+    12543 packets to unknown port received
+    8234 packet receive errors  <- DROPS!
+    654321 packets sent
+    0 receive buffer errors
+    8234 send buffer errors
+```
+
+Check receive buffer size:
+sysctl net.core.rmem_max
+sysctl net.core.rmem_default
+
+Increase:
+sudo sysctl -w net.core.rmem_max=134217728     # 128MB
+sudo sysctl -w net.core.rmem_default=67108864  # 64MB
+
+UDP-specific:
+sudo sysctl -w net.core.netdev_max_backlog=10000
+sudo sysctl -w net.ipv4.udp_mem='8192 131072 134217728'
+
+DETECTING APPLICATION DROPS
+----------------------------
+
+Monitor socket queue depth:
+ss -plum | grep <port>
+
+Output:
+```
+Recv-Q  Send-Q  Local Address:Port  Peer Address:Port
+1024    0       *:12345            *:*           users:(("trading",pid=1234))
+```
+
+Recv-Q = 1024 means socket buffer is full, packets will be dropped!
+
+Code to check drops:
+```cpp
+#include <sys/socket.h>
+#include <sys/ioctl.h>
+
+int get_queue_depth(int sockfd) {
+    int bytes_available = 0;
+    if (ioctl(sockfd, FIONREAD, &bytes_available) == -1) {
+        return -1;
+    }
+    return bytes_available;
+}
+
+void monitor_drops(int sockfd) {
+    struct {
+        uint64_t rx_packets;
+        uint64_t rx_drops;
+    } stats, prev_stats = {0, 0};
+
+    // Read socket stats periodically
+    socklen_t len = sizeof(stats);
+    if (getsockopt(sockfd, SOL_SOCKET, SO_TIMESTAMPING, &stats, &len) == 0) {
+        if (stats.rx_drops > prev_stats.rx_drops) {
+            std::cerr << "Detected " << (stats.rx_drops - prev_stats.rx_drops)
+                      << " packet drops!\n";
+        }
+        prev_stats = stats;
+    }
+}
+```
+
+MULTICAST PACKET LOSS DETECTION
+--------------------------------
+
+Sequence number gap detection:
+```cpp
+class MulticastReceiver {
+    uint64_t expected_seq = 0;
+    uint64_t gaps_detected = 0;
+    uint64_t packets_received = 0;
+
+public:
+    void on_packet(uint64_t seq_num) {
+        packets_received++;
+
+        if (seq_num != expected_seq) {
+            uint64_t gap = seq_num - expected_seq;
+            gaps_detected += gap;
+
+            std::cerr << "PACKET LOSS: Expected " << expected_seq
+                      << " but got " << seq_num
+                      << " (gap = " << gap << ")\n";
+        }
+
+        expected_seq = seq_num + 1;
+    }
+
+    double get_loss_rate() const {
+        return (double)gaps_detected / (packets_received + gaps_detected);
+    }
+};
+```
+
+================================================================================
+4. LATENCY SPIKE INVESTIGATION
+================================================================================
+
+SOURCES OF NETWORK LATENCY IN HFT
+----------------------------------
+
+1. Network transit time (speed of light)
+2. Switch/router processing
+3. NIC processing
+4. Interrupt handling
+5. Kernel network stack
+6. Application processing
+7. Context switches
+8. Memory access (cache misses)
+
+MEASURING END-TO-END LATENCY
+-----------------------------
+
+Hardware timestamping (most accurate):
+```cpp
+#include <linux/net_tstamp.h>
+#include <linux/sockios.h>
+
+int enable_hw_timestamps(int sockfd) {
+    struct hwtstamp_config hw_config;
+    hw_config.tx_type = HWTSTAMP_TX_ON;
+    hw_config.rx_filter = HWTSTAMP_FILTER_ALL;
+
+    struct ifreq ifr;
+    strncpy(ifr.ifr_name, "eth0", IFNAMSIZ);
+    ifr.ifr_data = reinterpret_cast<char*>(&hw_config);
+
+    if (ioctl(sockfd, SIOCSHWTSTAMP, &ifr) < 0) {
+        return -1;
+    }
+
+    int flags = SOF_TIMESTAMPING_RX_HARDWARE |
+                SOF_TIMESTAMPING_TX_HARDWARE |
+                SOF_TIMESTAMPING_RAW_HARDWARE;
+
+    return setsockopt(sockfd, SOL_SOCKET, SO_TIMESTAMPING, &flags, sizeof(flags));
+}
+
+struct timespec get_hw_timestamp(struct msghdr* msg) {
+    struct timespec ts = {0, 0};
+
+    for (struct cmsghdr* cmsg = CMSG_FIRSTHDR(msg);
+         cmsg != nullptr;
+         cmsg = CMSG_NXTHDR(msg, cmsg)) {
+
+        if (cmsg->cmsg_level == SOL_SOCKET &&
+            cmsg->cmsg_type == SO_TIMESTAMPING) {
+
+            struct timespec* stamps = (struct timespec*)CMSG_DATA(cmsg);
+            ts = stamps[2];  // Hardware timestamp
+            break;
+        }
+    }
+
+    return ts;
+}
+```
+
+Software timestamping:
+```cpp
+#include <sys/time.h>
+
+uint64_t get_timestamp_ns() {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return ts.tv_sec * 1'000'000'000ULL + ts.tv_nsec;
+}
+
+void measure_recv_latency(int sockfd) {
+    uint64_t recv_time = get_timestamp_ns();
+
+    char buffer[1024];
+    ssize_t n = recv(sockfd, buffer, sizeof(buffer), 0);
+
+    uint64_t process_time = get_timestamp_ns();
+    uint64_t latency_ns = process_time - recv_time;
+
+    if (latency_ns > 1000000) {  // > 1ms
+        std::cerr << "HIGH LATENCY: " << latency_ns << " ns\n";
+    }
+}
+```
+
+IDENTIFYING LATENCY SPIKE ROOT CAUSE
+-------------------------------------
+
+Technique 1: Kernel Trace Events
+
+Setup:
+```bash
+# Enable network stack tracing
+echo 1 > /sys/kernel/debug/tracing/events/net/enable
+echo 1 > /sys/kernel/debug/tracing/events/napi/enable
+
+# Trace specific socket
+echo 'sock_family == 2 && sock_type == 2' > /sys/kernel/debug/tracing/events/sock/filter
+
+# Start tracing
+echo 1 > /sys/kernel/debug/tracing/tracing_on
+
+# ... run application ...
+
+# View trace
+cat /sys/kernel/debug/tracing/trace
+```
+
+Technique 2: perf Timing Analysis
+
+```bash
+# Profile network receive path
+perf probe --add 'netif_receive_skb'
+perf probe --add 'tcp_v4_rcv'
+perf probe --add 'udp_rcv'
+
+perf record -e probe:* -aR -g sleep 10
+perf script | less
+
+# Look for long delays between events
+```
+
+Technique 3: Application-Level Instrumentation
+
+```cpp
+class LatencyTracker {
+    static constexpr size_t HISTOGRAM_BUCKETS = 100;
+    std::array<uint64_t, HISTOGRAM_BUCKETS> histogram{};
+    uint64_t min_latency = UINT64_MAX;
+    uint64_t max_latency = 0;
+    uint64_t sum_latency = 0;
+    uint64_t count = 0;
+
+public:
+    void record(uint64_t latency_ns) {
+        count++;
+        sum_latency += latency_ns;
+
+        if (latency_ns < min_latency) min_latency = latency_ns;
+        if (latency_ns > max_latency) max_latency = latency_ns;
+
+        // Bucket: 0-1us, 1-2us, ..., 99-100us, 100us+
+        size_t bucket = std::min(latency_ns / 1000, HISTOGRAM_BUCKETS - 1);
+        histogram[bucket]++;
+    }
+
+    void print_stats() {
+        std::cout << "Latency Statistics:\n"
+                  << "  Count: " << count << "\n"
+                  << "  Min: " << min_latency << " ns\n"
+                  << "  Max: " << max_latency << " ns\n"
+                  << "  Avg: " << (sum_latency / count) << " ns\n\n";
+
+        std::cout << "Histogram (microseconds):\n";
+        for (size_t i = 0; i < HISTOGRAM_BUCKETS; ++i) {
+            if (histogram[i] > 0) {
+                std::cout << "  " << i << "-" << (i+1) << "us: "
+                          << histogram[i] << "\n";
+            }
+        }
+    }
+};
+```
+
+COMMON CAUSES OF SPIKES
+------------------------
+
+1. Interrupt Coalescing
+   Problem: NIC delays interrupt to batch packets
+   Solution: Disable or tune coalescing
+
+   Check:
+   ethtool -c eth0
+
+   Disable:
+   ethtool -C eth0 rx-usecs 0 tx-usecs 0
+
+2. CPU Frequency Scaling
+   Problem: CPU in low-power state during I/O
+   Solution: Set performance governor
+
+   echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+
+3. NUMA Memory Access
+   Problem: NIC on different NUMA node
+   Solution: Pin process to NIC's NUMA node
+
+   Check NIC NUMA node:
+   cat /sys/class/net/eth0/device/numa_node
+
+   Pin process:
+   numactl --cpunodebind=0 --membind=0 ./trading_engine
+
+4. Kernel Preemption
+   Problem: Network processing interrupted
+   Solution: Use realtime kernel or isolate CPUs
+
+   Isolate CPUs:
+   Edit /etc/default/grub:
+   GRUB_CMDLINE_LINUX="isolcpus=2,3,4,5"
+
+5. IRQ Affinity
+   Problem: Network interrupts on busy CPUs
+   Solution: Bind IRQs to dedicated CPUs
+
+   Find IRQ:
+   grep eth0 /proc/interrupts
+
+   Set affinity:
+   echo 1 > /proc/irq/<IRQ_NUM>/smp_affinity
+
+================================================================================
+5. CONNECTION ISSUES AND TIMEOUTS
+================================================================================
+
+COMMON CONNECTION PROBLEMS
+---------------------------
+
+A) TCP Connection Refused
+   Cause: No process listening on port
+   Debug: netstat -lntp | grep <port>
+
+B) Connection Timeout
+   Causes:
+   - Firewall blocking
+   - Network unreachable
+   - Server overloaded
+   - SYN flood protection
+
+C) Connection Reset (RST)
+   Causes:
+   - Server crash
+   - Firewall intervention
+   - Application closes socket
+   - TCP sequence error
+
+D) Half-Open Connection
+   Cause: One side thinks connected, other doesn't
+   Solution: Enable TCP keepalive
+
+E) Listen Queue Overflow
+   Cause: Too many pending connections
+   Debug: netstat -s | grep overflowed
+
+DEBUGGING CONNECTION FAILURES
+------------------------------
+
+Check connectivity:
+```bash
+# Basic connectivity
+ping <host>
+
+# TCP port reachable
+telnet <host> <port>
+# Or
+nc -zv <host> <port>
+
+# Trace route
+traceroute <host>
+mtr <host>  # Better, real-time
+```
+
+Capture connection attempt:
+```bash
+sudo tcpdump -i eth0 -n 'tcp and host <host> and port <port>'
+```
+
+Look for:
+- SYN sent
+- SYN-ACK received
+- ACK sent (connection established)
+- RST received (connection refused)
+- No response (firewall/timeout)
+
+Code to detect connection issues:
+```cpp
+#include <sys/socket.h>
+#include <netinet/tcp.h>
+#include <errno.h>
+
+enum class ConnectionState {
+    CONNECTED,
+    DISCONNECTED,
+    ERROR
+};
+
+ConnectionState check_connection(int sockfd) {
+    // Try to get socket error
+    int error = 0;
+    socklen_t len = sizeof(error);
+    if (getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &error, &len) < 0) {
+        return ConnectionState::ERROR;
+    }
+
+    if (error != 0) {
+        errno = error;
+        return ConnectionState::ERROR;
+    }
+
+    // Check if peer is alive with TCP_INFO
+    struct tcp_info info;
+    len = sizeof(info);
+    if (getsockopt(sockfd, IPPROTO_TCP, TCP_INFO, &info, &len) < 0) {
+        return ConnectionState::ERROR;
+    }
+
+    if (info.tcpi_state != TCP_ESTABLISHED) {
+        return ConnectionState::DISCONNECTED;
+    }
+
+    return ConnectionState::CONNECTED;
+}
+
+bool is_socket_alive(int sockfd) {
+    char buf[1];
+    ssize_t n = recv(sockfd, buf, sizeof(buf), MSG_PEEK | MSG_DONTWAIT);
+
+    if (n == 0) {
+        // Connection closed by peer
+        return false;
+    }
+
+    if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            // No data, but connection alive
+            return true;
+        }
+        // Other error
+        return false;
+    }
+
+    // Data available, connection alive
+    return true;
+}
+```
+
+ENABLING TCP KEEPALIVE
+-----------------------
+
+```cpp
+int enable_keepalive(int sockfd) {
+    int optval = 1;
+    if (setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, &optval, sizeof(optval)) < 0) {
+        return -1;
+    }
+
+    // Time before first probe (seconds)
+    int keepidle = 10;
+    setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle));
+
+    // Interval between probes (seconds)
+    int keepintvl = 5;
+    setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
+
+    // Number of probes before giving up
+    int keepcnt = 3;
+    setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
+
+    return 0;
+}
+```
+
+HANDLING CONNECTION LOSS
+-------------------------
+
+```cpp
+class ResilientConnection {
+    int sockfd = -1;
+    std::string host;
+    uint16_t port;
+    bool connected = false;
+
+public:
+    ResilientConnection(const std::string& h, uint16_t p)
+        : host(h), port(p) {}
+
+    bool connect() {
+        sockfd = socket(AF_INET, SOCK_STREAM, 0);
+        if (sockfd < 0) return false;
+
+        struct sockaddr_in addr;
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+        inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
+
+        if (::connect(sockfd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+            close(sockfd);
+            sockfd = -1;
+            return false;
+        }
+
+        enable_keepalive(sockfd);
+        connected = true;
+        return true;
+    }
+
+    bool reconnect_if_needed() {
+        if (!connected || !is_socket_alive(sockfd)) {
+            if (sockfd >= 0) {
+                close(sockfd);
+                sockfd = -1;
+            }
+            connected = false;
+
+            // Exponential backoff
+            int retry_delay_ms = 100;
+            for (int i = 0; i < 5; ++i) {
+                if (connect()) {
+                    return true;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(retry_delay_ms));
+                retry_delay_ms *= 2;
+            }
+            return false;
+        }
+        return true;
+    }
+
+    ssize_t send_data(const void* buf, size_t len) {
+        if (!reconnect_if_needed()) {
+            return -1;
+        }
+
+        ssize_t n = send(sockfd, buf, len, 0);
+        if (n < 0 && (errno == EPIPE || errno == ECONNRESET)) {
+            connected = false;
+        }
+        return n;
+    }
+};
+```
+
+================================================================================
+6. STEP-BY-STEP DEBUGGING WORKFLOWS
+================================================================================
+
+WORKFLOW 1: DEBUGGING MULTICAST PACKET LOSS
+--------------------------------------------
+
+Step 1: Verify Multicast Membership
+```bash
+ip maddress show dev eth0
+```
+
+Step 2: Check NIC Statistics
+```bash
+ethtool -S eth0 | grep -E 'drop|error|miss'
+```
+
+Step 3: Monitor Kernel Drops
+```bash
+watch -n 1 'netstat -su | grep -A 5 Udp'
+```
+
+Step 4: Capture Packets
+```bash
+sudo tcpdump -i eth0 -n 'multicast and udp port 12345' -w capture.pcap
+```
+
+Step 5: Analyze with Wireshark
+- Open capture.pcap
+- Check for sequence gaps
+- Look at inter-packet timing
+- Verify no fragmentation
+
+Step 6: Application-Level Detection
+```cpp
+// Implement sequence number gap tracking
+// Log gaps with timestamps
+```
+
+Step 7: Tune System
+```bash
+# Increase socket buffer
+sudo sysctl -w net.core.rmem_max=134217728
+
+# Increase NIC ring buffer
+sudo ethtool -G eth0 rx 4096
+
+# Increase backlog queue
+sudo sysctl -w net.core.netdev_max_backlog=10000
+```
+
+WORKFLOW 2: INVESTIGATING LATENCY SPIKE
+----------------------------------------
+
+Step 1: Reproduce and Capture
+```cpp
+// Add timestamp logging
+uint64_t t0 = get_timestamp_ns();
+recv(sockfd, buffer, size, 0);
+uint64_t t1 = get_timestamp_ns();
+
+if (t1 - t0 > 1000000) {  // > 1ms
+    log("SPIKE: " + std::to_string(t1 - t0) + " ns");
+}
+```
+
+Step 2: Check System Events
+```bash
+# Check for CPU frequency changes
+perf stat -e power:cpu_frequency -a -I 1000
+
+# Check for context switches
+perf stat -e sched:sched_switch -p <pid> -I 1000
+
+# Check for interrupts
+cat /proc/interrupts
+```
+
+Step 3: Profile with perf
+```bash
+perf record -g -F 999 -p <pid> sleep 60
+perf report --stdio | less
+```
+
+Step 4: Check Network Stack
+```bash
+# Enable net stack tracing
+echo 1 > /sys/kernel/debug/tracing/events/net/enable
+
+# Capture trace during spike
+cat /sys/kernel/debug/tracing/trace > spike_trace.txt
+```
+
+Step 5: Analyze NIC Behavior
+```bash
+# Check interrupt coalescing
+ethtool -c eth0
+
+# Check interrupt distribution
+cat /proc/interrupts | grep eth0
+```
+
+Step 6: Fix Based on Findings
+- Disable C-states if CPU frequency changes
+- Pin IRQs if interrupt migration seen
+- Disable coalescing if batching detected
+- Increase buffer if queue full
+
+WORKFLOW 3: DEBUGGING CONNECTION DROPS
+---------------------------------------
+
+Step 1: Enable Connection Logging
+```cpp
+void log_connection_event(const char* event, int sockfd) {
+    struct tcp_info info;
+    socklen_t len = sizeof(info);
+    getsockopt(sockfd, IPPROTO_TCP, TCP_INFO, &info, &len);
+
+    std::cerr << event << ": state=" << info.tcpi_state
+              << " retransmits=" << info.tcpi_retransmits
+              << " rtt=" << info.tcpi_rtt << "us\n";
+}
+```
+
+Step 2: Capture Traffic
+```bash
+sudo tcpdump -i eth0 -n 'host <peer>' -w connection.pcap
+```
+
+Step 3: Analyze Capture
+Look for:
+- FIN packets (clean close)
+- RST packets (abrupt close)
+- Retransmissions
+- Zero window
+
+Step 4: Check Kernel Logs
+```bash
+dmesg | grep -i 'tcp\|network'
+journalctl -u network.service
+```
+
+Step 5: Monitor TCP State
+```bash
+watch -n 1 'ss -tna | grep <port>'
+```
+
+Step 6: Implement Reconnection
+```cpp
+// See ResilientConnection example above
+```
+
+================================================================================
+7. REAL HFT C++ CODE EXAMPLES
+================================================================================
+
+EXAMPLE 1: LOW-LATENCY UDP RECEIVER
+------------------------------------
+
+```cpp
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <cstring>
+
+class UDPReceiver {
+    int sockfd = -1;
+    uint16_t port;
+
+public:
+    UDPReceiver(uint16_t p) : port(p) {}
+
+    bool initialize() {
+        sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sockfd < 0) return false;
+
+        // Set socket buffer size (128MB)
+        int bufsize = 128 * 1024 * 1024;
+        setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
+
+        // Enable timestamp reception
+        int enabled = 1;
+        setsockopt(sockfd, SOL_SOCKET, SO_TIMESTAMP, &enabled, sizeof(enabled));
+
+        // Bind to port
+        struct sockaddr_in addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = INADDR_ANY;
+        addr.sin_port = htons(port);
+
+        if (bind(sockfd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+            close(sockfd);
+            return false;
+        }
+
+        return true;
+    }
+
+    ssize_t receive(void* buffer, size_t size, struct timespec* timestamp) {
+        struct iovec iov = {
+            .iov_base = buffer,
+            .iov_len = size
+        };
+
+        char control[1024];
+        struct msghdr msg;
+        memset(&msg, 0, sizeof(msg));
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control;
+        msg.msg_controllen = sizeof(control);
+
+        ssize_t n = recvmsg(sockfd, &msg, 0);
+        if (n < 0) return n;
+
+        // Extract timestamp
+        for (struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+             cmsg != nullptr;
+             cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+
+            if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SO_TIMESTAMP) {
+                struct timeval* tv = (struct timeval*)CMSG_DATA(cmsg);
+                timestamp->tv_sec = tv->tv_sec;
+                timestamp->tv_nsec = tv->tv_usec * 1000;
+            }
+        }
+
+        return n;
+    }
+
+    void get_statistics() {
+        // Get socket statistics
+        unsigned int queue_depth = 0;
+        ioctl(sockfd, FIONREAD, &queue_depth);
+
+        struct {
+            uint64_t rx_packets;
+            uint64_t rx_bytes;
+            uint64_t rx_errors;
+        } stats;
+
+        socklen_t len = sizeof(stats);
+        getsockopt(sockfd, SOL_SOCKET, SO_MEMINFO, &stats, &len);
+
+        std::cout << "Queue depth: " << queue_depth << " bytes\n"
+                  << "RX packets: " << stats.rx_packets << "\n"
+                  << "RX errors: " << stats.rx_errors << "\n";
+    }
+
+    ~UDPReceiver() {
+        if (sockfd >= 0) close(sockfd);
+    }
+};
+```
+
+EXAMPLE 2: MULTICAST RECEIVER WITH LOSS DETECTION
+--------------------------------------------------
+
+```cpp
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
+class MulticastReceiver {
+    int sockfd = -1;
+    std::string mcast_group;
+    uint16_t port;
+    uint64_t expected_seq = 0;
+    uint64_t packets_lost = 0;
+    uint64_t packets_received = 0;
+
+public:
+    MulticastReceiver(const std::string& group, uint16_t p)
+        : mcast_group(group), port(p) {}
+
+    bool initialize(const std::string& interface = "eth0") {
+        sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sockfd < 0) return false;
+
+        // Allow multiple sockets on same port
+        int reuse = 1;
+        setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+        // Large socket buffer
+        int bufsize = 256 * 1024 * 1024;  // 256MB
+        setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
+
+        // Bind to port
+        struct sockaddr_in addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = INADDR_ANY;
+        addr.sin_port = htons(port);
+
+        if (bind(sockfd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+            close(sockfd);
+            return false;
+        }
+
+        // Join multicast group
+        struct ip_mreqn mreq;
+        mreq.imr_multiaddr.s_addr = inet_addr(mcast_group.c_str());
+        mreq.imr_address.s_addr = INADDR_ANY;
+        mreq.imr_ifindex = if_nametoindex(interface.c_str());
+
+        if (setsockopt(sockfd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
+            close(sockfd);
+            return false;
+        }
+
+        return true;
+    }
+
+    struct Packet {
+        uint64_t sequence;
+        uint64_t timestamp;
+        char data[1024];
+    };
+
+    bool receive(Packet& packet) {
+        ssize_t n = recv(sockfd, &packet, sizeof(packet), 0);
+        if (n != sizeof(packet)) return false;
+
+        packets_received++;
+
+        // Check for packet loss
+        if (packet.sequence != expected_seq) {
+            uint64_t gap = packet.sequence - expected_seq;
+            packets_lost += gap;
+
+            std::cerr << "PACKET LOSS: Expected " << expected_seq
+                      << " got " << packet.sequence
+                      << " (lost " << gap << " packets)\n";
+        }
+
+        expected_seq = packet.sequence + 1;
+        return true;
+    }
+
+    double get_loss_rate() const {
+        uint64_t total = packets_received + packets_lost;
+        return total > 0 ? (double)packets_lost / total : 0.0;
+    }
+
+    ~MulticastReceiver() {
+        if (sockfd >= 0) {
+            // Leave multicast group
+            struct ip_mreqn mreq;
+            mreq.imr_multiaddr.s_addr = inet_addr(mcast_group.c_str());
+            mreq.imr_address.s_addr = INADDR_ANY;
+            mreq.imr_ifindex = 0;
+            setsockopt(sockfd, IPPROTO_IP, IP_DROP_MEMBERSHIP, &mreq, sizeof(mreq));
+
+            close(sockfd);
+        }
+    }
+};
+```
+
+EXAMPLE 3: ZERO-COPY TCP SENDER
+--------------------------------
+
+```cpp
+#include <sys/socket.h>
+#include <sys/sendfile.h>
+#include <fcntl.h>
+
+class ZeroCopyTCPSender {
+    int sockfd = -1;
+
+public:
+    bool connect(const std::string& host, uint16_t port) {
+        sockfd = socket(AF_INET, SOCK_STREAM, 0);
+        if (sockfd < 0) return false;
+
+        // Enable TCP_NODELAY (disable Nagle's algorithm)
+        int nodelay = 1;
+        setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+
+        // Set TCP_QUICKACK
+        int quickack = 1;
+        setsockopt(sockfd, IPPROTO_TCP, TCP_QUICKACK, &quickack, sizeof(quickack));
+
+        // Large send buffer
+        int bufsize = 128 * 1024 * 1024;
+        setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
+
+        struct sockaddr_in addr;
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+        inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
+
+        return ::connect(sockfd, (struct sockaddr*)&addr, sizeof(addr)) == 0;
+    }
+
+    // Zero-copy send using sendfile (for file data)
+    ssize_t send_file(const char* filename) {
+        int fd = open(filename, O_RDONLY);
+        if (fd < 0) return -1;
+
+        struct stat st;
+        fstat(fd, &st);
+
+        ssize_t sent = sendfile(sockfd, fd, nullptr, st.st_size);
+        close(fd);
+        return sent;
+    }
+
+    // Zero-copy send using MSG_ZEROCOPY (Linux 4.14+)
+    ssize_t send_zerocopy(const void* buffer, size_t len) {
+        return send(sockfd, buffer, len, MSG_ZEROCOPY);
+    }
+
+    // Regular send
+    ssize_t send_data(const void* buffer, size_t len) {
+        return send(sockfd, buffer, len, 0);
+    }
+
+    ~ZeroCopyTCPSender() {
+        if (sockfd >= 0) close(sockfd);
+    }
+};
+```
+
+EXAMPLE 4: NETWORK LATENCY MONITOR
+-----------------------------------
+
+```cpp
+#include <chrono>
+#include <vector>
+#include <algorithm>
+
+class NetworkLatencyMonitor {
+    struct Sample {
+        uint64_t timestamp_ns;
+        uint64_t latency_ns;
+    };
+
+    std::vector<Sample> samples;
+    size_t max_samples;
+
+    static constexpr size_t PERCENTILES[] = {50, 90, 95, 99, 999};
+
+public:
+    NetworkLatencyMonitor(size_t max = 1000000) : max_samples(max) {
+        samples.reserve(max_samples);
+    }
+
+    void record(uint64_t latency_ns) {
+        auto now = std::chrono::system_clock::now().time_since_epoch();
+        uint64_t ts = std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
+
+        if (samples.size() >= max_samples) {
+            samples.erase(samples.begin());
+        }
+
+        samples.push_back({ts, latency_ns});
+    }
+
+    void print_statistics() {
+        if (samples.empty()) return;
+
+        std::vector<uint64_t> latencies;
+        latencies.reserve(samples.size());
+        for (const auto& s : samples) {
+            latencies.push_back(s.latency_ns);
+        }
+
+        std::sort(latencies.begin(), latencies.end());
+
+        uint64_t sum = 0;
+        for (uint64_t lat : latencies) sum += lat;
+
+        std::cout << "Network Latency Statistics:\n"
+                  << "  Count: " << latencies.size() << "\n"
+                  << "  Min: " << latencies.front() << " ns\n"
+                  << "  Max: " << latencies.back() << " ns\n"
+                  << "  Mean: " << (sum / latencies.size()) << " ns\n";
+
+        for (size_t pct : PERCENTILES) {
+            size_t idx = (latencies.size() * pct) / 1000;
+            if (idx >= latencies.size()) idx = latencies.size() - 1;
+
+            double pct_val = pct / 10.0;
+            std::cout << "  P" << pct_val << ": "
+                      << latencies[idx] << " ns\n";
+        }
+    }
+};
+```
+
+================================================================================
+8. DEBUGGING COMMANDS AND INTERPRETATION
+================================================================================
+
+TCPDUMP COMMANDS
+----------------
+
+Capture specific port:
+sudo tcpdump -i eth0 -n port 12345 -w capture.pcap
+
+Capture with timestamps:
+sudo tcpdump -i eth0 -tt -n port 12345
+
+Display packet content:
+sudo tcpdump -i eth0 -X -n port 12345
+
+Filter SYN packets:
+sudo tcpdump -i eth0 'tcp[tcpflags] & tcp-syn != 0'
+
+Filter retransmissions:
+sudo tcpdump -i eth0 'tcp[tcpflags] & tcp-push != 0 and tcp[tcpflags] & tcp-ack != 0'
+
+NETSTAT / SS COMMANDS
+---------------------
+
+Show all TCP connections:
+netstat -antp
+ss -antp
+
+Show UDP sockets:
+netstat -anup
+ss -anup
+
+Show socket memory:
+ss -m
+
+Show socket timers:
+ss -o
+
+Show extended info:
+ss -e
+
+Statistics:
+netstat -s
+ss -s
+
+ETHTOOL COMMANDS
+----------------
+
+Show NIC statistics:
+ethtool -S eth0
+
+Show ring buffer sizes:
+ethtool -g eth0
+
+Set ring buffer sizes:
+sudo ethtool -G eth0 rx 4096 tx 4096
+
+Show interrupt coalescing:
+ethtool -c eth0
+
+Disable interrupt coalescing:
+sudo ethtool -C eth0 rx-usecs 0 tx-usecs 0
+
+Show offload settings:
+ethtool -k eth0
+
+SYSCTL NETWORK TUNABLES
+------------------------
+
+View all network settings:
+sysctl -a | grep net
+
+Key settings for HFT:
+net.core.rmem_max                # Max socket receive buffer
+net.core.wmem_max                # Max socket send buffer
+net.core.rmem_default            # Default receive buffer
+net.core.wmem_default            # Default send buffer
+net.core.netdev_max_backlog      # Input queue size
+net.core.somaxconn               # Listen backlog
+net.ipv4.tcp_rmem                # TCP receive buffer
+net.ipv4.tcp_wmem                # TCP send buffer
+net.ipv4.udp_mem                 # UDP memory limits
+
+================================================================================
+9. SOLUTIONS AND FIXES
+================================================================================
+
+SOLUTION 1: FIX PACKET LOSS
+----------------------------
+
+Problem: UDP packet drops
+
+Diagnosis:
+netstat -su shows "packet receive errors"
+ethtool -S eth0 shows rx_dropped increasing
+
+Solution:
+```bash
+# Increase socket buffer
+sudo sysctl -w net.core.rmem_max=268435456     # 256MB
+sudo sysctl -w net.core.rmem_default=134217728 # 128MB
+
+# Increase NIC ring buffer
+sudo ethtool -G eth0 rx 4096
+
+# Increase kernel backlog
+sudo sysctl -w net.core.netdev_max_backlog=50000
+
+# In application code:
+int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+int bufsize = 268435456;  // 256MB
+setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
+```
+
+SOLUTION 2: REDUCE LATENCY SPIKES
+----------------------------------
+
+Problem: Occasional multi-millisecond latency spikes
+
+Diagnosis:
+- CPU frequency scaling enabled
+- Interrupt coalescing enabled
+- Network IRQs on busy CPUs
+
+Solution:
+```bash
+# Disable CPU frequency scaling
+echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+
+# Disable C-states
+sudo cpupower idle-set -D 0
+
+# Disable interrupt coalescing
+sudo ethtool -C eth0 rx-usecs 0 rx-frames 1 tx-usecs 0 tx-frames 1
+
+# Pin network IRQs to dedicated CPUs
+IRQ=$(grep eth0 /proc/interrupts | awk '{print $1}' | tr -d ':')
+echo 2 | sudo tee /proc/irq/$IRQ/smp_affinity_list  # Pin to CPU 2
+```
+
+SOLUTION 3: FIX CONNECTION INSTABILITY
+---------------------------------------
+
+Problem: TCP connections randomly drop
+
+Diagnosis:
+tcpdump shows RST packets
+Application not seeing disconnection immediately
+
+Solution:
+```cpp
+// Enable TCP keepalive
+int enable_tcp_keepalive(int sockfd) {
+    int optval = 1;
+    setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, &optval, sizeof(optval));
+
+    int keepidle = 10;   // Start probing after 10s idle
+    int keepintvl = 5;   // Probe every 5s
+    int keepcnt = 3;     // Give up after 3 failed probes
+
+    setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle));
+    setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
+    setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
+
+    return 0;
+}
+
+// Detect disconnection faster
+bool is_socket_alive(int sockfd) {
+    char buf[1];
+    ssize_t n = recv(sockfd, buf, 1, MSG_PEEK | MSG_DONTWAIT);
+    return !(n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK));
+}
+```
+
+================================================================================
+10. BEST PRACTICES FOR HFT NETWORK PROGRAMMING
+================================================================================
+
+1. USE KERNEL BYPASS WHEN POSSIBLE
+   - DPDK for ultra-low latency
+   - Solarflare OpenOnload
+   - Mellanox VMA
+
+2. TUNE KERNEL NETWORK STACK
+   ```bash
+   # Comprehensive tuning script
+   sudo sysctl -w net.core.rmem_max=268435456
+   sudo sysctl -w net.core.wmem_max=268435456
+   sudo sysctl -w net.core.netdev_max_backlog=50000
+   sudo sysctl -w net.core.somaxconn=4096
+   sudo sysctl -w net.ipv4.tcp_rmem='4096 87380 268435456'
+   sudo sysctl -w net.ipv4.tcp_wmem='4096 87380 268435456'
+   sudo sysctl -w net.ipv4.tcp_low_latency=1
+   ```
+
+3. OPTIMIZE NIC SETTINGS
+   ```bash
+   # Disable unnecessary features
+   sudo ethtool -K eth0 gro off lro off tso off gso off
+
+   # Maximum ring buffers
+   sudo ethtool -G eth0 rx 4096 tx 4096
+
+   # Disable coalescing
+   sudo ethtool -C eth0 rx-usecs 0 tx-usecs 0
+   ```
+
+4. USE HARDWARE TIMESTAMPS
+   Always use NIC hardware timestamps for accurate latency measurement
+
+5. IMPLEMENT SEQUENCE NUMBER TRACKING
+   Essential for detecting packet loss in multicast feeds
+
+6. MONITOR CONTINUOUSLY
+   ```cpp
+   // Log key metrics every second
+   - Packet rate
+   - Drop rate
+   - Latency percentiles
+   - Connection state
+   ```
+
+7. HANDLE DISCONNECTIONS GRACEFULLY
+   - Implement automatic reconnection
+   - Use exponential backoff
+   - Alert on repeated failures
+
+8. AVOID BLOCKING I/O IN HOT PATH
+   - Use non-blocking sockets
+   - Use epoll/io_uring for multiplexing
+   - Don't call blocking DNS functions
+
+9. TEST UNDER REALISTIC CONDITIONS
+   - Simulate burst traffic
+   - Test with packet loss
+   - Test with latency variation
+   - Test reconnection scenarios
+
+10. DOCUMENT NETWORK ARCHITECTURE
+    - Network topology
+    - Expected latency budgets
+    - Failover procedures
+    - Tuning parameters
+
+================================================================================
+END OF NETWORK DEBUGGING GUIDE
+================================================================================

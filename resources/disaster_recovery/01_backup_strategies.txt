@@ -1,0 +1,1014 @@
+================================================================================
+DISASTER RECOVERY - BACKUP STRATEGIES
+High-Frequency Trading System
+Target: 99.99% Uptime | RTO: 60 seconds | RPO: 0 seconds
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Backup Strategy Overview
+2. Hot Backup Architecture
+3. Warm Backup Configuration
+4. Cold Backup Procedures
+5. Backup Automation Scripts
+6. Data Classification & Retention
+7. Backup Verification & Testing
+8. Storage Infrastructure
+9. Encryption & Security
+10. Recovery Validation
+
+================================================================================
+1. BACKUP STRATEGY OVERVIEW
+================================================================================
+
+1.1 THREE-TIER BACKUP ARCHITECTURE
+-----------------------------------
+
+┌─────────────────────────────────────────────────────────────────────┐
+│                     HFT BACKUP HIERARCHY                            │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  ┌──────────────┐     ┌──────────────┐     ┌──────────────┐      │
+│  │  HOT BACKUP  │     │ WARM BACKUP  │     │ COLD BACKUP  │      │
+│  │              │     │              │     │              │      │
+│  │  Real-time   │────▶│  Near-line   │────▶│  Offline     │      │
+│  │  Replication │     │  Standby     │     │  Archive     │      │
+│  │              │     │              │     │              │      │
+│  │  RPO: 0s     │     │  RPO: <5s    │     │  RPO: 24h    │      │
+│  │  RTO: <60s   │     │  RTO: <5min  │     │  RTO: <4h    │      │
+│  └──────────────┘     └──────────────┘     └──────────────┘      │
+│       │                     │                     │               │
+│       ▼                     ▼                     ▼               │
+│  Production DC         DR Site              Tape/Cloud            │
+│  Same Metro           Different Metro       Geographically        │
+│  <10ms latency        <50ms latency         Distributed           │
+└─────────────────────────────────────────────────────────────────────┘
+
+1.2 BACKUP CLASSIFICATION
+--------------------------
+
+TIER 1 - CRITICAL (HOT)
+-----------------------
+- Order Management State
+- Position Data
+- Risk Parameters
+- Market Data Feed State
+- Trading Account Balances
+- Open Orders & Executions
+- Real-time P&L
+
+Backup Frequency: Continuous (synchronous replication)
+Retention: 90 days hot, 1 year warm, 7 years cold
+Recovery Priority: Immediate
+
+TIER 2 - ESSENTIAL (WARM)
+--------------------------
+- Historical Market Data
+- Configuration Files
+- Strategy Parameters
+- Performance Metrics
+- Audit Logs
+- Trading Analytics
+
+Backup Frequency: Every 5 minutes
+Retention: 30 days hot, 1 year warm, 7 years cold
+Recovery Priority: Within 5 minutes
+
+TIER 3 - ARCHIVAL (COLD)
+-------------------------
+- Historical Trade Records
+- Compliance Documentation
+- End-of-Day Reports
+- Monthly Reconciliation
+- Regulatory Filings
+- System Logs
+
+Backup Frequency: Daily/Weekly
+Retention: 7-10 years (regulatory requirement)
+Recovery Priority: Within 4 hours
+
+1.3 BACKUP SLA TARGETS
+-----------------------
+
+Service Level Agreement:
+- System Availability: 99.99% (52.56 minutes downtime/year)
+- Data Loss Tolerance: 0 transactions for Tier 1
+- Recovery Time Objective (RTO): 60 seconds
+- Recovery Point Objective (RPO): 0 seconds for critical data
+- Backup Success Rate: 99.999%
+- Verification Success Rate: 100%
+
+================================================================================
+2. HOT BACKUP ARCHITECTURE
+================================================================================
+
+2.1 SYNCHRONOUS REPLICATION DESIGN
+-----------------------------------
+
+Primary Site (Production)          DR Site (Hot Standby)
+─────────────────────              ─────────────────────
+
+┌─────────────────────┐            ┌─────────────────────┐
+│  Trading Engine     │            │  Trading Engine     │
+│  (Active)           │══════════▶ │  (Standby)          │
+│                     │ Sync Rep   │                     │
+│  - Order Manager    │            │  - Order Manager    │
+│  - Risk Engine      │            │  - Risk Engine      │
+│  - Execution        │            │  - Execution        │
+└─────────────────────┘            └─────────────────────┘
+         │                                  │
+         ▼                                  ▼
+┌─────────────────────┐            ┌─────────────────────┐
+│  PostgreSQL Primary │            │  PostgreSQL Standby │
+│  - Streaming Rep    │══════════▶ │  - Hot Standby      │
+│  - WAL Archiving    │ <1ms lag   │  - Read Replica     │
+└─────────────────────┘            └─────────────────────┘
+         │                                  │
+         ▼                                  ▼
+┌─────────────────────┐            ┌─────────────────────┐
+│  Redis Cluster      │            │  Redis Cluster      │
+│  - Master Nodes     │══════════▶ │  - Replica Nodes    │
+│  - State Store      │ Real-time  │  - State Store      │
+└─────────────────────┘            └─────────────────────┘
+
+Network: Dedicated 10Gbps fiber link
+Latency: <1ms between sites
+Distance: <50km (metro area)
+
+2.2 HOT BACKUP IMPLEMENTATION
+------------------------------
+
+POSTGRESQL STREAMING REPLICATION
+---------------------------------
+
+Primary Configuration (postgresql.conf):
+```conf
+# Replication Settings
+wal_level = replica
+max_wal_senders = 10
+wal_keep_size = 1GB
+hot_standby = on
+archive_mode = on
+archive_command = 'rsync -az %p standby:/var/lib/pgsql/wal_archive/%f'
+synchronous_commit = remote_apply
+synchronous_standby_names = 'standby1,standby2'
+
+# Performance
+checkpoint_timeout = 5min
+max_wal_size = 2GB
+min_wal_size = 1GB
+```
+
+Standby Configuration (recovery.conf):
+```conf
+standby_mode = on
+primary_conninfo = 'host=primary.hft.local port=5432 user=replicator password=XXX application_name=standby1'
+trigger_file = '/tmp/postgresql.trigger'
+restore_command = 'cp /var/lib/pgsql/wal_archive/%f %p'
+recovery_target_timeline = 'latest'
+hot_standby = on
+hot_standby_feedback = on
+```
+
+REDIS REPLICATION CONFIGURATION
+--------------------------------
+
+Master Configuration (redis-master.conf):
+```conf
+# Replication
+replicaof no one
+replica-announce-ip 10.1.1.10
+replica-announce-port 6379
+
+# Persistence
+save 900 1
+save 300 10
+save 60 10000
+rdbcompression yes
+rdbchecksum yes
+dir /var/lib/redis
+dbfilename dump.rdb
+
+# AOF
+appendonly yes
+appendfilename "appendonly.aof"
+appendfsync everysec
+no-appendfsync-on-rewrite no
+auto-aof-rewrite-percentage 100
+auto-aof-rewrite-min-size 64mb
+
+# Replication
+min-replicas-to-write 1
+min-replicas-max-lag 10
+```
+
+Replica Configuration (redis-replica.conf):
+```conf
+replicaof 10.1.1.10 6379
+replica-read-only yes
+replica-serve-stale-data yes
+replica-priority 100
+```
+
+2.3 HOT BACKUP MONITORING SCRIPT
+---------------------------------
+
+Script: /opt/hft/scripts/monitor_hot_backup.sh
+
+```bash
+#!/bin/bash
+# Hot Backup Monitoring and Alerting
+# Monitors replication lag and health
+
+ALERT_THRESHOLD_MS=100
+LOG_FILE="/var/log/hft/backup_monitor.log"
+SLACK_WEBHOOK="https://hooks.slack.com/services/YOUR/WEBHOOK/URL"
+
+# Check PostgreSQL Replication Lag
+check_postgres_lag() {
+    LAG=$(psql -h primary.hft.local -U monitoring -d trading -t -c \
+        "SELECT EXTRACT(EPOCH FROM (NOW() - pg_last_xact_replay_timestamp())) * 1000 AS lag_ms;")
+
+    if (( $(echo "$LAG > $ALERT_THRESHOLD_MS" | bc -l) )); then
+        alert "CRITICAL: PostgreSQL replication lag: ${LAG}ms"
+        return 1
+    fi
+
+    log "INFO: PostgreSQL replication lag: ${LAG}ms - OK"
+    return 0
+}
+
+# Check Redis Replication Lag
+check_redis_lag() {
+    REDIS_INFO=$(redis-cli -h replica.hft.local INFO replication)
+    LAG=$(echo "$REDIS_INFO" | grep "master_repl_offset" | cut -d: -f2)
+    OFFSET=$(echo "$REDIS_INFO" | grep "slave_repl_offset" | cut -d: -f2)
+
+    DIFF=$((LAG - OFFSET))
+
+    if [ $DIFF -gt 1000 ]; then
+        alert "CRITICAL: Redis replication lag: ${DIFF} operations"
+        return 1
+    fi
+
+    log "INFO: Redis replication lag: ${DIFF} operations - OK"
+    return 0
+}
+
+# Check Disk Space
+check_disk_space() {
+    USAGE=$(df -h /var/lib/pgsql | tail -1 | awk '{print $5}' | sed 's/%//')
+
+    if [ $USAGE -gt 80 ]; then
+        alert "WARNING: Disk space usage: ${USAGE}%"
+        return 1
+    fi
+
+    log "INFO: Disk space usage: ${USAGE}% - OK"
+    return 0
+}
+
+# Alert Function
+alert() {
+    MESSAGE=$1
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [ALERT] $MESSAGE" >> $LOG_FILE
+
+    # Send to Slack
+    curl -X POST -H 'Content-type: application/json' \
+        --data "{\"text\":\"HFT Backup Alert: $MESSAGE\"}" \
+        $SLACK_WEBHOOK
+
+    # Send email
+    echo "$MESSAGE" | mail -s "HFT Backup Alert" ops@trading.com
+
+    # PagerDuty integration
+    curl -X POST https://events.pagerduty.com/v2/enqueue \
+        -H 'Content-Type: application/json' \
+        -d "{
+            \"routing_key\": \"YOUR_INTEGRATION_KEY\",
+            \"event_action\": \"trigger\",
+            \"payload\": {
+                \"summary\": \"$MESSAGE\",
+                \"severity\": \"critical\",
+                \"source\": \"hft-backup-monitor\"
+            }
+        }"
+}
+
+# Log Function
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >> $LOG_FILE
+}
+
+# Main Monitoring Loop
+main() {
+    while true; do
+        check_postgres_lag
+        check_redis_lag
+        check_disk_space
+
+        # Check every 10 seconds
+        sleep 10
+    done
+}
+
+main
+```
+
+2.4 CONTINUOUS DATA PROTECTION (CDP)
+-------------------------------------
+
+TRANSACTION LOG SHIPPING
+-------------------------
+
+Script: /opt/hft/scripts/wal_shipping.sh
+
+```bash
+#!/bin/bash
+# WAL (Write-Ahead Log) Shipping
+# Ships transaction logs to DR site in real-time
+
+WAL_SOURCE="/var/lib/pgsql/data/pg_wal"
+WAL_ARCHIVE="/backup/wal_archive"
+DR_SITE="dr-server.hft.local"
+DR_PATH="/var/lib/pgsql/wal_archive"
+
+ship_wal() {
+    WAL_FILE=$1
+
+    # Compress and encrypt
+    gzip -c "$WAL_SOURCE/$WAL_FILE" | \
+        openssl enc -aes-256-cbc -salt -pass file:/etc/hft/backup.key | \
+        ssh postgres@$DR_SITE "cat > $DR_PATH/$WAL_FILE.gz.enc"
+
+    # Verify transfer
+    if [ $? -eq 0 ]; then
+        echo "$(date): Successfully shipped $WAL_FILE" >> /var/log/hft/wal_shipping.log
+
+        # Archive locally
+        cp "$WAL_SOURCE/$WAL_FILE" "$WAL_ARCHIVE/"
+
+        return 0
+    else
+        echo "$(date): FAILED to ship $WAL_FILE" >> /var/log/hft/wal_shipping.log
+        return 1
+    fi
+}
+
+# Archive completed WAL files
+for wal_file in $(ls $WAL_SOURCE/*.ready 2>/dev/null | sed 's/.ready//'); do
+    ship_wal $(basename $wal_file)
+done
+```
+
+================================================================================
+3. WARM BACKUP CONFIGURATION
+================================================================================
+
+3.1 WARM STANDBY ARCHITECTURE
+------------------------------
+
+Warm Standby: System ready to take over with minimal delay (5-15 minutes)
+Location: Secondary data center (different metro area)
+Update Frequency: 5-minute intervals
+Data Transfer: Asynchronous replication
+
+┌─────────────────────────────────────────────────────────────┐
+│              WARM BACKUP INFRASTRUCTURE                     │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  Primary DC ─────────▶ Warm Standby DC                     │
+│                                                             │
+│  ┌──────────────┐      ┌──────────────┐                    │
+│  │  Production  │      │  Warm System │                    │
+│  │  Database    │─────▶│  Database    │                    │
+│  │              │ 5min │  (Delayed)   │                    │
+│  └──────────────┘      └──────────────┘                    │
+│                                                             │
+│  ┌──────────────┐      ┌──────────────┐                    │
+│  │  Config      │      │  Config      │                    │
+│  │  Files       │─────▶│  Files       │                    │
+│  │              │ rsync│  (Mirror)    │                    │
+│  └──────────────┘      └──────────────┘                    │
+│                                                             │
+│  ┌──────────────┐      ┌──────────────┐                    │
+│  │  Market Data │      │  Market Data │                    │
+│  │  Archive     │─────▶│  Archive     │                    │
+│  │              │ async│  (Replica)   │                    │
+│  └──────────────┘      └──────────────┘                    │
+└─────────────────────────────────────────────────────────────┘
+
+3.2 WARM BACKUP IMPLEMENTATION
+-------------------------------
+
+DELAYED REPLICATION SETUP
+--------------------------
+
+Purpose: Protect against logical errors (accidental deletes, corruptions)
+Delay: 5 minutes behind primary
+
+PostgreSQL Delayed Standby Configuration:
+```conf
+# recovery.conf
+standby_mode = on
+primary_conninfo = 'host=primary.hft.local port=5432 user=replicator'
+recovery_min_apply_delay = 300000  # 5 minutes in milliseconds
+restore_command = 'cp /var/lib/pgsql/wal_archive/%f %p'
+```
+
+3.3 INCREMENTAL BACKUP SCRIPT
+------------------------------
+
+Script: /opt/hft/scripts/incremental_backup.sh
+
+```bash
+#!/bin/bash
+# Incremental Backup Script
+# Runs every 5 minutes via cron
+
+BACKUP_DIR="/backup/incremental"
+RETENTION_DAYS=30
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+
+# Database Incremental Backup
+perform_db_backup() {
+    echo "Starting incremental backup: $TIMESTAMP"
+
+    # PostgreSQL base backup
+    pg_basebackup -h localhost -D "$BACKUP_DIR/postgres_$TIMESTAMP" \
+        -F tar -z -P -X stream -c fast
+
+    if [ $? -eq 0 ]; then
+        echo "Database backup completed: postgres_$TIMESTAMP"
+
+        # Sync to warm standby
+        rsync -avz --delete "$BACKUP_DIR/postgres_$TIMESTAMP" \
+            warmstandby:/backup/incremental/
+    else
+        echo "ERROR: Database backup failed"
+        exit 1
+    fi
+}
+
+# Configuration Files Backup
+backup_configs() {
+    CONFIG_BACKUP="$BACKUP_DIR/config_$TIMESTAMP.tar.gz"
+
+    tar -czf "$CONFIG_BACKUP" \
+        /etc/hft/ \
+        /opt/hft/config/ \
+        /opt/hft/strategies/
+
+    # Sync to warm standby
+    rsync -avz "$CONFIG_BACKUP" warmstandby:/backup/config/
+}
+
+# Market Data Incremental Sync
+sync_market_data() {
+    # Sync last 24 hours of market data
+    YESTERDAY=$(date -d "yesterday" +%Y%m%d)
+    TODAY=$(date +%Y%m%d)
+
+    rsync -avz --include="*$YESTERDAY*" --include="*$TODAY*" \
+        /data/market_data/ warmstandby:/data/market_data/
+}
+
+# Cleanup old backups
+cleanup_old_backups() {
+    find $BACKUP_DIR -type d -mtime +$RETENTION_DAYS -exec rm -rf {} \;
+}
+
+# Main execution
+main() {
+    perform_db_backup
+    backup_configs
+    sync_market_data
+    cleanup_old_backups
+
+    echo "Incremental backup completed: $TIMESTAMP"
+}
+
+main
+```
+
+Cron Configuration:
+```cron
+# Incremental backups every 5 minutes
+*/5 * * * * /opt/hft/scripts/incremental_backup.sh >> /var/log/hft/incremental_backup.log 2>&1
+```
+
+3.4 WARM STANDBY HEALTH CHECK
+------------------------------
+
+Script: /opt/hft/scripts/check_warm_standby.sh
+
+```bash
+#!/bin/bash
+# Warm Standby Health Check
+
+check_data_freshness() {
+    # Check last backup timestamp
+    LAST_BACKUP=$(ls -t /backup/incremental/postgres_* | head -1 | \
+        sed 's/.*postgres_//' | sed 's/_/T/' | sed 's/T/ /')
+
+    LAST_EPOCH=$(date -d "$LAST_BACKUP" +%s)
+    NOW_EPOCH=$(date +%s)
+    AGE=$((NOW_EPOCH - LAST_EPOCH))
+
+    # Alert if backup older than 10 minutes
+    if [ $AGE -gt 600 ]; then
+        echo "WARNING: Last backup is $((AGE/60)) minutes old"
+        return 1
+    fi
+
+    echo "OK: Last backup is $((AGE/60)) minutes old"
+    return 0
+}
+
+check_disk_replication() {
+    # Compare data sizes between primary and standby
+    PRIMARY_SIZE=$(ssh primary "du -s /var/lib/pgsql/data" | awk '{print $1}')
+    STANDBY_SIZE=$(du -s /var/lib/pgsql/data | awk '{print $1}')
+
+    DIFF=$((PRIMARY_SIZE - STANDBY_SIZE))
+    PERCENT=$(echo "scale=2; ($DIFF / $PRIMARY_SIZE) * 100" | bc)
+
+    if (( $(echo "$PERCENT > 5" | bc -l) )); then
+        echo "WARNING: Standby data differs by ${PERCENT}%"
+        return 1
+    fi
+
+    echo "OK: Data size difference: ${PERCENT}%"
+    return 0
+}
+
+check_data_freshness
+check_disk_replication
+```
+
+================================================================================
+4. COLD BACKUP PROCEDURES
+================================================================================
+
+4.1 COLD BACKUP STRATEGY
+-------------------------
+
+Purpose: Long-term archival, regulatory compliance, disaster recovery
+Frequency: Daily (full), Weekly (consolidated)
+Storage: Tape, Cloud (AWS Glacier, Azure Archive)
+Retention: 7-10 years
+Encryption: AES-256
+Compression: gzip/bzip2
+
+4.2 DAILY FULL BACKUP SCRIPT
+-----------------------------
+
+Script: /opt/hft/scripts/cold_backup.sh
+
+```bash
+#!/bin/bash
+# Cold Backup - Full Daily Backup
+# Runs at 02:00 AM daily via cron
+
+BACKUP_ROOT="/backup/cold"
+TAPE_DEVICE="/dev/nst0"
+CLOUD_BUCKET="s3://hft-backup-archive"
+DATE=$(date +%Y%m%d)
+BACKUP_DIR="$BACKUP_ROOT/$DATE"
+ENCRYPTION_KEY="/etc/hft/backup_master.key"
+
+# Create backup directory
+mkdir -p "$BACKUP_DIR"
+
+# 1. Database Full Backup
+backup_database() {
+    echo "Starting database full backup..."
+
+    # PostgreSQL dump
+    pg_dumpall -h localhost -U postgres | \
+        gzip | \
+        openssl enc -aes-256-cbc -salt -pass file:$ENCRYPTION_KEY \
+        > "$BACKUP_DIR/database_full_$DATE.sql.gz.enc"
+
+    # Verify backup
+    if [ -f "$BACKUP_DIR/database_full_$DATE.sql.gz.enc" ]; then
+        SIZE=$(du -h "$BACKUP_DIR/database_full_$DATE.sql.gz.enc" | awk '{print $1}')
+        echo "Database backup completed: $SIZE"
+    else
+        echo "ERROR: Database backup failed"
+        return 1
+    fi
+}
+
+# 2. Market Data Archive
+backup_market_data() {
+    echo "Archiving market data..."
+
+    # Archive last 7 days of market data
+    find /data/market_data -mtime -7 -type f | \
+        tar -czf - -T - | \
+        openssl enc -aes-256-cbc -salt -pass file:$ENCRYPTION_KEY \
+        > "$BACKUP_DIR/market_data_$DATE.tar.gz.enc"
+}
+
+# 3. Trading Logs
+backup_logs() {
+    echo "Archiving trading logs..."
+
+    tar -czf - /var/log/hft/ | \
+        openssl enc -aes-256-cbc -salt -pass file:$ENCRYPTION_KEY \
+        > "$BACKUP_DIR/logs_$DATE.tar.gz.enc"
+}
+
+# 4. Configuration and Code
+backup_configs_code() {
+    echo "Backing up configurations and code..."
+
+    tar -czf - /opt/hft/ /etc/hft/ | \
+        openssl enc -aes-256-cbc -salt -pass file:$ENCRYPTION_KEY \
+        > "$BACKUP_DIR/config_code_$DATE.tar.gz.enc"
+}
+
+# 5. System State
+backup_system_state() {
+    echo "Capturing system state..."
+
+    {
+        echo "=== System Information ==="
+        uname -a
+        echo ""
+        echo "=== Installed Packages ==="
+        dpkg -l
+        echo ""
+        echo "=== Network Configuration ==="
+        ip addr show
+        echo ""
+        echo "=== Mount Points ==="
+        df -h
+    } > "$BACKUP_DIR/system_state_$DATE.txt"
+}
+
+# 6. Write to Tape
+write_to_tape() {
+    echo "Writing backup to tape..."
+
+    # Rewind tape
+    mt -f $TAPE_DEVICE rewind
+
+    # Write to tape
+    tar -cvf $TAPE_DEVICE "$BACKUP_DIR"
+
+    # Eject tape
+    mt -f $TAPE_DEVICE offline
+
+    echo "Tape backup completed. Please label tape: HFT_BACKUP_$DATE"
+}
+
+# 7. Upload to Cloud
+upload_to_cloud() {
+    echo "Uploading to cloud storage..."
+
+    # AWS S3 Glacier
+    aws s3 sync "$BACKUP_DIR" "$CLOUD_BUCKET/$DATE/" \
+        --storage-class GLACIER
+
+    # Azure Blob Archive
+    az storage blob upload-batch \
+        --destination hft-backup \
+        --source "$BACKUP_DIR" \
+        --tier Archive
+
+    echo "Cloud upload completed"
+}
+
+# 8. Generate Backup Manifest
+generate_manifest() {
+    MANIFEST="$BACKUP_DIR/MANIFEST_$DATE.txt"
+
+    {
+        echo "HFT System Cold Backup Manifest"
+        echo "Date: $DATE"
+        echo "Backup Directory: $BACKUP_DIR"
+        echo ""
+        echo "=== Files ==="
+        ls -lh "$BACKUP_DIR"
+        echo ""
+        echo "=== Checksums (SHA256) ==="
+        sha256sum "$BACKUP_DIR"/* | tee "$BACKUP_DIR/checksums.txt"
+        echo ""
+        echo "=== Total Size ==="
+        du -sh "$BACKUP_DIR"
+    } > "$MANIFEST"
+}
+
+# 9. Retention Policy Cleanup
+cleanup_old_backups() {
+    echo "Applying retention policy..."
+
+    # Keep daily backups for 90 days
+    find "$BACKUP_ROOT" -maxdepth 1 -type d -mtime +90 -exec rm -rf {} \;
+
+    # Delete cloud backups older than 10 years
+    CUTOFF_DATE=$(date -d "10 years ago" +%Y%m%d)
+    aws s3 ls "$CLOUD_BUCKET/" | while read -r line; do
+        BACKUP_DATE=$(echo $line | awk '{print $2}' | sed 's/\///')
+        if [ "$BACKUP_DATE" -lt "$CUTOFF_DATE" ]; then
+            aws s3 rm "$CLOUD_BUCKET/$BACKUP_DATE/" --recursive
+        fi
+    done
+}
+
+# 10. Send Backup Report
+send_report() {
+    REPORT_FILE="$BACKUP_DIR/backup_report_$DATE.txt"
+
+    {
+        echo "HFT Cold Backup Report - $DATE"
+        echo "================================"
+        echo ""
+        cat "$BACKUP_DIR/MANIFEST_$DATE.txt"
+        echo ""
+        echo "Backup Status: SUCCESS"
+        echo "Start Time: $START_TIME"
+        echo "End Time: $(date '+%Y-%m-%d %H:%M:%S')"
+    } > "$REPORT_FILE"
+
+    # Email report
+    mail -s "HFT Cold Backup Report - $DATE" \
+        -a "$REPORT_FILE" \
+        ops@trading.com < "$REPORT_FILE"
+}
+
+# Main Execution
+main() {
+    START_TIME=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "Starting cold backup: $START_TIME"
+
+    backup_database
+    backup_market_data
+    backup_logs
+    backup_configs_code
+    backup_system_state
+    generate_manifest
+
+    # Parallel cloud and tape backup
+    write_to_tape &
+    upload_to_cloud &
+    wait
+
+    cleanup_old_backups
+    send_report
+
+    echo "Cold backup completed: $(date '+%Y-%m-%d %H:%M:%S')"
+}
+
+# Execute
+main 2>&1 | tee -a /var/log/hft/cold_backup.log
+```
+
+Cron Configuration:
+```cron
+# Daily cold backup at 2 AM
+0 2 * * * /opt/hft/scripts/cold_backup.sh
+```
+
+4.3 BACKUP VERIFICATION
+------------------------
+
+Script: /opt/hft/scripts/verify_backup.sh
+
+```bash
+#!/bin/bash
+# Backup Verification and Integrity Check
+
+verify_backup() {
+    BACKUP_FILE=$1
+
+    echo "Verifying: $BACKUP_FILE"
+
+    # Check file exists
+    if [ ! -f "$BACKUP_FILE" ]; then
+        echo "ERROR: Backup file not found"
+        return 1
+    fi
+
+    # Verify checksum
+    STORED_CHECKSUM=$(grep $(basename $BACKUP_FILE) checksums.txt | awk '{print $1}')
+    CURRENT_CHECKSUM=$(sha256sum $BACKUP_FILE | awk '{print $1}')
+
+    if [ "$STORED_CHECKSUM" != "$CURRENT_CHECKSUM" ]; then
+        echo "ERROR: Checksum mismatch"
+        return 1
+    fi
+
+    # Test decryption
+    openssl enc -aes-256-cbc -d -salt -pass file:/etc/hft/backup_master.key \
+        -in "$BACKUP_FILE" | gunzip | head -n 1 > /dev/null 2>&1
+
+    if [ $? -eq 0 ]; then
+        echo "OK: Backup verified successfully"
+        return 0
+    else
+        echo "ERROR: Backup verification failed"
+        return 1
+    fi
+}
+
+# Verify all backups in directory
+for backup in /backup/cold/$(date +%Y%m%d)/*.enc; do
+    verify_backup "$backup"
+done
+```
+
+================================================================================
+5. BACKUP AUTOMATION & ORCHESTRATION
+================================================================================
+
+5.1 BACKUP ORCHESTRATION FRAMEWORK
+-----------------------------------
+
+Script: /opt/hft/scripts/backup_orchestrator.py
+
+```python
+#!/usr/bin/env python3
+"""
+Backup Orchestration System
+Coordinates hot, warm, and cold backups
+"""
+
+import os
+import sys
+import time
+import logging
+import subprocess
+from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
+import json
+
+class BackupOrchestrator:
+    def __init__(self):
+        self.logger = self.setup_logging()
+        self.config = self.load_config()
+
+    def setup_logging(self):
+        logging.basicConfig(
+            filename='/var/log/hft/backup_orchestrator.log',
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s'
+        )
+        return logging.getLogger(__name__)
+
+    def load_config(self):
+        with open('/etc/hft/backup_config.json') as f:
+            return json.load(f)
+
+    def execute_backup(self, backup_type, script_path):
+        """Execute backup script and monitor"""
+        self.logger.info(f"Starting {backup_type} backup")
+        start_time = time.time()
+
+        try:
+            result = subprocess.run(
+                [script_path],
+                capture_output=True,
+                text=True,
+                timeout=3600
+            )
+
+            duration = time.time() - start_time
+
+            if result.returncode == 0:
+                self.logger.info(
+                    f"{backup_type} backup completed in {duration:.2f}s"
+                )
+                return True
+            else:
+                self.logger.error(
+                    f"{backup_type} backup failed: {result.stderr}"
+                )
+                self.send_alert(backup_type, result.stderr)
+                return False
+
+        except subprocess.TimeoutExpired:
+            self.logger.error(f"{backup_type} backup timed out")
+            self.send_alert(backup_type, "Timeout")
+            return False
+
+    def send_alert(self, backup_type, error):
+        """Send alert via multiple channels"""
+        # Implementation for alerts
+        pass
+
+    def run_scheduled_backups(self):
+        """Execute scheduled backups based on configuration"""
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = []
+
+            # Submit backup jobs
+            for backup in self.config['backups']:
+                future = executor.submit(
+                    self.execute_backup,
+                    backup['type'],
+                    backup['script']
+                )
+                futures.append(future)
+
+            # Wait for completion
+            results = [f.result() for f in futures]
+
+        return all(results)
+
+if __name__ == '__main__':
+    orchestrator = BackupOrchestrator()
+    orchestrator.run_scheduled_backups()
+```
+
+Configuration: /etc/hft/backup_config.json
+```json
+{
+  "backups": [
+    {
+      "type": "hot",
+      "script": "/opt/hft/scripts/monitor_hot_backup.sh",
+      "schedule": "continuous",
+      "priority": 1
+    },
+    {
+      "type": "warm",
+      "script": "/opt/hft/scripts/incremental_backup.sh",
+      "schedule": "*/5 * * * *",
+      "priority": 2
+    },
+    {
+      "type": "cold",
+      "script": "/opt/hft/scripts/cold_backup.sh",
+      "schedule": "0 2 * * *",
+      "priority": 3
+    }
+  ],
+  "retention": {
+    "hot": 90,
+    "warm": 365,
+    "cold": 3650
+  },
+  "alerts": {
+    "email": ["ops@trading.com"],
+    "slack": "https://hooks.slack.com/...",
+    "pagerduty": "integration_key"
+  }
+}
+```
+
+================================================================================
+6. SUMMARY & BEST PRACTICES
+================================================================================
+
+6.1 BACKUP CHECKLIST
+--------------------
+
+Daily Tasks:
+☐ Verify hot backup replication lag < 100ms
+☐ Check warm backup completion (5-min intervals)
+☐ Monitor cold backup execution (2 AM)
+☐ Validate backup integrity (checksums)
+☐ Review backup logs for errors
+☐ Test random backup restoration
+☐ Check storage capacity (>20% free)
+
+Weekly Tasks:
+☐ Full backup verification test
+☐ DR site connectivity test
+☐ Tape rotation and labeling
+☐ Cloud backup sync verification
+☐ Review and update retention policies
+☐ Backup performance analysis
+
+Monthly Tasks:
+☐ Full disaster recovery drill
+☐ Restore test from each backup tier
+☐ Update backup documentation
+☐ Review and optimize backup scripts
+☐ Audit backup access logs
+☐ Capacity planning review
+
+6.2 KEY METRICS
+---------------
+
+- Backup Success Rate: 99.999%
+- Average Backup Duration: <30 minutes (cold)
+- Replication Lag: <1ms (hot), <5min (warm)
+- Storage Utilization: <80%
+- Recovery Test Success: 100%
+- Data Loss: 0 transactions (Tier 1)
+
+6.3 EMERGENCY CONTACTS
+----------------------
+
+Backup Team Lead: backup-lead@trading.com
+24/7 Ops Center: +1-555-0100
+DR Coordinator: dr-coord@trading.com
+Storage Admin: storage@trading.com
+
+================================================================================
+END OF DOCUMENT
+================================================================================

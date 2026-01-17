@@ -1,0 +1,528 @@
+================================================================================
+REAL-WORLD SCENARIO SIMULATION FOR HFT SYSTEMS
+MARKET CONDITIONS, TRADING PATTERNS, AND EVENT SIMULATION
+================================================================================
+
+TABLE OF CONTENTS
+1. Market Data Replay Framework
+2. Trading Session Simulation
+3. Market Event Scenarios
+4. Order Flow Patterns
+5. Market Microstructure Simulation
+6. Extreme Event Testing
+7. Multi-Asset Simulation
+8. Realistic Workload Generation
+
+================================================================================
+1. MARKET DATA REPLAY FRAMEWORK
+================================================================================
+
+// Historical Market Data Replay Engine
+// File: market_data_replay.hpp
+
+#ifndef MARKET_DATA_REPLAY_HPP
+#define MARKET_DATA_REPLAY_HPP
+
+#include <vector>
+#include <string>
+#include <fstream>
+#include <chrono>
+#include <thread>
+#include <queue>
+
+namespace hft {
+namespace simulation {
+
+struct MarketTick {
+    uint64_t timestamp_ns;
+    std::string symbol;
+    double bid_price;
+    double ask_price;
+    uint32_t bid_size;
+    uint32_t ask_size;
+    double last_trade_price;
+    uint32_t last_trade_size;
+    
+    bool operator<(const MarketTick& other) const {
+        return timestamp_ns < other.timestamp_ns;
+    }
+};
+
+class MarketDataReplayer {
+private:
+    std::vector<MarketTick> historical_data_;
+    size_t current_index_{0};
+    bool running_{false};
+    double replay_speed_{1.0};  // 1.0 = real-time, 10.0 = 10x speed
+    
+public:
+    // Load historical market data from CSV
+    void load_from_csv(const std::string& filename) {
+        std::ifstream file(filename);
+        std::string line;
+        
+        // Skip header
+        std::getline(file, line);
+        
+        while (std::getline(file, line)) {
+            MarketTick tick = parse_csv_line(line);
+            historical_data_.push_back(tick);
+        }
+        
+        std::sort(historical_data_.begin(), historical_data_.end());
+        
+        std::cout << "Loaded " << historical_data_.size() 
+                  << " market ticks\n";
+    }
+    
+    // Replay with callback function
+    template<typename Callback>
+    void replay(Callback on_tick, double speed = 1.0) {
+        replay_speed_ = speed;
+        running_ = true;
+        current_index_ = 0;
+        
+        if (historical_data_.empty()) {
+            std::cerr << "No data to replay\n";
+            return;
+        }
+        
+        auto start_time = std::chrono::high_resolution_clock::now();
+        uint64_t data_start_ns = historical_data_[0].timestamp_ns;
+        
+        while (running_ && current_index_ < historical_data_.size()) {
+            const auto& tick = historical_data_[current_index_];
+            
+            // Calculate when this tick should be replayed
+            uint64_t tick_offset_ns = tick.timestamp_ns - data_start_ns;
+            uint64_t replay_offset_ns = static_cast<uint64_t>(
+                tick_offset_ns / replay_speed_);
+            
+            auto target_time = start_time + 
+                std::chrono::nanoseconds(replay_offset_ns);
+            
+            // Sleep until it's time for this tick
+            std::this_thread::sleep_until(target_time);
+            
+            // Deliver tick
+            on_tick(tick);
+            
+            current_index_++;
+        }
+    }
+    
+    void stop() {
+        running_ = false;
+    }
+    
+    // Get statistics about the loaded data
+    struct DataStatistics {
+        size_t total_ticks;
+        uint64_t duration_seconds;
+        double avg_ticks_per_second;
+        size_t unique_symbols;
+        double min_price;
+        double max_price;
+    };
+    
+    DataStatistics get_statistics() const {
+        DataStatistics stats{};
+        
+        if (historical_data_.empty()) return stats;
+        
+        stats.total_ticks = historical_data_.size();
+        
+        uint64_t duration_ns = historical_data_.back().timestamp_ns - 
+                              historical_data_.front().timestamp_ns;
+        stats.duration_seconds = duration_ns / 1'000'000'000ULL;
+        
+        stats.avg_ticks_per_second = static_cast<double>(stats.total_ticks) /
+                                    stats.duration_seconds;
+        
+        std::set<std::string> symbols;
+        double min_price = historical_data_[0].last_trade_price;
+        double max_price = min_price;
+        
+        for (const auto& tick : historical_data_) {
+            symbols.insert(tick.symbol);
+            min_price = std::min(min_price, tick.last_trade_price);
+            max_price = std::max(max_price, tick.last_trade_price);
+        }
+        
+        stats.unique_symbols = symbols.size();
+        stats.min_price = min_price;
+        stats.max_price = max_price;
+        
+        return stats;
+    }
+    
+private:
+    MarketTick parse_csv_line(const std::string& line) {
+        // CSV format: timestamp,symbol,bid,ask,bid_size,ask_size,last_price,last_size
+        MarketTick tick{};
+        
+        std::istringstream ss(line);
+        std::string field;
+        
+        std::getline(ss, field, ',');
+        tick.timestamp_ns = std::stoull(field);
+        
+        std::getline(ss, field, ',');
+        tick.symbol = field;
+        
+        std::getline(ss, field, ',');
+        tick.bid_price = std::stod(field);
+        
+        std::getline(ss, field, ',');
+        tick.ask_price = std::stod(field);
+        
+        std::getline(ss, field, ',');
+        tick.bid_size = std::stoul(field);
+        
+        std::getline(ss, field, ',');
+        tick.ask_size = std::stoul(field);
+        
+        std::getline(ss, field, ',');
+        tick.last_trade_price = std::stod(field);
+        
+        std::getline(ss, field, ',');
+        tick.last_trade_size = std::stoul(field);
+        
+        return tick;
+    }
+};
+
+================================================================================
+2. REALISTIC TRADING SESSION SIMULATION
+================================================================================
+
+// Simulates a full trading day with realistic patterns
+class TradingSessionSimulator {
+private:
+    enum class SessionPhase {
+        PRE_OPEN,
+        OPENING_AUCTION,
+        CONTINUOUS_TRADING,
+        CLOSING_AUCTION,
+        POST_CLOSE
+    };
+    
+    SessionPhase current_phase_;
+    std::chrono::system_clock::time_point session_start_;
+    
+public:
+    struct SessionConfig {
+        std::chrono::seconds pre_open_duration{900};      // 15 minutes
+        std::chrono::seconds opening_auction_duration{60}; // 1 minute
+        std::chrono::hours continuous_duration{6};         // 6.5 hours
+        std::chrono::seconds closing_auction_duration{60}; // 1 minute
+        std::chrono::seconds post_close_duration{900};    // 15 minutes
+        
+        // Activity levels (messages per second)
+        size_t pre_open_activity{1000};
+        size_t opening_activity{50000};
+        size_t normal_activity{10000};
+        size_t lunch_activity{5000};
+        size_t closing_activity{100000};
+        size_t post_close_activity{500};
+    };
+    
+    TradingSessionSimulator(const SessionConfig& config) 
+        : config_(config) {}
+    
+    template<typename MessageCallback>
+    void run_session(MessageCallback on_message) {
+        session_start_ = std::chrono::system_clock::now();
+        
+        // Pre-open phase
+        current_phase_ = SessionPhase::PRE_OPEN;
+        simulate_phase(config_.pre_open_duration, 
+                      config_.pre_open_activity, 
+                      on_message);
+        
+        // Opening auction
+        current_phase_ = SessionPhase::OPENING_AUCTION;
+        simulate_phase(config_.opening_auction_duration,
+                      config_.opening_activity,
+                      on_message);
+        
+        // Continuous trading (with lunch dip)
+        current_phase_ = SessionPhase::CONTINUOUS_TRADING;
+        simulate_continuous_trading(on_message);
+        
+        // Closing auction
+        current_phase_ = SessionPhase::CLOSING_AUCTION;
+        simulate_phase(config_.closing_auction_duration,
+                      config_.closing_activity,
+                      on_message);
+        
+        // Post-close
+        current_phase_ = SessionPhase::POST_CLOSE;
+        simulate_phase(config_.post_close_duration,
+                      config_.post_close_activity,
+                      on_message);
+    }
+    
+private:
+    SessionConfig config_;
+    
+    template<typename Callback>
+    void simulate_phase(std::chrono::seconds duration, 
+                       size_t msgs_per_sec,
+                       Callback on_message) {
+        auto phase_start = std::chrono::high_resolution_clock::now();
+        auto phase_end = phase_start + duration;
+        
+        size_t interval_us = 1'000'000 / msgs_per_sec;
+        
+        while (std::chrono::high_resolution_clock::now() < phase_end) {
+            auto msg = generate_market_message();
+            on_message(msg);
+            
+            std::this_thread::sleep_for(std::chrono::microseconds(interval_us));
+        }
+    }
+    
+    template<typename Callback>
+    void simulate_continuous_trading(Callback on_message) {
+        auto start = std::chrono::high_resolution_clock::now();
+        auto end = start + config_.continuous_duration;
+        
+        while (std::chrono::high_resolution_clock::now() < end) {
+            auto elapsed = std::chrono::high_resolution_clock::now() - start;
+            auto hours = std::chrono::duration_cast<std::chrono::hours>(elapsed).count();
+            
+            // Reduce activity during lunch (hours 3-4)
+            size_t activity = (hours >= 3 && hours < 4) ? 
+                             config_.lunch_activity : config_.normal_activity;
+            
+            auto msg = generate_market_message();
+            on_message(msg);
+            
+            size_t interval_us = 1'000'000 / activity;
+            std::this_thread::sleep_for(std::chrono::microseconds(interval_us));
+        }
+    }
+    
+    MarketTick generate_market_message() {
+        // Generate realistic market message based on current phase
+        static std::random_device rd;
+        static std::mt19937 gen(rd());
+        static std::uniform_real_distribution<> price_dist(99.0, 101.0);
+        static std::uniform_int_distribution<> size_dist(100, 10000);
+        
+        MarketTick tick;
+        tick.timestamp_ns = std::chrono::system_clock::now()
+                               .time_since_epoch().count();
+        tick.symbol = "AAPL";  // Simplified
+        tick.bid_price = price_dist(gen);
+        tick.ask_price = tick.bid_price + 0.01;
+        tick.bid_size = size_dist(gen);
+        tick.ask_size = size_dist(gen);
+        tick.last_trade_price = tick.bid_price;
+        tick.last_trade_size = size_dist(gen);
+        
+        return tick;
+    }
+};
+
+================================================================================
+3. MARKET EVENT SCENARIOS
+================================================================================
+
+// Specific market event simulations
+class MarketEventSimulator {
+public:
+    // Flash crash scenario
+    void simulate_flash_crash(size_t duration_seconds = 300) {
+        std::cout << "Simulating flash crash...\n";
+        
+        // Rapid price decline
+        for (size_t i = 0; i < duration_seconds; ++i) {
+            // Generate high-frequency sell orders
+            for (size_t j = 0; j < 10000; ++j) {
+                generate_aggressive_sell_order();
+            }
+            
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+        
+        // Recovery
+        std::cout << "Market recovering...\n";
+    }
+    
+    // News announcement impact
+    void simulate_news_event() {
+        std::cout << "Simulating news event impact...\n";
+        
+        // Spike in market data updates
+        auto start = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::seconds(60);
+        
+        while (std::chrono::high_resolution_clock::now() - start < duration) {
+            // 100x normal message rate
+            for (int i = 0; i < 100; ++i) {
+                generate_market_update();
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+    }
+    
+    // Trading halt and resume
+    void simulate_trading_halt(size_t halt_duration_seconds = 300) {
+        std::cout << "Simulating trading halt...\n";
+        
+        // Pre-halt activity spike
+        for (int i = 0; i < 1000; ++i) {
+            generate_cancel_order();
+        }
+        
+        // Halt period - no trading
+        std::this_thread::sleep_for(std::chrono::seconds(halt_duration_seconds));
+        
+        // Resume - surge of orders
+        std::cout << "Trading resumed - order surge...\n";
+        for (int i = 0; i < 10000; ++i) {
+            generate_limit_order();
+        }
+    }
+    
+    // Circuit breaker trigger
+    void simulate_circuit_breaker() {
+        std::cout << "Simulating circuit breaker activation...\n";
+        
+        // Rapid price movement
+        // System should detect and halt trading
+    }
+    
+private:
+    void generate_aggressive_sell_order() {
+        // Simulation placeholder
+    }
+    
+    void generate_market_update() {
+        // Simulation placeholder
+    }
+    
+    void generate_cancel_order() {
+        // Simulation placeholder
+    }
+    
+    void generate_limit_order() {
+        // Simulation placeholder
+    }
+};
+
+================================================================================
+4. COMPREHENSIVE SCENARIO TEST SUITE
+================================================================================
+
+int main() {
+    using namespace hft::simulation;
+    
+    std::cout << "================================================\n";
+    std::cout << "REAL-WORLD SCENARIO SIMULATION SUITE\n";
+    std::cout << "================================================\n\n";
+    
+    // Scenario 1: Historical data replay
+    std::cout << "=== Scenario 1: Historical Market Data Replay ===\n";
+    MarketDataReplayer replayer;
+    replayer.load_from_csv("historical_data_20250101.csv");
+    
+    auto stats = replayer.get_statistics();
+    std::cout << "Data statistics:\n";
+    std::cout << "  Total ticks: " << stats.total_ticks << "\n";
+    std::cout << "  Duration: " << stats.duration_seconds << " seconds\n";
+    std::cout << "  Avg rate: " << stats.avg_ticks_per_second << " ticks/sec\n\n";
+    
+    // Replay at 10x speed
+    replayer.replay([](const MarketTick& tick) {
+        // Process tick
+        volatile double spread = tick.ask_price - tick.bid_price;
+    }, 10.0);
+    
+    // Scenario 2: Full trading session
+    std::cout << "\n=== Scenario 2: Full Trading Session ===\n";
+    TradingSessionSimulator::SessionConfig session_config;
+    TradingSessionSimulator session(session_config);
+    
+    size_t msg_count = 0;
+    session.run_session([&](const MarketTick& msg) {
+        msg_count++;
+        if (msg_count % 10000 == 0) {
+            std::cout << "Processed " << msg_count << " messages\n";
+        }
+    });
+    
+    // Scenario 3: Market events
+    std::cout << "\n=== Scenario 3: Market Event Scenarios ===\n";
+    MarketEventSimulator events;
+    
+    events.simulate_news_event();
+    events.simulate_flash_crash(60);
+    events.simulate_trading_halt(300);
+    
+    std::cout << "\n================================================\n";
+    std::cout << "SIMULATION COMPLETE\n";
+    std::cout << "================================================\n";
+    
+    return 0;
+}
+
+} // namespace simulation
+} // namespace hft
+
+#endif // MARKET_DATA_REPLAY_HPP
+
+================================================================================
+REALISTIC SCENARIO CATALOG
+================================================================================
+
+STANDARD SCENARIOS:
+==================
+1. Normal Trading Day
+   - Pre-market: Low volume, wide spreads
+   - Opening: High volume spike (3-5x normal)
+   - Mid-day: Steady volume
+   - Lunch: 30-40% volume reduction
+   - Closing: Volume spike (5-10x normal)
+
+2. Earnings Announcement
+   - Pre-announcement: Increased volatility
+   - Announcement: 100x message spike
+   - Post-announcement: Gradual normalization
+
+3. Market Open Scenarios
+   - Gap up/down: Price discontinuity
+   - Opening auction: Concentrated liquidity
+   - First minute: Extreme volatility
+
+STRESS SCENARIOS:
+=================
+1. Flash Crash (2010-style)
+   - Duration: 5-20 minutes
+   - Price drop: 5-10%
+   - Recovery: V-shaped
+   - Message rate: 50x normal
+
+2. Trading Halt
+   - Pre-halt spike: Order cancellations
+   - Halt period: Zero trading
+   - Resume: Order flood (10-20x normal)
+
+3. News-Driven Volatility
+   - Fed announcement
+   - Geopolitical event
+   - Earnings surprise
+
+CORNER CASES:
+=============
+1. Market maker withdrawal
+2. Quote stuffing attack
+3. Crossed markets
+4. Erroneous trades (fat finger)
+5. System outages and recovery
+
+================================================================================
+END OF REAL-WORLD SCENARIO SIMULATION
+================================================================================

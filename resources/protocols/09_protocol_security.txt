@@ -1,0 +1,938 @@
+================================================================================
+                   PROTOCOL SECURITY DOCUMENTATION
+             TLS, Authentication, Message Signing for Trading Systems
+                      Security Best Practices for HFT
+================================================================================
+
+TABLE OF CONTENTS
+================================================================================
+1. Overview
+2. TLS/SSL Implementation
+3. Authentication Mechanisms
+4. Message Signing and Encryption
+5. Session Security
+6. Network Security
+7. Compliance and Auditing
+8. Security Testing
+
+================================================================================
+1. OVERVIEW
+================================================================================
+
+1.1 SECURITY REQUIREMENTS
+--------------------------
+Trading System Security Goals:
+- Confidentiality: Protect sensitive trading data
+- Integrity: Ensure messages haven't been tampered
+- Authentication: Verify identity of participants
+- Non-repudiation: Prove message origin
+- Availability: Prevent denial-of-service
+
+Threat Model:
+- Man-in-the-middle attacks
+- Message replay attacks
+- Unauthorized access
+- Data tampering
+- Denial of service
+- Information leakage
+
+Regulatory Requirements:
+- SEC Rule 15c3-5 (Market Access Rule)
+- MiFID II (EU)
+- GDPR (data protection)
+- PCI DSS (payment card data)
+- SOC 2 compliance
+
+1.2 SECURITY VS PERFORMANCE
+----------------------------
+Trade-offs:
+Operation            Without Security  With TLS    Overhead
+TCP handshake        100us            10-50ms     100-500x
+Message encryption   0ns              200-500ns   Added
+Message validation   50ns             300-800ns   6-16x
+Authentication       0ns              5-20ms      One-time
+
+Optimization Strategies:
+1. Session reuse (avoid repeated handshakes)
+2. Hardware acceleration (AES-NI, QAT)
+3. Connection pooling
+4. Efficient cipher suites
+5. Pre-shared keys where possible
+
+1.3 SECURITY LAYERS
+-------------------
++----------------------+
+| Application Layer    | (Message signing, encryption)
++----------------------+
+| Session Layer        | (Authentication, key exchange)
++----------------------+
+| Transport Layer      | (TLS/SSL)
++----------------------+
+| Network Layer        | (IPsec, VPN)
++----------------------+
+| Physical Layer       | (Dedicated lines, colocation)
++----------------------+
+
+================================================================================
+2. TLS/SSL IMPLEMENTATION
+================================================================================
+
+2.1 TLS BASICS
+--------------
+TLS Versions:
+- TLS 1.0/1.1: Deprecated (security vulnerabilities)
+- TLS 1.2: Current standard (use this)
+- TLS 1.3: Latest (faster, more secure)
+
+Cipher Suites (Recommended):
+TLS 1.2:
+- TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+- TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+- TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+
+TLS 1.3:
+- TLS_AES_128_GCM_SHA256
+- TLS_AES_256_GCM_SHA384
+- TLS_CHACHA20_POLY1305_SHA256
+
+Avoid:
+- RC4 (broken)
+- 3DES (weak)
+- MD5 (collision vulnerabilities)
+- SHA-1 (deprecated)
+
+2.2 OPENSSL IMPLEMENTATION
+---------------------------
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+
+class TLSConnection {
+private:
+    SSL_CTX* ctx_;
+    SSL* ssl_;
+    int socket_fd_;
+
+public:
+    TLSConnection() : ctx_(nullptr), ssl_(nullptr), socket_fd_(-1) {}
+
+    ~TLSConnection() {
+        if (ssl_) SSL_free(ssl_);
+        if (ctx_) SSL_CTX_free(ctx_);
+        if (socket_fd_ >= 0) close(socket_fd_);
+    }
+
+    bool initClient(const char* cert_file, const char* key_file,
+                   const char* ca_file) {
+        // Initialize OpenSSL
+        SSL_library_init();
+        SSL_load_error_strings();
+        OpenSSL_add_all_algorithms();
+
+        // Create SSL context
+        const SSL_METHOD* method = TLS_client_method();
+        ctx_ = SSL_CTX_new(method);
+        if (!ctx_) {
+            ERR_print_errors_fp(stderr);
+            return false;
+        }
+
+        // Set minimum TLS version
+        SSL_CTX_set_min_proto_version(ctx_, TLS1_2_VERSION);
+
+        // Load certificate and key
+        if (SSL_CTX_use_certificate_file(ctx_, cert_file,
+                                         SSL_FILETYPE_PEM) <= 0) {
+            ERR_print_errors_fp(stderr);
+            return false;
+        }
+
+        if (SSL_CTX_use_PrivateKey_file(ctx_, key_file,
+                                        SSL_FILETYPE_PEM) <= 0) {
+            ERR_print_errors_fp(stderr);
+            return false;
+        }
+
+        // Verify private key
+        if (!SSL_CTX_check_private_key(ctx_)) {
+            fprintf(stderr, "Private key does not match certificate\n");
+            return false;
+        }
+
+        // Load CA certificates
+        if (!SSL_CTX_load_verify_locations(ctx_, ca_file, nullptr)) {
+            ERR_print_errors_fp(stderr);
+            return false;
+        }
+
+        // Set verification mode
+        SSL_CTX_set_verify(ctx_, SSL_VERIFY_PEER, nullptr);
+
+        // Set cipher suites
+        if (!SSL_CTX_set_cipher_list(ctx_,
+            "ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384")) {
+            ERR_print_errors_fp(stderr);
+            return false;
+        }
+
+        return true;
+    }
+
+    bool connect(const char* hostname, int port) {
+        // Create socket
+        socket_fd_ = socket(AF_INET, SOCK_STREAM, 0);
+        if (socket_fd_ < 0) {
+            perror("socket");
+            return false;
+        }
+
+        // Connect to server
+        struct sockaddr_in server_addr;
+        memset(&server_addr, 0, sizeof(server_addr));
+        server_addr.sin_family = AF_INET;
+        server_addr.sin_port = htons(port);
+
+        if (inet_pton(AF_INET, hostname, &server_addr.sin_addr) <= 0) {
+            perror("inet_pton");
+            return false;
+        }
+
+        if (::connect(socket_fd_, (struct sockaddr*)&server_addr,
+                     sizeof(server_addr)) < 0) {
+            perror("connect");
+            return false;
+        }
+
+        // Create SSL object
+        ssl_ = SSL_new(ctx_);
+        if (!ssl_) {
+            ERR_print_errors_fp(stderr);
+            return false;
+        }
+
+        // Attach socket
+        SSL_set_fd(ssl_, socket_fd_);
+
+        // Set SNI hostname
+        SSL_set_tlsext_host_name(ssl_, hostname);
+
+        // Perform TLS handshake
+        if (SSL_connect(ssl_) <= 0) {
+            ERR_print_errors_fp(stderr);
+            return false;
+        }
+
+        // Verify certificate
+        if (!verifyServer Certificatemask(hostname)) {
+            return false;
+        }
+
+        return true;
+    }
+
+    ssize_t send(const void* data, size_t length) {
+        int sent = SSL_write(ssl_, data, length);
+        if (sent <= 0) {
+            int err = SSL_get_error(ssl_, sent);
+            fprintf(stderr, "SSL_write error: %d\n", err);
+            return -1;
+        }
+        return sent;
+    }
+
+    ssize_t receive(void* buffer, size_t buffer_size) {
+        int received = SSL_read(ssl_, buffer, buffer_size);
+        if (received <= 0) {
+            int err = SSL_get_error(ssl_, received);
+            if (err != SSL_ERROR_WANT_READ) {
+                fprintf(stderr, "SSL_read error: %d\n", err);
+            }
+            return -1;
+        }
+        return received;
+    }
+
+private:
+    bool verifyServerCertificate(const char* hostname) {
+        // Get peer certificate
+        X509* cert = SSL_get_peer_certificate(ssl_);
+        if (!cert) {
+            fprintf(stderr, "No peer certificate\n");
+            return false;
+        }
+
+        // Verify certificate chain
+        long verify_result = SSL_get_verify_result(ssl_);
+        if (verify_result != X509_V_OK) {
+            fprintf(stderr, "Certificate verification failed: %ld\n",
+                   verify_result);
+            X509_free(cert);
+            return false;
+        }
+
+        // Check hostname
+        if (!verifyHostname(cert, hostname)) {
+            fprintf(stderr, "Hostname verification failed\n");
+            X509_free(cert);
+            return false;
+        }
+
+        X509_free(cert);
+        return true;
+    }
+
+    bool verifyHostname(X509* cert, const char* hostname) {
+        // Check Subject Alternative Name (SAN)
+        STACK_OF(GENERAL_NAME)* san_names =
+            (STACK_OF(GENERAL_NAME)*)X509_get_ext_d2i(
+                cert, NID_subject_alt_name, nullptr, nullptr);
+
+        if (san_names) {
+            int san_count = sk_GENERAL_NAME_num(san_names);
+
+            for (int i = 0; i < san_count; ++i) {
+                const GENERAL_NAME* name = sk_GENERAL_NAME_value(san_names, i);
+
+                if (name->type == GEN_DNS) {
+                    const char* san_hostname =
+                        (const char*)ASN1_STRING_get0_data(name->d.dNSName);
+
+                    if (strcasecmp(san_hostname, hostname) == 0) {
+                        sk_GENERAL_NAME_pop_free(san_names, GENERAL_NAME_free);
+                        return true;
+                    }
+                }
+            }
+
+            sk_GENERAL_NAME_pop_free(san_names, GENERAL_NAME_free);
+        }
+
+        // Fallback to Common Name (CN)
+        X509_NAME* subject = X509_get_subject_name(cert);
+        char cn[256];
+
+        if (X509_NAME_get_text_by_NID(subject, NID_commonName,
+                                      cn, sizeof(cn)) > 0) {
+            return strcasecmp(cn, hostname) == 0;
+        }
+
+        return false;
+    }
+};
+
+2.3 TLS SESSION RESUMPTION
+---------------------------
+// Optimize TLS overhead by reusing sessions
+
+class TLSSessionCache {
+private:
+    std::unordered_map<std::string, SSL_SESSION*> sessions_;
+    std::mutex mutex_;
+
+public:
+    ~TLSSessionCache() {
+        for (auto& pair : sessions_) {
+            SSL_SESSION_free(pair.second);
+        }
+    }
+
+    void saveSession(const std::string& hostname, SSL_SESSION* session) {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        auto it = sessions_.find(hostname);
+        if (it != sessions_.end()) {
+            SSL_SESSION_free(it->second);
+        }
+
+        sessions_[hostname] = session;
+    }
+
+    SSL_SESSION* getSession(const std::string& hostname) {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        auto it = sessions_.find(hostname);
+        if (it != sessions_.end()) {
+            return it->second;
+        }
+
+        return nullptr;
+    }
+};
+
+// Usage
+bool connectWithSessionResumption(TLSConnection& conn,
+                                  const char* hostname,
+                                  TLSSessionCache& cache) {
+    // Get cached session
+    SSL_SESSION* session = cache.getSession(hostname);
+
+    if (session) {
+        // Reuse session (fast path)
+        SSL_set_session(conn.getSSL(), session);
+    }
+
+    // Connect
+    bool result = conn.connect(hostname, 443);
+
+    if (result) {
+        // Save new session
+        SSL_SESSION* new_session = SSL_get1_session(conn.getSSL());
+        if (new_session) {
+            cache.saveSession(hostname, new_session);
+        }
+    }
+
+    return result;
+}
+
+Performance:
+Full handshake: 10-50ms
+Session resumption: 1-5ms
+Improvement: 80-95%
+
+2.4 HARDWARE ACCELERATION
+--------------------------
+// Use Intel AES-NI for faster encryption
+
+void enableHardwareAcceleration(SSL_CTX* ctx) {
+    // OpenSSL automatically uses AES-NI if available
+    // Verify support:
+    const char* engine_id = "aesni";
+
+    ENGINE* engine = ENGINE_by_id(engine_id);
+    if (engine) {
+        ENGINE_init(engine);
+        ENGINE_set_default(engine, ENGINE_METHOD_ALL);
+        ENGINE_free(engine);
+    }
+}
+
+// Check CPU capabilities
+#include <cpuid.h>
+
+bool hasAESNI() {
+    unsigned int eax, ebx, ecx, edx;
+    __cpuid(1, eax, ebx, ecx, edx);
+    return (ecx & (1 << 25)) != 0;  // Check AES-NI bit
+}
+
+Performance with AES-NI:
+Without: ~2000ns per encrypt/decrypt
+With: ~200-500ns per encrypt/decrypt
+Improvement: 4-10x
+
+================================================================================
+3. AUTHENTICATION MECHANISMS
+================================================================================
+
+3.1 API KEY AUTHENTICATION
+---------------------------
+struct APICredentials {
+    std::string api_key;
+    std::string api_secret;
+    uint64_t timestamp;
+    std::string nonce;
+};
+
+// Generate signature
+std::string generateHMAC(const std::string& message,
+                        const std::string& secret) {
+    unsigned char hmac[EVP_MAX_MD_SIZE];
+    unsigned int hmac_len;
+
+    HMAC(EVP_sha256(),
+         secret.c_str(), secret.length(),
+         (unsigned char*)message.c_str(), message.length(),
+         hmac, &hmac_len);
+
+    // Convert to hex
+    std::stringstream ss;
+    for (unsigned int i = 0; i < hmac_len; ++i) {
+        ss << std::hex << std::setw(2) << std::setfill('0')
+           << (int)hmac[i];
+    }
+
+    return ss.str();
+}
+
+// Create signed request
+std::string createSignedRequest(const std::string& endpoint,
+                               const std::string& method,
+                               const std::string& body,
+                               const APICredentials& creds) {
+    // Create timestamp and nonce
+    uint64_t timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+
+    std::string nonce = generateNonce();
+
+    // Create message to sign
+    std::string message = method + endpoint + std::to_string(timestamp) +
+                         nonce + body;
+
+    // Generate signature
+    std::string signature = generateHMAC(message, creds.api_secret);
+
+    // Build request
+    std::stringstream request;
+    request << method << " " << endpoint << " HTTP/1.1\r\n";
+    request << "X-API-Key: " << creds.api_key << "\r\n";
+    request << "X-Timestamp: " << timestamp << "\r\n";
+    request << "X-Nonce: " << nonce << "\r\n";
+    request << "X-Signature: " << signature << "\r\n";
+    request << "Content-Length: " << body.length() << "\r\n";
+    request << "\r\n";
+    request << body;
+
+    return request.str();
+}
+
+// Verify signature (server-side)
+bool verifySignature(const std::string& method,
+                    const std::string& endpoint,
+                    const std::string& body,
+                    const std::string& api_key,
+                    const std::string& timestamp_str,
+                    const std::string& nonce,
+                    const std::string& signature) {
+    // Look up secret for API key
+    std::string api_secret = lookupAPISecret(api_key);
+    if (api_secret.empty()) return false;
+
+    // Check timestamp (prevent replay attacks)
+    uint64_t timestamp = std::stoull(timestamp_str);
+    uint64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+
+    if (abs((int64_t)(now - timestamp)) > 60000) {  // 60 second window
+        return false;
+    }
+
+    // Check nonce (prevent replay attacks)
+    if (!checkAndStoreNonce(nonce, timestamp)) {
+        return false;
+    }
+
+    // Recreate message
+    std::string message = method + endpoint + timestamp_str + nonce + body;
+
+    // Verify signature
+    std::string expected_signature = generateHMAC(message, api_secret);
+
+    return signature == expected_signature;
+}
+
+3.2 JWT (JSON WEB TOKENS)
+--------------------------
+#include <jwt-cpp/jwt.h>
+
+// Create JWT
+std::string createJWT(const std::string& user_id,
+                     const std::string& secret,
+                     int expiry_seconds = 3600) {
+    auto token = jwt::create()
+        .set_issuer("trading-system")
+        .set_subject(user_id)
+        .set_issued_at(std::chrono::system_clock::now())
+        .set_expires_at(std::chrono::system_clock::now() +
+                       std::chrono::seconds{expiry_seconds})
+        .set_payload_claim("permissions", jwt::claim(std::set<std::string>{
+            "read:positions", "write:orders"
+        }))
+        .sign(jwt::algorithm::hs256{secret});
+
+    return token;
+}
+
+// Verify JWT
+bool verifyJWT(const std::string& token, const std::string& secret,
+              std::string& user_id) {
+    try {
+        auto decoded = jwt::decode(token);
+
+        // Verify signature
+        auto verifier = jwt::verify()
+            .allow_algorithm(jwt::algorithm::hs256{secret})
+            .with_issuer("trading-system");
+
+        verifier.verify(decoded);
+
+        // Check expiration
+        if (decoded.get_expires_at() < std::chrono::system_clock::now()) {
+            return false;
+        }
+
+        // Extract user ID
+        user_id = decoded.get_subject();
+
+        return true;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "JWT verification failed: %s\n", e.what());
+        return false;
+    }
+}
+
+3.3 MUTUAL TLS (mTLS)
+---------------------
+// Both client and server authenticate with certificates
+
+bool initServerMTLS(SSL_CTX* ctx,
+                   const char* cert_file,
+                   const char* key_file,
+                   const char* ca_file) {
+    // Load server certificate
+    if (SSL_CTX_use_certificate_file(ctx, cert_file,
+                                     SSL_FILETYPE_PEM) <= 0) {
+        return false;
+    }
+
+    // Load server key
+    if (SSL_CTX_use_PrivateKey_file(ctx, key_file,
+                                    SSL_FILETYPE_PEM) <= 0) {
+        return false;
+    }
+
+    // Load CA certificates
+    if (!SSL_CTX_load_verify_locations(ctx, ca_file, nullptr)) {
+        return false;
+    }
+
+    // Require client certificate
+    SSL_CTX_set_verify(ctx,
+                      SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
+                      nullptr);
+
+    return true;
+}
+
+================================================================================
+4. MESSAGE SIGNING AND ENCRYPTION
+================================================================================
+
+4.1 HMAC MESSAGE SIGNING
+-------------------------
+class MessageSigner {
+private:
+    std::string secret_key_;
+
+public:
+    MessageSigner(const std::string& secret) : secret_key_(secret) {}
+
+    void signMessage(uint8_t* message, size_t message_length,
+                    uint8_t* signature, size_t* signature_length) {
+        unsigned int len;
+
+        HMAC(EVP_sha256(),
+             secret_key_.c_str(), secret_key_.length(),
+             message, message_length,
+             signature, &len);
+
+        *signature_length = len;
+    }
+
+    bool verifyMessage(const uint8_t* message, size_t message_length,
+                      const uint8_t* signature, size_t signature_length) {
+        unsigned char expected_sig[EVP_MAX_MD_SIZE];
+        unsigned int expected_len;
+
+        HMAC(EVP_sha256(),
+             secret_key_.c_str(), secret_key_.length(),
+             message, message_length,
+             expected_sig, &expected_len);
+
+        if (expected_len != signature_length) {
+            return false;
+        }
+
+        return CRYPTO_memcmp(signature, expected_sig, signature_length) == 0;
+    }
+};
+
+// Usage
+MessageSigner signer("shared-secret-key");
+
+// Sign message
+uint8_t message[128] = { /* message data */ };
+uint8_t signature[32];
+size_t sig_len;
+
+signer.signMessage(message, sizeof(message), signature, &sig_len);
+
+// Verify message
+bool valid = signer.verifyMessage(message, sizeof(message),
+                                 signature, sig_len);
+
+4.2 AES ENCRYPTION
+------------------
+class MessageEncryptor {
+private:
+    unsigned char key_[32];  // 256-bit key
+    unsigned char iv_[16];   // 128-bit IV
+
+public:
+    MessageEncryptor(const unsigned char* key, const unsigned char* iv) {
+        memcpy(key_, key, 32);
+        memcpy(iv_, iv, 16);
+    }
+
+    size_t encrypt(const unsigned char* plaintext, size_t plaintext_len,
+                  unsigned char* ciphertext) {
+        EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+        if (!ctx) return 0;
+
+        int len;
+        size_t ciphertext_len = 0;
+
+        // Initialize encryption
+        if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr,
+                              key_, iv_) != 1) {
+            EVP_CIPHER_CTX_free(ctx);
+            return 0;
+        }
+
+        // Encrypt
+        if (EVP_EncryptUpdate(ctx, ciphertext, &len,
+                             plaintext, plaintext_len) != 1) {
+            EVP_CIPHER_CTX_free(ctx);
+            return 0;
+        }
+        ciphertext_len = len;
+
+        // Finalize
+        if (EVP_EncryptFinal_ex(ctx, ciphertext + len, &len) != 1) {
+            EVP_CIPHER_CTX_free(ctx);
+            return 0;
+        }
+        ciphertext_len += len;
+
+        // Get authentication tag
+        unsigned char tag[16];
+        if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, 16, tag) != 1) {
+            EVP_CIPHER_CTX_free(ctx);
+            return 0;
+        }
+
+        // Append tag to ciphertext
+        memcpy(ciphertext + ciphertext_len, tag, 16);
+        ciphertext_len += 16;
+
+        EVP_CIPHER_CTX_free(ctx);
+        return ciphertext_len;
+    }
+
+    size_t decrypt(const unsigned char* ciphertext, size_t ciphertext_len,
+                  unsigned char* plaintext) {
+        EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+        if (!ctx) return 0;
+
+        int len;
+        size_t plaintext_len = 0;
+
+        // Extract authentication tag
+        unsigned char tag[16];
+        memcpy(tag, ciphertext + ciphertext_len - 16, 16);
+        ciphertext_len -= 16;
+
+        // Initialize decryption
+        if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr,
+                              key_, iv_) != 1) {
+            EVP_CIPHER_CTX_free(ctx);
+            return 0;
+        }
+
+        // Decrypt
+        if (EVP_DecryptUpdate(ctx, plaintext, &len,
+                             ciphertext, ciphertext_len) != 1) {
+            EVP_CIPHER_CTX_free(ctx);
+            return 0;
+        }
+        plaintext_len = len;
+
+        // Set authentication tag
+        if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, tag) != 1) {
+            EVP_CIPHER_CTX_free(ctx);
+            return 0;
+        }
+
+        // Finalize (verifies tag)
+        if (EVP_DecryptFinal_ex(ctx, plaintext + len, &len) != 1) {
+            EVP_CIPHER_CTX_free(ctx);
+            return 0;  // Authentication failed
+        }
+        plaintext_len += len;
+
+        EVP_CIPHER_CTX_free(ctx);
+        return plaintext_len;
+    }
+};
+
+4.3 RSA DIGITAL SIGNATURES
+---------------------------
+class RSASigner {
+private:
+    EVP_PKEY* private_key_;
+    EVP_PKEY* public_key_;
+
+public:
+    bool loadKeys(const char* private_key_file,
+                 const char* public_key_file) {
+        // Load private key
+        FILE* fp = fopen(private_key_file, "r");
+        if (!fp) return false;
+
+        private_key_ = PEM_read_PrivateKey(fp, nullptr, nullptr, nullptr);
+        fclose(fp);
+
+        if (!private_key_) return false;
+
+        // Load public key
+        fp = fopen(public_key_file, "r");
+        if (!fp) return false;
+
+        public_key_ = PEM_read_PUBKEY(fp, nullptr, nullptr, nullptr);
+        fclose(fp);
+
+        return public_key_ != nullptr;
+    }
+
+    ~RSASigner() {
+        if (private_key_) EVP_PKEY_free(private_key_);
+        if (public_key_) EVP_PKEY_free(public_key_);
+    }
+
+    bool sign(const unsigned char* message, size_t message_len,
+             unsigned char* signature, size_t* signature_len) {
+        EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+        if (!ctx) return false;
+
+        if (EVP_DigestSignInit(ctx, nullptr, EVP_sha256(), nullptr,
+                              private_key_) != 1) {
+            EVP_MD_CTX_free(ctx);
+            return false;
+        }
+
+        if (EVP_DigestSign(ctx, signature, signature_len,
+                          message, message_len) != 1) {
+            EVP_MD_CTX_free(ctx);
+            return false;
+        }
+
+        EVP_MD_CTX_free(ctx);
+        return true;
+    }
+
+    bool verify(const unsigned char* message, size_t message_len,
+               const unsigned char* signature, size_t signature_len) {
+        EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+        if (!ctx) return false;
+
+        if (EVP_DigestVerifyInit(ctx, nullptr, EVP_sha256(), nullptr,
+                                public_key_) != 1) {
+            EVP_MD_CTX_free(ctx);
+            return false;
+        }
+
+        int result = EVP_DigestVerify(ctx, signature, signature_len,
+                                      message, message_len);
+
+        EVP_MD_CTX_free(ctx);
+        return result == 1;
+    }
+};
+
+================================================================================
+5. SESSION SECURITY
+================================================================================
+
+5.1 SEQUENCE NUMBER MANAGEMENT
+-------------------------------
+class SecureSequenceManager {
+private:
+    uint64_t next_send_seq_;
+    uint64_t next_recv_seq_;
+    std::unordered_set<uint64_t> received_seqs_;  // Replay detection
+    std::mutex mutex_;
+
+public:
+    SecureSequenceManager()
+        : next_send_seq_(1), next_recv_seq_(1) {}
+
+    uint64_t getNextSendSequence() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return next_send_seq_++;
+    }
+
+    bool validateReceiveSequence(uint64_t seq_num) {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        // Check for replay
+        if (received_seqs_.count(seq_num)) {
+            return false;  // Duplicate/replay
+        }
+
+        // Check for gaps
+        if (seq_num < next_recv_seq_) {
+            return false;  // Out of order
+        }
+
+        // Store received sequence
+        received_seqs_.insert(seq_num);
+
+        // Clean up old sequences (keep last 1000)
+        if (received_seqs_.size() > 1000) {
+            auto it = received_seqs_.begin();
+            received_seqs_.erase(it);
+        }
+
+        next_recv_seq_ = seq_num + 1;
+        return true;
+    }
+
+    void reset() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        next_send_seq_ = 1;
+        next_recv_seq_ = 1;
+        received_seqs_.clear();
+    }
+};
+
+5.2 SESSION TOKEN MANAGEMENT
+-----------------------------
+class SessionTokenManager {
+private:
+    struct SessionToken {
+        std::string token;
+        uint64_t created_at;
+        uint64_t expires_at;
+        std::string user_id;
+    };
+
+    std::unordered_map<std::string, SessionToken> active_tokens_;
+    std::mutex mutex_;
+
+public:
+    std::string createToken(const std::string& user_id,
+                           int validity_seconds = 3600) {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        // Generate random token
+        unsigned char random_bytes[32];
+        RAND_bytes(random_bytes, 32);
+
+        std::string token = base64Encode(random_bytes, 32);
+
+        // Store token
+        SessionToken session;
+        session.token = token;
+        session.user_id = user_id;
+        session.created_at = getCurrentTimestamp();
+        session.expires_at = session.created_at + validity_seconds;
+
+        active_tokens_[token] = session;
+
+        return token;
+    }
+
+    bool validateToken(const std::string& token, std::string& user_id) {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        auto it = active_tokens_.find(

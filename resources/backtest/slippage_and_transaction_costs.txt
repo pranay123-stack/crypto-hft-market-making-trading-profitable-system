@@ -1,0 +1,1097 @@
+================================================================================
+SLIPPAGE AND TRANSACTION COSTS MODELING
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Transaction Cost Overview
+2. Commission Models
+3. Slippage Models
+4. Market Impact Models
+5. Bid-Ask Spread Modeling
+6. Realistic Fill Simulation
+7. Exchange Fee Structures
+8. Latency Cost Modeling
+9. Complete Implementation
+10. Cost Analysis Tools
+
+================================================================================
+1. TRANSACTION COST OVERVIEW
+================================================================================
+
+Transaction costs in HFT include multiple components:
+
+Total Transaction Cost = Commission + Slippage + Market Impact +
+                        Spread Cost + Opportunity Cost + Latency Cost
+
+Component Breakdown:
+--------------------
+
+1. Commission: Fixed or variable fees charged by broker/exchange
+   - Maker fees (provide liquidity): Typically -$0.0002 to $0.0005 per share
+   - Taker fees (remove liquidity): Typically $0.0003 to $0.0030 per share
+   - Can be negative (rebates) for adding liquidity
+
+2. Slippage: Difference between expected and actual execution price
+   - Caused by market movement during order placement
+   - Increases with order size and market volatility
+
+3. Market Impact: Price movement caused by the order itself
+   - Temporary impact: Immediate price movement
+   - Permanent impact: Lasting price change
+   - Non-linear relationship with order size
+
+4. Spread Cost: Cost of crossing the bid-ask spread
+   - For market orders: Full spread
+   - For limit orders: Partial or zero spread cost
+
+5. Opportunity Cost: Cost of not getting filled
+   - Missed profit from unfilled passive orders
+   - Price improvement opportunities
+
+6. Latency Cost: Cost due to information delay
+   - Network latency
+   - Processing latency
+   - Queue delays
+
+================================================================================
+2. COMMISSION MODELS
+================================================================================
+
+/*******************************************************************************
+ * COMMISSION CALCULATOR
+ ******************************************************************************/
+
+#pragma once
+#include <cmath>
+#include <string>
+#include <map>
+
+namespace HFT {
+namespace Backtest {
+namespace Costs {
+
+enum class CommissionType {
+    FIXED_PER_SHARE,
+    FIXED_PER_TRADE,
+    PERCENTAGE,
+    TIERED,
+    MAKER_TAKER,
+    EXCHANGE_SPECIFIC
+};
+
+/*******************************************************************************
+ * BASE COMMISSION MODEL
+ ******************************************************************************/
+
+class ICommissionModel {
+public:
+    virtual ~ICommissionModel() = default;
+
+    virtual double calculate(double price,
+                            int64_t quantity,
+                            bool is_maker,
+                            const std::string& symbol) const = 0;
+
+    virtual std::string get_model_name() const = 0;
+};
+
+/*******************************************************************************
+ * FIXED PER SHARE COMMISSION
+ ******************************************************************************/
+
+class FixedPerShareCommission : public ICommissionModel {
+private:
+    double rate_per_share_;
+    double min_commission_;
+    double max_commission_;
+
+public:
+    FixedPerShareCommission(double rate = 0.0005,
+                           double min_comm = 1.0,
+                           double max_comm = 0.005)  // 0.5% of trade value
+        : rate_per_share_(rate),
+          min_commission_(min_comm),
+          max_commission_(max_comm) {}
+
+    double calculate(double price,
+                    int64_t quantity,
+                    bool is_maker,
+                    const std::string& symbol) const override {
+
+        double commission = quantity * rate_per_share_;
+        double max_allowed = price * quantity * max_commission_;
+
+        commission = std::max(commission, min_commission_);
+        commission = std::min(commission, max_allowed);
+
+        return commission;
+    }
+
+    std::string get_model_name() const override {
+        return "FixedPerShare";
+    }
+};
+
+/*******************************************************************************
+ * PERCENTAGE COMMISSION
+ ******************************************************************************/
+
+class PercentageCommission : public ICommissionModel {
+private:
+    double rate_;
+    double min_commission_;
+
+public:
+    PercentageCommission(double rate = 0.001,  // 0.1%
+                        double min_comm = 1.0)
+        : rate_(rate),
+          min_commission_(min_comm) {}
+
+    double calculate(double price,
+                    int64_t quantity,
+                    bool is_maker,
+                    const std::string& symbol) const override {
+
+        double trade_value = price * quantity;
+        double commission = trade_value * rate_;
+
+        return std::max(commission, min_commission_);
+    }
+
+    std::string get_model_name() const override {
+        return "Percentage";
+    }
+};
+
+/*******************************************************************************
+ * MAKER-TAKER COMMISSION MODEL
+ ******************************************************************************/
+
+class MakerTakerCommission : public ICommissionModel {
+private:
+    double maker_rate_;   // Can be negative (rebate)
+    double taker_rate_;
+
+public:
+    MakerTakerCommission(double maker_rate = -0.00015,  // $0.00015 rebate
+                        double taker_rate = 0.0003)     // $0.0003 fee
+        : maker_rate_(maker_rate),
+          taker_rate_(taker_rate) {}
+
+    double calculate(double price,
+                    int64_t quantity,
+                    bool is_maker,
+                    const std::string& symbol) const override {
+
+        double rate = is_maker ? maker_rate_ : taker_rate_;
+        return quantity * rate;
+    }
+
+    std::string get_model_name() const override {
+        return "MakerTaker";
+    }
+};
+
+/*******************************************************************************
+ * TIERED COMMISSION MODEL
+ ******************************************************************************/
+
+class TieredCommission : public ICommissionModel {
+private:
+    struct Tier {
+        int64_t volume_threshold;  // Monthly volume
+        double rate;
+    };
+
+    std::vector<Tier> tiers_;
+    int64_t current_monthly_volume_;
+
+public:
+    TieredCommission() : current_monthly_volume_(0) {
+        // Example tiers (shares per month)
+        tiers_ = {
+            {0,          0.0010},  // $0.0010 per share for 0-1M shares
+            {1000000,    0.0008},  // $0.0008 per share for 1M-10M shares
+            {10000000,   0.0005},  // $0.0005 per share for 10M+ shares
+            {100000000,  0.0003}   // $0.0003 per share for 100M+ shares
+        };
+    }
+
+    double calculate(double price,
+                    int64_t quantity,
+                    bool is_maker,
+                    const std::string& symbol) const override {
+
+        double rate = get_rate_for_volume(current_monthly_volume_);
+        return quantity * rate;
+    }
+
+    void update_monthly_volume(int64_t volume) {
+        current_monthly_volume_ = volume;
+    }
+
+    void reset_monthly_volume() {
+        current_monthly_volume_ = 0;
+    }
+
+    std::string get_model_name() const override {
+        return "Tiered";
+    }
+
+private:
+    double get_rate_for_volume(int64_t volume) const {
+        double rate = tiers_[0].rate;
+
+        for (const auto& tier : tiers_) {
+            if (volume >= tier.volume_threshold) {
+                rate = tier.rate;
+            } else {
+                break;
+            }
+        }
+
+        return rate;
+    }
+};
+
+/*******************************************************************************
+ * EXCHANGE-SPECIFIC COMMISSION MODELS
+ ******************************************************************************/
+
+class ExchangeCommissionModel : public ICommissionModel {
+private:
+    std::map<std::string, std::unique_ptr<ICommissionModel>> exchange_models_;
+    std::unique_ptr<ICommissionModel> default_model_;
+
+public:
+    ExchangeCommissionModel() {
+        // Default model
+        default_model_ = std::make_unique<MakerTakerCommission>();
+
+        // NASDAQ (example rates)
+        exchange_models_["NASDAQ"] = std::make_unique<MakerTakerCommission>(
+            -0.00020,  // Maker rebate
+            0.00030    // Taker fee
+        );
+
+        // NYSE (example rates)
+        exchange_models_["NYSE"] = std::make_unique<MakerTakerCommission>(
+            -0.00015,  // Maker rebate
+            0.00025    // Taker fee
+        );
+
+        // BATS (example rates)
+        exchange_models_["BATS"] = std::make_unique<MakerTakerCommission>(
+            -0.00025,  // Maker rebate
+            0.00028    // Taker fee
+        );
+    }
+
+    void set_exchange_model(const std::string& exchange,
+                           std::unique_ptr<ICommissionModel> model) {
+        exchange_models_[exchange] = std::move(model);
+    }
+
+    double calculate(double price,
+                    int64_t quantity,
+                    bool is_maker,
+                    const std::string& symbol) const override {
+
+        // Extract exchange from symbol or use default
+        std::string exchange = extract_exchange(symbol);
+
+        auto it = exchange_models_.find(exchange);
+        if (it != exchange_models_.end()) {
+            return it->second->calculate(price, quantity, is_maker, symbol);
+        }
+
+        return default_model_->calculate(price, quantity, is_maker, symbol);
+    }
+
+    std::string get_model_name() const override {
+        return "ExchangeSpecific";
+    }
+
+private:
+    std::string extract_exchange(const std::string& symbol) const {
+        // Simple extraction - can be more sophisticated
+        size_t pos = symbol.find('.');
+        if (pos != std::string::npos && pos + 1 < symbol.length()) {
+            return symbol.substr(pos + 1);
+        }
+        return "DEFAULT";
+    }
+};
+
+================================================================================
+3. SLIPPAGE MODELS
+================================================================================
+
+/*******************************************************************************
+ * SLIPPAGE CALCULATOR
+ ******************************************************************************/
+
+enum class SlippageType {
+    FIXED,
+    PERCENTAGE,
+    VOLUME_DEPENDENT,
+    SPREAD_DEPENDENT,
+    VOLATILITY_DEPENDENT,
+    REALISTIC
+};
+
+/*******************************************************************************
+ * BASE SLIPPAGE MODEL
+ ******************************************************************************/
+
+class ISlippageModel {
+public:
+    virtual ~ISlippageModel() = default;
+
+    virtual double calculate_slippage(double price,
+                                     int64_t order_size,
+                                     int64_t available_liquidity,
+                                     double spread,
+                                     double volatility,
+                                     bool is_buy) const = 0;
+
+    virtual std::string get_model_name() const = 0;
+};
+
+/*******************************************************************************
+ * FIXED SLIPPAGE MODEL
+ ******************************************************************************/
+
+class FixedSlippageModel : public ISlippageModel {
+private:
+    double slippage_bps_;  // Slippage in basis points
+
+public:
+    FixedSlippageModel(double slippage_bps = 1.0)
+        : slippage_bps_(slippage_bps) {}
+
+    double calculate_slippage(double price,
+                             int64_t order_size,
+                             int64_t available_liquidity,
+                             double spread,
+                             double volatility,
+                             bool is_buy) const override {
+
+        double slippage = price * (slippage_bps_ / 10000.0);
+        return is_buy ? slippage : -slippage;
+    }
+
+    std::string get_model_name() const override {
+        return "FixedSlippage";
+    }
+};
+
+/*******************************************************************************
+ * VOLUME-DEPENDENT SLIPPAGE MODEL
+ ******************************************************************************/
+
+class VolumeDependentSlippage : public ISlippageModel {
+private:
+    double base_slippage_bps_;
+    double volume_impact_factor_;
+
+public:
+    VolumeDependentSlippage(double base_bps = 0.5,
+                           double volume_factor = 0.5)
+        : base_slippage_bps_(base_bps),
+          volume_impact_factor_(volume_factor) {}
+
+    double calculate_slippage(double price,
+                             int64_t order_size,
+                             int64_t available_liquidity,
+                             double spread,
+                             double volatility,
+                             bool is_buy) const override {
+
+        if (available_liquidity == 0) {
+            return price * 0.01;  // 100 bps if no liquidity
+        }
+
+        // Volume ratio
+        double volume_ratio = static_cast<double>(order_size) /
+                             available_liquidity;
+
+        // Non-linear impact: square root model
+        double impact = base_slippage_bps_ *
+                       (1.0 + volume_impact_factor_ * std::sqrt(volume_ratio));
+
+        double slippage = price * (impact / 10000.0);
+        return is_buy ? slippage : -slippage;
+    }
+
+    std::string get_model_name() const override {
+        return "VolumeDependentSlippage";
+    }
+};
+
+/*******************************************************************************
+ * SPREAD-DEPENDENT SLIPPAGE MODEL
+ ******************************************************************************/
+
+class SpreadDependentSlippage : public ISlippageModel {
+private:
+    double spread_factor_;
+
+public:
+    SpreadDependentSlippage(double spread_factor = 0.5)
+        : spread_factor_(spread_factor) {}
+
+    double calculate_slippage(double price,
+                             int64_t order_size,
+                             int64_t available_liquidity,
+                             double spread,
+                             double volatility,
+                             bool is_buy) const override {
+
+        // Slippage proportional to spread
+        double slippage = spread * spread_factor_;
+        return is_buy ? slippage : -slippage;
+    }
+
+    std::string get_model_name() const override {
+        return "SpreadDependentSlippage";
+    }
+};
+
+/*******************************************************************************
+ * REALISTIC SLIPPAGE MODEL
+ * Combines multiple factors: volume, spread, volatility
+ ******************************************************************************/
+
+class RealisticSlippageModel : public ISlippageModel {
+private:
+    double base_slippage_bps_;
+    double volume_factor_;
+    double spread_factor_;
+    double volatility_factor_;
+
+public:
+    RealisticSlippageModel(double base_bps = 0.3,
+                          double vol_factor = 0.4,
+                          double spread_factor = 0.3,
+                          double volatility_factor = 0.2)
+        : base_slippage_bps_(base_bps),
+          volume_factor_(vol_factor),
+          spread_factor_(spread_factor),
+          volatility_factor_(volatility_factor) {}
+
+    double calculate_slippage(double price,
+                             int64_t order_size,
+                             int64_t available_liquidity,
+                             double spread,
+                             double volatility,
+                             bool is_buy) const override {
+
+        // Base slippage
+        double total_slippage = base_slippage_bps_;
+
+        // Volume component
+        if (available_liquidity > 0) {
+            double volume_ratio = static_cast<double>(order_size) /
+                                 available_liquidity;
+            total_slippage += volume_factor_ * 100.0 * std::sqrt(volume_ratio);
+        }
+
+        // Spread component
+        double spread_bps = (spread / price) * 10000.0;
+        total_slippage += spread_factor_ * spread_bps;
+
+        // Volatility component (assuming volatility is in decimal form)
+        double volatility_bps = volatility * 10000.0;
+        total_slippage += volatility_factor_ * volatility_bps;
+
+        // Convert to price
+        double slippage = price * (total_slippage / 10000.0);
+        return is_buy ? slippage : -slippage;
+    }
+
+    std::string get_model_name() const override {
+        return "RealisticSlippage";
+    }
+};
+
+================================================================================
+4. MARKET IMPACT MODELS
+================================================================================
+
+/*******************************************************************************
+ * MARKET IMPACT CALCULATOR
+ ******************************************************************************/
+
+class IMarketImpactModel {
+public:
+    virtual ~IMarketImpactModel() = default;
+
+    struct ImpactResult {
+        double temporary_impact;
+        double permanent_impact;
+        double total_impact;
+    };
+
+    virtual ImpactResult calculate_impact(
+        double price,
+        int64_t order_size,
+        double daily_volume,
+        double volatility) const = 0;
+
+    virtual std::string get_model_name() const = 0;
+};
+
+/*******************************************************************************
+ * SQUARE ROOT IMPACT MODEL (Almgren-Chriss)
+ ******************************************************************************/
+
+class SquareRootImpactModel : public IMarketImpactModel {
+private:
+    double temporary_impact_coeff_;
+    double permanent_impact_coeff_;
+
+public:
+    SquareRootImpactModel(double temp_coeff = 0.1,
+                         double perm_coeff = 0.01)
+        : temporary_impact_coeff_(temp_coeff),
+          permanent_impact_coeff_(perm_coeff) {}
+
+    ImpactResult calculate_impact(
+        double price,
+        int64_t order_size,
+        double daily_volume,
+        double volatility) const override {
+
+        ImpactResult result;
+
+        if (daily_volume == 0) {
+            result.temporary_impact = 0.0;
+            result.permanent_impact = 0.0;
+            result.total_impact = 0.0;
+            return result;
+        }
+
+        // Participation rate
+        double participation = static_cast<double>(order_size) / daily_volume;
+
+        // Temporary impact (square root model)
+        result.temporary_impact = price * volatility *
+                                 temporary_impact_coeff_ *
+                                 std::sqrt(participation);
+
+        // Permanent impact (linear model)
+        result.permanent_impact = price * volatility *
+                                 permanent_impact_coeff_ *
+                                 participation;
+
+        result.total_impact = result.temporary_impact + result.permanent_impact;
+
+        return result;
+    }
+
+    std::string get_model_name() const override {
+        return "SquareRootImpact";
+    }
+};
+
+/*******************************************************************************
+ * LINEAR IMPACT MODEL
+ ******************************************************************************/
+
+class LinearImpactModel : public IMarketImpactModel {
+private:
+    double impact_coeff_;
+
+public:
+    LinearImpactModel(double coeff = 0.01)
+        : impact_coeff_(coeff) {}
+
+    ImpactResult calculate_impact(
+        double price,
+        int64_t order_size,
+        double daily_volume,
+        double volatility) const override {
+
+        ImpactResult result;
+
+        if (daily_volume == 0) {
+            result.temporary_impact = 0.0;
+            result.permanent_impact = 0.0;
+            result.total_impact = 0.0;
+            return result;
+        }
+
+        double participation = static_cast<double>(order_size) / daily_volume;
+        result.total_impact = price * impact_coeff_ * participation;
+
+        // Split into temporary and permanent
+        result.temporary_impact = result.total_impact * 0.7;
+        result.permanent_impact = result.total_impact * 0.3;
+
+        return result;
+    }
+
+    std::string get_model_name() const override {
+        return "LinearImpact";
+    }
+};
+
+================================================================================
+5. BID-ASK SPREAD MODELING
+================================================================================
+
+/*******************************************************************************
+ * SPREAD COST CALCULATOR
+ ******************************************************************************/
+
+class SpreadCostCalculator {
+public:
+    // Full spread cost for aggressive market orders
+    static double calculate_market_order_spread_cost(
+        double bid_price,
+        double ask_price,
+        int64_t quantity,
+        bool is_buy) {
+
+        double spread = ask_price - bid_price;
+        double mid_price = (bid_price + ask_price) / 2.0;
+
+        // Market orders pay half the spread as cost
+        double cost_per_share = spread / 2.0;
+
+        return quantity * cost_per_share;
+    }
+
+    // Partial spread cost for limit orders
+    static double calculate_limit_order_spread_cost(
+        double limit_price,
+        double bid_price,
+        double ask_price,
+        int64_t quantity,
+        bool is_buy) {
+
+        double mid_price = (bid_price + ask_price) / 2.0;
+
+        double cost_per_share;
+        if (is_buy) {
+            // Buy limit order
+            if (limit_price >= ask_price) {
+                // Aggressive - crosses spread
+                cost_per_share = limit_price - mid_price;
+            } else if (limit_price > bid_price) {
+                // Inside spread
+                cost_per_share = limit_price - mid_price;
+            } else {
+                // Passive - at or below bid
+                cost_per_share = 0.0;  // May get rebate
+            }
+        } else {
+            // Sell limit order
+            if (limit_price <= bid_price) {
+                // Aggressive - crosses spread
+                cost_per_share = mid_price - limit_price;
+            } else if (limit_price < ask_price) {
+                // Inside spread
+                cost_per_share = mid_price - limit_price;
+            } else {
+                // Passive - at or above ask
+                cost_per_share = 0.0;  // May get rebate
+            }
+        }
+
+        return quantity * std::abs(cost_per_share);
+    }
+
+    // Effective spread (what was actually paid)
+    static double calculate_effective_spread(
+        double execution_price,
+        double mid_price_at_execution,
+        int64_t quantity,
+        bool is_buy) {
+
+        double diff = is_buy ?
+            (execution_price - mid_price_at_execution) :
+            (mid_price_at_execution - execution_price);
+
+        return quantity * diff * 2.0;  // Multiply by 2 to get full spread equivalent
+    }
+
+    // Realized spread (excludes post-trade price movement)
+    static double calculate_realized_spread(
+        double execution_price,
+        double mid_price_at_execution,
+        double mid_price_after,
+        int64_t quantity,
+        bool is_buy) {
+
+        double effective = calculate_effective_spread(
+            execution_price, mid_price_at_execution, quantity, is_buy);
+
+        // Price change component
+        double price_change = is_buy ?
+            (mid_price_after - mid_price_at_execution) :
+            (mid_price_at_execution - mid_price_after);
+
+        return effective - (quantity * price_change * 2.0);
+    }
+};
+
+================================================================================
+6. REALISTIC FILL SIMULATION
+================================================================================
+
+/*******************************************************************************
+ * FILL PROBABILITY MODEL
+ ******************************************************************************/
+
+class FillProbabilityModel {
+public:
+    // Calculate probability of limit order getting filled
+    static double calculate_fill_probability(
+        double limit_price,
+        double current_best_price,
+        double spread,
+        double volatility,
+        int time_horizon_seconds) {
+
+        if (spread == 0) return 0.5;
+
+        // Distance from best price as fraction of spread
+        double distance = std::abs(limit_price - current_best_price);
+        double normalized_distance = distance / spread;
+
+        // Time factor - more time = higher probability
+        double time_factor = std::sqrt(static_cast<double>(time_horizon_seconds) / 60.0);
+
+        // Volatility factor - higher volatility = higher probability
+        double vol_factor = 1.0 + volatility * 10.0;
+
+        // Exponential decay with distance
+        double base_prob = std::exp(-2.0 * normalized_distance);
+
+        return std::min(0.99, base_prob * time_factor * vol_factor);
+    }
+
+    // Queue position impact on fill probability
+    static double adjust_for_queue_position(
+        double base_probability,
+        int64_t our_size,
+        int64_t total_size_at_level) {
+
+        if (total_size_at_level == 0) return base_probability;
+
+        double queue_position = static_cast<double>(our_size) / total_size_at_level;
+
+        // Adjust probability based on queue position
+        return base_probability * (1.0 - queue_position * 0.5);
+    }
+};
+
+/*******************************************************************************
+ * PARTIAL FILL SIMULATOR
+ ******************************************************************************/
+
+class PartialFillSimulator {
+public:
+    struct FillResult {
+        int64_t filled_quantity;
+        double avg_fill_price;
+        double total_commission;
+        double total_slippage;
+        bool fully_filled;
+    };
+
+    static FillResult simulate_market_order(
+        int64_t order_size,
+        const std::vector<std::pair<double, int64_t>>& levels,  // price, size
+        bool is_buy,
+        ICommissionModel& commission_model,
+        const std::string& symbol) {
+
+        FillResult result;
+        result.filled_quantity = 0;
+        result.total_commission = 0.0;
+        result.total_slippage = 0.0;
+        result.fully_filled = false;
+
+        int64_t remaining = order_size;
+        double total_cost = 0.0;
+
+        for (const auto& [price, available_size] : levels) {
+            if (remaining == 0) break;
+
+            int64_t fill_qty = std::min(remaining, available_size);
+
+            double commission = commission_model.calculate(
+                price, fill_qty, false, symbol);
+
+            result.filled_quantity += fill_qty;
+            result.total_commission += commission;
+            total_cost += fill_qty * price;
+
+            remaining -= fill_qty;
+        }
+
+        if (result.filled_quantity > 0) {
+            result.avg_fill_price = total_cost / result.filled_quantity;
+            result.fully_filled = (remaining == 0);
+        }
+
+        return result;
+    }
+};
+
+================================================================================
+7. LATENCY COST MODELING
+================================================================================
+
+/*******************************************************************************
+ * LATENCY IMPACT CALCULATOR
+ ******************************************************************************/
+
+class LatencyImpactModel {
+public:
+    // Calculate cost of latency based on price movement
+    static double calculate_latency_cost(
+        double price,
+        int64_t quantity,
+        double volatility,          // Price volatility (std dev)
+        double latency_ms,          // Latency in milliseconds
+        bool is_buy) {
+
+        // Assume price follows random walk
+        // Expected price move = volatility * sqrt(time)
+        double time_seconds = latency_ms / 1000.0;
+        double expected_move = volatility * std::sqrt(time_seconds / (252.0 * 6.5 * 3600.0));
+
+        // Cost is quantity * expected adverse move
+        double cost_per_share = expected_move / 2.0;  // Average case
+
+        return quantity * cost_per_share;
+    }
+
+    // Calculate opportunity cost of delay
+    static double calculate_opportunity_cost(
+        double initial_signal_price,
+        double actual_execution_price,
+        int64_t quantity,
+        bool is_buy) {
+
+        double price_diff = is_buy ?
+            (actual_execution_price - initial_signal_price) :
+            (initial_signal_price - actual_execution_price);
+
+        return quantity * std::max(0.0, price_diff);
+    }
+};
+
+================================================================================
+8. COMPLETE TRANSACTION COST CALCULATOR
+================================================================================
+
+/*******************************************************************************
+ * UNIFIED TRANSACTION COST CALCULATOR
+ ******************************************************************************/
+
+class TransactionCostCalculator {
+public:
+    struct CostBreakdown {
+        double commission;
+        double slippage;
+        double market_impact;
+        double spread_cost;
+        double latency_cost;
+        double total_cost;
+
+        double cost_bps;  // Total cost in basis points
+
+        CostBreakdown()
+            : commission(0.0), slippage(0.0),
+              market_impact(0.0), spread_cost(0.0),
+              latency_cost(0.0), total_cost(0.0),
+              cost_bps(0.0) {}
+    };
+
+private:
+    std::unique_ptr<ICommissionModel> commission_model_;
+    std::unique_ptr<ISlippageModel> slippage_model_;
+    std::unique_ptr<IMarketImpactModel> impact_model_;
+
+public:
+    TransactionCostCalculator(
+        std::unique_ptr<ICommissionModel> comm_model,
+        std::unique_ptr<ISlippageModel> slip_model,
+        std::unique_ptr<IMarketImpactModel> impact_model)
+        : commission_model_(std::move(comm_model)),
+          slippage_model_(std::move(slip_model)),
+          impact_model_(std::move(impact_model)) {}
+
+    CostBreakdown calculate_total_cost(
+        double price,
+        int64_t quantity,
+        double bid_price,
+        double ask_price,
+        int64_t available_liquidity,
+        double daily_volume,
+        double volatility,
+        double latency_ms,
+        bool is_buy,
+        bool is_maker,
+        const std::string& symbol) {
+
+        CostBreakdown cost;
+
+        // Commission
+        cost.commission = commission_model_->calculate(
+            price, quantity, is_maker, symbol);
+
+        // Slippage
+        double spread = ask_price - bid_price;
+        double slippage_per_share = slippage_model_->calculate_slippage(
+            price, quantity, available_liquidity, spread, volatility, is_buy);
+        cost.slippage = std::abs(slippage_per_share) * quantity;
+
+        // Market impact
+        auto impact = impact_model_->calculate_impact(
+            price, quantity, daily_volume, volatility);
+        cost.market_impact = impact.total_impact * quantity;
+
+        // Spread cost (if crossing)
+        if (!is_maker) {
+            cost.spread_cost = SpreadCostCalculator::calculate_market_order_spread_cost(
+                bid_price, ask_price, quantity, is_buy);
+        }
+
+        // Latency cost
+        cost.latency_cost = LatencyImpactModel::calculate_latency_cost(
+            price, quantity, volatility, latency_ms, is_buy);
+
+        // Total
+        cost.total_cost = cost.commission + cost.slippage +
+                         cost.market_impact + cost.spread_cost +
+                         cost.latency_cost;
+
+        // Cost in basis points
+        double trade_value = price * quantity;
+        if (trade_value > 0.0) {
+            cost.cost_bps = (cost.total_cost / trade_value) * 10000.0;
+        }
+
+        return cost;
+    }
+
+    void print_cost_breakdown(const CostBreakdown& cost) {
+        printf("\n");
+        printf("Transaction Cost Breakdown:\n");
+        printf("---------------------------\n");
+        printf("Commission:      $%.2f\n", cost.commission);
+        printf("Slippage:        $%.2f\n", cost.slippage);
+        printf("Market Impact:   $%.2f\n", cost.market_impact);
+        printf("Spread Cost:     $%.2f\n", cost.spread_cost);
+        printf("Latency Cost:    $%.2f\n", cost.latency_cost);
+        printf("---------------------------\n");
+        printf("Total Cost:      $%.2f\n", cost.total_cost);
+        printf("Cost (bps):      %.2f\n", cost.cost_bps);
+        printf("\n");
+    }
+};
+
+================================================================================
+9. COST ANALYSIS TOOLS
+================================================================================
+
+/*******************************************************************************
+ * TRANSACTION COST ANALYZER
+ ******************************************************************************/
+
+class TransactionCostAnalyzer {
+public:
+    struct AggregatedCosts {
+        double total_commission;
+        double total_slippage;
+        double total_market_impact;
+        double total_spread_cost;
+        double total_latency_cost;
+        double total_cost;
+
+        double avg_commission_per_trade;
+        double avg_slippage_per_trade;
+        double avg_total_cost_per_trade;
+        double avg_cost_bps;
+
+        int total_trades;
+
+        AggregatedCosts()
+            : total_commission(0.0), total_slippage(0.0),
+              total_market_impact(0.0), total_spread_cost(0.0),
+              total_latency_cost(0.0), total_cost(0.0),
+              avg_commission_per_trade(0.0), avg_slippage_per_trade(0.0),
+              avg_total_cost_per_trade(0.0), avg_cost_bps(0.0),
+              total_trades(0) {}
+    };
+
+    static AggregatedCosts aggregate_costs(
+        const std::vector<TransactionCostCalculator::CostBreakdown>& costs) {
+
+        AggregatedCosts agg;
+        agg.total_trades = costs.size();
+
+        if (costs.empty()) {
+            return agg;
+        }
+
+        for (const auto& cost : costs) {
+            agg.total_commission += cost.commission;
+            agg.total_slippage += cost.slippage;
+            agg.total_market_impact += cost.market_impact;
+            agg.total_spread_cost += cost.spread_cost;
+            agg.total_latency_cost += cost.latency_cost;
+            agg.total_cost += cost.total_cost;
+            agg.avg_cost_bps += cost.cost_bps;
+        }
+
+        agg.avg_commission_per_trade = agg.total_commission / agg.total_trades;
+        agg.avg_slippage_per_trade = agg.total_slippage / agg.total_trades;
+        agg.avg_total_cost_per_trade = agg.total_cost / agg.total_trades;
+        agg.avg_cost_bps /= agg.total_trades;
+
+        return agg;
+    }
+
+    static void print_aggregated_costs(const AggregatedCosts& agg) {
+        printf("\n");
+        printf("================================================================================\n");
+        printf("AGGREGATED TRANSACTION COSTS\n");
+        printf("================================================================================\n\n");
+
+        printf("Total Trades:           %d\n\n", agg.total_trades);
+
+        printf("TOTAL COSTS\n");
+        printf("-----------\n");
+        printf("Commission:             $%.2f\n", agg.total_commission);
+        printf("Slippage:               $%.2f\n", agg.total_slippage);
+        printf("Market Impact:          $%.2f\n", agg.total_market_impact);
+        printf("Spread Cost:            $%.2f\n", agg.total_spread_cost);
+        printf("Latency Cost:           $%.2f\n", agg.total_latency_cost);
+        printf("Total:                  $%.2f\n\n", agg.total_cost);
+
+        printf("AVERAGE PER TRADE\n");
+        printf("-----------------\n");
+        printf("Commission:             $%.2f\n", agg.avg_commission_per_trade);
+        printf("Slippage:               $%.2f\n", agg.avg_slippage_per_trade);
+        printf("Total Cost:             $%.2f\n", agg.avg_total_cost_per_trade);
+        printf("Cost (bps):             %.2f\n\n", agg.avg_cost_bps);
+
+        printf("================================================================================\n");
+    }
+};
+
+} // namespace Costs
+} // namespace Backtest
+} // namespace HFT
+
+================================================================================
+END OF SLIPPAGE AND TRANSACTION COSTS
+================================================================================

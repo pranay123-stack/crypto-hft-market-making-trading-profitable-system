@@ -1,0 +1,911 @@
+================================================================================
+DAY 4 PLANNING - ORDER MANAGEMENT SYSTEM CORE
+================================================================================
+
+Date: Week 1, Day 4
+Phase: Foundation (Week 1-8)
+Status: Ready to Execute
+Critical Path: YES
+Dependencies: Day 3 (market data infrastructure)
+
+================================================================================
+DAILY OBJECTIVES
+================================================================================
+
+PRIMARY GOALS:
+--------------
+1. Implement order lifecycle management (New, Filled, Cancelled, Rejected)
+2. Create order routing framework
+3. Build position tracking system
+4. Implement fill processing and reconciliation
+5. Create order ID generation (globally unique, monotonic)
+6. Develop basic exchange simulator for testing
+
+SUCCESS CRITERIA:
+-----------------
+✓ Can create and manage orders through complete lifecycle
+✓ Position tracking accurate across multiple fills
+✓ Order ID generation <50ns
+✓ Order state transitions validated
+✓ Fill processing <200ns per fill
+✓ Exchange simulator validates order flow
+✓ Zero data races (verified with ThreadSanitizer)
+
+DELIVERABLES:
+-------------
+- Order structure and lifecycle management
+- Position tracker (multi-symbol, multi-strategy)
+- Order ID generator (fast, unique)
+- Fill processor and reconciliation engine
+- Exchange simulator for testing
+- Unit and integration tests
+- Performance benchmarks
+
+================================================================================
+HOUR-BY-HOUR SCHEDULE
+================================================================================
+
+08:00 - 08:15 | DAILY STANDUP
+------------------------------
+
+08:15 - 10:30 | ORDER MANAGEMENT CORE
+--------------------------------------
+Responsible: Senior C++ Developer 1, Technical Lead
+
+1. Order Structure Definition (45 min)
+
+   File: include/order_management/order.hpp
+
+   ```cpp
+   #ifndef HFT_ORDER_MANAGEMENT_ORDER_HPP
+   #define HFT_ORDER_MANAGEMENT_ORDER_HPP
+
+   #include <cstdint>
+   #include <string>
+   #include <atomic>
+
+   namespace hft {
+   namespace order_management {
+
+   // Order side
+   enum class Side : uint8_t {
+       Buy = 0,
+       Sell = 1
+   };
+
+   // Order type
+   enum class OrderType : uint8_t {
+       Market = 0,
+       Limit = 1,
+       Stop = 2,
+       StopLimit = 3,
+       IOC = 4,  // Immediate or Cancel
+       FOK = 5   // Fill or Kill
+   };
+
+   // Order state
+   enum class OrderState : uint8_t {
+       PendingNew = 0,    // Created, not yet sent
+       New = 1,           // Acknowledged by exchange
+       PartiallyFilled = 2,
+       Filled = 3,
+       PendingCancel = 4, // Cancel request sent
+       Cancelled = 5,
+       Rejected = 6,
+       Expired = 7
+   };
+
+   // Time in force
+   enum class TimeInForce : uint8_t {
+       Day = 0,
+       GTC = 1,  // Good Till Cancel
+       IOC = 2,  // Immediate or Cancel
+       FOK = 3   // Fill or Kill
+   };
+
+   // Order ID type (64-bit unique identifier)
+   using OrderID = uint64_t;
+
+   // Client order ID generator
+   // Format: [timestamp:42 bits][sequence:16 bits][instance:6 bits]
+   class OrderIDGenerator {
+   public:
+       explicit OrderIDGenerator(uint8_t instance_id = 0)
+           : instance_id_(instance_id & 0x3F), sequence_(0) {}
+
+       OrderID generate() {
+           // Get current timestamp (milliseconds since epoch)
+           uint64_t timestamp_ms = get_timestamp_ms();
+
+           // Get next sequence number (wraps at 65536)
+           uint16_t seq = sequence_.fetch_add(1, std::memory_order_relaxed) & 0xFFFF;
+
+           // Combine: [timestamp:42][sequence:16][instance:6]
+           OrderID id = (timestamp_ms & 0x3FFFFFFFFFF) << 22;
+           id |= (static_cast<uint64_t>(seq) << 6);
+           id |= instance_id_;
+
+           return id;
+       }
+
+   private:
+       uint8_t instance_id_;
+       std::atomic<uint16_t> sequence_;
+
+       static uint64_t get_timestamp_ms() {
+           struct timespec ts;
+           clock_gettime(CLOCK_REALTIME, &ts);
+           return ts.tv_sec * 1000ULL + ts.tv_nsec / 1000000ULL;
+       }
+   };
+
+   // Order structure (aligned to cache line)
+   struct alignas(64) Order {
+       OrderID order_id;
+       std::string symbol;
+       Side side;
+       OrderType order_type;
+       OrderState state;
+       TimeInForce time_in_force;
+
+       double price;
+       double quantity;
+       double filled_quantity;
+       double remaining_quantity;
+       double average_fill_price;
+
+       uint64_t create_time_ns;
+       uint64_t send_time_ns;
+       uint64_t ack_time_ns;
+       uint64_t fill_time_ns;
+
+       std::string strategy_id;
+       std::string exchange_order_id;
+
+       // Constructor
+       Order()
+           : order_id(0), side(Side::Buy), order_type(OrderType::Limit),
+             state(OrderState::PendingNew), time_in_force(TimeInForce::Day),
+             price(0.0), quantity(0.0), filled_quantity(0.0),
+             remaining_quantity(0.0), average_fill_price(0.0),
+             create_time_ns(0), send_time_ns(0), ack_time_ns(0), fill_time_ns(0) {}
+
+       // Helper methods
+       bool is_buy() const { return side == Side::Buy; }
+       bool is_sell() const { return side == Side::Sell; }
+       bool is_active() const {
+           return state == OrderState::New || state == OrderState::PartiallyFilled;
+       }
+       bool is_terminal() const {
+           return state == OrderState::Filled ||
+                  state == OrderState::Cancelled ||
+                  state == OrderState::Rejected ||
+                  state == OrderState::Expired;
+       }
+       double get_fill_ratio() const {
+           return quantity > 0.0 ? (filled_quantity / quantity) : 0.0;
+       }
+   };
+
+   // Fill event
+   struct Fill {
+       OrderID order_id;
+       std::string exchange_fill_id;
+       double price;
+       double quantity;
+       uint64_t timestamp_ns;
+       Side side;
+       std::string symbol;
+
+       Fill() : order_id(0), price(0.0), quantity(0.0),
+                timestamp_ns(0), side(Side::Buy) {}
+   };
+
+   } // namespace order_management
+   } // namespace hft
+
+   #endif // HFT_ORDER_MANAGEMENT_ORDER_HPP
+   ```
+
+2. Position Tracker (60 min)
+
+   File: include/order_management/position_tracker.hpp
+
+   ```cpp
+   #ifndef HFT_ORDER_MANAGEMENT_POSITION_TRACKER_HPP
+   #define HFT_ORDER_MANAGEMENT_POSITION_TRACKER_HPP
+
+   #include "order_management/order.hpp"
+   #include <unordered_map>
+   #include <string>
+   #include <mutex>
+
+   namespace hft {
+   namespace order_management {
+
+   // Position for a single symbol
+   struct Position {
+       std::string symbol;
+       double quantity;          // Net position (positive = long, negative = short)
+       double average_price;     // Average entry price
+       double realized_pnl;      // Realized P&L
+       double unrealized_pnl;    // Unrealized P&L (requires market price)
+       uint64_t last_update_ns;
+
+       Position() : quantity(0.0), average_price(0.0),
+                    realized_pnl(0.0), unrealized_pnl(0.0),
+                    last_update_ns(0) {}
+
+       bool is_flat() const { return quantity == 0.0; }
+       bool is_long() const { return quantity > 0.0; }
+       bool is_short() const { return quantity < 0.0; }
+   };
+
+   // Position tracker (per strategy)
+   class PositionTracker {
+   public:
+       PositionTracker(const std::string& strategy_id)
+           : strategy_id_(strategy_id) {}
+
+       // Process fill and update position
+       void on_fill(const Fill& fill, uint64_t timestamp_ns) {
+           std::lock_guard<std::mutex> lock(mutex_);
+
+           Position& pos = positions_[fill.symbol];
+           pos.symbol = fill.symbol;
+
+           double trade_qty = (fill.side == Side::Buy) ?
+                              fill.quantity : -fill.quantity;
+
+           // Calculate realized P&L if reducing position
+           if ((pos.quantity > 0 && trade_qty < 0) ||
+               (pos.quantity < 0 && trade_qty > 0)) {
+
+               double closed_qty = std::min(std::abs(pos.quantity), std::abs(trade_qty));
+               double pnl_per_share = (fill.side == Side::Sell) ?
+                                      (fill.price - pos.average_price) :
+                                      (pos.average_price - fill.price);
+               pos.realized_pnl += pnl_per_share * closed_qty;
+           }
+
+           // Update position
+           double new_qty = pos.quantity + trade_qty;
+
+           if (std::abs(new_qty) < 1e-6) {
+               // Position closed
+               pos.quantity = 0.0;
+               pos.average_price = 0.0;
+           } else if ((pos.quantity >= 0 && new_qty >= 0) ||
+                      (pos.quantity <= 0 && new_qty <= 0)) {
+               // Adding to position or new position
+               pos.average_price = (pos.quantity * pos.average_price +
+                                    trade_qty * fill.price) / new_qty;
+               pos.quantity = new_qty;
+           } else {
+               // Reversed position
+               pos.quantity = new_qty;
+               pos.average_price = fill.price;
+           }
+
+           pos.last_update_ns = timestamp_ns;
+       }
+
+       // Get position for symbol
+       Position get_position(const std::string& symbol) const {
+           std::lock_guard<std::mutex> lock(mutex_);
+           auto it = positions_.find(symbol);
+           return (it != positions_.end()) ? it->second : Position();
+       }
+
+       // Update unrealized P&L with current market price
+       void update_unrealized_pnl(const std::string& symbol, double market_price) {
+           std::lock_guard<std::mutex> lock(mutex_);
+           auto it = positions_.find(symbol);
+           if (it != positions_.end() && !it->second.is_flat()) {
+               Position& pos = it->second;
+               double pnl_per_share = (pos.quantity > 0) ?
+                                      (market_price - pos.average_price) :
+                                      (pos.average_price - market_price);
+               pos.unrealized_pnl = pnl_per_share * std::abs(pos.quantity);
+           }
+       }
+
+       // Get total P&L (realized + unrealized)
+       double get_total_pnl() const {
+           std::lock_guard<std::mutex> lock(mutex_);
+           double total = 0.0;
+           for (const auto& [symbol, pos] : positions_) {
+               total += pos.realized_pnl + pos.unrealized_pnl;
+           }
+           return total;
+       }
+
+       // Get all positions
+       std::unordered_map<std::string, Position> get_all_positions() const {
+           std::lock_guard<std::mutex> lock(mutex_);
+           return positions_;
+       }
+
+   private:
+       std::string strategy_id_;
+       mutable std::mutex mutex_;
+       std::unordered_map<std::string, Position> positions_;
+   };
+
+   } // namespace order_management
+   } // namespace hft
+
+   #endif // HFT_ORDER_MANAGEMENT_POSITION_TRACKER_HPP
+   ```
+
+3. Order Manager (45 min)
+
+   File: include/order_management/order_manager.hpp
+
+   ```cpp
+   #ifndef HFT_ORDER_MANAGEMENT_ORDER_MANAGER_HPP
+   #define HFT_ORDER_MANAGEMENT_ORDER_MANAGER_HPP
+
+   #include "order_management/order.hpp"
+   #include "order_management/position_tracker.hpp"
+   #include <unordered_map>
+   #include <memory>
+   #include <mutex>
+   #include <functional>
+
+   namespace hft {
+   namespace order_management {
+
+   // Callbacks
+   using OrderCallback = std::function<void(const Order&)>;
+   using FillCallback = std::function<void(const Fill&)>;
+
+   class OrderManager {
+   public:
+       OrderManager(const std::string& strategy_id)
+           : strategy_id_(strategy_id),
+             id_generator_(0),
+             position_tracker_(strategy_id) {}
+
+       // Create new order
+       OrderID create_order(const std::string& symbol,
+                           Side side,
+                           OrderType type,
+                           double price,
+                           double quantity) {
+           auto order = std::make_shared<Order>();
+           order->order_id = id_generator_.generate();
+           order->symbol = symbol;
+           order->side = side;
+           order->order_type = type;
+           order->price = price;
+           order->quantity = quantity;
+           order->remaining_quantity = quantity;
+           order->state = OrderState::PendingNew;
+           order->strategy_id = strategy_id_;
+           order->create_time_ns = get_timestamp_ns();
+
+           std::lock_guard<std::mutex> lock(mutex_);
+           orders_[order->order_id] = order;
+
+           return order->order_id;
+       }
+
+       // Send order (transition to New state)
+       bool send_order(OrderID order_id) {
+           std::lock_guard<std::mutex> lock(mutex_);
+           auto it = orders_.find(order_id);
+           if (it == orders_.end()) return false;
+
+           Order& order = *it->second;
+           if (order.state != OrderState::PendingNew) return false;
+
+           order.state = OrderState::New;
+           order.send_time_ns = get_timestamp_ns();
+
+           if (order_callback_) {
+               order_callback_(order);
+           }
+
+           return true;
+       }
+
+       // Process fill
+       void on_fill(const Fill& fill) {
+           std::lock_guard<std::mutex> lock(mutex_);
+           auto it = orders_.find(fill.order_id);
+           if (it == orders_.end()) return;
+
+           Order& order = *it->second;
+           order.filled_quantity += fill.quantity;
+           order.remaining_quantity = order.quantity - order.filled_quantity;
+
+           // Update average fill price
+           order.average_fill_price =
+               (order.average_fill_price * (order.filled_quantity - fill.quantity) +
+                fill.price * fill.quantity) / order.filled_quantity;
+
+           // Update state
+           if (order.remaining_quantity < 1e-6) {
+               order.state = OrderState::Filled;
+           } else {
+               order.state = OrderState::PartiallyFilled;
+           }
+
+           order.fill_time_ns = fill.timestamp_ns;
+
+           // Update position
+           position_tracker_.on_fill(fill, fill.timestamp_ns);
+
+           if (order_callback_) {
+               order_callback_(order);
+           }
+
+           if (fill_callback_) {
+               fill_callback_(fill);
+           }
+       }
+
+       // Cancel order
+       bool cancel_order(OrderID order_id) {
+           std::lock_guard<std::mutex> lock(mutex_);
+           auto it = orders_.find(order_id);
+           if (it == orders_.end()) return false;
+
+           Order& order = *it->second;
+           if (!order.is_active()) return false;
+
+           order.state = OrderState::PendingCancel;
+
+           if (order_callback_) {
+               order_callback_(order);
+           }
+
+           return true;
+       }
+
+       // Order cancelled confirmation
+       void on_cancelled(OrderID order_id) {
+           std::lock_guard<std::mutex> lock(mutex_);
+           auto it = orders_.find(order_id);
+           if (it == orders_.end()) return;
+
+           Order& order = *it->second;
+           order.state = OrderState::Cancelled;
+
+           if (order_callback_) {
+               order_callback_(order);
+           }
+       }
+
+       // Order rejected
+       void on_rejected(OrderID order_id) {
+           std::lock_guard<std::mutex> lock(mutex_);
+           auto it = orders_.find(order_id);
+           if (it == orders_.end()) return;
+
+           Order& order = *it->second;
+           order.state = OrderState::Rejected;
+
+           if (order_callback_) {
+               order_callback_(order);
+           }
+       }
+
+       // Get order
+       std::shared_ptr<Order> get_order(OrderID order_id) const {
+           std::lock_guard<std::mutex> lock(mutex_);
+           auto it = orders_.find(order_id);
+           return (it != orders_.end()) ? it->second : nullptr;
+       }
+
+       // Get position tracker
+       const PositionTracker& get_position_tracker() const {
+           return position_tracker_;
+       }
+
+       // Register callbacks
+       void set_order_callback(OrderCallback callback) {
+           order_callback_ = std::move(callback);
+       }
+
+       void set_fill_callback(FillCallback callback) {
+           fill_callback_ = std::move(callback);
+       }
+
+   private:
+       std::string strategy_id_;
+       OrderIDGenerator id_generator_;
+       PositionTracker position_tracker_;
+
+       mutable std::mutex mutex_;
+       std::unordered_map<OrderID, std::shared_ptr<Order>> orders_;
+
+       OrderCallback order_callback_;
+       FillCallback fill_callback_;
+
+       static uint64_t get_timestamp_ns() {
+           struct timespec ts;
+           clock_gettime(CLOCK_MONOTONIC, &ts);
+           return ts.tv_sec * 1'000'000'000ULL + ts.tv_nsec;
+       }
+   };
+
+   } // namespace order_management
+   } // namespace hft
+
+   #endif // HFT_ORDER_MANAGEMENT_ORDER_MANAGER_HPP
+   ```
+
+Checkpoint #1 (10:30):
+- [ ] Order management code compiles
+- [ ] Data structures aligned and optimized
+
+10:30 - 10:45 | BREAK
+
+10:45 - 12:30 | EXCHANGE SIMULATOR FOR TESTING
+-----------------------------------------------
+Responsible: Senior C++ Developer 2, QA Engineer
+
+1. Exchange Simulator (75 min)
+
+   File: test/simulation/exchange_simulator.hpp
+
+   ```cpp
+   #ifndef HFT_TEST_EXCHANGE_SIMULATOR_HPP
+   #define HFT_TEST_EXCHANGE_SIMULATOR_HPP
+
+   #include "order_management/order.hpp"
+   #include <queue>
+   #include <map>
+   #include <random>
+   #include <functional>
+
+   namespace hft {
+   namespace test {
+
+   using namespace order_management;
+
+   // Simulated exchange for testing
+   class ExchangeSimulator {
+   public:
+       ExchangeSimulator() : fill_latency_ns_(1000), reject_rate_(0.01),
+                             gen_(std::random_device{}()),
+                             dist_(0.0, 1.0) {}
+
+       // Set fill latency (simulated)
+       void set_fill_latency_ns(uint64_t latency) {
+           fill_latency_ns_ = latency;
+       }
+
+       // Set rejection rate (0.0 - 1.0)
+       void set_reject_rate(double rate) {
+           reject_rate_ = std::clamp(rate, 0.0, 1.0);
+       }
+
+       // Set market price for symbol
+       void set_market_price(const std::string& symbol, double price) {
+           market_prices_[symbol] = price;
+       }
+
+       // Submit order to exchange
+       void submit_order(const Order& order,
+                        std::function<void(const Fill&)> fill_callback,
+                        std::function<void(OrderID)> reject_callback) {
+
+           // Simulate rejection
+           if (dist_(gen_) < reject_rate_) {
+               if (reject_callback) {
+                   reject_callback(order.order_id);
+               }
+               return;
+           }
+
+           // Simulate fill
+           double fill_price = order.price;
+
+           // Market orders fill at market price
+           if (order.order_type == OrderType::Market) {
+               auto it = market_prices_.find(order.symbol);
+               if (it != market_prices_.end()) {
+                   fill_price = it->second;
+               }
+           }
+
+           // Create fill
+           Fill fill;
+           fill.order_id = order.order_id;
+           fill.price = fill_price;
+           fill.quantity = order.quantity;
+           fill.timestamp_ns = get_timestamp_ns() + fill_latency_ns_;
+           fill.side = order.side;
+           fill.symbol = order.symbol;
+
+           if (fill_callback) {
+               fill_callback(fill);
+           }
+       }
+
+       // Get market price
+       double get_market_price(const std::string& symbol) const {
+           auto it = market_prices_.find(symbol);
+           return (it != market_prices_.end()) ? it->second : 0.0;
+       }
+
+   private:
+       uint64_t fill_latency_ns_;
+       double reject_rate_;
+       std::map<std::string, double> market_prices_;
+       std::mt19937 gen_;
+       std::uniform_real_distribution<> dist_;
+
+       static uint64_t get_timestamp_ns() {
+           struct timespec ts;
+           clock_gettime(CLOCK_MONOTONIC, &ts);
+           return ts.tv_sec * 1'000'000'000ULL + ts.tv_nsec;
+       }
+   };
+
+   } // namespace test
+   } // namespace hft
+
+   #endif // HFT_TEST_EXCHANGE_SIMULATOR_HPP
+   ```
+
+2. Integration Test (30 min)
+
+   File: test/integration/test_order_lifecycle.cpp
+
+   ```cpp
+   #include "order_management/order_manager.hpp"
+   #include "test/simulation/exchange_simulator.hpp"
+   #include <iostream>
+   #include <cassert>
+   #include <thread>
+   #include <chrono>
+
+   using namespace hft::order_management;
+   using namespace hft::test;
+
+   void test_complete_order_lifecycle() {
+       OrderManager om("test_strategy");
+       ExchangeSimulator exchange;
+
+       exchange.set_market_price("AAPL", 150.00);
+       exchange.set_fill_latency_ns(1000);
+       exchange.set_reject_rate(0.0);
+
+       bool order_filled = false;
+
+       // Register callbacks
+       om.set_fill_callback([&](const Fill& fill) {
+           std::cout << "Fill received: " << fill.quantity
+                     << " @ " << fill.price << "\n";
+           order_filled = true;
+       });
+
+       // Create and send order
+       OrderID oid = om.create_order("AAPL", Side::Buy, OrderType::Market, 150.00, 100.0);
+       om.send_order(oid);
+
+       auto order = om.get_order(oid);
+       assert(order != nullptr);
+       assert(order->state == OrderState::New);
+
+       // Simulate exchange processing
+       exchange.submit_order(*order,
+           [&](const Fill& fill) { om.on_fill(fill); },
+           [&](OrderID id) { om.on_rejected(id); });
+
+       // Wait for fill
+       std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+       assert(order_filled);
+       assert(order->state == OrderState::Filled);
+       assert(order->filled_quantity == 100.0);
+
+       // Check position
+       Position pos = om.get_position_tracker().get_position("AAPL");
+       assert(pos.quantity == 100.0);  // Long 100 shares
+
+       std::cout << "✓ test_complete_order_lifecycle passed\n";
+   }
+
+   int main() {
+       std::cout << "=== Order Lifecycle Integration Tests ===\n";
+       test_complete_order_lifecycle();
+       std::cout << "All tests passed!\n";
+       return 0;
+   }
+   ```
+
+Checkpoint #2 (12:30):
+- [ ] Exchange simulator working
+- [ ] Integration test passes
+- [ ] Order lifecycle validated
+
+12:30 - 13:30 | LUNCH BREAK
+
+13:30 - 15:30 | PERFORMANCE TESTING AND OPTIMIZATION
+-----------------------------------------------------
+
+1. Order ID Generation Benchmark (30 min)
+2. Position Update Benchmark (30 min)
+3. Fill Processing Benchmark (30 min)
+4. End-to-End Order Latency Test (30 min)
+
+File: benchmarks/order_management_benchmark.cpp
+
+```cpp
+#include "order_management/order_manager.hpp"
+#include "core/timing.hpp"
+#include <iostream>
+#include <vector>
+#include <algorithm>
+
+using namespace hft::order_management;
+using namespace hft::core;
+
+void benchmark_order_id_generation() {
+    OrderIDGenerator gen(1);
+    constexpr size_t iterations = 10'000'000;
+    std::vector<uint64_t> latencies;
+    latencies.reserve(iterations);
+
+    for (size_t i = 0; i < iterations; ++i) {
+        uint64_t start = rdtscp();
+        volatile OrderID id = gen.generate();
+        uint64_t end = rdtscp();
+        latencies.push_back(end - start);
+    }
+
+    std::sort(latencies.begin(), latencies.end());
+
+    std::cout << "\n=== Order ID Generation ===\n";
+    std::cout << "Iterations: " << iterations << "\n";
+    std::cout << "Median: " << latencies[iterations / 2] << " cycles\n";
+    std::cout << "P99: " << latencies[static_cast<size_t>(iterations * 0.99)] << " cycles\n";
+}
+
+void benchmark_position_update() {
+    PositionTracker tracker("benchmark");
+    constexpr size_t iterations = 1'000'000;
+    std::vector<uint64_t> latencies;
+    latencies.reserve(iterations);
+
+    for (size_t i = 0; i < iterations; ++i) {
+        Fill fill;
+        fill.order_id = i;
+        fill.symbol = "AAPL";
+        fill.price = 150.0 + (i % 100) * 0.01;
+        fill.quantity = 100.0;
+        fill.side = (i % 2 == 0) ? Side::Buy : Side::Sell;
+        fill.timestamp_ns = i;
+
+        uint64_t start = rdtscp();
+        tracker.on_fill(fill, i);
+        uint64_t end = rdtscp();
+
+        latencies.push_back(end - start);
+    }
+
+    std::sort(latencies.begin(), latencies.end());
+
+    std::cout << "\n=== Position Update ===\n";
+    std::cout << "Iterations: " << iterations << "\n";
+    std::cout << "Median: " << latencies[iterations / 2] << " cycles\n";
+    std::cout << "P99: " << latencies[static_cast<size_t>(iterations * 0.99)] << " cycles\n";
+}
+
+int main() {
+    std::cout << "=== Order Management Performance ===\n";
+    benchmark_order_id_generation();
+    benchmark_position_update();
+    return 0;
+}
+```
+
+Checkpoint #3 (15:30):
+- [ ] All benchmarks complete
+- [ ] Performance targets met:
+  - Order ID generation: <50ns
+  - Position update: <200ns
+  - Fill processing: <300ns
+
+15:30 - 15:45 | BREAK
+
+15:45 - 17:15 | DOCUMENTATION AND INTEGRATION
+-----------------------------------------------
+
+1. Update CMake (15 min)
+2. Run ThreadSanitizer tests (30 min)
+3. Documentation (30 min)
+4. Commit Day 4 work (20 min)
+
+```bash
+git add .
+git commit -m "Day 4: Order management system core
+
+Order Management:
+- Complete order lifecycle implementation
+- Order states: PendingNew -> New -> Filled/Cancelled
+- Fast order ID generation (<50ns)
+- Order state validation and transitions
+
+Position Tracking:
+- Multi-symbol position tracker
+- Realized and unrealized P&L calculation
+- Average price computation
+- Position updates <200ns per fill
+
+Testing Infrastructure:
+- Exchange simulator for testing
+- Complete order lifecycle tests
+- Integration tests passing
+- ThreadSanitizer validation (zero data races)
+
+Performance:
+- Order ID generation: <50ns
+- Fill processing: <200ns
+- Position update: <300ns
+
+Next: Day 5 - Risk management and compliance
+"
+
+git tag -a v0.1.0-day4 -m "Day 4: Order management foundation"
+```
+
+17:15 - 17:30 | DAILY RETROSPECTIVE
+
+Day 5 Preview:
+- Pre-trade risk checks
+- Position limits
+- Order rate limits
+- Kill switch implementation
+
+================================================================================
+SUCCESS METRICS
+================================================================================
+
+PERFORMANCE:
+✓ Order ID generation: <50ns
+✓ Position tracking: <200ns per update
+✓ Fill processing: <300ns
+✓ Order state transitions: <100ns
+
+CORRECTNESS:
+✓ Position tracking 100% accurate
+✓ P&L calculations verified
+✓ No data races (ThreadSanitizer clean)
+✓ Order lifecycle FSM validated
+
+QUALITY:
+✓ Unit test coverage >80%
+✓ Integration tests passing
+✓ Zero memory leaks
+✓ Documentation complete
+
+================================================================================
+DELIVERABLES CHECKLIST
+================================================================================
+
+[ ] include/order_management/order.hpp
+[ ] include/order_management/position_tracker.hpp
+[ ] include/order_management/order_manager.hpp
+[ ] test/simulation/exchange_simulator.hpp
+[ ] test/integration/test_order_lifecycle.cpp
+[ ] benchmarks/order_management_benchmark.cpp
+[ ] docs/order_management_design.md
+[ ] planning/day4_completion_report.txt
+
+================================================================================
+SIGN-OFF
+================================================================================
+
+Technical Lead: _________________ Date: _______ Time: _______
+
+DAY 4 STATUS: [ ] SUCCESS  [ ] PARTIAL  [ ] BLOCKED
+
+================================================================================
+END OF DAY 4 PLANNING
+================================================================================

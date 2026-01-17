@@ -1,0 +1,1073 @@
+================================================================================
+HISTORICAL DATA MANAGEMENT FOR HFT BACKTESTING
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Data Architecture Overview
+2. Tick Data Structures
+3. Data Storage Systems
+4. Memory-Mapped File Access
+5. Data Compression
+6. Data Loader Implementation
+7. Cache Management
+8. Data Feed Adapters
+9. Real-time Data Replay
+10. Complete Implementation
+
+================================================================================
+1. DATA ARCHITECTURE OVERVIEW
+================================================================================
+
+High-Frequency Trading requires efficient storage and retrieval of massive
+amounts of tick-level data. The architecture supports:
+
+- Nanosecond-precision timestamps
+- Multiple data types (trades, quotes, order book snapshots)
+- Efficient compression (10:1 to 50:1 ratios)
+- Fast random access and sequential scanning
+- Memory-mapped files for zero-copy access
+- Multi-threaded data loading
+
+Data Flow:
+┌─────────────────────────────────────────────────────────────────┐
+│                    Data Sources                                  │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐       │
+│  │ Exchange │  │   CSV    │  │  Binary  │  │   APIs   │       │
+│  │  Feeds   │  │  Files   │  │  Files   │  │          │       │
+│  └─────┬────┘  └─────┬────┘  └─────┬────┘  └─────┬────┘       │
+└────────┼─────────────┼─────────────┼─────────────┼─────────────┘
+         │             │             │             │
+         └─────────────┴──────┬──────┴─────────────┘
+                              │
+                    ┌─────────▼─────────┐
+                    │  Data Normalizer  │
+                    └─────────┬─────────┘
+                              │
+         ┌────────────────────┼────────────────────┐
+         │                    │                    │
+    ┌────▼─────┐      ┌──────▼──────┐      ┌──────▼──────┐
+    │ Tick DB  │      │ Compressed  │      │   Memory    │
+    │  Binary  │      │   Archive   │      │    Cache    │
+    └────┬─────┘      └──────┬──────┘      └──────┬──────┘
+         │                   │                    │
+         └───────────────────┴────────┬───────────┘
+                                      │
+                            ┌─────────▼──────────┐
+                            │  Backtest Engine   │
+                            └────────────────────┘
+
+================================================================================
+2. TICK DATA STRUCTURES
+================================================================================
+
+/*******************************************************************************
+ * CORE TICK DATA TYPES
+ ******************************************************************************/
+
+#pragma once
+#include <cstdint>
+#include <cstring>
+#include <vector>
+#include <string>
+#include <chrono>
+#include <memory>
+#include <fstream>
+
+namespace HFT {
+namespace Data {
+
+using Timestamp = std::chrono::time_point<std::chrono::system_clock,
+                                          std::chrono::nanoseconds>;
+using Duration = std::chrono::nanoseconds;
+
+/*******************************************************************************
+ * TRADE TICK - Fixed size structure for cache efficiency
+ ******************************************************************************/
+
+#pragma pack(push, 1)
+struct TradeTick {
+    int64_t timestamp_ns;      // Nanoseconds since epoch
+    uint32_t symbol_id;        // Symbol mapping ID
+    double price;              // Trade price
+    int32_t size;              // Trade size
+    uint16_t exchange_id;      // Exchange identifier
+    uint8_t conditions;        // Trade conditions bitfield
+    uint8_t side;              // 0=buy, 1=sell, 2=unknown
+
+    TradeTick()
+        : timestamp_ns(0), symbol_id(0), price(0.0), size(0),
+          exchange_id(0), conditions(0), side(2) {}
+
+    Timestamp get_timestamp() const {
+        return Timestamp(Duration(timestamp_ns));
+    }
+
+    void set_timestamp(Timestamp ts) {
+        timestamp_ns = std::chrono::duration_cast<Duration>(
+            ts.time_since_epoch()).count();
+    }
+
+    bool is_regular_trade() const {
+        return (conditions & 0x01) == 0; // Bit 0: irregular trade
+    }
+
+    bool is_high_low() const {
+        return (conditions & 0x02) != 0; // Bit 1: high/low
+    }
+
+    bool is_opening() const {
+        return (conditions & 0x04) != 0; // Bit 2: opening
+    }
+
+    bool is_closing() const {
+        return (conditions & 0x08) != 0; // Bit 3: closing
+    }
+};
+#pragma pack(pop)
+
+static_assert(sizeof(TradeTick) == 32, "TradeTick should be 32 bytes");
+
+/*******************************************************************************
+ * QUOTE TICK - BBO (Best Bid/Offer)
+ ******************************************************************************/
+
+#pragma pack(push, 1)
+struct QuoteTick {
+    int64_t timestamp_ns;
+    uint32_t symbol_id;
+    double bid_price;
+    double ask_price;
+    int32_t bid_size;
+    int32_t ask_size;
+    uint16_t exchange_id;
+    uint8_t quote_condition;
+    uint8_t reserved;
+
+    QuoteTick()
+        : timestamp_ns(0), symbol_id(0),
+          bid_price(0.0), ask_price(0.0),
+          bid_size(0), ask_size(0),
+          exchange_id(0), quote_condition(0), reserved(0) {}
+
+    Timestamp get_timestamp() const {
+        return Timestamp(Duration(timestamp_ns));
+    }
+
+    void set_timestamp(Timestamp ts) {
+        timestamp_ns = std::chrono::duration_cast<Duration>(
+            ts.time_since_epoch()).count();
+    }
+
+    double get_mid_price() const {
+        return (bid_price + ask_price) / 2.0;
+    }
+
+    double get_spread() const {
+        return ask_price - bid_price;
+    }
+
+    double get_spread_bps() const {
+        double mid = get_mid_price();
+        return (mid > 0.0) ? (get_spread() / mid * 10000.0) : 0.0;
+    }
+};
+#pragma pack(pop)
+
+static_assert(sizeof(QuoteTick) == 40, "QuoteTick should be 40 bytes");
+
+/*******************************************************************************
+ * ORDER BOOK SNAPSHOT - Full depth
+ ******************************************************************************/
+
+#pragma pack(push, 1)
+struct OrderBookLevel {
+    double price;
+    int32_t size;
+    uint16_t order_count;
+    uint16_t reserved;
+
+    OrderBookLevel()
+        : price(0.0), size(0), order_count(0), reserved(0) {}
+};
+#pragma pack(pop)
+
+static_assert(sizeof(OrderBookLevel) == 16, "OrderBookLevel should be 16 bytes");
+
+struct OrderBookSnapshot {
+    int64_t timestamp_ns;
+    uint32_t symbol_id;
+    uint16_t exchange_id;
+    uint8_t num_bid_levels;
+    uint8_t num_ask_levels;
+
+    std::vector<OrderBookLevel> bids; // Sorted descending
+    std::vector<OrderBookLevel> asks; // Sorted ascending
+
+    OrderBookSnapshot()
+        : timestamp_ns(0), symbol_id(0), exchange_id(0),
+          num_bid_levels(0), num_ask_levels(0) {}
+
+    Timestamp get_timestamp() const {
+        return Timestamp(Duration(timestamp_ns));
+    }
+
+    void set_timestamp(Timestamp ts) {
+        timestamp_ns = std::chrono::duration_cast<Duration>(
+            ts.time_since_epoch()).count();
+    }
+
+    double get_mid_price() const {
+        if (bids.empty() || asks.empty()) return 0.0;
+        return (bids[0].price + asks[0].price) / 2.0;
+    }
+
+    int64_t get_total_bid_size(int levels = -1) const {
+        int64_t total = 0;
+        int count = (levels < 0) ? bids.size() : std::min(levels, (int)bids.size());
+        for (int i = 0; i < count; ++i) {
+            total += bids[i].size;
+        }
+        return total;
+    }
+
+    int64_t get_total_ask_size(int levels = -1) const {
+        int64_t total = 0;
+        int count = (levels < 0) ? asks.size() : std::min(levels, (int)asks.size());
+        for (int i = 0; i < count; ++i) {
+            total += asks[i].size;
+        }
+        return total;
+    }
+};
+
+/*******************************************************************************
+ * AGGREGATED BAR DATA
+ ******************************************************************************/
+
+struct OHLCV {
+    int64_t timestamp_ns;      // Bar start time
+    uint32_t symbol_id;
+    double open;
+    double high;
+    double low;
+    double close;
+    int64_t volume;
+    int64_t trade_count;
+    double vwap;               // Volume-weighted average price
+    int32_t duration_ns;       // Bar duration
+
+    OHLCV()
+        : timestamp_ns(0), symbol_id(0),
+          open(0.0), high(0.0), low(0.0), close(0.0),
+          volume(0), trade_count(0), vwap(0.0), duration_ns(0) {}
+
+    Timestamp get_timestamp() const {
+        return Timestamp(Duration(timestamp_ns));
+    }
+};
+
+/*******************************************************************************
+ * SYMBOL MAPPING - For space-efficient storage
+ ******************************************************************************/
+
+class SymbolMapper {
+private:
+    std::map<std::string, uint32_t> symbol_to_id_;
+    std::map<uint32_t, std::string> id_to_symbol_;
+    std::atomic<uint32_t> next_id_{1};
+    mutable std::shared_mutex mutex_;
+
+public:
+    uint32_t get_or_create_id(const std::string& symbol) {
+        {
+            std::shared_lock<std::shared_mutex> lock(mutex_);
+            auto it = symbol_to_id_.find(symbol);
+            if (it != symbol_to_id_.end()) {
+                return it->second;
+            }
+        }
+
+        std::unique_lock<std::shared_mutex> lock(mutex_);
+        // Double-check after acquiring write lock
+        auto it = symbol_to_id_.find(symbol);
+        if (it != symbol_to_id_.end()) {
+            return it->second;
+        }
+
+        uint32_t id = next_id_++;
+        symbol_to_id_[symbol] = id;
+        id_to_symbol_[id] = symbol;
+        return id;
+    }
+
+    std::string get_symbol(uint32_t id) const {
+        std::shared_lock<std::shared_mutex> lock(mutex_);
+        auto it = id_to_symbol_.find(id);
+        return (it != id_to_symbol_.end()) ? it->second : "";
+    }
+
+    uint32_t get_id(const std::string& symbol) const {
+        std::shared_lock<std::shared_mutex> lock(mutex_);
+        auto it = symbol_to_id_.find(symbol);
+        return (it != symbol_to_id_.end()) ? it->second : 0;
+    }
+
+    void clear() {
+        std::unique_lock<std::shared_mutex> lock(mutex_);
+        symbol_to_id_.clear();
+        id_to_symbol_.clear();
+        next_id_ = 1;
+    }
+
+    size_t size() const {
+        std::shared_lock<std::shared_mutex> lock(mutex_);
+        return symbol_to_id_.size();
+    }
+};
+
+================================================================================
+3. DATA STORAGE SYSTEMS
+================================================================================
+
+/*******************************************************************************
+ * BINARY DATA FILE FORMAT
+ ******************************************************************************/
+
+// File Structure:
+// [Header][Index][Data Blocks][Footer]
+//
+// Header: Metadata about the file
+// Index: Quick lookup for timestamp ranges
+// Data Blocks: Compressed tick data
+// Footer: Checksum and validation
+
+#pragma pack(push, 1)
+struct DataFileHeader {
+    char magic[8];              // "HFTDATA1"
+    uint32_t version;           // Format version
+    uint32_t data_type;         // 1=Trade, 2=Quote, 3=OrderBook
+    int64_t start_time_ns;      // First tick timestamp
+    int64_t end_time_ns;        // Last tick timestamp
+    uint64_t num_records;       // Total number of ticks
+    uint64_t index_offset;      // Offset to index section
+    uint64_t data_offset;       // Offset to data section
+    uint32_t compression;       // 0=None, 1=LZ4, 2=Zstd
+    uint32_t record_size;       // Size of each record
+    char reserved[64];          // Future use
+
+    DataFileHeader()
+        : version(1), data_type(0),
+          start_time_ns(0), end_time_ns(0),
+          num_records(0), index_offset(0),
+          data_offset(0), compression(0),
+          record_size(0) {
+        std::memcpy(magic, "HFTDATA1", 8);
+        std::memset(reserved, 0, sizeof(reserved));
+    }
+
+    bool is_valid() const {
+        return std::memcmp(magic, "HFTDATA1", 8) == 0;
+    }
+};
+#pragma pack(pop)
+
+/*******************************************************************************
+ * TIME-BASED INDEX FOR FAST LOOKUPS
+ ******************************************************************************/
+
+struct TimeIndex {
+    int64_t timestamp_ns;       // Index timestamp
+    uint64_t file_offset;       // Offset in file
+    uint32_t record_count;      // Records in this block
+    uint32_t compressed_size;   // Compressed block size
+
+    TimeIndex()
+        : timestamp_ns(0), file_offset(0),
+          record_count(0), compressed_size(0) {}
+};
+
+/*******************************************************************************
+ * BINARY DATA WRITER
+ ******************************************************************************/
+
+template<typename TickType>
+class BinaryDataWriter {
+private:
+    std::ofstream file_;
+    DataFileHeader header_;
+    std::vector<TimeIndex> index_;
+    std::vector<TickType> buffer_;
+    size_t buffer_size_;
+    uint64_t records_written_;
+
+    static constexpr size_t DEFAULT_BUFFER_SIZE = 10000;
+
+public:
+    BinaryDataWriter(const std::string& filename,
+                     size_t buffer_size = DEFAULT_BUFFER_SIZE)
+        : buffer_size_(buffer_size),
+          records_written_(0) {
+
+        buffer_.reserve(buffer_size_);
+
+        file_.open(filename, std::ios::binary | std::ios::out);
+        if (!file_) {
+            throw std::runtime_error("Failed to open file: " + filename);
+        }
+
+        // Write placeholder header
+        header_.record_size = sizeof(TickType);
+        write_header();
+    }
+
+    ~BinaryDataWriter() {
+        close();
+    }
+
+    void write(const TickType& tick) {
+        buffer_.push_back(tick);
+
+        if (records_written_ == 0) {
+            header_.start_time_ns = tick.timestamp_ns;
+        }
+        header_.end_time_ns = tick.timestamp_ns;
+
+        if (buffer_.size() >= buffer_size_) {
+            flush();
+        }
+    }
+
+    void write_batch(const std::vector<TickType>& ticks) {
+        for (const auto& tick : ticks) {
+            write(tick);
+        }
+    }
+
+    void flush() {
+        if (buffer_.empty()) return;
+
+        TimeIndex idx;
+        idx.timestamp_ns = buffer_.front().timestamp_ns;
+        idx.file_offset = file_.tellp();
+        idx.record_count = buffer_.size();
+
+        // Write uncompressed for now (add compression later)
+        file_.write(reinterpret_cast<const char*>(buffer_.data()),
+                   buffer_.size() * sizeof(TickType));
+
+        idx.compressed_size = buffer_.size() * sizeof(TickType);
+
+        index_.push_back(idx);
+        records_written_ += buffer_.size();
+        buffer_.clear();
+    }
+
+    void close() {
+        if (!file_.is_open()) return;
+
+        flush();
+
+        // Write index
+        header_.index_offset = file_.tellp();
+        file_.write(reinterpret_cast<const char*>(index_.data()),
+                   index_.size() * sizeof(TimeIndex));
+
+        // Update header
+        header_.num_records = records_written_;
+        header_.data_offset = sizeof(DataFileHeader);
+
+        // Rewrite header
+        file_.seekp(0);
+        write_header();
+
+        file_.close();
+    }
+
+private:
+    void write_header() {
+        file_.write(reinterpret_cast<const char*>(&header_),
+                   sizeof(DataFileHeader));
+    }
+};
+
+/*******************************************************************************
+ * BINARY DATA READER
+ ******************************************************************************/
+
+template<typename TickType>
+class BinaryDataReader {
+private:
+    std::ifstream file_;
+    DataFileHeader header_;
+    std::vector<TimeIndex> index_;
+    std::string filename_;
+
+public:
+    BinaryDataReader(const std::string& filename)
+        : filename_(filename) {
+
+        file_.open(filename, std::ios::binary | std::ios::in);
+        if (!file_) {
+            throw std::runtime_error("Failed to open file: " + filename);
+        }
+
+        read_header();
+        read_index();
+    }
+
+    ~BinaryDataReader() {
+        if (file_.is_open()) {
+            file_.close();
+        }
+    }
+
+    const DataFileHeader& get_header() const {
+        return header_;
+    }
+
+    uint64_t get_record_count() const {
+        return header_.num_records;
+    }
+
+    // Read all ticks
+    std::vector<TickType> read_all() {
+        std::vector<TickType> ticks;
+        ticks.reserve(header_.num_records);
+
+        file_.seekg(header_.data_offset);
+
+        for (const auto& idx : index_) {
+            auto block = read_block(idx);
+            ticks.insert(ticks.end(), block.begin(), block.end());
+        }
+
+        return ticks;
+    }
+
+    // Read ticks in time range
+    std::vector<TickType> read_range(int64_t start_ns, int64_t end_ns) {
+        std::vector<TickType> ticks;
+
+        // Find relevant index entries
+        for (const auto& idx : index_) {
+            if (idx.timestamp_ns > end_ns) break;
+
+            auto block = read_block(idx);
+
+            for (const auto& tick : block) {
+                if (tick.timestamp_ns >= start_ns &&
+                    tick.timestamp_ns <= end_ns) {
+                    ticks.push_back(tick);
+                }
+            }
+        }
+
+        return ticks;
+    }
+
+    // Sequential reader for streaming
+    class Iterator {
+    private:
+        BinaryDataReader* reader_;
+        size_t index_pos_;
+        std::vector<TickType> current_block_;
+        size_t block_pos_;
+
+    public:
+        Iterator(BinaryDataReader* reader, size_t index_pos)
+            : reader_(reader), index_pos_(index_pos), block_pos_(0) {
+            load_next_block();
+        }
+
+        bool has_next() const {
+            return index_pos_ < reader_->index_.size() ||
+                   block_pos_ < current_block_.size();
+        }
+
+        TickType next() {
+            if (block_pos_ >= current_block_.size()) {
+                load_next_block();
+            }
+            return current_block_[block_pos_++];
+        }
+
+    private:
+        void load_next_block() {
+            if (index_pos_ < reader_->index_.size()) {
+                current_block_ = reader_->read_block(
+                    reader_->index_[index_pos_]);
+                index_pos_++;
+                block_pos_ = 0;
+            }
+        }
+    };
+
+    Iterator begin() {
+        return Iterator(this, 0);
+    }
+
+private:
+    void read_header() {
+        file_.read(reinterpret_cast<char*>(&header_),
+                  sizeof(DataFileHeader));
+
+        if (!header_.is_valid()) {
+            throw std::runtime_error("Invalid file format");
+        }
+
+        if (header_.record_size != sizeof(TickType)) {
+            throw std::runtime_error("Record size mismatch");
+        }
+    }
+
+    void read_index() {
+        file_.seekg(header_.index_offset);
+
+        size_t index_count = (file_.seekg(0, std::ios::end).tellg() -
+                             header_.index_offset) / sizeof(TimeIndex);
+
+        file_.seekg(header_.index_offset);
+
+        index_.resize(index_count);
+        file_.read(reinterpret_cast<char*>(index_.data()),
+                  index_count * sizeof(TimeIndex));
+    }
+
+    std::vector<TickType> read_block(const TimeIndex& idx) {
+        std::vector<TickType> block(idx.record_count);
+
+        file_.seekg(idx.file_offset);
+        file_.read(reinterpret_cast<char*>(block.data()),
+                  idx.compressed_size);
+
+        return block;
+    }
+};
+
+================================================================================
+4. MEMORY-MAPPED FILE ACCESS
+================================================================================
+
+/*******************************************************************************
+ * MEMORY-MAPPED DATA READER - Zero-copy access
+ ******************************************************************************/
+
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+template<typename TickType>
+class MmapDataReader {
+private:
+    int fd_;
+    void* mapped_data_;
+    size_t file_size_;
+    DataFileHeader* header_;
+    TimeIndex* index_;
+    size_t index_count_;
+    TickType* data_;
+
+public:
+    MmapDataReader(const std::string& filename) {
+        fd_ = open(filename.c_str(), O_RDONLY);
+        if (fd_ == -1) {
+            throw std::runtime_error("Failed to open file: " + filename);
+        }
+
+        struct stat sb;
+        if (fstat(fd_, &sb) == -1) {
+            close(fd_);
+            throw std::runtime_error("Failed to stat file");
+        }
+        file_size_ = sb.st_size;
+
+        mapped_data_ = mmap(nullptr, file_size_, PROT_READ,
+                           MAP_PRIVATE, fd_, 0);
+        if (mapped_data_ == MAP_FAILED) {
+            close(fd_);
+            throw std::runtime_error("Failed to mmap file");
+        }
+
+        // Advise kernel about access pattern
+        madvise(mapped_data_, file_size_, MADV_SEQUENTIAL);
+
+        // Parse header
+        header_ = static_cast<DataFileHeader*>(mapped_data_);
+        if (!header_->is_valid()) {
+            munmap(mapped_data_, file_size_);
+            close(fd_);
+            throw std::runtime_error("Invalid file format");
+        }
+
+        // Parse index
+        index_ = reinterpret_cast<TimeIndex*>(
+            static_cast<char*>(mapped_data_) + header_->index_offset);
+
+        index_count_ = (file_size_ - header_->index_offset) /
+                      sizeof(TimeIndex);
+
+        // Data pointer
+        data_ = reinterpret_cast<TickType*>(
+            static_cast<char*>(mapped_data_) + header_->data_offset);
+    }
+
+    ~MmapDataReader() {
+        if (mapped_data_ != nullptr) {
+            munmap(mapped_data_, file_size_);
+        }
+        if (fd_ != -1) {
+            close(fd_);
+        }
+    }
+
+    const TickType* get_data() const {
+        return data_;
+    }
+
+    size_t get_record_count() const {
+        return header_->num_records;
+    }
+
+    // Zero-copy access to tick by index
+    const TickType& operator[](size_t index) const {
+        return data_[index];
+    }
+
+    // Find ticks in time range (returns pointers to mapped data)
+    std::pair<const TickType*, const TickType*>
+    find_range(int64_t start_ns, int64_t end_ns) const {
+
+        // Binary search for start
+        const TickType* begin_ptr = nullptr;
+        const TickType* end_ptr = nullptr;
+
+        size_t offset = 0;
+        for (size_t i = 0; i < index_count_; ++i) {
+            const auto& idx = index_[i];
+
+            if (idx.timestamp_ns <= end_ns) {
+                const TickType* block = data_ + offset;
+
+                for (size_t j = 0; j < idx.record_count; ++j) {
+                    if (block[j].timestamp_ns >= start_ns &&
+                        block[j].timestamp_ns <= end_ns) {
+
+                        if (begin_ptr == nullptr) {
+                            begin_ptr = &block[j];
+                        }
+                        end_ptr = &block[j] + 1;
+                    }
+                }
+            }
+
+            offset += idx.record_count;
+        }
+
+        return {begin_ptr, end_ptr};
+    }
+};
+
+================================================================================
+5. DATA COMPRESSION
+================================================================================
+
+/*******************************************************************************
+ * LZ4 COMPRESSION FOR TICK DATA
+ ******************************************************************************/
+
+#include <lz4.h>
+#include <lz4hc.h>
+
+class TickCompressor {
+public:
+    // Compress a block of ticks
+    template<typename TickType>
+    static std::vector<char> compress(const std::vector<TickType>& ticks,
+                                     int compression_level = 9) {
+        const char* src = reinterpret_cast<const char*>(ticks.data());
+        int src_size = ticks.size() * sizeof(TickType);
+
+        int max_dst_size = LZ4_compressBound(src_size);
+        std::vector<char> compressed(max_dst_size + 4); // +4 for size header
+
+        // Write uncompressed size
+        *reinterpret_cast<int*>(compressed.data()) = src_size;
+
+        int compressed_size = LZ4_compress_HC(
+            src, compressed.data() + 4, src_size,
+            max_dst_size, compression_level);
+
+        if (compressed_size <= 0) {
+            throw std::runtime_error("Compression failed");
+        }
+
+        compressed.resize(compressed_size + 4);
+        return compressed;
+    }
+
+    // Decompress tick data
+    template<typename TickType>
+    static std::vector<TickType> decompress(const std::vector<char>& compressed) {
+        int uncompressed_size = *reinterpret_cast<const int*>(
+            compressed.data());
+
+        std::vector<TickType> ticks(uncompressed_size / sizeof(TickType));
+
+        int result = LZ4_decompress_safe(
+            compressed.data() + 4,
+            reinterpret_cast<char*>(ticks.data()),
+            compressed.size() - 4,
+            uncompressed_size);
+
+        if (result < 0) {
+            throw std::runtime_error("Decompression failed");
+        }
+
+        return ticks;
+    }
+
+    // Calculate compression ratio
+    template<typename TickType>
+    static double get_compression_ratio(const std::vector<TickType>& ticks) {
+        auto compressed = compress(ticks);
+        return static_cast<double>(ticks.size() * sizeof(TickType)) /
+               compressed.size();
+    }
+};
+
+================================================================================
+6. DATA LOADER IMPLEMENTATION
+================================================================================
+
+/*******************************************************************************
+ * MULTI-THREADED DATA LOADER
+ ******************************************************************************/
+
+#include <thread>
+#include <future>
+#include <queue>
+
+template<typename TickType>
+class ParallelDataLoader {
+private:
+    size_t num_threads_;
+    std::vector<std::string> filenames_;
+
+public:
+    ParallelDataLoader(size_t num_threads = std::thread::hardware_concurrency())
+        : num_threads_(num_threads) {}
+
+    void add_file(const std::string& filename) {
+        filenames_.push_back(filename);
+    }
+
+    std::vector<TickType> load_all() {
+        std::vector<std::future<std::vector<TickType>>> futures;
+
+        // Launch parallel readers
+        for (const auto& filename : filenames_) {
+            futures.push_back(std::async(std::launch::async,
+                [filename]() {
+                    BinaryDataReader<TickType> reader(filename);
+                    return reader.read_all();
+                }));
+        }
+
+        // Collect results
+        std::vector<TickType> all_ticks;
+        for (auto& future : futures) {
+            auto ticks = future.get();
+            all_ticks.insert(all_ticks.end(), ticks.begin(), ticks.end());
+        }
+
+        // Sort by timestamp
+        std::sort(all_ticks.begin(), all_ticks.end(),
+            [](const TickType& a, const TickType& b) {
+                return a.timestamp_ns < b.timestamp_ns;
+            });
+
+        return all_ticks;
+    }
+
+    std::vector<TickType> load_range(int64_t start_ns, int64_t end_ns) {
+        std::vector<std::future<std::vector<TickType>>> futures;
+
+        for (const auto& filename : filenames_) {
+            futures.push_back(std::async(std::launch::async,
+                [filename, start_ns, end_ns]() {
+                    BinaryDataReader<TickType> reader(filename);
+                    return reader.read_range(start_ns, end_ns);
+                }));
+        }
+
+        std::vector<TickType> all_ticks;
+        for (auto& future : futures) {
+            auto ticks = future.get();
+            all_ticks.insert(all_ticks.end(), ticks.begin(), ticks.end());
+        }
+
+        std::sort(all_ticks.begin(), all_ticks.end(),
+            [](const TickType& a, const TickType& b) {
+                return a.timestamp_ns < b.timestamp_ns;
+            });
+
+        return all_ticks;
+    }
+};
+
+/*******************************************************************************
+ * CSV TO BINARY CONVERTER
+ ******************************************************************************/
+
+class CSVToBinaryConverter {
+public:
+    static void convert_trades(const std::string& csv_file,
+                              const std::string& binary_file,
+                              SymbolMapper& mapper) {
+
+        BinaryDataWriter<TradeTick> writer(binary_file);
+        std::ifstream csv(csv_file);
+
+        if (!csv) {
+            throw std::runtime_error("Failed to open CSV: " + csv_file);
+        }
+
+        std::string line;
+        std::getline(csv, line); // Skip header
+
+        while (std::getline(csv, line)) {
+            TradeTick tick = parse_trade_csv_line(line, mapper);
+            writer.write(tick);
+        }
+
+        writer.close();
+    }
+
+private:
+    static TradeTick parse_trade_csv_line(const std::string& line,
+                                          SymbolMapper& mapper) {
+        TradeTick tick;
+
+        std::istringstream ss(line);
+        std::string field;
+
+        // timestamp,symbol,price,size,side
+        std::getline(ss, field, ',');
+        tick.timestamp_ns = std::stoll(field);
+
+        std::getline(ss, field, ',');
+        tick.symbol_id = mapper.get_or_create_id(field);
+
+        std::getline(ss, field, ',');
+        tick.price = std::stod(field);
+
+        std::getline(ss, field, ',');
+        tick.size = std::stoi(field);
+
+        std::getline(ss, field, ',');
+        tick.side = (field == "BUY") ? 0 : 1;
+
+        return tick;
+    }
+};
+
+================================================================================
+7. COMPLETE DATA MANAGEMENT SYSTEM
+================================================================================
+
+/*******************************************************************************
+ * UNIFIED DATA MANAGER
+ ******************************************************************************/
+
+class HistoricalDataManager {
+private:
+    std::string data_directory_;
+    SymbolMapper symbol_mapper_;
+
+    std::map<std::string, std::unique_ptr<MmapDataReader<TradeTick>>>
+        trade_readers_;
+    std::map<std::string, std::unique_ptr<MmapDataReader<QuoteTick>>>
+        quote_readers_;
+
+    mutable std::shared_mutex mutex_;
+
+public:
+    HistoricalDataManager(const std::string& data_dir)
+        : data_directory_(data_dir) {}
+
+    void load_symbol(const std::string& symbol, const std::string& date) {
+        std::string trade_file = get_trade_filename(symbol, date);
+        std::string quote_file = get_quote_filename(symbol, date);
+
+        std::unique_lock<std::shared_mutex> lock(mutex_);
+
+        if (file_exists(trade_file)) {
+            trade_readers_[symbol + "_" + date] =
+                std::make_unique<MmapDataReader<TradeTick>>(trade_file);
+        }
+
+        if (file_exists(quote_file)) {
+            quote_readers_[symbol + "_" + date] =
+                std::make_unique<MmapDataReader<QuoteTick>>(quote_file);
+        }
+    }
+
+    std::vector<TradeTick> get_trades(const std::string& symbol,
+                                     const std::string& date,
+                                     int64_t start_ns,
+                                     int64_t end_ns) {
+        std::shared_lock<std::shared_mutex> lock(mutex_);
+
+        std::string key = symbol + "_" + date;
+        auto it = trade_readers_.find(key);
+
+        if (it == trade_readers_.end()) {
+            return {};
+        }
+
+        auto [begin, end] = it->second->find_range(start_ns, end_ns);
+        return std::vector<TradeTick>(begin, end);
+    }
+
+    std::vector<QuoteTick> get_quotes(const std::string& symbol,
+                                     const std::string& date,
+                                     int64_t start_ns,
+                                     int64_t end_ns) {
+        std::shared_lock<std::shared_mutex> lock(mutex_);
+
+        std::string key = symbol + "_" + date;
+        auto it = quote_readers_.find(key);
+
+        if (it == quote_readers_.end()) {
+            return {};
+        }
+
+        auto [begin, end] = it->second->find_range(start_ns, end_ns);
+        return std::vector<QuoteTick>(begin, end);
+    }
+
+private:
+    std::string get_trade_filename(const std::string& symbol,
+                                  const std::string& date) const {
+        return data_directory_ + "/" + symbol + "_" + date + "_trades.bin";
+    }
+
+    std::string get_quote_filename(const std::string& symbol,
+                                  const std::string& date) const {
+        return data_directory_ + "/" + symbol + "_" + date + "_quotes.bin";
+    }
+
+    bool file_exists(const std::string& filename) const {
+        std::ifstream f(filename);
+        return f.good();
+    }
+};
+
+} // namespace Data
+} // namespace HFT
+
+================================================================================
+END OF HISTORICAL DATA MANAGEMENT
+================================================================================

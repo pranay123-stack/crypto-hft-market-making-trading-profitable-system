@@ -1,0 +1,885 @@
+================================================================================
+NETWORK SETTINGS FOR HFT OPTIMIZATION
+================================================================================
+
+OVERVIEW:
+Network optimization is critical for HFT systems where every microsecond
+matters. This document covers TCP/UDP tuning, ring buffer optimization,
+interrupt coalescing, kernel bypass techniques, and NIC configuration.
+
+TARGET METRICS:
+- Network Latency: < 10 microseconds (userspace to wire)
+- Packet Processing: < 1 microsecond per packet
+- Jitter: < 5 microseconds (99.99th percentile)
+- Packet Loss: 0% under normal conditions
+- CPU Overhead: < 5% for network processing
+
+================================================================================
+1. NETWORK INTERFACE CARD (NIC) SELECTION
+================================================================================
+
+RECOMMENDED NICS FOR HFT:
+- Intel X710/XL710 (10/40 GbE)
+- Intel E810 (25/50/100 GbE)
+- Mellanox ConnectX-5/6/7 (25/40/100 GbE)
+- Solarflare (Xilinx) X2/X3 series
+- Broadcom NetXtreme-E
+
+KEY FEATURES TO LOOK FOR:
+- Kernel bypass support (DPDK, AF_XDP)
+- Hardware timestamping (PTP)
+- Multiple queue support (RSS/MSI-X)
+- Low-latency firmware
+- PCI Express 3.0/4.0 x8 or x16
+
+CHECK CURRENT NIC:
+----------------------------------------
+# List network interfaces
+ip link show
+
+# Check NIC model and driver
+lspci | grep -i ethernet
+ethtool -i eth0
+
+# Check NIC capabilities
+ethtool eth0
+ethtool -k eth0  # Feature list
+
+# Check PCIe link speed
+lspci -vv -s <BUS:DEVICE.FUNCTION> | grep -i "lnksta:"
+# Should show: Speed 8GT/s (Gen3) or 16GT/s (Gen4)
+----------------------------------------
+
+================================================================================
+2. NETWORK DRIVER CONFIGURATION
+================================================================================
+
+DRIVER SELECTION:
+- Native kernel drivers (e1000e, i40e, ice, mlx5_core)
+- Kernel bypass: DPDK, AF_XDP, Solarflare Onload
+- User-space networking: Netmap, PF_RING
+
+UPDATE NETWORK DRIVERS:
+----------------------------------------
+# Check current driver version
+ethtool -i eth0 | grep version
+
+# Update to latest driver (Intel example)
+cd /usr/src
+wget https://downloadcenter.intel.com/download/xxx/i40e-x.x.x.tar.gz
+tar xvf i40e-x.x.x.tar.gz
+cd i40e-x.x.x/src
+make install
+modprobe -r i40e
+modprobe i40e
+----------------------------------------
+
+DRIVER PARAMETERS (INTEL I40E EXAMPLE):
+----------------------------------------
+# View current parameters
+modinfo i40e
+
+# Create driver configuration
+cat > /etc/modprobe.d/i40e.conf << EOF
+# Interrupt throttling (0 = disabled for lowest latency)
+options i40e IntMode=2 ITR=0
+
+# Enable flow director for filtering
+options i40e FdirPballoc=3
+
+# Number of queues (match number of isolated CPUs)
+# Let driver auto-detect or specify manually
+EOF
+
+# Reload driver
+modprobe -r i40e && modprobe i40e
+----------------------------------------
+
+MELLANOX MLX5 DRIVER PARAMETERS:
+----------------------------------------
+cat > /etc/modprobe.d/mlx5.conf << EOF
+# Enable adaptive interrupt moderation (disable for lowest latency)
+options mlx5_core rx_cqe_compress=0
+
+# Set number of channels
+options mlx5_core num_of_channels=8
+EOF
+
+modprobe -r mlx5_core && modprobe mlx5_core
+----------------------------------------
+
+================================================================================
+3. RING BUFFER OPTIMIZATION
+================================================================================
+
+CONCEPT:
+Ring buffers store incoming/outgoing packets. Larger buffers reduce drops
+but increase latency. For HFT, tune for minimal latency.
+
+CHECK RING BUFFER SIZE:
+----------------------------------------
+# Current ring buffer settings
+ethtool -g eth0
+
+# Output shows:
+# Ring parameters for eth0:
+# Pre-set maximums:
+# RX:         4096
+# TX:         4096
+# Current hardware settings:
+# RX:         512
+# TX:         512
+----------------------------------------
+
+OPTIMIZE RING BUFFERS:
+----------------------------------------
+# For low latency, use smaller ring buffers
+# Reduces buffering delay but requires faster processing
+
+# Set ring buffer size
+ethtool -G eth0 rx 256 tx 256
+
+# For very low latency (if no drops occur)
+ethtool -G eth0 rx 128 tx 128
+
+# Make persistent (create systemd service)
+cat > /etc/systemd/system/network-tuning.service << EOF
+[Unit]
+Description=Network Tuning for HFT
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/ethtool -G eth0 rx 256 tx 256
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl enable network-tuning.service
+systemctl start network-tuning.service
+----------------------------------------
+
+MONITORING:
+----------------------------------------
+# Check for packet drops
+ethtool -S eth0 | grep -E "drop|error|miss"
+
+# If drops occur, increase ring buffer
+# Balance between latency and drops
+# Target: 0 drops under normal load
+
+# Continuous monitoring
+watch -n 1 "ethtool -S eth0 | grep -E 'drop|error|miss'"
+----------------------------------------
+
+================================================================================
+4. INTERRUPT COALESCING (CRITICAL)
+================================================================================
+
+CONCEPT:
+Interrupt coalescing groups packets before generating interrupts.
+Reduces CPU overhead but increases latency. For HFT, minimize or disable.
+
+CHECK INTERRUPT COALESCING:
+----------------------------------------
+# Current settings
+ethtool -c eth0
+
+# Key parameters:
+# rx-usecs: Delay before RX interrupt (microseconds)
+# tx-usecs: Delay before TX interrupt
+# rx-frames: Number of frames before RX interrupt
+# adaptive-rx: Adaptive interrupt moderation
+----------------------------------------
+
+DISABLE INTERRUPT COALESCING (LOWEST LATENCY):
+----------------------------------------
+# Disable all coalescing
+ethtool -C eth0 adaptive-rx off adaptive-tx off \
+    rx-usecs 0 tx-usecs 0 \
+    rx-frames 1 tx-frames 1
+
+# This generates interrupt per packet
+# Highest CPU usage, lowest latency
+
+# Verify
+ethtool -c eth0
+----------------------------------------
+
+MINIMAL COALESCING (BALANCED):
+----------------------------------------
+# Very small coalescing for slight CPU relief
+ethtool -C eth0 adaptive-rx off adaptive-tx off \
+    rx-usecs 1 tx-usecs 1 \
+    rx-frames 1 tx-frames 1
+
+# Or use adaptive with low threshold
+ethtool -C eth0 adaptive-rx on adaptive-tx on \
+    rx-usecs-low 0 rx-frames-low 1
+----------------------------------------
+
+MAKE PERSISTENT:
+----------------------------------------
+# Add to network-tuning.service
+ExecStart=/usr/sbin/ethtool -C eth0 adaptive-rx off rx-usecs 0 tx-usecs 0
+
+# Or use udev rule
+cat > /etc/udev/rules.d/60-network-tuning.rules << EOF
+ACTION=="add", SUBSYSTEM=="net", KERNEL=="eth0", \
+    RUN+="/usr/sbin/ethtool -C eth0 adaptive-rx off rx-usecs 0 tx-usecs 0"
+EOF
+----------------------------------------
+
+================================================================================
+5. MULTI-QUEUE AND RSS (RECEIVE SIDE SCALING)
+================================================================================
+
+CONCEPT:
+Distribute packet processing across multiple CPUs using hardware queues
+and RSS. Essential for multi-core HFT systems.
+
+CHECK QUEUE CONFIGURATION:
+----------------------------------------
+# Number of queues
+ethtool -l eth0
+
+# Queue statistics
+ethtool -S eth0 | grep "queue.*packets"
+
+# RSS hash function
+ethtool -x eth0
+----------------------------------------
+
+CONFIGURE MULTI-QUEUE:
+----------------------------------------
+# Set number of combined queues (RX+TX)
+# Match number of isolated CPUs
+ethtool -L eth0 combined 4
+
+# Or set RX and TX separately
+ethtool -L eth0 rx 4 tx 4
+
+# Verify
+ethtool -l eth0
+----------------------------------------
+
+RSS CONFIGURATION:
+----------------------------------------
+# Configure RSS hash key (for distribution)
+# Use default or custom key
+
+# View current RSS configuration
+ethtool -x eth0
+
+# Set RSS queue mapping
+# Distribute to isolated CPUs (1-4)
+ethtool -X eth0 equal 4
+
+# Custom distribution
+ethtool -X eth0 weight 1 1 1 1
+
+# Set RSS hash fields
+ethtool -N eth0 rx-flow-hash tcp4 sdfn
+# s=source IP, d=dest IP, f=source port, n=dest port
+----------------------------------------
+
+IRQ AFFINITY FOR QUEUES:
+----------------------------------------
+# Pin each queue's IRQ to specific isolated CPU
+# Find IRQ numbers for eth0
+grep eth0 /proc/interrupts | awk '{print $1}' | sed 's/://g'
+
+# Script to set affinity
+#!/bin/bash
+INTERFACE="eth0"
+CPUS=(1 2 3 4)  # Isolated CPUs
+
+# Get IRQ numbers for interface queues
+IRQS=($(grep $INTERFACE /proc/interrupts | awk '{print $1}' | sed 's/:$//'))
+
+# Set affinity for each IRQ
+for i in "${!IRQS[@]}"; do
+    IRQ=${IRQS[$i]}
+    CPU=${CPUS[$i % ${#CPUS[@]}]}
+    echo "Setting IRQ $IRQ to CPU $CPU"
+    echo $CPU > /proc/irq/$IRQ/smp_affinity_list
+done
+
+# Verify
+cat /proc/irq/*/smp_affinity_list
+----------------------------------------
+
+RPS/RFS (RECEIVE PACKET STEERING):
+----------------------------------------
+# Software-based load balancing (use if hardware RSS limited)
+# Not needed with good hardware RSS
+
+# Enable RPS (if needed)
+for queue in /sys/class/net/eth0/queues/rx-*/rps_cpus; do
+    echo "f" > $queue  # CPUs 0-3 (binary: 1111)
+done
+
+# RFS (Receive Flow Steering)
+echo 32768 > /proc/sys/net/core/rps_sock_flow_entries
+for queue in /sys/class/net/eth0/queues/rx-*/rps_flow_cnt; do
+    echo 8192 > $queue
+done
+----------------------------------------
+
+================================================================================
+6. TCP/UDP STACK TUNING
+================================================================================
+
+TCP TUNING (IF USING TCP):
+----------------------------------------
+# Network interface buffer sizes
+ethtool -g eth0
+
+# Kernel socket buffers
+cat > /etc/sysctl.d/99-hft-network.conf << EOF
+# Socket buffer sizes (bytes)
+net.core.rmem_max = 134217728          # 128 MB
+net.core.wmem_max = 134217728          # 128 MB
+net.core.rmem_default = 16777216       # 16 MB
+net.core.wmem_default = 16777216       # 16 MB
+
+# TCP buffer sizes (min, default, max)
+net.ipv4.tcp_rmem = 4096 87380 134217728
+net.ipv4.tcp_wmem = 4096 65536 134217728
+
+# TCP optimization
+net.ipv4.tcp_timestamps = 0            # Disable for lower overhead
+net.ipv4.tcp_sack = 1                  # Selective ACK
+net.ipv4.tcp_window_scaling = 1        # Window scaling
+net.ipv4.tcp_low_latency = 1           # Low latency mode
+net.ipv4.tcp_adv_win_scale = 1         # Reduce buffering
+net.ipv4.tcp_no_metrics_save = 1       # Don't cache metrics
+
+# TCP congestion control (use cubic or bbr)
+net.ipv4.tcp_congestion_control = cubic
+
+# Disable slow start after idle
+net.ipv4.tcp_slow_start_after_idle = 0
+
+# Fast socket allocation
+net.ipv4.tcp_fastopen = 3              # Enable TFO
+
+# Connection tracking
+net.netfilter.nf_conntrack_max = 1000000
+net.nf_conntrack_max = 1000000
+
+# Backlog sizes
+net.core.netdev_max_backlog = 10000
+net.core.somaxconn = 1024
+net.ipv4.tcp_max_syn_backlog = 8192
+
+# Apply
+sysctl -p /etc/sysctl.d/99-hft-network.conf
+EOF
+----------------------------------------
+
+UDP TUNING (PREFERRED FOR HFT):
+----------------------------------------
+cat >> /etc/sysctl.d/99-hft-network.conf << EOF
+# UDP buffer sizes
+net.core.rmem_max = 134217728
+net.core.wmem_max = 134217728
+
+# Increase default UDP buffer
+net.core.rmem_default = 16777216
+net.core.wmem_default = 16777216
+
+# Netdev budget (packets per NAPI poll)
+net.core.netdev_budget = 600           # Default: 300
+net.core.netdev_budget_usecs = 8000    # Default: 2000
+
+# Busy polling (for ultra-low latency)
+net.core.busy_poll = 50                # Microseconds
+net.core.busy_read = 50
+
+# Apply
+sysctl -p /etc/sysctl.d/99-hft-network.conf
+EOF
+----------------------------------------
+
+BUSY POLLING:
+----------------------------------------
+# Enable busy polling in application
+# C++ code example:
+
+#include <sys/socket.h>
+
+void enable_busy_poll(int sockfd) {
+    int busy_poll = 50;  // microseconds
+    setsockopt(sockfd, SOL_SOCKET, SO_BUSY_POLL,
+               &busy_poll, sizeof(busy_poll));
+}
+
+// Usage
+int sock = socket(AF_INET, SOCK_DGRAM, 0);
+enable_busy_poll(sock);
+----------------------------------------
+
+SOCKET OPTIONS FOR LOW LATENCY:
+----------------------------------------
+// C++ socket optimization
+#include <netinet/tcp.h>
+
+void optimize_socket(int sockfd) {
+    int flag = 1;
+
+    // TCP_NODELAY: Disable Nagle's algorithm
+    setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY,
+               &flag, sizeof(flag));
+
+    // TCP_QUICKACK: Send ACKs immediately
+    setsockopt(sockfd, IPPROTO_TCP, TCP_QUICKACK,
+               &flag, sizeof(flag));
+
+    // SO_PRIORITY: Set socket priority
+    int priority = 6;  // High priority
+    setsockopt(sockfd, SOL_SOCKET, SO_PRIORITY,
+               &priority, sizeof(priority));
+
+    // SO_RCVBUF/SO_SNDBUF: Buffer sizes
+    int bufsize = 16777216;  // 16 MB
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF,
+               &bufsize, sizeof(bufsize));
+    setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF,
+               &bufsize, sizeof(bufsize));
+
+    // SO_BUSY_POLL: Enable busy polling
+    int busy_poll = 50;
+    setsockopt(sockfd, SOL_SOCKET, SO_BUSY_POLL,
+               &busy_poll, sizeof(busy_poll));
+}
+----------------------------------------
+
+================================================================================
+7. KERNEL BYPASS TECHNIQUES
+================================================================================
+
+CONCEPT:
+Bypass kernel network stack entirely for absolute minimum latency.
+
+DPDK (DATA PLANE DEVELOPMENT KIT):
+----------------------------------------
+# Install DPDK
+apt-get install dpdk dpdk-dev  # Ubuntu/Debian
+yum install dpdk dpdk-devel    # RHEL/CentOS
+
+# Or build from source
+cd /usr/src
+wget https://fast.dpdk.org/rel/dpdk-23.11.tar.xz
+tar xvf dpdk-23.11.tar.xz
+cd dpdk-stable-23.11
+
+# Install dependencies
+apt-get install python3-pip ninja-build
+pip3 install meson
+
+# Build DPDK
+meson build
+cd build
+ninja
+ninja install
+ldconfig
+
+# Setup huge pages (required for DPDK)
+echo 2048 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+mkdir -p /mnt/huge
+mount -t hugetlbfs nodev /mnt/huge
+
+# Bind NIC to DPDK driver
+modprobe vfio-pci
+dpdk-devbind.py --bind=vfio-pci 0000:03:00.0  # Your NIC PCIe address
+
+# Verify
+dpdk-devbind.py --status
+----------------------------------------
+
+DPDK APPLICATION EXAMPLE:
+----------------------------------------
+// Minimal DPDK receive loop
+#include <rte_eal.h>
+#include <rte_ethdev.h>
+#include <rte_mbuf.h>
+
+#define RX_RING_SIZE 128
+#define NUM_MBUFS 8191
+#define MBUF_CACHE_SIZE 250
+
+int main(int argc, char *argv[]) {
+    // Initialize DPDK
+    int ret = rte_eal_init(argc, argv);
+    if (ret < 0)
+        rte_exit(EXIT_FAILURE, "Cannot init EAL\\n");
+
+    // Create mempool
+    struct rte_mempool *mbuf_pool = rte_pktmbuf_pool_create(
+        "MBUF_POOL", NUM_MBUFS, MBUF_CACHE_SIZE, 0,
+        RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
+
+    // Configure port
+    uint16_t port = 0;
+    struct rte_eth_conf port_conf = {};
+    rte_eth_dev_configure(port, 1, 1, &port_conf);
+
+    // Setup RX queue
+    rte_eth_rx_queue_setup(port, 0, RX_RING_SIZE,
+        rte_eth_dev_socket_id(port), NULL, mbuf_pool);
+
+    // Start device
+    rte_eth_dev_start(port);
+
+    // Receive loop
+    struct rte_mbuf *bufs[32];
+    while (1) {
+        uint16_t nb_rx = rte_eth_rx_burst(port, 0, bufs, 32);
+        for (uint16_t i = 0; i < nb_rx; i++) {
+            // Process packet
+            // ... trading logic ...
+            rte_pktmbuf_free(bufs[i]);
+        }
+    }
+
+    return 0;
+}
+
+# Compile
+gcc -o dpdk_app dpdk_app.c $(pkg-config --cflags --libs libdpdk)
+
+# Run with EAL parameters
+./dpdk_app -l 1-2 -n 4 -- -p 0x1
+----------------------------------------
+
+AF_XDP (LINUX NATIVE KERNEL BYPASS):
+----------------------------------------
+# Simpler than DPDK, lower performance but easier integration
+# Requires Linux 5.x+ and libbpf
+
+# Install dependencies
+apt-get install libbpf-dev libelf-dev
+
+# AF_XDP socket creation (C++ example)
+#include <linux/if_xdp.h>
+#include <bpf/xsk.h>
+
+struct xsk_socket_info {
+    struct xsk_ring_cons rx;
+    struct xsk_ring_prod tx;
+    struct xsk_umem *umem;
+    struct xsk_socket *xsk;
+};
+
+// Setup AF_XDP socket
+// (See kernel samples/bpf for complete example)
+----------------------------------------
+
+SOLARFLARE ONLOAD:
+----------------------------------------
+# Commercial kernel bypass from Xilinx (formerly Solarflare)
+# Requires Solarflare NICs
+
+# Install Onload
+# Download from Xilinx website
+tar xvf onload-x.x.tar.gz
+cd onload-x.x/scripts
+./onload_install
+
+# Use with existing applications (LD_PRELOAD)
+onload ./trading_engine
+
+# Or use Onload API directly
+#include <onload/extensions.h>
+----------------------------------------
+
+================================================================================
+8. NETWORK MONITORING AND VALIDATION
+================================================================================
+
+INTERFACE STATISTICS:
+----------------------------------------
+# Real-time packet statistics
+ethtool -S eth0
+
+# Important metrics:
+# - rx_packets, tx_packets: Total packets
+# - rx_errors, tx_errors: Error count (should be 0)
+# - rx_dropped, tx_dropped: Dropped packets (should be 0)
+# - rx_missed_errors: Buffer overflow (should be 0)
+
+# Continuous monitoring
+watch -n 1 "ethtool -S eth0 | grep -E 'packets|errors|dropped|missed'"
+----------------------------------------
+
+NETWORK LATENCY MEASUREMENT:
+----------------------------------------
+# ICMP ping (basic, not accurate for HFT)
+ping -i 0.001 -c 10000 target_host
+
+# TCP latency with sockperf
+# Install sockperf
+git clone https://github.com/Mellanox/sockperf
+cd sockperf && ./autogen.sh && ./configure && make && make install
+
+# Server side
+sockperf server -i 192.168.1.100 -p 11111
+
+# Client side (latency test)
+sockperf under-load -i 192.168.1.100 -p 11111 -t 60 --mps=10000
+
+# UDP latency
+sockperf ping-pong -i 192.168.1.100 -p 11111 --udp
+
+# Target: < 10 us for 50th percentile
+#         < 50 us for 99.99th percentile
+----------------------------------------
+
+PACKET CAPTURE (MINIMAL OVERHEAD):
+----------------------------------------
+# Use hardware timestamping if available
+tcpdump -i eth0 -j adapter_unsynced -w capture.pcap
+
+# Minimal capture (headers only)
+tcpdump -i eth0 -s 96 -w capture.pcap
+
+# Better: Use DPDK packet capture or hardware mirroring
+# Avoid tcpdump on production trading interface
+----------------------------------------
+
+BANDWIDTH MONITORING:
+----------------------------------------
+# iftop: Real-time bandwidth monitor
+iftop -i eth0
+
+# nload: Simple bandwidth monitor
+nload eth0
+
+# iperf3: Bandwidth testing
+# Server
+iperf3 -s
+
+# Client
+iperf3 -c server_ip -t 60 -i 1
+
+# Should achieve line rate (10 Gbps for 10GbE)
+----------------------------------------
+
+================================================================================
+9. HARDWARE TIMESTAMPING (PTP)
+================================================================================
+
+CONCEPT:
+Hardware timestamping provides nanosecond-accurate packet timestamps
+in hardware, eliminating kernel overhead.
+
+CHECK PTP SUPPORT:
+----------------------------------------
+# Check if NIC supports hardware timestamping
+ethtool -T eth0
+
+# Should show:
+# Time stamping parameters for eth0:
+# Capabilities:
+#   hardware-transmit
+#   hardware-receive
+#   hardware-raw-clock
+----------------------------------------
+
+CONFIGURE PTP:
+----------------------------------------
+# Install ptp4l (Linux PTP)
+apt-get install linuxptp
+
+# Configure PTP
+cat > /etc/ptp4l.conf << EOF
+[global]
+tx_timestamp_timeout     10
+logMinPdelayReqInterval  0
+logSyncInterval         -3
+logAnnounceInterval      1
+announceReceiptTimeout   3
+
+[eth0]
+delay_mechanism          E2E
+network_transport        UDPv4
+EOF
+
+# Start PTP daemon
+ptp4l -i eth0 -m -f /etc/ptp4l.conf
+
+# Sync system clock to PTP
+phc2sys -a -r -m
+----------------------------------------
+
+HARDWARE TIMESTAMPING IN CODE:
+----------------------------------------
+#include <linux/net_tstamp.h>
+#include <linux/sockios.h>
+
+void enable_hw_timestamps(int sockfd) {
+    struct ifreq ifr = {};
+    struct hwtstamp_config hwc = {};
+
+    strncpy(ifr.ifr_name, "eth0", IFNAMSIZ);
+
+    // Enable RX and TX hardware timestamps
+    hwc.tx_type = HWTSTAMP_TX_ON;
+    hwc.rx_filter = HWTSTAMP_FILTER_ALL;
+
+    ifr.ifr_data = (char*)&hwc;
+
+    if (ioctl(sockfd, SIOCSHWTSTAMP, &ifr) < 0) {
+        perror("Hardware timestamping not available");
+        return;
+    }
+
+    // Enable SO_TIMESTAMPING
+    int flags = SOF_TIMESTAMPING_RX_HARDWARE |
+                SOF_TIMESTAMPING_TX_HARDWARE |
+                SOF_TIMESTAMPING_RAW_HARDWARE;
+
+    setsockopt(sockfd, SOL_SOCKET, SO_TIMESTAMPING,
+               &flags, sizeof(flags));
+}
+
+// Retrieve timestamp from received packet
+void get_rx_timestamp(struct msghdr *msg, struct timespec *ts) {
+    struct cmsghdr *cmsg;
+    for (cmsg = CMSG_FIRSTHDR(msg); cmsg; cmsg = CMSG_NXTHDR(msg, cmsg)) {
+        if (cmsg->cmsg_level == SOL_SOCKET &&
+            cmsg->cmsg_type == SO_TIMESTAMPING) {
+            struct timespec *stamps = (struct timespec*)CMSG_DATA(cmsg);
+            *ts = stamps[2];  // Hardware timestamp
+            break;
+        }
+    }
+}
+----------------------------------------
+
+================================================================================
+10. ADVANCED NETWORK OPTIMIZATIONS
+================================================================================
+
+JUMBO FRAMES:
+----------------------------------------
+# Increase MTU for lower protocol overhead
+# Check current MTU
+ip link show eth0 | grep mtu
+
+# Set jumbo frames (9000 MTU)
+ip link set eth0 mtu 9000
+
+# Make persistent
+cat >> /etc/network/interfaces << EOF
+auto eth0
+iface eth0 inet static
+    mtu 9000
+EOF
+
+# Note: All devices in path must support jumbo frames
+----------------------------------------
+
+FLOW DIRECTOR / NTUPLE FILTERING:
+----------------------------------------
+# Direct specific flows to specific queues/CPUs
+
+# Enable flow director
+ethtool -K eth0 ntuple on
+
+# Add filter (example: TCP traffic to queue 2)
+ethtool -N eth0 flow-type tcp4 \
+    dst-ip 192.168.1.100 dst-port 11111 action 2
+
+# View filters
+ethtool -n eth0
+
+# Delete filter
+ethtool -N eth0 delete <rule_number>
+----------------------------------------
+
+VLAN OFFLOADING:
+----------------------------------------
+# Enable VLAN hardware offload if used
+ethtool -K eth0 rxvlan on txvlan on
+
+# Or disable if not using VLANs (reduce overhead)
+ethtool -K eth0 rxvlan off txvlan off
+----------------------------------------
+
+GENERIC OFFLOADS:
+----------------------------------------
+# View all offload settings
+ethtool -k eth0
+
+# For low latency, consider disabling some offloads
+# Trade throughput for deterministic latency
+
+# Disable offloads (more CPU, lower latency)
+ethtool -K eth0 tso off gso off gro off
+
+# Or keep enabled (less CPU, slightly higher latency)
+ethtool -K eth0 tso on gso on gro on
+
+# Experiment and measure for your workload
+----------------------------------------
+
+MULTICAST OPTIMIZATION (IF USING MARKET DATA):
+----------------------------------------
+# Increase multicast buffer
+sysctl -w net.core.rmem_max=134217728
+sysctl -w net.core.rmem_default=16777216
+
+# Multicast routing
+echo 1 > /proc/sys/net/ipv4/ip_forward
+
+# Join multicast group in code
+#include <arpa/inet.h>
+
+void join_multicast(int sockfd, const char *group, const char *ifaddr) {
+    struct ip_mreq mreq;
+    mreq.imr_multiaddr.s_addr = inet_addr(group);
+    mreq.imr_interface.s_addr = inet_addr(ifaddr);
+
+    setsockopt(sockfd, IPPROTO_IP, IP_ADD_MEMBERSHIP,
+               &mreq, sizeof(mreq));
+}
+----------------------------------------
+
+================================================================================
+SUMMARY CHECKLIST
+================================================================================
+
+[ ] High-performance NIC installed and verified
+[ ] Latest network drivers installed
+[ ] Ring buffers tuned (128-256 for low latency)
+[ ] Interrupt coalescing disabled or minimized
+[ ] Multi-queue RSS configured
+[ ] IRQ affinity set to isolated CPUs
+[ ] TCP/UDP stack tuned via sysctl
+[ ] Busy polling enabled (if applicable)
+[ ] Socket options optimized in code
+[ ] Kernel bypass evaluated (DPDK/AF_XDP)
+[ ] Hardware timestamping enabled (if needed)
+[ ] MTU configured (standard or jumbo frames)
+[ ] Network offloads tuned
+[ ] Monitoring tools deployed
+[ ] Latency benchmarks passing (< 10 us)
+
+VALIDATION:
+----------------------------------------
+# Quick network validation
+ethtool eth0 | grep -E "Speed|Duplex"  # Should be max speed, full duplex
+ethtool -c eth0 | grep -E "usecs|frames"  # Should show minimal coalescing
+ethtool -g eth0  # Should show optimized ring sizes
+ethtool -S eth0 | grep -E "error|drop"  # Should show 0 errors/drops
+cat /proc/interrupts | grep eth0  # Verify IRQ distribution
+sockperf ping-pong -i target --udp  # Should show < 10 us latency
+----------------------------------------
+
+================================================================================
+END OF DOCUMENT
+================================================================================

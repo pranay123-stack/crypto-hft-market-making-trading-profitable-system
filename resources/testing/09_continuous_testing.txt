@@ -1,0 +1,944 @@
+================================================================================
+CONTINUOUS TESTING FOR HFT SYSTEMS
+Automated Test Pipelines and CI/CD Integration
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Continuous Testing Overview
+2. CI/CD Pipeline Setup
+3. Automated Test Execution
+4. Test Categorization
+5. Parallel Test Execution
+6. Performance Regression Detection
+7. Test Result Reporting
+8. Deployment Gates
+9. Monitoring and Alerts
+10. Best Practices
+
+================================================================================
+1. CONTINUOUS TESTING OVERVIEW
+================================================================================
+
+1.1 Continuous Testing Goals
+-----------------------------
+Objectives:
+- Run tests automatically on every commit
+- Catch regressions early
+- Maintain code quality
+- Ensure performance standards
+- Enable rapid deployment
+
+Test Categories:
+- Unit tests (fast, run on every commit)
+- Integration tests (medium, run on PR)
+- Performance tests (slow, run nightly)
+- Stress tests (very slow, run weekly)
+- Simulation tests (continuous, run daily)
+
+
+1.2 Test Pipeline Architecture
+-------------------------------
+commit -> build -> unit_tests -> integration_tests -> deploy_staging -> smoke_tests -> deploy_production
+
+Pipeline Stages:
+1. Code commit triggers build
+2. Fast unit tests run (< 5 minutes)
+3. Integration tests run if unit tests pass (< 30 minutes)
+4. Performance tests run nightly
+5. Stress tests run weekly
+6. Results aggregated and reported
+7. Automatic deployment on success
+
+
+================================================================================
+2. CI/CD PIPELINE SETUP
+================================================================================
+
+2.1 GitHub Actions Pipeline
+----------------------------
+# .github/workflows/continuous_testing.yml
+name: Continuous Testing Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 2 * * *'  # Nightly at 2 AM
+
+env:
+  BUILD_TYPE: Release
+  CMAKE_OPTIONS: -DENABLE_TESTING=ON
+
+jobs:
+  # Stage 1: Build
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ libssl-dev libcurl4-openssl-dev
+
+      - name: Configure
+        run: |
+          mkdir build && cd build
+          cmake ${{ env.CMAKE_OPTIONS }} -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} ..
+
+      - name: Build
+        run: |
+          cd build
+          make -j$(nproc)
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: build-artifacts
+          path: build/
+
+  # Stage 2: Unit Tests
+  unit-tests:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: build-artifacts
+          path: build/
+
+      - name: Run unit tests
+        run: |
+          cd build
+          chmod +x hft_tests
+          ./hft_tests --gtest_filter=*Unit* --gtest_output=xml:unit_test_results.xml
+
+      - name: Publish unit test results
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        if: always()
+        with:
+          files: build/unit_test_results.xml
+
+      - name: Check unit test coverage
+        run: |
+          cd build
+          lcov --capture --directory . --output-file coverage.info
+          lcov --list coverage.info | tail -1 | awk '{if ($4+0 < 85.0) exit 1}'
+
+  # Stage 3: Integration Tests
+  integration-tests:
+    needs: unit-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      mock-exchange:
+        image: hft/mock-exchange:latest
+        ports:
+          - 9878:9878
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: build-artifacts
+          path: build/
+
+      - name: Run integration tests
+        run: |
+          cd build
+          chmod +x hft_integration_tests
+          ./hft_integration_tests --gtest_output=xml:integration_test_results.xml
+
+      - name: Publish integration test results
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        if: always()
+        with:
+          files: build/integration_test_results.xml
+
+  # Stage 4: Performance Tests (only on schedule)
+  performance-tests:
+    needs: integration-tests
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: build-artifacts
+          path: build/
+
+      - name: Run performance tests
+        run: |
+          cd build
+          chmod +x hft_perf_tests
+          ./hft_perf_tests --gtest_output=json:perf_results.json
+
+      - name: Check for performance regressions
+        run: |
+          python3 scripts/check_perf_regression.py \
+            build/perf_results.json \
+            perf_baseline.json \
+            --threshold 0.05
+
+      - name: Upload performance results
+        uses: actions/upload-artifact@v3
+        with:
+          name: performance-results
+          path: build/perf_results.json
+
+  # Stage 5: Stress Tests (weekly)
+  stress-tests:
+    needs: integration-tests
+    if: github.event_name == 'schedule' && github.event.schedule == '0 2 * * 0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: build-artifacts
+          path: build/
+
+      - name: Run stress tests
+        run: |
+          cd build
+          chmod +x hft_stress_tests
+          ./hft_stress_tests --gtest_output=xml:stress_test_results.xml
+
+      - name: Upload stress test results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: stress-test-results
+          path: build/stress_test_results.xml
+
+
+2.2 Jenkins Pipeline
+--------------------
+// Jenkinsfile
+pipeline {
+    agent any
+
+    environment {
+        CMAKE_BUILD_TYPE = 'Release'
+    }
+
+    stages {
+        stage('Build') {
+            steps {
+                sh '''
+                    mkdir -p build
+                    cd build
+                    cmake -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} ..
+                    make -j$(nproc)
+                '''
+            }
+        }
+
+        stage('Unit Tests') {
+            steps {
+                sh '''
+                    cd build
+                    ./hft_tests --gtest_filter=*Unit* --gtest_output=xml:unit_results.xml
+                '''
+            }
+            post {
+                always {
+                    junit 'build/unit_results.xml'
+                }
+            }
+        }
+
+        stage('Integration Tests') {
+            steps {
+                sh '''
+                    cd build
+                    ./hft_integration_tests --gtest_output=xml:integration_results.xml
+                '''
+            }
+            post {
+                always {
+                    junit 'build/integration_results.xml'
+                }
+            }
+        }
+
+        stage('Performance Tests') {
+            when {
+                branch 'main'
+            }
+            steps {
+                sh '''
+                    cd build
+                    ./hft_perf_tests --gtest_output=json:perf_results.json
+                '''
+                script {
+                    def perfResults = readJSON file: 'build/perf_results.json'
+                    // Check for regressions
+                }
+            }
+        }
+
+        stage('Deploy to Staging') {
+            when {
+                branch 'main'
+            }
+            steps {
+                sh '''
+                    ./scripts/deploy_staging.sh
+                '''
+            }
+        }
+
+        stage('Smoke Tests') {
+            when {
+                branch 'main'
+            }
+            steps {
+                sh '''
+                    ./scripts/run_smoke_tests.sh staging
+                '''
+            }
+        }
+    }
+
+    post {
+        failure {
+            mail to: 'team@example.com',
+                 subject: "Build Failed: ${env.JOB_NAME} - ${env.BUILD_NUMBER}",
+                 body: "Check console output at ${env.BUILD_URL}"
+        }
+    }
+}
+
+
+================================================================================
+3. AUTOMATED TEST EXECUTION
+================================================================================
+
+3.1 Test Runner Script
+-----------------------
+#!/bin/bash
+# scripts/run_all_tests.sh
+
+set -e
+
+BUILD_DIR="build"
+RESULTS_DIR="test_results"
+
+# Create results directory
+mkdir -p ${RESULTS_DIR}
+
+echo "===== Running All Tests ====="
+
+# Unit tests (fast)
+echo "Running unit tests..."
+${BUILD_DIR}/hft_tests \
+    --gtest_filter=*Unit* \
+    --gtest_output=xml:${RESULTS_DIR}/unit_tests.xml
+
+# Integration tests
+echo "Running integration tests..."
+${BUILD_DIR}/hft_integration_tests \
+    --gtest_output=xml:${RESULTS_DIR}/integration_tests.xml
+
+# Performance tests
+echo "Running performance tests..."
+${BUILD_DIR}/hft_perf_tests \
+    --gtest_output=json:${RESULTS_DIR}/perf_tests.json
+
+# Backtests
+echo "Running backtests..."
+${BUILD_DIR}/hft_backtest \
+    --config configs/backtest_config.json \
+    --output ${RESULTS_DIR}/backtest_results.csv
+
+# Generate summary report
+python3 scripts/generate_test_report.py \
+    --results-dir ${RESULTS_DIR} \
+    --output ${RESULTS_DIR}/test_report.html
+
+echo "===== All Tests Complete ====="
+echo "Report: ${RESULTS_DIR}/test_report.html"
+
+
+3.2 Pre-commit Hook
+-------------------
+#!/bin/bash
+# .git/hooks/pre-commit
+
+echo "Running pre-commit tests..."
+
+# Build
+cmake --build build --config Release
+
+# Run fast unit tests only
+build/hft_tests --gtest_filter=*Unit* --gtest_brief=1
+
+if [ $? -ne 0 ]; then
+    echo "Unit tests failed. Commit aborted."
+    exit 1
+fi
+
+# Check code formatting
+scripts/check_formatting.sh
+
+if [ $? -ne 0 ]; then
+    echo "Code formatting check failed. Run clang-format."
+    exit 1
+fi
+
+echo "Pre-commit checks passed."
+exit 0
+
+
+================================================================================
+4. TEST CATEGORIZATION
+================================================================================
+
+4.1 Test Labels and Filters
+----------------------------
+// Label tests by type
+TEST(OrderManager, SubmitOrder) {
+    // Fast unit test
+}
+
+TEST(OrderManager, DISABLED_SlowIntegrationTest) {
+    // Disabled by default, only run explicitly
+}
+
+// Using custom test labels
+class QuickTest : public ::testing::Test {};
+class SlowTest : public ::testing::Test {};
+class NightlyTest : public ::testing::Test {};
+
+TEST_F(QuickTest, FastOperation) {
+    // Runs on every commit
+}
+
+TEST_F(SlowTest, ComplexScenario) {
+    // Runs on PR merge
+}
+
+TEST_F(NightlyTest, LongRunningBacktest) {
+    // Runs nightly
+}
+
+
+4.2 Test Execution Strategy
+----------------------------
+# Run only fast tests
+./hft_tests --gtest_filter=QuickTest.*
+
+# Run all except slow tests
+./hft_tests --gtest_filter=-SlowTest.*:-NightlyTest.*
+
+# Run only nightly tests
+./hft_tests --gtest_filter=NightlyTest.*
+
+# Run specific test suite
+./hft_tests --gtest_filter=OrderManager.*
+
+
+================================================================================
+5. PARALLEL TEST EXECUTION
+================================================================================
+
+5.1 Google Test Parallel Execution
+-----------------------------------
+#!/bin/bash
+# scripts/run_tests_parallel.sh
+
+NUM_THREADS=$(nproc)
+
+# Run tests in parallel using GNU parallel
+./hft_tests --gtest_list_tests | \
+    grep -v '  ' | \
+    sed 's/\.$//' | \
+    parallel -j${NUM_THREADS} \
+        "./hft_tests --gtest_filter={}* --gtest_output=xml:results/{}.xml"
+
+# Merge results
+python3 scripts/merge_test_results.py results/ merged_results.xml
+
+
+5.2 CTest Parallel Execution
+-----------------------------
+# CMakeLists.txt
+enable_testing()
+
+add_test(NAME UnitTests COMMAND hft_tests --gtest_filter=*Unit*)
+add_test(NAME IntegrationTests COMMAND hft_integration_tests)
+add_test(NAME PerformanceTests COMMAND hft_perf_tests)
+
+# Run tests in parallel
+ctest -j$(nproc) --output-on-failure
+
+# Run specific tests
+ctest -R Unit  # Run tests matching "Unit"
+ctest -E Slow  # Exclude tests matching "Slow"
+
+
+================================================================================
+6. PERFORMANCE REGRESSION DETECTION
+================================================================================
+
+6.1 Performance Baseline Tracking
+----------------------------------
+// scripts/check_perf_regression.py
+import json
+import sys
+
+def load_results(filename):
+    with open(filename) as f:
+        return json.load(f)
+
+def check_regression(current, baseline, threshold=0.05):
+    regressions = []
+
+    for test_name, current_result in current.items():
+        if test_name not in baseline:
+            continue
+
+        baseline_result = baseline[test_name]
+
+        # Check P99 latency regression
+        if 'p99_latency_ns' in current_result:
+            current_p99 = current_result['p99_latency_ns']
+            baseline_p99 = baseline_result['p99_latency_ns']
+
+            regression_pct = (current_p99 - baseline_p99) / baseline_p99
+
+            if regression_pct > threshold:
+                regressions.append({
+                    'test': test_name,
+                    'metric': 'P99 latency',
+                    'current': current_p99,
+                    'baseline': baseline_p99,
+                    'regression': f'{regression_pct * 100:.2f}%'
+                })
+
+        # Check throughput regression
+        if 'throughput_qps' in current_result:
+            current_tput = current_result['throughput_qps']
+            baseline_tput = baseline_result['throughput_qps']
+
+            regression_pct = (baseline_tput - current_tput) / baseline_tput
+
+            if regression_pct > threshold:
+                regressions.append({
+                    'test': test_name,
+                    'metric': 'Throughput',
+                    'current': current_tput,
+                    'baseline': baseline_tput,
+                    'regression': f'{regression_pct * 100:.2f}%'
+                })
+
+    return regressions
+
+def main():
+    if len(sys.argv) < 4:
+        print("Usage: check_perf_regression.py current.json baseline.json --threshold 0.05")
+        sys.exit(1)
+
+    current_file = sys.argv[1]
+    baseline_file = sys.argv[2]
+    threshold = float(sys.argv[4])
+
+    current = load_results(current_file)
+    baseline = load_results(baseline_file)
+
+    regressions = check_regression(current, baseline, threshold)
+
+    if regressions:
+        print("PERFORMANCE REGRESSIONS DETECTED:")
+        for reg in regressions:
+            print(f"\n  Test: {reg['test']}")
+            print(f"  Metric: {reg['metric']}")
+            print(f"  Current: {reg['current']}")
+            print(f"  Baseline: {reg['baseline']}")
+            print(f"  Regression: {reg['regression']}")
+
+        sys.exit(1)
+    else:
+        print("No performance regressions detected.")
+        sys.exit(0)
+
+if __name__ == '__main__':
+    main()
+
+
+6.2 Automatic Baseline Update
+------------------------------
+#!/bin/bash
+# scripts/update_perf_baseline.sh
+
+# Run performance tests
+./build/hft_perf_tests --gtest_output=json:perf_results.json
+
+# Backup old baseline
+cp perf_baseline.json perf_baseline_$(date +%Y%m%d).json
+
+# Update baseline
+cp perf_results.json perf_baseline.json
+
+# Commit to repository
+git add perf_baseline.json
+git commit -m "Update performance baseline [skip ci]"
+git push
+
+
+================================================================================
+7. TEST RESULT REPORTING
+================================================================================
+
+7.1 HTML Test Report Generator
+-------------------------------
+// scripts/generate_test_report.py
+import json
+import xml.etree.ElementTree as ET
+from datetime import datetime
+
+def generate_html_report(results_dir, output_file):
+    html = f"""
+    <html>
+    <head>
+        <title>HFT System Test Report</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; margin: 20px; }}
+            table {{ border-collapse: collapse; width: 100%; }}
+            th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
+            th {{ background-color: #4CAF50; color: white; }}
+            .pass {{ background-color: #90EE90; }}
+            .fail {{ background-color: #FFB6C1; }}
+            .summary {{ margin-bottom: 20px; }}
+        </style>
+    </head>
+    <body>
+        <h1>HFT System Test Report</h1>
+        <p>Generated: {datetime.now()}</p>
+    """
+
+    # Parse unit test results
+    unit_results = parse_xml_results(f"{results_dir}/unit_tests.xml")
+    html += generate_test_section("Unit Tests", unit_results)
+
+    # Parse integration test results
+    int_results = parse_xml_results(f"{results_dir}/integration_tests.xml")
+    html += generate_test_section("Integration Tests", int_results)
+
+    # Parse performance test results
+    perf_results = parse_json_results(f"{results_dir}/perf_tests.json")
+    html += generate_perf_section("Performance Tests", perf_results)
+
+    html += "</body></html>"
+
+    with open(output_file, 'w') as f:
+        f.write(html)
+
+    print(f"Test report generated: {output_file}")
+
+
+7.2 Slack Notification
+-----------------------
+#!/bin/bash
+# scripts/notify_slack.sh
+
+WEBHOOK_URL=$1
+STATUS=$2
+BUILD_URL=$3
+
+if [ "$STATUS" == "success" ]; then
+    COLOR="good"
+    MESSAGE="All tests passed!"
+else
+    COLOR="danger"
+    MESSAGE="Tests failed!"
+fi
+
+curl -X POST -H 'Content-type: application/json' \
+    --data "{
+        \"attachments\": [{
+            \"color\": \"${COLOR}\",
+            \"title\": \"HFT System Build ${STATUS}\",
+            \"text\": \"${MESSAGE}\",
+            \"fields\": [{
+                \"title\": \"Build\",
+                \"value\": \"${BUILD_URL}\",
+                \"short\": false
+            }]
+        }]
+    }" \
+    ${WEBHOOK_URL}
+
+
+================================================================================
+8. DEPLOYMENT GATES
+================================================================================
+
+8.1 Quality Gates
+-----------------
+// scripts/check_quality_gates.sh
+#!/bin/bash
+
+set -e
+
+echo "Checking quality gates..."
+
+# Gate 1: All tests must pass
+echo "Gate 1: Test pass rate"
+PASS_RATE=$(python3 scripts/get_test_pass_rate.py)
+if (( $(echo "$PASS_RATE < 100.0" | bc -l) )); then
+    echo "FAILED: Test pass rate is ${PASS_RATE}%, must be 100%"
+    exit 1
+fi
+echo "PASSED: All tests passing"
+
+# Gate 2: Code coverage > 85%
+echo "Gate 2: Code coverage"
+COVERAGE=$(lcov --list coverage.info | tail -1 | awk '{print $4}' | sed 's/%//')
+if (( $(echo "$COVERAGE < 85.0" | bc -l) )); then
+    echo "FAILED: Code coverage is ${COVERAGE}%, must be >= 85%"
+    exit 1
+fi
+echo "PASSED: Code coverage is ${COVERAGE}%"
+
+# Gate 3: No performance regressions
+echo "Gate 3: Performance"
+python3 scripts/check_perf_regression.py \
+    perf_results.json \
+    perf_baseline.json \
+    --threshold 0.05
+echo "PASSED: No performance regressions"
+
+# Gate 4: No high-severity bugs
+echo "Gate 4: Static analysis"
+BUGS=$(cppcheck --error-exitcode=1 src/ 2>&1 | grep -c "error:" || true)
+if [ $BUGS -gt 0 ]; then
+    echo "FAILED: Found ${BUGS} high-severity bugs"
+    exit 1
+fi
+echo "PASSED: No high-severity bugs"
+
+echo "All quality gates passed!"
+
+
+8.2 Automatic Rollback
+-----------------------
+#!/bin/bash
+# scripts/deploy_with_rollback.sh
+
+VERSION=$1
+ENVIRONMENT=$2
+
+echo "Deploying version ${VERSION} to ${ENVIRONMENT}..."
+
+# Deploy new version
+./scripts/deploy.sh ${VERSION} ${ENVIRONMENT}
+
+# Wait for deployment
+sleep 30
+
+# Run smoke tests
+./scripts/run_smoke_tests.sh ${ENVIRONMENT}
+
+if [ $? -ne 0 ]; then
+    echo "Smoke tests failed! Rolling back..."
+
+    # Get previous version
+    PREV_VERSION=$(cat ${ENVIRONMENT}_version.txt)
+
+    # Rollback
+    ./scripts/deploy.sh ${PREV_VERSION} ${ENVIRONMENT}
+
+    echo "Rolled back to ${PREV_VERSION}"
+    exit 1
+fi
+
+# Save deployed version
+echo ${VERSION} > ${ENVIRONMENT}_version.txt
+
+echo "Deployment successful!"
+
+
+================================================================================
+9. MONITORING AND ALERTS
+================================================================================
+
+9.1 Test Metrics Collection
+----------------------------
+class TestMetricsCollector {
+public:
+    void recordTestRun(const TestResult& result) {
+        metrics_.test_runs++;
+
+        if (result.passed) {
+            metrics_.tests_passed++;
+        } else {
+            metrics_.tests_failed++;
+        }
+
+        metrics_.total_duration_ms += result.duration_ms;
+
+        // Send to metrics system (e.g., Prometheus)
+        sendMetric("test_runs_total", metrics_.test_runs);
+        sendMetric("test_pass_rate", getPassRate());
+        sendMetric("test_duration_ms", result.duration_ms);
+    }
+
+    double getPassRate() const {
+        if (metrics_.test_runs == 0) return 0.0;
+        return 100.0 * metrics_.tests_passed / metrics_.test_runs;
+    }
+
+private:
+    struct Metrics {
+        size_t test_runs = 0;
+        size_t tests_passed = 0;
+        size_t tests_failed = 0;
+        long long total_duration_ms = 0;
+    } metrics_;
+
+    void sendMetric(const std::string& name, double value) {
+        // Send to monitoring system
+    }
+};
+
+
+9.2 Alerting Rules
+------------------
+# prometheus_alerts.yml
+groups:
+  - name: test_alerts
+    rules:
+      - alert: TestFailureRate
+        expr: test_failure_rate > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High test failure rate detected"
+          description: "Test failure rate is {{ $value }}%"
+
+      - alert: PerformanceRegression
+        expr: p99_latency_ns > 100000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Performance regression detected"
+          description: "P99 latency is {{ $value }} ns"
+
+      - alert: LongTestDuration
+        expr: test_duration_seconds > 3600
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Tests taking too long"
+          description: "Test duration is {{ $value }} seconds"
+
+
+================================================================================
+10. BEST PRACTICES
+================================================================================
+
+10.1 Continuous Testing Best Practices
+---------------------------------------
+1. Fast Feedback
+   - Keep unit tests under 10 minutes
+   - Run subset of tests on pre-commit
+   - Use test parallelization
+
+2. Test Stability
+   - Avoid flaky tests
+   - Use fixed seeds for random tests
+   - Implement proper test isolation
+
+3. Comprehensive Coverage
+   - Maintain >85% code coverage
+   - Test edge cases
+   - Include performance tests
+
+4. Clear Reporting
+   - Generate easy-to-read reports
+   - Track metrics over time
+   - Alert on failures immediately
+
+5. Continuous Improvement
+   - Review and update tests regularly
+   - Refactor slow tests
+   - Add tests for bug fixes
+
+6. Environment Consistency
+   - Use containerized test environments
+   - Pin dependency versions
+   - Test on target platforms
+
+
+10.2 Example: Complete CI/CD Script
+------------------------------------
+#!/bin/bash
+# scripts/ci_cd_pipeline.sh
+
+set -e
+
+STAGE=$1
+
+case $STAGE in
+    "build")
+        echo "Building..."
+        cmake --build build --config Release
+        ;;
+
+    "test")
+        echo "Running tests..."
+        cd build
+        ctest -j$(nproc) --output-on-failure
+        ;;
+
+    "performance")
+        echo "Running performance tests..."
+        ./build/hft_perf_tests --gtest_output=json:perf_results.json
+        python3 scripts/check_perf_regression.py perf_results.json perf_baseline.json
+        ;;
+
+    "quality-gates")
+        echo "Checking quality gates..."
+        ./scripts/check_quality_gates.sh
+        ;;
+
+    "deploy-staging")
+        echo "Deploying to staging..."
+        ./scripts/deploy.sh $(git rev-parse HEAD) staging
+        ./scripts/run_smoke_tests.sh staging
+        ;;
+
+    "deploy-production")
+        echo "Deploying to production..."
+        ./scripts/deploy_with_rollback.sh $(git rev-parse HEAD) production
+        ;;
+
+    *)
+        echo "Unknown stage: $STAGE"
+        exit 1
+        ;;
+esac
+
+
+================================================================================
+END OF CONTINUOUS TESTING
+================================================================================

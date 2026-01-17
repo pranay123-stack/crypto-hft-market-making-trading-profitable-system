@@ -1,0 +1,1179 @@
+================================================================================
+ENVIRONMENT MANAGEMENT FOR HFT SYSTEMS
+================================================================================
+Complete guide for managing development, staging, and production environments
+with configuration management, isolation, and promotion strategies.
+
+Last Updated: 2025-11-25
+================================================================================
+
+TABLE OF CONTENTS
+================================================================================
+1. Environment Configuration
+2. Development Environment
+3. Staging Environment
+4. Production Environment
+5. Environment Promotion
+6. Configuration Management
+7. Environment Isolation
+8. Resource Allocation
+9. Access Control
+
+================================================================================
+1. ENVIRONMENT CONFIGURATION
+================================================================================
+
+# environments/common.yaml
+# Common configuration across all environments
+common:
+  application:
+    name: hft-trading-engine
+    version: "1.0.0"
+
+  logging:
+    format: json
+    rotation:
+      max_size: 100M
+      max_files: 10
+
+  metrics:
+    enabled: true
+    port: 9090
+    interval: 1s
+
+  network:
+    tcp_nodelay: true
+    so_reuseaddr: true
+    buffer_size: 2097152
+
+  security:
+    tls_enabled: true
+    min_tls_version: "1.3"
+
+---
+# environments/development.yaml
+environment:
+  name: development
+  tier: dev
+
+deployment:
+  replicas: 1
+  auto_scaling: false
+
+resources:
+  cpu:
+    request: 1000m
+    limit: 2000m
+  memory:
+    request: 2Gi
+    limit: 4Gi
+
+database:
+  host: postgres-dev.hft-trading.svc.cluster.local
+  port: 5432
+  database: hft_trading_dev
+  pool_size: 10
+
+redis:
+  host: redis-dev.hft-trading.svc.cluster.local
+  port: 6379
+  db: 0
+
+logging:
+  level: debug
+  output: stdout
+
+features:
+  debug_mode: true
+  profiling: true
+  mock_market_data: true
+
+---
+# environments/staging.yaml
+environment:
+  name: staging
+  tier: staging
+
+deployment:
+  replicas: 3
+  auto_scaling: true
+  min_replicas: 3
+  max_replicas: 5
+
+resources:
+  cpu:
+    request: 2000m
+    limit: 4000m
+  memory:
+    request: 4Gi
+    limit: 8Gi
+
+database:
+  host: postgres-staging.hft-trading.svc.cluster.local
+  port: 5432
+  database: hft_trading_staging
+  pool_size: 50
+  ssl_mode: require
+
+redis:
+  host: redis-staging.hft-trading.svc.cluster.local
+  port: 6379
+  db: 0
+  ssl: true
+
+logging:
+  level: info
+  output: /var/log/trading/app.log
+
+features:
+  debug_mode: false
+  profiling: true
+  mock_market_data: false
+
+---
+# environments/production.yaml
+environment:
+  name: production
+  tier: prod
+
+deployment:
+  replicas: 5
+  auto_scaling: true
+  min_replicas: 5
+  max_replicas: 20
+
+resources:
+  cpu:
+    request: 4000m
+    limit: 8000m
+  memory:
+    request: 8Gi
+    limit: 16Gi
+
+database:
+  host: postgres-prod.hft-trading.svc.cluster.local
+  port: 5432
+  database: hft_trading
+  pool_size: 100
+  ssl_mode: verify-full
+  read_replicas:
+    - postgres-prod-replica-1.hft-trading.svc.cluster.local
+    - postgres-prod-replica-2.hft-trading.svc.cluster.local
+
+redis:
+  mode: cluster
+  nodes:
+    - redis-prod-0.hft-trading.svc.cluster.local:6379
+    - redis-prod-1.hft-trading.svc.cluster.local:6379
+    - redis-prod-2.hft-trading.svc.cluster.local:6379
+  ssl: true
+
+logging:
+  level: warn
+  output: /var/log/trading/app.log
+
+features:
+  debug_mode: false
+  profiling: false
+  mock_market_data: false
+
+performance:
+  cpu_affinity: "0-7"
+  thread_priority: high
+  huge_pages: true
+  numa_node: 0
+
+================================================================================
+2. DEVELOPMENT ENVIRONMENT
+================================================================================
+
+# scripts/setup-dev-environment.sh
+#!/bin/bash
+set -e
+
+NAMESPACE="hft-trading-dev"
+
+echo "Setting up development environment..."
+
+# Create namespace
+kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
+
+# Label namespace
+kubectl label namespace ${NAMESPACE} \
+  environment=development \
+  tier=dev \
+  managed-by=devops
+
+# Apply resource quotas
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: dev-quota
+  namespace: ${NAMESPACE}
+spec:
+  hard:
+    requests.cpu: "8"
+    requests.memory: 16Gi
+    limits.cpu: "16"
+    limits.memory: 32Gi
+    persistentvolumeclaims: "5"
+EOF
+
+# Deploy PostgreSQL for development
+kubectl apply -f - <<EOF
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres-dev
+  namespace: ${NAMESPACE}
+spec:
+  serviceName: postgres-dev
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+      env: dev
+  template:
+    metadata:
+      labels:
+        app: postgres
+        env: dev
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:15-alpine
+        env:
+        - name: POSTGRES_DB
+          value: hft_trading_dev
+        - name: POSTGRES_USER
+          value: devuser
+        - name: POSTGRES_PASSWORD
+          value: devpass123
+        ports:
+        - containerPort: 5432
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+          limits:
+            cpu: 1000m
+            memory: 2Gi
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: standard
+      resources:
+        requests:
+          storage: 20Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-dev
+  namespace: ${NAMESPACE}
+spec:
+  selector:
+    app: postgres
+    env: dev
+  ports:
+  - port: 5432
+    targetPort: 5432
+EOF
+
+# Deploy Redis for development
+kubectl apply -f - <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-dev
+  namespace: ${NAMESPACE}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+      env: dev
+  template:
+    metadata:
+      labels:
+        app: redis
+        env: dev
+    spec:
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        command: ["redis-server"]
+        args: ["--appendonly", "yes"]
+        ports:
+        - containerPort: 6379
+        resources:
+          requests:
+            cpu: 250m
+            memory: 512Mi
+          limits:
+            cpu: 500m
+            memory: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-dev
+  namespace: ${NAMESPACE}
+spec:
+  selector:
+    app: redis
+    env: dev
+  ports:
+  - port: 6379
+    targetPort: 6379
+EOF
+
+# Deploy development ConfigMap
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trading-engine-config
+  namespace: ${NAMESPACE}
+data:
+  config.yaml: |
+$(cat environments/development.yaml | sed 's/^/    /')
+EOF
+
+# Deploy application
+kubectl apply -f k8s/dev/statefulset.yaml
+
+echo "Development environment setup complete!"
+
+---
+# k8s/dev/statefulset.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: trading-engine
+  namespace: hft-trading-dev
+  labels:
+    app: trading-engine
+    env: dev
+spec:
+  serviceName: trading-engine-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app: trading-engine
+      env: dev
+  template:
+    metadata:
+      labels:
+        app: trading-engine
+        env: dev
+    spec:
+      containers:
+      - name: trading-engine
+        image: registry.example.com/hft-trading-engine:dev
+        env:
+        - name: ENVIRONMENT
+          value: "development"
+        - name: LOG_LEVEL
+          value: "debug"
+        - name: DEBUG_MODE
+          value: "true"
+        - name: DATABASE_URL
+          value: "postgresql://devuser:devpass123@postgres-dev:5432/hft_trading_dev"
+        - name: REDIS_URL
+          value: "redis://redis-dev:6379/0"
+        ports:
+        - containerPort: 8080
+          name: http
+        - containerPort: 9090
+          name: metrics
+        resources:
+          requests:
+            cpu: 1000m
+            memory: 2Gi
+          limits:
+            cpu: 2000m
+            memory: 4Gi
+        volumeMounts:
+        - name: config
+          mountPath: /app/config
+        - name: logs
+          mountPath: /var/log/trading
+      volumes:
+      - name: config
+        configMap:
+          name: trading-engine-config
+      - name: logs
+        emptyDir: {}
+
+---
+# docker-compose.dev.yml
+# Local development with Docker Compose
+version: '3.8'
+
+services:
+  trading-engine:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.development
+    volumes:
+      - .:/workspace
+      - build-cache:/workspace/build
+    environment:
+      - ENVIRONMENT=development
+      - LOG_LEVEL=debug
+      - DATABASE_URL=postgresql://devuser:devpass@postgres:5432/hft_trading_dev
+      - REDIS_URL=redis://redis:6379/0
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+    depends_on:
+      - postgres
+      - redis
+    command: /bin/bash
+
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_DB=hft_trading_dev
+      - POSTGRES_USER=devuser
+      - POSTGRES_PASSWORD=devpass
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./monitoring/prometheus-dev.yml:/etc/prometheus/prometheus.yml
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana-data:/var/lib/grafana
+
+volumes:
+  build-cache:
+  postgres-data:
+  redis-data:
+  grafana-data:
+
+================================================================================
+3. STAGING ENVIRONMENT
+================================================================================
+
+# scripts/setup-staging-environment.sh
+#!/bin/bash
+set -e
+
+NAMESPACE="hft-trading-staging"
+
+echo "Setting up staging environment..."
+
+# Create namespace
+kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
+
+# Label namespace
+kubectl label namespace ${NAMESPACE} \
+  environment=staging \
+  tier=staging \
+  managed-by=devops
+
+# Network policies for staging
+kubectl apply -f - <<EOF
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: staging-network-policy
+  namespace: ${NAMESPACE}
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  # Allow from ingress
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: ingress-nginx
+    ports:
+    - port: 8080
+  # Allow from monitoring
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: monitoring
+    ports:
+    - port: 9090
+  egress:
+  # Allow DNS
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: kube-system
+    ports:
+    - port: 53
+      protocol: UDP
+  # Allow external HTTPS
+  - to:
+    - podSelector: {}
+    ports:
+    - port: 443
+  # Allow database
+  - to:
+    - podSelector:
+        matchLabels:
+          app: postgres
+    ports:
+    - port: 5432
+EOF
+
+# Deploy RDS instance (via Terraform)
+terraform -chdir=terraform/aws apply \
+  -var="environment=staging" \
+  -target=module.rds_staging \
+  -auto-approve
+
+# Deploy ElastiCache Redis
+terraform -chdir=terraform/aws apply \
+  -var="environment=staging" \
+  -target=module.redis_staging \
+  -auto-approve
+
+# Get database credentials
+DB_ENDPOINT=$(terraform -chdir=terraform/aws output -raw staging_db_endpoint)
+DB_PASSWORD=$(aws secretsmanager get-secret-value \
+  --secret-id hft-trading-staging-db-password \
+  --query SecretString --output text)
+
+# Create Kubernetes secret
+kubectl create secret generic database-credentials \
+  --from-literal=host=${DB_ENDPOINT} \
+  --from-literal=password=${DB_PASSWORD} \
+  --namespace=${NAMESPACE} \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+# Deploy staging configuration
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: trading-engine-config
+  namespace: ${NAMESPACE}
+data:
+  config.yaml: |
+$(cat environments/staging.yaml | sed 's/^/    /')
+EOF
+
+# Deploy application
+helm upgrade --install hft-trading ./helm/hft-trading \
+  --namespace ${NAMESPACE} \
+  --values environments/staging.yaml \
+  --set image.tag=staging-${GIT_COMMIT} \
+  --wait
+
+echo "Staging environment setup complete!"
+
+---
+# k8s/staging/statefulset.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: trading-engine
+  namespace: hft-trading-staging
+spec:
+  serviceName: trading-engine-headless
+  replicas: 3
+  selector:
+    matchLabels:
+      app: trading-engine
+      env: staging
+  template:
+    metadata:
+      labels:
+        app: trading-engine
+        env: staging
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - trading-engine
+            topologyKey: kubernetes.io/hostname
+
+      containers:
+      - name: trading-engine
+        image: registry.example.com/hft-trading-engine:staging
+        env:
+        - name: ENVIRONMENT
+          value: "staging"
+        - name: LOG_LEVEL
+          value: "info"
+        - name: DATABASE_HOST
+          valueFrom:
+            secretKeyRef:
+              name: database-credentials
+              key: host
+        - name: DATABASE_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: database-credentials
+              key: password
+        resources:
+          requests:
+            cpu: 2000m
+            memory: 4Gi
+          limits:
+            cpu: 4000m
+            memory: 8Gi
+        livenessProbe:
+          httpGet:
+            path: /health/live
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 5
+
+================================================================================
+4. PRODUCTION ENVIRONMENT
+================================================================================
+
+# scripts/setup-production-environment.sh
+#!/bin/bash
+set -e
+
+NAMESPACE="hft-trading-production"
+
+echo "Setting up production environment..."
+echo "WARNING: This will create production resources!"
+read -p "Are you sure? (yes/no): " confirm
+
+if [ "$confirm" != "yes" ]; then
+    echo "Aborted."
+    exit 1
+fi
+
+# Create namespace
+kubectl create namespace ${NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
+
+# Label namespace
+kubectl label namespace ${NAMESPACE} \
+  environment=production \
+  tier=prod \
+  managed-by=devops \
+  critical=true
+
+# Production resource quotas
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: prod-quota
+  namespace: ${NAMESPACE}
+spec:
+  hard:
+    requests.cpu: "64"
+    requests.memory: 128Gi
+    limits.cpu: "128"
+    limits.memory: 256Gi
+    persistentvolumeclaims: "20"
+EOF
+
+# Pod Disruption Budget
+kubectl apply -f - <<EOF
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: trading-engine-pdb
+  namespace: ${NAMESPACE}
+spec:
+  minAvailable: 3
+  selector:
+    matchLabels:
+      app: trading-engine
+EOF
+
+# Deploy production infrastructure
+terraform -chdir=terraform/aws apply \
+  -var="environment=production" \
+  -var-file="environments/production.tfvars" \
+  -auto-approve
+
+# Setup monitoring and alerting
+kubectl apply -f monitoring/prometheus-rules-production.yaml
+kubectl apply -f monitoring/alertmanager-config-production.yaml
+
+# Deploy application with Helm
+helm upgrade --install hft-trading ./helm/hft-trading \
+  --namespace ${NAMESPACE} \
+  --values environments/production.yaml \
+  --set image.tag=${VERSION} \
+  --set replicaCount=5 \
+  --wait \
+  --timeout 10m
+
+echo "Production environment setup complete!"
+
+---
+# k8s/production/statefulset.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: trading-engine
+  namespace: hft-trading-production
+spec:
+  serviceName: trading-engine-headless
+  replicas: 5
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      partition: 0
+  selector:
+    matchLabels:
+      app: trading-engine
+      env: production
+  template:
+    metadata:
+      labels:
+        app: trading-engine
+        env: production
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+    spec:
+      priorityClassName: high-priority
+
+      nodeSelector:
+        node-type: high-performance
+        availability-zone: us-east-1a
+
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - trading-engine
+            topologyKey: kubernetes.io/hostname
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: node.kubernetes.io/instance-type
+                operator: In
+                values:
+                - c6i.4xlarge
+                - c6i.8xlarge
+
+      initContainers:
+      - name: sysctl-tuning
+        image: busybox:latest
+        command:
+        - sh
+        - -c
+        - |
+          sysctl -w net.core.somaxconn=4096
+          sysctl -w net.ipv4.tcp_max_syn_backlog=8192
+        securityContext:
+          privileged: true
+
+      containers:
+      - name: trading-engine
+        image: registry.example.com/hft-trading-engine:v1.0.0
+        env:
+        - name: ENVIRONMENT
+          value: "production"
+        - name: LOG_LEVEL
+          value: "warn"
+        - name: CPU_AFFINITY
+          value: "0-7"
+        - name: DATABASE_HOST
+          valueFrom:
+            secretKeyRef:
+              name: database-credentials
+              key: host
+        - name: DATABASE_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: database-credentials
+              key: password
+        resources:
+          requests:
+            cpu: 4000m
+            memory: 8Gi
+          limits:
+            cpu: 8000m
+            memory: 16Gi
+
+        livenessProbe:
+          httpGet:
+            path: /health/live
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+
+        lifecycle:
+          preStop:
+            exec:
+              command:
+              - /bin/sh
+              - -c
+              - |
+                kill -TERM 1
+                sleep 15
+
+        securityContext:
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
+          runAsUser: 1000
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+          readOnlyRootFilesystem: true
+
+================================================================================
+5. ENVIRONMENT PROMOTION
+================================================================================
+
+# scripts/promote-to-staging.sh
+#!/bin/bash
+set -e
+
+DEV_IMAGE=$1
+
+if [ -z "$DEV_IMAGE" ]; then
+    echo "Usage: $0 <dev_image_tag>"
+    exit 1
+fi
+
+echo "Promoting from dev to staging..."
+echo "Dev image: $DEV_IMAGE"
+
+# Run integration tests in dev
+echo "Running integration tests in dev..."
+./scripts/run-integration-tests.sh hft-trading-dev
+
+# Tag image for staging
+STAGING_IMAGE="registry.example.com/hft-trading-engine:staging-$(git rev-parse --short HEAD)"
+docker pull registry.example.com/hft-trading-engine:${DEV_IMAGE}
+docker tag registry.example.com/hft-trading-engine:${DEV_IMAGE} ${STAGING_IMAGE}
+docker push ${STAGING_IMAGE}
+
+# Deploy to staging
+echo "Deploying to staging..."
+helm upgrade hft-trading ./helm/hft-trading \
+  --namespace hft-trading-staging \
+  --values environments/staging.yaml \
+  --set image.tag=staging-$(git rev-parse --short HEAD) \
+  --wait
+
+# Run smoke tests
+echo "Running smoke tests in staging..."
+./scripts/smoke-test.sh hft-trading-staging
+
+echo "Promotion to staging complete!"
+
+---
+# scripts/promote-to-production.sh
+#!/bin/bash
+set -e
+
+STAGING_IMAGE=$1
+
+if [ -z "$STAGING_IMAGE" ]; then
+    echo "Usage: $0 <staging_image_tag>"
+    exit 1
+fi
+
+echo "======================================"
+echo "PRODUCTION PROMOTION"
+echo "======================================"
+echo "Staging image: $STAGING_IMAGE"
+echo "======================================"
+echo ""
+echo "This will deploy to PRODUCTION!"
+read -p "Have you completed the pre-deployment checklist? (yes/no): " confirm
+
+if [ "$confirm" != "yes" ]; then
+    echo "Aborted."
+    exit 1
+fi
+
+# Run full test suite in staging
+echo "Running full test suite in staging..."
+./scripts/run-all-tests.sh hft-trading-staging
+
+# Performance benchmarks
+echo "Running performance benchmarks..."
+./scripts/run-benchmarks.sh hft-trading-staging
+
+# Security scan
+echo "Running security scan..."
+trivy image registry.example.com/hft-trading-engine:${STAGING_IMAGE}
+
+# Tag image for production
+PRODUCTION_IMAGE="registry.example.com/hft-trading-engine:v$(cat VERSION)"
+docker pull registry.example.com/hft-trading-engine:${STAGING_IMAGE}
+docker tag registry.example.com/hft-trading-engine:${STAGING_IMAGE} ${PRODUCTION_IMAGE}
+docker push ${PRODUCTION_IMAGE}
+
+# Create Git tag
+git tag -a v$(cat VERSION) -m "Release v$(cat VERSION)"
+git push origin v$(cat VERSION)
+
+# Deploy to production using canary strategy
+echo "Deploying to production (canary)..."
+./scripts/deploy-canary.sh production 10 ${PRODUCTION_IMAGE}
+
+echo "Monitoring canary for 5 minutes..."
+sleep 300
+
+./scripts/deploy-canary.sh production 50 ${PRODUCTION_IMAGE}
+sleep 300
+
+./scripts/deploy-canary.sh production 100 ${PRODUCTION_IMAGE}
+
+echo "======================================"
+echo "Production deployment complete!"
+echo "Version: v$(cat VERSION)"
+echo "======================================"
+
+# Send notification
+./scripts/send-notification.sh "Production deployment complete: v$(cat VERSION)"
+
+================================================================================
+6. CONFIGURATION MANAGEMENT
+================================================================================
+
+# scripts/generate-config.sh
+#!/bin/bash
+set -e
+
+ENVIRONMENT=$1
+OUTPUT_DIR=${2:-.}
+
+if [ -z "$ENVIRONMENT" ]; then
+    echo "Usage: $0 <environment> [output_dir]"
+    exit 1
+fi
+
+echo "Generating configuration for ${ENVIRONMENT}..."
+
+# Merge common and environment-specific config
+python3 - <<EOF
+import yaml
+import sys
+
+# Load common config
+with open('environments/common.yaml') as f:
+    common = yaml.safe_load(f)
+
+# Load environment config
+with open('environments/${ENVIRONMENT}.yaml') as f:
+    env = yaml.safe_load(f)
+
+# Deep merge
+def merge(a, b):
+    for key in b:
+        if key in a:
+            if isinstance(a[key], dict) and isinstance(b[key], dict):
+                merge(a[key], b[key])
+            else:
+                a[key] = b[key]
+        else:
+            a[key] = b[key]
+    return a
+
+config = merge(common, env)
+
+# Output
+with open('${OUTPUT_DIR}/config-${ENVIRONMENT}.yaml', 'w') as f:
+    yaml.dump(config, f, default_flow_style=False)
+
+print("Configuration generated: ${OUTPUT_DIR}/config-${ENVIRONMENT}.yaml")
+EOF
+
+---
+# Configuration validation
+# scripts/validate-config.sh
+#!/bin/bash
+set -e
+
+CONFIG_FILE=$1
+
+if [ -z "$CONFIG_FILE" ]; then
+    echo "Usage: $0 <config_file>"
+    exit 1
+fi
+
+echo "Validating configuration: ${CONFIG_FILE}"
+
+# Validate YAML syntax
+python3 -c "import yaml; yaml.safe_load(open('${CONFIG_FILE}'))"
+
+# Validate against schema
+python3 - <<EOF
+import yaml
+import jsonschema
+
+# Load config
+with open('${CONFIG_FILE}') as f:
+    config = yaml.safe_load(f)
+
+# Load schema
+with open('config-schema.json') as f:
+    schema = json.load(f)
+
+# Validate
+try:
+    jsonschema.validate(config, schema)
+    print("Configuration is valid")
+except jsonschema.ValidationError as e:
+    print(f"Validation error: {e}")
+    sys.exit(1)
+EOF
+
+echo "Validation passed!"
+
+================================================================================
+7. ENVIRONMENT ISOLATION
+================================================================================
+
+# Network policies for environment isolation
+# k8s/network-policies/isolation.yaml
+---
+# Deny all traffic by default
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: hft-trading-production
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+
+---
+# Allow only necessary ingress
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress
+  namespace: hft-trading-production
+spec:
+  podSelector:
+    matchLabels:
+      app: trading-engine
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: ingress-nginx
+    ports:
+    - protocol: TCP
+      port: 8080
+
+---
+# Prevent cross-environment communication
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-other-environments
+  namespace: hft-trading-production
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          environment: production
+
+================================================================================
+ENVIRONMENT MANAGEMENT BEST PRACTICES
+================================================================================
+
+1. ENVIRONMENT PARITY
+   - Keep environments as similar as possible
+   - Use same container images across environments
+   - Differ only in configuration, not code
+   - Test promotion process regularly
+
+2. CONFIGURATION MANAGEMENT
+   - Store configs in version control
+   - Use environment variables for secrets
+   - Validate configurations before deployment
+   - Document all environment-specific settings
+
+3. RESOURCE ALLOCATION
+   - Development: Minimal resources for cost savings
+   - Staging: Production-like for realistic testing
+   - Production: Generous resources for performance
+
+4. ACCESS CONTROL
+   - Development: Open access for developers
+   - Staging: Restricted to QA and DevOps
+   - Production: Strict access, audit logs
+
+5. DATA MANAGEMENT
+   - Development: Synthetic/mock data
+   - Staging: Anonymized production data
+   - Production: Real data with backups
+
+================================================================================
+END OF ENVIRONMENT MANAGEMENT GUIDE
+================================================================================

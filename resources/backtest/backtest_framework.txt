@@ -1,0 +1,1226 @@
+================================================================================
+COMPREHENSIVE BACKTESTING FRAMEWORK FOR HFT SYSTEMS
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Architecture Overview
+2. Core Framework Components
+3. Backtesting Engine Implementation
+4. Event Processing System
+5. Order Book Reconstruction
+6. Strategy Interface
+7. Execution Simulator
+8. Complete Implementation Examples
+9. Multi-Threading Support
+10. Advanced Features
+
+================================================================================
+1. ARCHITECTURE OVERVIEW
+================================================================================
+
+The backtesting framework follows a modular, event-driven architecture that
+accurately simulates real-world HFT trading conditions:
+
+Components Hierarchy:
+┌─────────────────────────────────────────────────────────────────┐
+│                    Backtesting Engine                           │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │              Event Queue Manager                         │  │
+│  │  ┌────────────┐  ┌────────────┐  ┌────────────────┐    │  │
+│  │  │Market Data │  │   Orders   │  │  Executions    │    │  │
+│  │  │  Events    │  │  Events    │  │    Events      │    │  │
+│  │  └────────────┘  └────────────┘  └────────────────┘    │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │              Strategy Manager                            │  │
+│  │  ┌────────────┐  ┌────────────┐  ┌────────────────┐    │  │
+│  │  │ Strategy 1 │  │ Strategy 2 │  │  Strategy N    │    │  │
+│  │  └────────────┘  └────────────┘  └────────────────┘    │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │              Execution Simulator                         │  │
+│  │  ┌────────────┐  ┌────────────┐  ┌────────────────┐    │  │
+│  │  │ Order Book │  │Fill Engine │  │  Slippage      │    │  │
+│  │  │ Simulator  │  │            │  │  Model         │    │  │
+│  │  └────────────┘  └────────────┘  └────────────────┘    │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │              Portfolio Manager                           │  │
+│  │  ┌────────────┐  ┌────────────┐  ┌────────────────┐    │  │
+│  │  │ Positions  │  │    P&L     │  │  Risk Metrics  │    │  │
+│  │  └────────────┘  └────────────┘  └────────────────┘    │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │              Data Manager                                │  │
+│  │  ┌────────────┐  ┌────────────┐  ┌────────────────┐    │  │
+│  │  │ Historical │  │   Cache    │  │  Data Feed     │    │  │
+│  │  │    Data    │  │            │  │  Adapter       │    │  │
+│  │  └────────────┘  └────────────┘  └────────────────┘    │  │
+│  └──────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+
+================================================================================
+2. CORE FRAMEWORK COMPONENTS
+================================================================================
+
+/*******************************************************************************
+ * BASE EVENT TYPES
+ ******************************************************************************/
+
+#pragma once
+#include <cstdint>
+#include <string>
+#include <memory>
+#include <chrono>
+#include <variant>
+#include <vector>
+#include <queue>
+#include <map>
+#include <atomic>
+
+namespace HFT {
+namespace Backtest {
+
+// High-precision timestamp using nanoseconds
+using Timestamp = std::chrono::time_point<std::chrono::system_clock,
+                                          std::chrono::nanoseconds>;
+using Duration = std::chrono::nanoseconds;
+
+// Event types for the backtesting system
+enum class EventType : uint8_t {
+    MARKET_DATA,        // Tick data, order book updates
+    ORDER,              // Order requests from strategy
+    FILL,               // Order execution confirmations
+    CANCEL,             // Order cancellation
+    MODIFY,             // Order modification
+    SIGNAL,             // Trading signals
+    TIMER,              // Scheduled events
+    CUSTOM              // User-defined events
+};
+
+// Order side
+enum class Side : uint8_t {
+    BUY = 0,
+    SELL = 1
+};
+
+// Order types
+enum class OrderType : uint8_t {
+    MARKET,
+    LIMIT,
+    STOP,
+    STOP_LIMIT,
+    ICEBERG,
+    POST_ONLY
+};
+
+// Time in force
+enum class TimeInForce : uint8_t {
+    GTC,        // Good till cancel
+    IOC,        // Immediate or cancel
+    FOK,        // Fill or kill
+    DAY,        // Day order
+    GTD         // Good till date
+};
+
+// Order status
+enum class OrderStatus : uint8_t {
+    PENDING_NEW,
+    NEW,
+    PARTIALLY_FILLED,
+    FILLED,
+    PENDING_CANCEL,
+    CANCELLED,
+    REJECTED,
+    EXPIRED
+};
+
+/*******************************************************************************
+ * BASE EVENT STRUCTURE
+ ******************************************************************************/
+
+struct Event {
+    EventType type;
+    Timestamp timestamp;
+    uint64_t sequence_number;
+    std::string symbol;
+
+    Event(EventType t, Timestamp ts, const std::string& sym)
+        : type(t), timestamp(ts), sequence_number(0), symbol(sym) {}
+
+    virtual ~Event() = default;
+};
+
+/*******************************************************************************
+ * MARKET DATA EVENT
+ ******************************************************************************/
+
+struct MarketDataEvent : public Event {
+    double bid_price;
+    double ask_price;
+    int64_t bid_size;
+    int64_t ask_size;
+    double last_price;
+    int64_t last_size;
+    uint64_t trade_count;
+    double vwap;
+
+    // Level 2 data (optional)
+    struct PriceLevel {
+        double price;
+        int64_t size;
+        uint32_t order_count;
+    };
+
+    std::vector<PriceLevel> bids;
+    std::vector<PriceLevel> asks;
+
+    MarketDataEvent(Timestamp ts, const std::string& sym)
+        : Event(EventType::MARKET_DATA, ts, sym),
+          bid_price(0.0), ask_price(0.0),
+          bid_size(0), ask_size(0),
+          last_price(0.0), last_size(0),
+          trade_count(0), vwap(0.0) {}
+};
+
+/*******************************************************************************
+ * ORDER EVENT
+ ******************************************************************************/
+
+struct OrderEvent : public Event {
+    uint64_t order_id;
+    uint64_t client_order_id;
+    OrderType order_type;
+    Side side;
+    double price;
+    int64_t quantity;
+    int64_t filled_quantity;
+    TimeInForce tif;
+    OrderStatus status;
+    std::string strategy_id;
+
+    // For iceberg orders
+    int64_t visible_quantity;
+
+    // For stop orders
+    double stop_price;
+
+    OrderEvent(Timestamp ts, const std::string& sym)
+        : Event(EventType::ORDER, ts, sym),
+          order_id(0), client_order_id(0),
+          order_type(OrderType::LIMIT),
+          side(Side::BUY),
+          price(0.0), quantity(0),
+          filled_quantity(0),
+          tif(TimeInForce::GTC),
+          status(OrderStatus::PENDING_NEW),
+          visible_quantity(0),
+          stop_price(0.0) {}
+};
+
+/*******************************************************************************
+ * FILL EVENT
+ ******************************************************************************/
+
+struct FillEvent : public Event {
+    uint64_t order_id;
+    uint64_t fill_id;
+    Side side;
+    double fill_price;
+    int64_t fill_quantity;
+    double commission;
+    std::string exchange;
+    std::string strategy_id;
+
+    // Execution details
+    bool is_maker;
+    int64_t remaining_quantity;
+
+    FillEvent(Timestamp ts, const std::string& sym)
+        : Event(EventType::FILL, ts, sym),
+          order_id(0), fill_id(0),
+          side(Side::BUY),
+          fill_price(0.0),
+          fill_quantity(0),
+          commission(0.0),
+          is_maker(false),
+          remaining_quantity(0) {}
+};
+
+================================================================================
+3. BACKTESTING ENGINE IMPLEMENTATION
+================================================================================
+
+/*******************************************************************************
+ * EVENT QUEUE WITH PRIORITY
+ ******************************************************************************/
+
+class EventQueue {
+public:
+    struct EventComparator {
+        bool operator()(const std::shared_ptr<Event>& a,
+                       const std::shared_ptr<Event>& b) const {
+            if (a->timestamp != b->timestamp) {
+                return a->timestamp > b->timestamp; // Min heap by timestamp
+            }
+            return a->sequence_number > b->sequence_number;
+        }
+    };
+
+    using QueueType = std::priority_queue<
+        std::shared_ptr<Event>,
+        std::vector<std::shared_ptr<Event>>,
+        EventComparator
+    >;
+
+private:
+    QueueType queue_;
+    std::atomic<uint64_t> sequence_counter_{0};
+    mutable std::mutex mutex_;
+
+public:
+    void push(std::shared_ptr<Event> event) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        event->sequence_number = sequence_counter_++;
+        queue_.push(std::move(event));
+    }
+
+    std::shared_ptr<Event> pop() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (queue_.empty()) {
+            return nullptr;
+        }
+        auto event = queue_.top();
+        queue_.pop();
+        return event;
+    }
+
+    bool empty() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return queue_.empty();
+    }
+
+    size_t size() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return queue_.size();
+    }
+
+    Timestamp next_time() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (queue_.empty()) {
+            return Timestamp::max();
+        }
+        return queue_.top()->timestamp;
+    }
+
+    void clear() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        while (!queue_.empty()) {
+            queue_.pop();
+        }
+        sequence_counter_ = 0;
+    }
+};
+
+/*******************************************************************************
+ * BACKTESTING CONFIGURATION
+ ******************************************************************************/
+
+struct BacktestConfig {
+    Timestamp start_time;
+    Timestamp end_time;
+    double initial_capital;
+    double commission_rate;
+    double slippage_rate;
+
+    // Advanced settings
+    bool use_realistic_fills;
+    bool simulate_latency;
+    Duration average_latency;
+    bool enable_order_book_simulation;
+    int order_book_depth;
+
+    // Risk limits
+    double max_position_size;
+    double max_order_size;
+    double max_daily_loss;
+
+    // Logging
+    bool log_all_events;
+    bool log_trades_only;
+    std::string output_directory;
+
+    BacktestConfig()
+        : initial_capital(1000000.0),
+          commission_rate(0.0001),
+          slippage_rate(0.0001),
+          use_realistic_fills(true),
+          simulate_latency(true),
+          average_latency(Duration(100000)), // 100 microseconds
+          enable_order_book_simulation(true),
+          order_book_depth(10),
+          max_position_size(1000000.0),
+          max_order_size(100000.0),
+          max_daily_loss(50000.0),
+          log_all_events(false),
+          log_trades_only(true) {}
+};
+
+/*******************************************************************************
+ * POSITION TRACKER
+ ******************************************************************************/
+
+class Position {
+private:
+    std::string symbol_;
+    int64_t quantity_;
+    double average_price_;
+    double realized_pnl_;
+    double unrealized_pnl_;
+    double total_commission_;
+
+public:
+    Position(const std::string& symbol = "")
+        : symbol_(symbol), quantity_(0), average_price_(0.0),
+          realized_pnl_(0.0), unrealized_pnl_(0.0),
+          total_commission_(0.0) {}
+
+    void update(Side side, int64_t quantity, double price, double commission) {
+        int64_t signed_quantity = (side == Side::BUY) ? quantity : -quantity;
+
+        // Calculate realized P&L if closing or reducing position
+        if ((quantity_ > 0 && signed_quantity < 0) ||
+            (quantity_ < 0 && signed_quantity > 0)) {
+
+            int64_t closing_qty = std::min(std::abs(quantity_),
+                                          std::abs(signed_quantity));
+            realized_pnl_ += closing_qty * (price - average_price_) *
+                           (quantity_ > 0 ? 1 : -1);
+        }
+
+        // Update position
+        int64_t new_quantity = quantity_ + signed_quantity;
+
+        if ((quantity_ >= 0 && signed_quantity > 0) ||
+            (quantity_ <= 0 && signed_quantity < 0)) {
+            // Increasing position - update average price
+            double total_cost = quantity_ * average_price_ +
+                              quantity * price;
+            average_price_ = (new_quantity != 0) ?
+                           total_cost / std::abs(new_quantity) : 0.0;
+        } else if (new_quantity == 0) {
+            // Closed position
+            average_price_ = 0.0;
+        }
+
+        quantity_ = new_quantity;
+        total_commission_ += commission;
+    }
+
+    void update_unrealized_pnl(double current_price) {
+        if (quantity_ == 0) {
+            unrealized_pnl_ = 0.0;
+        } else {
+            unrealized_pnl_ = quantity_ * (current_price - average_price_);
+        }
+    }
+
+    int64_t quantity() const { return quantity_; }
+    double average_price() const { return average_price_; }
+    double realized_pnl() const { return realized_pnl_; }
+    double unrealized_pnl() const { return unrealized_pnl_; }
+    double total_pnl() const { return realized_pnl_ + unrealized_pnl_; }
+    double total_commission() const { return total_commission_; }
+    double market_value(double current_price) const {
+        return quantity_ * current_price;
+    }
+};
+
+/*******************************************************************************
+ * PORTFOLIO MANAGER
+ ******************************************************************************/
+
+class PortfolioManager {
+private:
+    std::map<std::string, Position> positions_;
+    double initial_capital_;
+    double current_capital_;
+    double total_commission_;
+    double total_realized_pnl_;
+    double peak_capital_;
+    double max_drawdown_;
+
+    std::vector<double> equity_curve_;
+    std::vector<Timestamp> equity_timestamps_;
+
+    mutable std::mutex mutex_;
+
+public:
+    PortfolioManager(double initial_capital)
+        : initial_capital_(initial_capital),
+          current_capital_(initial_capital),
+          total_commission_(0.0),
+          total_realized_pnl_(0.0),
+          peak_capital_(initial_capital),
+          max_drawdown_(0.0) {}
+
+    void on_fill(const FillEvent& fill, double current_price) {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        auto& position = positions_[fill.symbol];
+        position.update(fill.side, fill.fill_quantity,
+                       fill.fill_price, fill.commission);
+
+        // Update capital
+        double fill_value = fill.fill_quantity * fill.fill_price;
+        if (fill.side == Side::BUY) {
+            current_capital_ -= (fill_value + fill.commission);
+        } else {
+            current_capital_ += (fill_value - fill.commission);
+        }
+
+        total_commission_ += fill.commission;
+        total_realized_pnl_ += position.realized_pnl();
+
+        // Update unrealized P&L for the symbol
+        position.update_unrealized_pnl(current_price);
+
+        update_equity();
+    }
+
+    void update_market_data(const std::string& symbol, double price) {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        auto it = positions_.find(symbol);
+        if (it != positions_.end()) {
+            it->second.update_unrealized_pnl(price);
+            update_equity();
+        }
+    }
+
+    double get_total_equity() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        double total = current_capital_;
+        for (const auto& [symbol, position] : positions_) {
+            total += position.unrealized_pnl();
+        }
+        return total;
+    }
+
+    double get_position_size(const std::string& symbol) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = positions_.find(symbol);
+        return (it != positions_.end()) ? it->second.quantity() : 0;
+    }
+
+    const Position* get_position(const std::string& symbol) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = positions_.find(symbol);
+        return (it != positions_.end()) ? &it->second : nullptr;
+    }
+
+    double get_realized_pnl() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return total_realized_pnl_;
+    }
+
+    double get_unrealized_pnl() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        double total = 0.0;
+        for (const auto& [symbol, position] : positions_) {
+            total += position.unrealized_pnl();
+        }
+        return total;
+    }
+
+    double get_max_drawdown() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return max_drawdown_;
+    }
+
+    const std::vector<double>& get_equity_curve() const {
+        return equity_curve_;
+    }
+
+private:
+    void update_equity() {
+        double equity = get_total_equity();
+        equity_curve_.push_back(equity);
+
+        if (equity > peak_capital_) {
+            peak_capital_ = equity;
+        }
+
+        double drawdown = (peak_capital_ - equity) / peak_capital_;
+        if (drawdown > max_drawdown_) {
+            max_drawdown_ = drawdown;
+        }
+    }
+};
+
+================================================================================
+4. EVENT PROCESSING SYSTEM
+================================================================================
+
+/*******************************************************************************
+ * STRATEGY INTERFACE
+ ******************************************************************************/
+
+class IStrategy {
+public:
+    virtual ~IStrategy() = default;
+
+    virtual void on_market_data(const MarketDataEvent& event) = 0;
+    virtual void on_fill(const FillEvent& event) = 0;
+    virtual void on_order_update(const OrderEvent& event) = 0;
+    virtual void on_timer(Timestamp time) = 0;
+
+    virtual std::string get_strategy_id() const = 0;
+    virtual void initialize() = 0;
+    virtual void shutdown() = 0;
+};
+
+/*******************************************************************************
+ * ORDER MANAGER
+ ******************************************************************************/
+
+class OrderManager {
+private:
+    std::map<uint64_t, OrderEvent> active_orders_;
+    std::map<uint64_t, OrderEvent> completed_orders_;
+    std::atomic<uint64_t> order_id_counter_{1};
+    mutable std::mutex mutex_;
+
+public:
+    uint64_t generate_order_id() {
+        return order_id_counter_++;
+    }
+
+    void add_order(const OrderEvent& order) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        active_orders_[order.order_id] = order;
+    }
+
+    void update_order(uint64_t order_id, OrderStatus status,
+                     int64_t filled_quantity = 0) {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        auto it = active_orders_.find(order_id);
+        if (it == active_orders_.end()) return;
+
+        it->second.status = status;
+        it->second.filled_quantity += filled_quantity;
+
+        // Move to completed if terminal state
+        if (status == OrderStatus::FILLED ||
+            status == OrderStatus::CANCELLED ||
+            status == OrderStatus::REJECTED) {
+            completed_orders_[order_id] = it->second;
+            active_orders_.erase(it);
+        }
+    }
+
+    const OrderEvent* get_order(uint64_t order_id) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        auto it = active_orders_.find(order_id);
+        if (it != active_orders_.end()) {
+            return &it->second;
+        }
+
+        auto it2 = completed_orders_.find(order_id);
+        if (it2 != completed_orders_.end()) {
+            return &it2->second;
+        }
+
+        return nullptr;
+    }
+
+    std::vector<OrderEvent> get_active_orders() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<OrderEvent> orders;
+        for (const auto& [id, order] : active_orders_) {
+            orders.push_back(order);
+        }
+        return orders;
+    }
+
+    void cancel_order(uint64_t order_id) {
+        update_order(order_id, OrderStatus::CANCELLED);
+    }
+
+    void clear() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        active_orders_.clear();
+        completed_orders_.clear();
+        order_id_counter_ = 1;
+    }
+};
+
+================================================================================
+5. ORDER BOOK RECONSTRUCTION
+================================================================================
+
+/*******************************************************************************
+ * LIMIT ORDER BOOK SIMULATOR
+ ******************************************************************************/
+
+class OrderBook {
+public:
+    struct Level {
+        double price;
+        int64_t size;
+        uint32_t order_count;
+
+        Level(double p = 0.0, int64_t s = 0, uint32_t c = 0)
+            : price(p), size(s), order_count(c) {}
+    };
+
+private:
+    std::string symbol_;
+
+    // Price levels: price -> size
+    std::map<double, int64_t, std::greater<double>> bids_; // Descending
+    std::map<double, int64_t> asks_;                       // Ascending
+
+    double last_price_;
+    Timestamp last_update_time_;
+
+    mutable std::mutex mutex_;
+
+public:
+    OrderBook(const std::string& symbol)
+        : symbol_(symbol), last_price_(0.0) {}
+
+    void update_from_market_data(const MarketDataEvent& event) {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        last_update_time_ = event.timestamp;
+        last_price_ = event.last_price;
+
+        // Clear existing levels
+        bids_.clear();
+        asks_.clear();
+
+        // Update from L2 data if available
+        if (!event.bids.empty() && !event.asks.empty()) {
+            for (const auto& level : event.bids) {
+                bids_[level.price] = level.size;
+            }
+            for (const auto& level : event.asks) {
+                asks_[level.price] = level.size;
+            }
+        } else {
+            // Use L1 data
+            if (event.bid_price > 0 && event.bid_size > 0) {
+                bids_[event.bid_price] = event.bid_size;
+            }
+            if (event.ask_price > 0 && event.ask_size > 0) {
+                asks_[event.ask_price] = event.ask_size;
+            }
+        }
+    }
+
+    std::pair<double, int64_t> get_best_bid() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (bids_.empty()) return {0.0, 0};
+        return {bids_.begin()->first, bids_.begin()->second};
+    }
+
+    std::pair<double, int64_t> get_best_ask() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (asks_.empty()) return {0.0, 0};
+        return {asks_.begin()->first, asks_.begin()->second};
+    }
+
+    double get_mid_price() const {
+        auto [bid_price, bid_size] = get_best_bid();
+        auto [ask_price, ask_size] = get_best_ask();
+
+        if (bid_price > 0 && ask_price > 0) {
+            return (bid_price + ask_price) / 2.0;
+        }
+        return last_price_;
+    }
+
+    double get_spread() const {
+        auto [bid_price, _1] = get_best_bid();
+        auto [ask_price, _2] = get_best_ask();
+        return (ask_price > bid_price) ? (ask_price - bid_price) : 0.0;
+    }
+
+    std::vector<Level> get_bid_levels(int depth = 10) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<Level> levels;
+
+        int count = 0;
+        for (const auto& [price, size] : bids_) {
+            if (count++ >= depth) break;
+            levels.emplace_back(price, size, 1);
+        }
+        return levels;
+    }
+
+    std::vector<Level> get_ask_levels(int depth = 10) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<Level> levels;
+
+        int count = 0;
+        for (const auto& [price, size] : asks_) {
+            if (count++ >= depth) break;
+            levels.emplace_back(price, size, 1);
+        }
+        return levels;
+    }
+
+    // Calculate available liquidity at a given price
+    int64_t get_available_liquidity(Side side, double price) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        int64_t total = 0;
+        if (side == Side::BUY) {
+            // Buying - sum ask liquidity up to price
+            for (const auto& [ask_price, size] : asks_) {
+                if (ask_price <= price) {
+                    total += size;
+                } else {
+                    break;
+                }
+            }
+        } else {
+            // Selling - sum bid liquidity down to price
+            for (const auto& [bid_price, size] : bids_) {
+                if (bid_price >= price) {
+                    total += size;
+                } else {
+                    break;
+                }
+            }
+        }
+        return total;
+    }
+};
+
+================================================================================
+6. EXECUTION SIMULATOR
+================================================================================
+
+/*******************************************************************************
+ * FILL SIMULATOR WITH REALISTIC MODELING
+ ******************************************************************************/
+
+class FillSimulator {
+private:
+    BacktestConfig config_;
+    std::map<std::string, OrderBook> order_books_;
+    std::mt19937_64 rng_;
+
+public:
+    FillSimulator(const BacktestConfig& config)
+        : config_(config) {
+        std::random_device rd;
+        rng_.seed(rd());
+    }
+
+    void update_order_book(const std::string& symbol,
+                          const MarketDataEvent& event) {
+        auto& book = order_books_[symbol];
+        book.update_from_market_data(event);
+    }
+
+    std::vector<FillEvent> simulate_order(const OrderEvent& order,
+                                         Timestamp current_time) {
+        std::vector<FillEvent> fills;
+
+        auto it = order_books_.find(order.symbol);
+        if (it == order_books_.end()) {
+            return fills; // No order book data
+        }
+
+        const auto& book = it->second;
+
+        if (order.order_type == OrderType::MARKET) {
+            fills = simulate_market_order(order, book, current_time);
+        } else if (order.order_type == OrderType::LIMIT) {
+            fills = simulate_limit_order(order, book, current_time);
+        }
+
+        return fills;
+    }
+
+private:
+    std::vector<FillEvent> simulate_market_order(
+        const OrderEvent& order,
+        const OrderBook& book,
+        Timestamp current_time) {
+
+        std::vector<FillEvent> fills;
+
+        // Get best price based on side
+        auto [best_price, best_size] = (order.side == Side::BUY) ?
+            book.get_best_ask() : book.get_best_bid();
+
+        if (best_price <= 0.0) {
+            return fills; // No liquidity
+        }
+
+        // Apply slippage for market orders
+        double slippage = calculate_slippage(order.quantity, best_size);
+        double fill_price = apply_slippage(best_price, order.side, slippage);
+
+        // Check liquidity
+        int64_t available = book.get_available_liquidity(order.side,
+                                                         fill_price);
+        int64_t fill_qty = std::min(order.quantity, available);
+
+        if (fill_qty > 0) {
+            FillEvent fill(current_time, order.symbol);
+            fill.order_id = order.order_id;
+            fill.fill_id = generate_fill_id();
+            fill.side = order.side;
+            fill.fill_price = fill_price;
+            fill.fill_quantity = fill_qty;
+            fill.commission = calculate_commission(fill_price, fill_qty);
+            fill.is_maker = false; // Market orders are taker
+            fill.remaining_quantity = order.quantity - fill_qty;
+            fill.strategy_id = order.strategy_id;
+
+            fills.push_back(fill);
+        }
+
+        return fills;
+    }
+
+    std::vector<FillEvent> simulate_limit_order(
+        const OrderEvent& order,
+        const OrderBook& book,
+        Timestamp current_time) {
+
+        std::vector<FillEvent> fills;
+
+        // Check if limit order can be filled immediately
+        auto [best_price, best_size] = (order.side == Side::BUY) ?
+            book.get_best_ask() : book.get_best_bid();
+
+        bool can_fill = false;
+        if (order.side == Side::BUY) {
+            can_fill = (best_price > 0.0 && order.price >= best_price);
+        } else {
+            can_fill = (best_price > 0.0 && order.price <= best_price);
+        }
+
+        if (can_fill) {
+            // Aggressive limit order - fills immediately as taker
+            int64_t available = book.get_available_liquidity(order.side,
+                                                             order.price);
+            int64_t fill_qty = std::min(order.quantity, available);
+
+            if (fill_qty > 0) {
+                FillEvent fill(current_time, order.symbol);
+                fill.order_id = order.order_id;
+                fill.fill_id = generate_fill_id();
+                fill.side = order.side;
+                fill.fill_price = order.price;
+                fill.fill_quantity = fill_qty;
+                fill.commission = calculate_commission(order.price, fill_qty);
+                fill.is_maker = false;
+                fill.remaining_quantity = order.quantity - fill_qty;
+                fill.strategy_id = order.strategy_id;
+
+                fills.push_back(fill);
+            }
+        } else {
+            // Passive limit order - simulate fill probability
+            double fill_prob = calculate_fill_probability(order, book);
+
+            std::uniform_real_distribution<double> dist(0.0, 1.0);
+            if (dist(rng_) < fill_prob) {
+                FillEvent fill(current_time, order.symbol);
+                fill.order_id = order.order_id;
+                fill.fill_id = generate_fill_id();
+                fill.side = order.side;
+                fill.fill_price = order.price;
+                fill.fill_quantity = order.quantity;
+                fill.commission = calculate_commission(order.price,
+                                                       order.quantity);
+                fill.is_maker = true; // Passive fill
+                fill.remaining_quantity = 0;
+                fill.strategy_id = order.strategy_id;
+
+                fills.push_back(fill);
+            }
+        }
+
+        return fills;
+    }
+
+    double calculate_slippage(int64_t order_size, int64_t available_size) {
+        if (available_size == 0) return config_.slippage_rate;
+
+        double size_ratio = static_cast<double>(order_size) / available_size;
+        return config_.slippage_rate * (1.0 + size_ratio);
+    }
+
+    double apply_slippage(double price, Side side, double slippage) {
+        if (side == Side::BUY) {
+            return price * (1.0 + slippage);
+        } else {
+            return price * (1.0 - slippage);
+        }
+    }
+
+    double calculate_commission(double price, int64_t quantity) {
+        return price * quantity * config_.commission_rate;
+    }
+
+    double calculate_fill_probability(const OrderEvent& order,
+                                      const OrderBook& book) {
+        // Simple model: probability based on distance from best price
+        auto [best_price, _] = (order.side == Side::BUY) ?
+            book.get_best_bid() : book.get_best_ask();
+
+        if (best_price <= 0.0) return 0.0;
+
+        double spread = book.get_spread();
+        if (spread <= 0.0) return 0.5;
+
+        double distance = std::abs(order.price - best_price);
+        double normalized_distance = distance / spread;
+
+        // Exponential decay based on distance
+        return std::exp(-2.0 * normalized_distance);
+    }
+
+    uint64_t generate_fill_id() {
+        static std::atomic<uint64_t> counter{1};
+        return counter++;
+    }
+};
+
+================================================================================
+7. MAIN BACKTESTING ENGINE
+================================================================================
+
+/*******************************************************************************
+ * COMPLETE BACKTESTING ENGINE
+ ******************************************************************************/
+
+class BacktestEngine {
+private:
+    BacktestConfig config_;
+    EventQueue event_queue_;
+    OrderManager order_manager_;
+    PortfolioManager portfolio_manager_;
+    FillSimulator fill_simulator_;
+
+    std::map<std::string, std::shared_ptr<IStrategy>> strategies_;
+    std::map<std::string, OrderBook> order_books_;
+
+    Timestamp current_time_;
+    bool is_running_;
+
+    // Statistics
+    uint64_t events_processed_;
+    uint64_t orders_submitted_;
+    uint64_t fills_executed_;
+
+public:
+    BacktestEngine(const BacktestConfig& config)
+        : config_(config),
+          portfolio_manager_(config.initial_capital),
+          fill_simulator_(config),
+          is_running_(false),
+          events_processed_(0),
+          orders_submitted_(0),
+          fills_executed_(0) {}
+
+    void add_strategy(std::shared_ptr<IStrategy> strategy) {
+        strategies_[strategy->get_strategy_id()] = strategy;
+    }
+
+    void add_market_data(std::shared_ptr<MarketDataEvent> event) {
+        event_queue_.push(event);
+    }
+
+    void run() {
+        is_running_ = true;
+
+        // Initialize strategies
+        for (auto& [id, strategy] : strategies_) {
+            strategy->initialize();
+        }
+
+        // Main event loop
+        while (is_running_ && !event_queue_.empty()) {
+            auto event = event_queue_.pop();
+            if (!event) break;
+
+            current_time_ = event->timestamp;
+
+            // Check time bounds
+            if (current_time_ > config_.end_time) {
+                break;
+            }
+
+            process_event(event);
+            events_processed_++;
+        }
+
+        // Shutdown strategies
+        for (auto& [id, strategy] : strategies_) {
+            strategy->shutdown();
+        }
+
+        is_running_ = false;
+    }
+
+    void submit_order(const OrderEvent& order) {
+        // Validate order
+        if (!validate_order(order)) {
+            return;
+        }
+
+        // Add to order manager
+        order_manager_.add_order(order);
+        orders_submitted_++;
+
+        // Simulate execution with latency
+        Timestamp execution_time = current_time_;
+        if (config_.simulate_latency) {
+            execution_time += config_.average_latency;
+        }
+
+        // Get fills
+        auto fills = fill_simulator_.simulate_order(order, execution_time);
+
+        // Process fills
+        for (auto& fill : fills) {
+            process_fill(fill);
+        }
+
+        // Update order status
+        if (fills.empty()) {
+            order_manager_.update_order(order.order_id,
+                                       OrderStatus::NEW);
+        } else {
+            int64_t total_filled = 0;
+            for (const auto& fill : fills) {
+                total_filled += fill.fill_quantity;
+            }
+
+            OrderStatus status = (total_filled >= order.quantity) ?
+                OrderStatus::FILLED : OrderStatus::PARTIALLY_FILLED;
+
+            order_manager_.update_order(order.order_id, status, total_filled);
+        }
+    }
+
+    const PortfolioManager& get_portfolio() const {
+        return portfolio_manager_;
+    }
+
+    const OrderManager& get_order_manager() const {
+        return order_manager_;
+    }
+
+    BacktestResults get_results() const {
+        BacktestResults results;
+        results.initial_capital = config_.initial_capital;
+        results.final_capital = portfolio_manager_.get_total_equity();
+        results.total_pnl = results.final_capital - results.initial_capital;
+        results.total_return = results.total_pnl / results.initial_capital;
+        results.max_drawdown = portfolio_manager_.get_max_drawdown();
+        results.events_processed = events_processed_;
+        results.orders_submitted = orders_submitted_;
+        results.fills_executed = fills_executed_;
+        results.equity_curve = portfolio_manager_.get_equity_curve();
+        return results;
+    }
+
+private:
+    void process_event(std::shared_ptr<Event> event) {
+        switch (event->type) {
+            case EventType::MARKET_DATA: {
+                auto md_event = std::static_pointer_cast<MarketDataEvent>(event);
+                process_market_data(*md_event);
+                break;
+            }
+            case EventType::FILL: {
+                auto fill_event = std::static_pointer_cast<FillEvent>(event);
+                process_fill(*fill_event);
+                break;
+            }
+            default:
+                break;
+        }
+    }
+
+    void process_market_data(const MarketDataEvent& event) {
+        // Update order book
+        fill_simulator_.update_order_book(event.symbol, event);
+
+        // Update portfolio with new prices
+        portfolio_manager_.update_market_data(event.symbol,
+                                             event.last_price);
+
+        // Notify strategies
+        for (auto& [id, strategy] : strategies_) {
+            strategy->on_market_data(event);
+        }
+    }
+
+    void process_fill(const FillEvent& fill) {
+        // Update portfolio
+        portfolio_manager_.on_fill(fill, fill.fill_price);
+        fills_executed_++;
+
+        // Notify strategy
+        auto it = strategies_.find(fill.strategy_id);
+        if (it != strategies_.end()) {
+            it->second->on_fill(fill);
+        }
+    }
+
+    bool validate_order(const OrderEvent& order) {
+        // Check position size limits
+        int64_t current_pos = portfolio_manager_.get_position_size(order.symbol);
+        int64_t new_pos = current_pos;
+
+        if (order.side == Side::BUY) {
+            new_pos += order.quantity;
+        } else {
+            new_pos -= order.quantity;
+        }
+
+        if (std::abs(new_pos) > config_.max_position_size) {
+            return false;
+        }
+
+        // Check order size limits
+        if (order.quantity > config_.max_order_size) {
+            return false;
+        }
+
+        return true;
+    }
+};
+
+struct BacktestResults {
+    double initial_capital;
+    double final_capital;
+    double total_pnl;
+    double total_return;
+    double max_drawdown;
+    uint64_t events_processed;
+    uint64_t orders_submitted;
+    uint64_t fills_executed;
+    std::vector<double> equity_curve;
+};
+
+} // namespace Backtest
+} // namespace HFT
+
+================================================================================
+END OF BACKTESTING FRAMEWORK
+================================================================================

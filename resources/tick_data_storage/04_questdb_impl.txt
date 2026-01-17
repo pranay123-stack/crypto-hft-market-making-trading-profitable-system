@@ -1,0 +1,808 @@
+================================================================================
+                        QUESTDB IMPLEMENTATION
+               Ultra-Fast Time-Series Database for Tick Data
+================================================================================
+
+PURPOSE: QuestDB is optimized for time-series data with blazing fast ingestion
+and query performance - ideal for HFT tick data storage.
+
+================================================================================
+                         TABLE OF CONTENTS
+================================================================================
+
+1. Why QuestDB for Tick Data
+2. Installation and Setup
+3. Schema Design
+4. C++ Client Implementation
+5. High-Speed Ingestion (ILP Protocol)
+6. Query Optimization
+7. Performance Benchmarks
+8. Production Configuration
+
+================================================================================
+                   1. WHY QUESTDB FOR TICK DATA
+================================================================================
+
+QUESTDB ADVANTAGES:
+-------------------
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    QUESTDB vs OTHER TIME-SERIES DBS                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  Feature           │ QuestDB    │ TimescaleDB │ InfluxDB  │ ClickHouse   │
+│  ──────────────────┼────────────┼─────────────┼───────────┼──────────────│
+│  Ingestion Rate    │ 4M rows/s  │ 200K rows/s │ 500K/s    │ 1M rows/s    │
+│  Query Latency     │ <1ms       │ 10-100ms    │ 10-50ms   │ 5-20ms       │
+│  Storage Efficiency│ Excellent  │ Good        │ Fair      │ Excellent    │
+│  SQL Support       │ Full       │ Full        │ Flux      │ Full         │
+│  Memory Mapped I/O │ Yes        │ No          │ No        │ No           │
+│  Column-Oriented   │ Yes        │ No          │ Yes       │ Yes          │
+│  Timestamp Index   │ Native     │ B-tree      │ TSI       │ Primary Key  │
+│                                                                             │
+│  BEST FOR HFT: QuestDB - fastest ingestion + lowest latency               │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+KEY FEATURES FOR HFT:
+---------------------
+
+1. ILP (Influx Line Protocol) INGESTION
+   - UDP or TCP streaming
+   - No acknowledgment overhead
+   - Fire-and-forget for maximum speed
+
+2. MEMORY-MAPPED FILES
+   - Direct disk access
+   - OS manages caching
+   - Minimal GC pauses
+
+3. SIMD VECTORIZED QUERIES
+   - Uses CPU vector instructions
+   - Parallel column processing
+   - Sub-millisecond aggregations
+
+4. DESIGNATED TIMESTAMP
+   - Partitions by time automatically
+   - Out-of-order handling
+   - Efficient time-range queries
+
+================================================================================
+                   2. INSTALLATION AND SETUP
+================================================================================
+
+DOCKER INSTALLATION (RECOMMENDED):
+----------------------------------
+
+```bash
+# Pull and run QuestDB
+docker run -d \
+  --name questdb \
+  -p 9000:9000 \
+  -p 9009:9009 \
+  -p 8812:8812 \
+  -p 9003:9003 \
+  -v /data/questdb:/var/lib/questdb \
+  questdb/questdb
+
+# Ports:
+# 9000 - REST API and Web Console
+# 9009 - InfluxDB Line Protocol (TCP)
+# 8812 - PostgreSQL wire protocol
+# 9003 - Health monitoring
+```
+
+NATIVE INSTALLATION (LINUX):
+----------------------------
+
+```bash
+# Download
+wget https://github.com/questdb/questdb/releases/download/7.3.10/questdb-7.3.10-rt-linux-amd64.tar.gz
+tar -xzf questdb-7.3.10-rt-linux-amd64.tar.gz
+cd questdb-7.3.10-rt-linux-amd64
+
+# Start QuestDB
+./bin/questdb.sh start
+
+# Configuration
+cat > conf/server.conf << 'EOF'
+# ILP configuration for high-speed ingestion
+line.tcp.enabled=true
+line.tcp.net.bind.to=0.0.0.0:9009
+line.tcp.writer.queue.size=1048576
+line.tcp.msg.buffer.size=65536
+
+# Memory configuration
+cairo.sql.page.frame.size=1048576
+cairo.writer.pool.size=16
+
+# Query optimization
+cairo.sql.parallel.enabled=true
+cairo.sql.parallel.workers=8
+
+# Storage
+cairo.root=/data/questdb/db
+EOF
+
+# Restart with new config
+./bin/questdb.sh restart
+```
+
+PERFORMANCE TUNING:
+-------------------
+
+```bash
+# System tuning for QuestDB
+# /etc/sysctl.conf
+
+# Increase file descriptors
+fs.file-max = 1000000
+
+# Network tuning
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+
+# Memory mapping
+vm.max_map_count = 1048576
+
+# Huge pages (optional, for large deployments)
+vm.nr_hugepages = 4096
+```
+
+================================================================================
+                   3. SCHEMA DESIGN
+================================================================================
+
+TICK DATA SCHEMA:
+-----------------
+
+```sql
+-- Create tick data table with designated timestamp
+CREATE TABLE ticks (
+    timestamp TIMESTAMP,
+    exchange SYMBOL,
+    symbol SYMBOL,
+    event_type SYMBOL,       -- 'quote', 'trade', 'book'
+    bid_price DOUBLE,
+    ask_price DOUBLE,
+    bid_size DOUBLE,
+    ask_size DOUBLE,
+    trade_price DOUBLE,
+    trade_size DOUBLE,
+    trade_side SYMBOL,       -- 'buy', 'sell'
+    sequence_num LONG
+) TIMESTAMP(timestamp) PARTITION BY DAY;
+
+-- Order book depth table
+CREATE TABLE orderbook_depth (
+    timestamp TIMESTAMP,
+    exchange SYMBOL,
+    symbol SYMBOL,
+    side SYMBOL,             -- 'bid', 'ask'
+    level INT,               -- 0 = best, 1 = second best, etc.
+    price DOUBLE,
+    size DOUBLE,
+    num_orders INT
+) TIMESTAMP(timestamp) PARTITION BY DAY;
+
+-- Trade events table
+CREATE TABLE trades (
+    timestamp TIMESTAMP,
+    exchange SYMBOL,
+    symbol SYMBOL,
+    trade_id LONG,
+    price DOUBLE,
+    size DOUBLE,
+    side SYMBOL,
+    maker_order_id STRING,
+    taker_order_id STRING
+) TIMESTAMP(timestamp) PARTITION BY DAY;
+```
+
+SYMBOL VS STRING:
+-----------------
+
+```sql
+-- SYMBOL type is much more efficient for repeated values
+-- Uses dictionary encoding internally
+
+-- Good: Use SYMBOL for exchanges, symbols, sides
+exchange SYMBOL  -- Stored as integer, dictionary lookup
+
+-- Bad: Use STRING for unique values like order IDs
+order_id STRING  -- Full string storage
+```
+
+PARTITIONING STRATEGY:
+----------------------
+
+```sql
+-- Partition by DAY for tick data (default)
+-- Each partition is a separate directory
+-- Enables efficient time-range queries
+
+-- For very high volume, consider HOUR partitioning
+CREATE TABLE high_volume_ticks (
+    timestamp TIMESTAMP,
+    ...
+) TIMESTAMP(timestamp) PARTITION BY HOUR;
+
+-- Query only reads relevant partitions
+SELECT * FROM ticks
+WHERE timestamp BETWEEN '2025-11-26' AND '2025-11-27';
+-- Only reads 2 partitions, not entire table
+```
+
+================================================================================
+                   4. C++ CLIENT IMPLEMENTATION
+================================================================================
+
+ILP CLIENT FOR HIGH-SPEED INGESTION:
+------------------------------------
+
+```cpp
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <string>
+#include <sstream>
+#include <chrono>
+
+namespace questdb {
+
+class ILPClient {
+public:
+    struct Config {
+        std::string host = "127.0.0.1";
+        int port = 9009;
+        size_t buffer_size = 65536;
+        bool tcp = true;  // TCP or UDP
+    };
+
+    ILPClient(const Config& config) : config_(config) {
+        buffer_.reserve(config.buffer_size);
+        connect();
+    }
+
+    ~ILPClient() {
+        flush();
+        close(socket_fd_);
+    }
+
+    // Add a tick to the buffer
+    void add_tick(
+        const std::string& exchange,
+        const std::string& symbol,
+        double bid_price,
+        double ask_price,
+        double bid_size,
+        double ask_size,
+        int64_t timestamp_ns
+    ) {
+        // ILP format: measurement,tag=value field=value timestamp
+        std::ostringstream ss;
+        ss << "ticks"
+           << ",exchange=" << exchange
+           << ",symbol=" << symbol
+           << " bid_price=" << bid_price
+           << ",ask_price=" << ask_price
+           << ",bid_size=" << bid_size
+           << ",ask_size=" << ask_size
+           << " " << timestamp_ns << "\n";
+
+        buffer_ += ss.str();
+
+        // Auto-flush if buffer is getting full
+        if (buffer_.size() > config_.buffer_size * 0.9) {
+            flush();
+        }
+    }
+
+    // Add a trade to the buffer
+    void add_trade(
+        const std::string& exchange,
+        const std::string& symbol,
+        double price,
+        double size,
+        const std::string& side,
+        int64_t trade_id,
+        int64_t timestamp_ns
+    ) {
+        std::ostringstream ss;
+        ss << "trades"
+           << ",exchange=" << exchange
+           << ",symbol=" << symbol
+           << ",side=" << side
+           << " price=" << price
+           << ",size=" << size
+           << ",trade_id=" << trade_id << "i"
+           << " " << timestamp_ns << "\n";
+
+        buffer_ += ss.str();
+
+        if (buffer_.size() > config_.buffer_size * 0.9) {
+            flush();
+        }
+    }
+
+    // Send buffered data to QuestDB
+    void flush() {
+        if (buffer_.empty()) return;
+
+        if (config_.tcp) {
+            send_tcp();
+        } else {
+            send_udp();
+        }
+
+        buffer_.clear();
+    }
+
+    // Get statistics
+    struct Stats {
+        size_t messages_sent;
+        size_t bytes_sent;
+        size_t flush_count;
+    };
+
+    Stats get_stats() const { return stats_; }
+
+private:
+    void connect() {
+        if (config_.tcp) {
+            socket_fd_ = socket(AF_INET, SOCK_STREAM, 0);
+        } else {
+            socket_fd_ = socket(AF_INET, SOCK_DGRAM, 0);
+        }
+
+        sockaddr_in server_addr{};
+        server_addr.sin_family = AF_INET;
+        server_addr.sin_port = htons(config_.port);
+        inet_pton(AF_INET, config_.host.c_str(), &server_addr.sin_addr);
+
+        if (config_.tcp) {
+            ::connect(socket_fd_, (sockaddr*)&server_addr, sizeof(server_addr));
+        } else {
+            // For UDP, store address for sendto
+            server_addr_ = server_addr;
+        }
+    }
+
+    void send_tcp() {
+        size_t total_sent = 0;
+        while (total_sent < buffer_.size()) {
+            ssize_t sent = ::send(socket_fd_,
+                                  buffer_.data() + total_sent,
+                                  buffer_.size() - total_sent,
+                                  0);
+            if (sent > 0) {
+                total_sent += sent;
+            }
+        }
+        stats_.bytes_sent += total_sent;
+        stats_.flush_count++;
+    }
+
+    void send_udp() {
+        // UDP may need to split large messages
+        const size_t max_udp = 65507;
+        size_t offset = 0;
+
+        while (offset < buffer_.size()) {
+            size_t chunk_size = std::min(max_udp, buffer_.size() - offset);
+            sendto(socket_fd_,
+                   buffer_.data() + offset,
+                   chunk_size,
+                   0,
+                   (sockaddr*)&server_addr_,
+                   sizeof(server_addr_));
+            offset += chunk_size;
+        }
+
+        stats_.bytes_sent += buffer_.size();
+        stats_.flush_count++;
+    }
+
+    Config config_;
+    int socket_fd_ = -1;
+    sockaddr_in server_addr_;
+    std::string buffer_;
+    Stats stats_{};
+};
+
+}  // namespace questdb
+```
+
+POSTGRESQL WIRE PROTOCOL CLIENT:
+--------------------------------
+
+```cpp
+#include <libpq-fe.h>
+#include <string>
+#include <vector>
+
+namespace questdb {
+
+class PGClient {
+public:
+    PGClient(const std::string& connection_string) {
+        conn_ = PQconnectdb(connection_string.c_str());
+        if (PQstatus(conn_) != CONNECTION_OK) {
+            throw std::runtime_error(PQerrorMessage(conn_));
+        }
+    }
+
+    ~PGClient() {
+        PQfinish(conn_);
+    }
+
+    // Execute query and get results
+    struct QueryResult {
+        std::vector<std::string> columns;
+        std::vector<std::vector<std::string>> rows;
+    };
+
+    QueryResult query(const std::string& sql) {
+        PGresult* res = PQexec(conn_, sql.c_str());
+
+        if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+            std::string error = PQerrorMessage(conn_);
+            PQclear(res);
+            throw std::runtime_error(error);
+        }
+
+        QueryResult result;
+
+        // Get column names
+        int num_cols = PQnfields(res);
+        for (int i = 0; i < num_cols; i++) {
+            result.columns.push_back(PQfname(res, i));
+        }
+
+        // Get rows
+        int num_rows = PQntuples(res);
+        for (int i = 0; i < num_rows; i++) {
+            std::vector<std::string> row;
+            for (int j = 0; j < num_cols; j++) {
+                row.push_back(PQgetvalue(res, i, j));
+            }
+            result.rows.push_back(std::move(row));
+        }
+
+        PQclear(res);
+        return result;
+    }
+
+    // Execute without results (INSERT, CREATE, etc.)
+    void execute(const std::string& sql) {
+        PGresult* res = PQexec(conn_, sql.c_str());
+        if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+            std::string error = PQerrorMessage(conn_);
+            PQclear(res);
+            throw std::runtime_error(error);
+        }
+        PQclear(res);
+    }
+
+private:
+    PGconn* conn_;
+};
+
+}  // namespace questdb
+```
+
+================================================================================
+                   5. HIGH-SPEED INGESTION (ILP PROTOCOL)
+================================================================================
+
+BATCH INGESTION:
+----------------
+
+```cpp
+class BatchIngester {
+public:
+    BatchIngester(questdb::ILPClient& client) : client_(client) {}
+
+    // Ingest from binary tick file
+    void ingest_file(const std::string& filename) {
+        MMapFile file(filename);
+
+        const Tick* ticks = reinterpret_cast<const Tick*>(file.data());
+        size_t num_ticks = file.size() / sizeof(Tick);
+
+        for (size_t i = 0; i < num_ticks; i++) {
+            const Tick& tick = ticks[i];
+
+            if (tick.type == TickType::QUOTE) {
+                client_.add_tick(
+                    tick.exchange,
+                    tick.symbol,
+                    tick.bid_price,
+                    tick.ask_price,
+                    tick.bid_size,
+                    tick.ask_size,
+                    tick.timestamp_ns
+                );
+            } else if (tick.type == TickType::TRADE) {
+                client_.add_trade(
+                    tick.exchange,
+                    tick.symbol,
+                    tick.trade_price,
+                    tick.trade_size,
+                    tick.trade_side == Side::BUY ? "buy" : "sell",
+                    tick.trade_id,
+                    tick.timestamp_ns
+                );
+            }
+        }
+
+        client_.flush();
+    }
+
+    // Real-time streaming ingestion
+    void start_streaming(MarketDataFeed& feed) {
+        feed.subscribe([this](const Tick& tick) {
+            ingest_tick(tick);
+        });
+    }
+
+private:
+    void ingest_tick(const Tick& tick) {
+        if (tick.type == TickType::QUOTE) {
+            client_.add_tick(
+                tick.exchange,
+                tick.symbol,
+                tick.bid_price,
+                tick.ask_price,
+                tick.bid_size,
+                tick.ask_size,
+                tick.timestamp_ns
+            );
+        }
+        // Flush is handled automatically by client
+    }
+
+    questdb::ILPClient& client_;
+};
+```
+
+PARALLEL INGESTION:
+-------------------
+
+```cpp
+class ParallelIngester {
+public:
+    ParallelIngester(int num_threads, const questdb::ILPClient::Config& config)
+        : num_threads_(num_threads) {
+        // Create a client per thread
+        for (int i = 0; i < num_threads; i++) {
+            clients_.emplace_back(std::make_unique<questdb::ILPClient>(config));
+        }
+    }
+
+    // Partition by symbol for parallel ingestion
+    void ingest_parallel(const std::vector<Tick>& ticks) {
+        // Partition ticks by symbol hash
+        std::vector<std::vector<const Tick*>> partitions(num_threads_);
+
+        for (const auto& tick : ticks) {
+            size_t partition = std::hash<std::string>{}(tick.symbol) % num_threads_;
+            partitions[partition].push_back(&tick);
+        }
+
+        // Ingest each partition in parallel
+        std::vector<std::thread> threads;
+        for (int i = 0; i < num_threads_; i++) {
+            threads.emplace_back([this, i, &partitions]() {
+                for (const Tick* tick : partitions[i]) {
+                    ingest_to_client(*clients_[i], *tick);
+                }
+                clients_[i]->flush();
+            });
+        }
+
+        for (auto& t : threads) {
+            t.join();
+        }
+    }
+
+private:
+    void ingest_to_client(questdb::ILPClient& client, const Tick& tick) {
+        client.add_tick(
+            tick.exchange, tick.symbol,
+            tick.bid_price, tick.ask_price,
+            tick.bid_size, tick.ask_size,
+            tick.timestamp_ns
+        );
+    }
+
+    int num_threads_;
+    std::vector<std::unique_ptr<questdb::ILPClient>> clients_;
+};
+```
+
+================================================================================
+                   6. QUERY OPTIMIZATION
+================================================================================
+
+EFFICIENT QUERIES FOR HFT:
+--------------------------
+
+```sql
+-- Fast time-range query (uses partition pruning)
+SELECT * FROM ticks
+WHERE timestamp BETWEEN '2025-11-26T09:30:00' AND '2025-11-26T16:00:00'
+  AND symbol = 'BTCUSDT'
+  AND exchange = 'BINANCE';
+
+-- Aggregations are vectorized (very fast)
+SELECT
+    timestamp,
+    avg(bid_price) as avg_bid,
+    avg(ask_price) as avg_ask,
+    max(ask_price) - min(bid_price) as spread_range
+FROM ticks
+WHERE timestamp IN '2025-11-26'
+  AND symbol = 'BTCUSDT'
+SAMPLE BY 1m;  -- 1-minute bars
+
+-- OHLCV bars
+SELECT
+    timestamp,
+    first(trade_price) as open,
+    max(trade_price) as high,
+    min(trade_price) as low,
+    last(trade_price) as close,
+    sum(trade_size) as volume
+FROM trades
+WHERE timestamp IN '2025-11-26'
+  AND symbol = 'BTCUSDT'
+SAMPLE BY 5m ALIGN TO CALENDAR;
+
+-- VWAP calculation
+SELECT
+    timestamp,
+    sum(trade_price * trade_size) / sum(trade_size) as vwap
+FROM trades
+WHERE timestamp BETWEEN '2025-11-26T09:30:00' AND '2025-11-26T10:00:00'
+  AND symbol = 'BTCUSDT'
+SAMPLE BY 1m;
+
+-- Order book snapshot reconstruction
+SELECT
+    timestamp,
+    side,
+    level,
+    price,
+    size
+FROM orderbook_depth
+WHERE timestamp <= '2025-11-26T10:00:00.000000'
+  AND symbol = 'BTCUSDT'
+LATEST ON timestamp PARTITION BY side, level;
+```
+
+QUERY OPTIMIZATION TIPS:
+------------------------
+
+```sql
+-- 1. Always filter by designated timestamp first
+-- GOOD:
+SELECT * FROM ticks WHERE timestamp IN '2025-11-26' AND symbol = 'BTCUSDT';
+
+-- BAD:
+SELECT * FROM ticks WHERE symbol = 'BTCUSDT' AND timestamp IN '2025-11-26';
+
+-- 2. Use SYMBOL type for filtering (dictionary lookup)
+-- SYMBOL columns have O(1) lookup
+
+-- 3. Use SAMPLE BY for time-based aggregations
+-- Much faster than GROUP BY for time-series
+
+-- 4. Use LATEST ON for point-in-time queries
+SELECT * FROM ticks
+WHERE symbol = 'BTCUSDT'
+LATEST ON timestamp PARTITION BY exchange;
+
+-- 5. Use ASOF JOIN for time-aligned queries
+SELECT t.*, q.bid_price, q.ask_price
+FROM trades t
+ASOF JOIN ticks q ON (t.symbol = q.symbol);
+```
+
+================================================================================
+                   7. PERFORMANCE BENCHMARKS
+================================================================================
+
+INGESTION BENCHMARKS:
+---------------------
+
+| Scenario              | Rate          | Latency (p99) | Notes              |
+|-----------------------|---------------|---------------|---------------------|
+| Single thread TCP     | 800K rows/s   | 50μs          | One ILP connection |
+| Multi-thread TCP (8)  | 4M rows/s     | 100μs         | 8 connections      |
+| UDP fire-and-forget   | 1.2M rows/s   | 10μs          | No ACK overhead    |
+| Batch insert (1000)   | 2M rows/s     | 500μs         | PG wire protocol   |
+
+QUERY BENCHMARKS:
+-----------------
+
+| Query Type           | 1 Day Data | 1 Week Data | 1 Month Data |
+|----------------------|------------|-------------|--------------|
+| Point lookup         | <1ms       | <1ms        | <1ms         |
+| Time range (1 hour)  | 2ms        | 2ms         | 2ms          |
+| Time range (1 day)   | 10ms       | 15ms        | 25ms         |
+| 1-min OHLCV bars     | 5ms        | 20ms        | 80ms         |
+| Full table scan      | 500ms      | 3s          | 12s          |
+
+STORAGE EFFICIENCY:
+-------------------
+
+| Data Type    | Raw Size | QuestDB Size | Compression |
+|--------------|----------|--------------|-------------|
+| 100M ticks   | 12 GB    | 2.5 GB       | 4.8x        |
+| 500M ticks   | 60 GB    | 11 GB        | 5.5x        |
+| 1B ticks     | 120 GB   | 20 GB        | 6x          |
+
+================================================================================
+                   8. PRODUCTION CONFIGURATION
+================================================================================
+
+RECOMMENDED CONFIGURATION:
+--------------------------
+
+```conf
+# /var/lib/questdb/conf/server.conf
+
+# ILP Configuration
+line.tcp.enabled=true
+line.tcp.net.bind.to=0.0.0.0:9009
+line.tcp.writer.queue.size=4194304
+line.tcp.msg.buffer.size=131072
+line.tcp.io.worker.count=8
+
+# PostgreSQL Wire Protocol
+pg.enabled=true
+pg.net.bind.to=0.0.0.0:8812
+pg.worker.count=4
+
+# HTTP REST API
+http.enabled=true
+http.net.bind.to=0.0.0.0:9000
+http.worker.count=4
+
+# Storage
+cairo.root=/data/questdb/db
+cairo.commit.lag=300000000  # 300 seconds for out-of-order data
+
+# Memory
+cairo.sql.page.frame.size=4194304  # 4MB
+cairo.writer.pool.size=32
+
+# Parallel Query
+cairo.sql.parallel.enabled=true
+cairo.sql.parallel.workers=16
+
+# Out-of-order handling
+cairo.o3.max.lag=600000000  # 600 seconds
+cairo.o3.commit.lag=60000000  # 60 seconds
+```
+
+MONITORING:
+-----------
+
+```sql
+-- Check table sizes
+SELECT table_name, size, rowCount FROM tables();
+
+-- Check active writers
+SELECT * FROM active_writers();
+
+-- Check reader pools
+SELECT * FROM reader_pools();
+
+-- Performance metrics
+SELECT * FROM telemetry();
+```
+
+================================================================================
+                         END OF DOCUMENT
+================================================================================

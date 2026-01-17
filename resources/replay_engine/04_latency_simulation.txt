@@ -1,0 +1,692 @@
+================================================================================
+LATENCY SIMULATION - REALISTIC NETWORK AND PROCESSING DELAYS
+================================================================================
+
+PURPOSE: Simulate realistic latency patterns during replay to accurately model
+order execution timing, fill probabilities, and race conditions.
+
+KEY INSIGHT: Latency is NOT constant - it follows complex distributions with
+correlation structure, time-of-day effects, and occasional spikes.
+
+================================================================================
+LATENCY COMPONENTS
+================================================================================
+
+TOTAL LATENCY BREAKDOWN:
+------------------------
+
+Total_Latency = Network_Latency + Queue_Latency + Processing_Latency
+
+1. NETWORK LATENCY (60-80% of total)
+   - Physical propagation delay (speed of light)
+   - Router/switch queuing delays
+   - Packet serialization/deserialization
+   - Typically: 50-500 microseconds (same datacenter)
+   - Occasionally: 1-50 milliseconds (spike events)
+
+2. QUEUE LATENCY (10-30% of total)
+   - Exchange matching engine queue
+   - Correlated across all participants
+   - Varies with order flow intensity
+   - Typically: 10-100 microseconds
+   - During volatility: 500+ microseconds
+
+3. PROCESSING LATENCY (5-15% of total)
+   - Our software processing time
+   - Message parsing, validation
+   - Strategy computation
+   - Typically: 5-50 microseconds
+   - Complex strategies: 100+ microseconds
+
+================================================================================
+LATENCY DISTRIBUTIONS
+================================================================================
+
+EMPIRICAL LATENCY DISTRIBUTION (measured from production):
+-----------------------------------------------------------
+
+Percentile    Latency (us)    Notes
+---------    ------------    -----
+P1              45           Best case (quiet market, direct route)
+P5              52           Good conditions
+P10             58           Normal operation
+P25             72           Normal operation
+P50 (median)   105           Typical latency
+P75            156           Some congestion
+P90            287           Network congestion
+P95            445           Moderate spike
+P99           1250           Significant spike
+P99.9         8500           Severe spike (volatility event)
+P99.99       45000           Extreme event (flash crash, outage)
+
+DISTRIBUTION CHARACTERISTICS:
+- Heavy-tailed (not Gaussian!)
+- Right-skewed with long tail
+- Multiple modes (different network paths)
+- Time-of-day dependent
+- Correlated spikes during volatility
+
+================================================================================
+LATENCY SIMULATION MODELS
+================================================================================
+
+1. HISTORICAL MODEL (Most Accurate)
+-----------------------------------
+
+Use actual latency distributions captured during live trading.
+
+class HistoricalLatencyModel : public LatencySimulator {
+public:
+    // Load historical latencies from capture
+    bool loadHistoricalData(const std::string& path) {
+        std::ifstream file(path, std::ios::binary);
+        if (!file.is_open()) {
+            LOG_ERROR("Failed to open latency data: {}", path);
+            return false;
+        }
+
+        // Read latency samples
+        uint64_t latency_ns;
+        uint64_t timestamp_ns;
+
+        while (file.read(reinterpret_cast<char*>(&timestamp_ns), sizeof(timestamp_ns))) {
+            file.read(reinterpret_cast<char*>(&latency_ns), sizeof(latency_ns));
+
+            latency_samples_.push_back({timestamp_ns, latency_ns});
+        }
+
+        LOG_INFO("Loaded {} latency samples", latency_samples_.size());
+
+        // Build CDF for sampling
+        buildCDF();
+
+        // Detect spike periods
+        detectSpikeRegimes();
+
+        return true;
+    }
+
+    uint64_t sampleLatency(uint64_t current_time, const std::string& symbol) override {
+        // Check if we're in a spike regime
+        if (isInSpikeRegime(current_time)) {
+            return sampleFromSpikeDistribution();
+        }
+
+        // Normal sampling from CDF
+        double u = uniform_dist_(rng_);
+        return sampleFromCDF(u);
+    }
+
+private:
+    struct LatencySample {
+        uint64_t timestamp_ns;
+        uint64_t latency_ns;
+    };
+
+    void buildCDF() {
+        // Sort by latency
+        std::vector<uint64_t> sorted_latencies;
+        sorted_latencies.reserve(latency_samples_.size());
+
+        for (const auto& sample : latency_samples_) {
+            sorted_latencies.push_back(sample.latency_ns);
+        }
+
+        std::sort(sorted_latencies.begin(), sorted_latencies.end());
+
+        // Build CDF lookup table
+        cdf_latencies_ = std::move(sorted_latencies);
+    }
+
+    void detectSpikeRegimes() {
+        // Detect periods of sustained high latency
+        const uint64_t spike_threshold = 500000;  // 500 us
+        const size_t min_spike_duration = 100;    // samples
+
+        size_t spike_count = 0;
+        uint64_t spike_start = 0;
+
+        for (size_t i = 0; i < latency_samples_.size(); ++i) {
+            if (latency_samples_[i].latency_ns > spike_threshold) {
+                if (spike_count == 0) {
+                    spike_start = latency_samples_[i].timestamp_ns;
+                }
+                spike_count++;
+            } else {
+                if (spike_count >= min_spike_duration) {
+                    // Record spike regime
+                    spike_regimes_.push_back({
+                        spike_start,
+                        latency_samples_[i-1].timestamp_ns
+                    });
+
+                    LOG_INFO("Detected spike regime: {} - {} ({} samples)",
+                            formatTimestamp(spike_start),
+                            formatTimestamp(latency_samples_[i-1].timestamp_ns),
+                            spike_count);
+                }
+                spike_count = 0;
+            }
+        }
+    }
+
+    bool isInSpikeRegime(uint64_t timestamp) const {
+        for (const auto& regime : spike_regimes_) {
+            if (timestamp >= regime.start && timestamp <= regime.end) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    uint64_t sampleFromCDF(double u) const {
+        size_t idx = static_cast<size_t>(u * cdf_latencies_.size());
+        idx = std::min(idx, cdf_latencies_.size() - 1);
+        return cdf_latencies_[idx];
+    }
+
+    uint64_t sampleFromSpikeDistribution() {
+        // During spike: use P90-P99.9 range
+        double u = uniform_dist_(rng_);
+        u = 0.9 + u * 0.099;  // Map to [0.9, 0.999]
+        return sampleFromCDF(u);
+    }
+
+    std::vector<LatencySample> latency_samples_;
+    std::vector<uint64_t> cdf_latencies_;
+
+    struct SpikeRegime {
+        uint64_t start;
+        uint64_t end;
+    };
+    std::vector<SpikeRegime> spike_regimes_;
+
+    std::mt19937_64 rng_{12345};
+    std::uniform_real_distribution<double> uniform_dist_{0.0, 1.0};
+};
+
+
+2. PARAMETRIC MODEL (Faster, Good Approximation)
+------------------------------------------------
+
+Model latency as mixture of log-normal distributions.
+
+class ParametricLatencyModel : public LatencySimulator {
+public:
+    struct Parameters {
+        // Normal regime (95% of time)
+        double normal_mean_us = 105.0;
+        double normal_stddev_us = 35.0;
+        double normal_probability = 0.95;
+
+        // Spike regime (5% of time)
+        double spike_mean_us = 850.0;
+        double spike_stddev_us = 450.0;
+        double spike_probability = 0.05;
+
+        // Minimum latency (physical limit)
+        double min_latency_us = 45.0;
+
+        // Correlation parameters
+        double spike_persistence = 0.7;  // Probability spike continues
+        double spike_duration_mean_ms = 5.0;  // Average spike duration
+    };
+
+    explicit ParametricLatencyModel(const Parameters& params)
+        : params_(params)
+        , normal_dist_(std::log(params.normal_mean_us),
+                      params.normal_stddev_us / params.normal_mean_us)
+        , spike_dist_(std::log(params.spike_mean_us),
+                     params.spike_stddev_us / params.spike_mean_us)
+        , uniform_dist_(0.0, 1.0)
+    {}
+
+    uint64_t sampleLatency(uint64_t current_time, const std::string& symbol) override {
+        // Check if we should transition spike state
+        if (in_spike_regime_) {
+            // Check if spike should end
+            if (current_time - spike_start_time_ > spike_duration_ns_) {
+                in_spike_regime_ = false;
+            } else if (uniform_dist_(rng_) > params_.spike_persistence) {
+                in_spike_regime_ = false;
+            }
+        } else {
+            // Check if spike should start
+            if (uniform_dist_(rng_) < params_.spike_probability) {
+                in_spike_regime_ = true;
+                spike_start_time_ = current_time;
+
+                // Sample spike duration
+                std::exponential_distribution<double> duration_dist(
+                    1.0 / (params_.spike_duration_mean_ms * 1e6)  // Convert to ns
+                );
+                spike_duration_ns_ = static_cast<uint64_t>(duration_dist(rng_));
+            }
+        }
+
+        // Sample from appropriate distribution
+        double latency_us;
+        if (in_spike_regime_) {
+            latency_us = std::exp(spike_dist_(rng_));
+        } else {
+            latency_us = std::exp(normal_dist_(rng_));
+        }
+
+        // Apply minimum latency
+        latency_us = std::max(latency_us, params_.min_latency_us);
+
+        // Convert to nanoseconds
+        return static_cast<uint64_t>(latency_us * 1000.0);
+    }
+
+private:
+    Parameters params_;
+
+    std::lognormal_distribution<double> normal_dist_;
+    std::lognormal_distribution<double> spike_dist_;
+    std::uniform_real_distribution<double> uniform_dist_;
+
+    std::mt19937_64 rng_{12345};
+
+    bool in_spike_regime_{false};
+    uint64_t spike_start_time_{0};
+    uint64_t spike_duration_ns_{0};
+};
+
+
+3. TIME-OF-DAY MODEL (Market Microstructure)
+--------------------------------------------
+
+Latency varies by time of day due to market activity.
+
+class TimeOfDayLatencyModel : public LatencySimulator {
+public:
+    struct TimeProfile {
+        uint64_t start_time_ns;  // Start of period (ns since market open)
+        uint64_t end_time_ns;    // End of period
+        double mean_latency_us;
+        double stddev_latency_us;
+        double spike_probability;
+    };
+
+    void addTimeProfile(const TimeProfile& profile) {
+        profiles_.push_back(profile);
+    }
+
+    uint64_t sampleLatency(uint64_t current_time, const std::string& symbol) override {
+        // Find current time profile
+        const TimeProfile* profile = nullptr;
+
+        uint64_t time_since_open = current_time - market_open_time_;
+
+        for (const auto& p : profiles_) {
+            if (time_since_open >= p.start_time_ns &&
+                time_since_open < p.end_time_ns) {
+                profile = &p;
+                break;
+            }
+        }
+
+        if (!profile) {
+            // Default to last profile
+            profile = &profiles_.back();
+        }
+
+        // Sample latency based on profile
+        std::lognormal_distribution<double> dist(
+            std::log(profile->mean_latency_us),
+            profile->stddev_latency_us / profile->mean_latency_us
+        );
+
+        double latency_us = std::exp(dist(rng_));
+
+        // Occasionally add spike
+        if (uniform_dist_(rng_) < profile->spike_probability) {
+            latency_us *= (5.0 + uniform_dist_(rng_) * 10.0);  // 5-15x spike
+        }
+
+        return static_cast<uint64_t>(latency_us * 1000.0);
+    }
+
+    void setMarketOpenTime(uint64_t timestamp_ns) {
+        market_open_time_ = timestamp_ns;
+    }
+
+private:
+    std::vector<TimeProfile> profiles_;
+    uint64_t market_open_time_{0};
+
+    std::mt19937_64 rng_{12345};
+    std::uniform_real_distribution<double> uniform_dist_{0.0, 1.0};
+};
+
+// Typical US equity market profile
+void setupTypicalEquityProfile(TimeOfDayLatencyModel& model, uint64_t market_open_ns) {
+    model.setMarketOpenTime(market_open_ns);
+
+    // 9:30-9:45 - Market open (high volatility, higher latency)
+    model.addTimeProfile({
+        0,                    // Start
+        15 * 60 * 1000000000ULL,  // 15 minutes
+        180.0,                // Mean latency (us)
+        65.0,                 // Stddev
+        0.08                  // 8% spike probability
+    });
+
+    // 9:45-11:30 - Morning session (normal)
+    model.addTimeProfile({
+        15 * 60 * 1000000000ULL,
+        120 * 60 * 1000000000ULL,
+        105.0,
+        35.0,
+        0.03
+    });
+
+    // 11:30-13:00 - Lunch (low volume, low latency)
+    model.addTimeProfile({
+        120 * 60 * 1000000000ULL,
+        210 * 60 * 1000000000ULL,
+        85.0,
+        25.0,
+        0.01
+    });
+
+    // 13:00-15:30 - Afternoon (normal)
+    model.addTimeProfile({
+        210 * 60 * 1000000000ULL,
+        360 * 60 * 1000000000ULL,
+        110.0,
+        40.0,
+        0.04
+    });
+
+    // 15:30-16:00 - Close (high volatility, higher latency)
+    model.addTimeProfile({
+        360 * 60 * 1000000000ULL,
+        390 * 60 * 1000000000ULL,
+        195.0,
+        75.0,
+        0.10
+    });
+}
+
+
+4. CORRELATED LATENCY MODEL (Multi-Symbol)
+------------------------------------------
+
+Latency spikes affect all symbols simultaneously (network congestion).
+
+class CorrelatedLatencyModel : public LatencySimulator {
+public:
+    struct GlobalState {
+        bool in_spike{false};
+        uint64_t spike_start_time{0};
+        uint64_t spike_duration{0};
+        double spike_multiplier{1.0};
+    };
+
+    uint64_t sampleLatency(uint64_t current_time, const std::string& symbol) override {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+
+        // Update global spike state
+        updateGlobalState(current_time);
+
+        // Base latency (symbol-specific)
+        double base_latency_us = sampleBaseLatency(symbol);
+
+        // Apply global spike multiplier
+        if (global_state_.in_spike) {
+            base_latency_us *= global_state_.spike_multiplier;
+        }
+
+        return static_cast<uint64_t>(base_latency_us * 1000.0);
+    }
+
+private:
+    void updateGlobalState(uint64_t current_time) {
+        if (global_state_.in_spike) {
+            // Check if spike should end
+            if (current_time - global_state_.spike_start_time >
+                global_state_.spike_duration) {
+                global_state_.in_spike = false;
+                LOG_INFO("Global latency spike ended at {}",
+                        formatTimestamp(current_time));
+            }
+        } else {
+            // Check if spike should start (1% probability per second)
+            if (uniform_dist_(rng_) < 0.01 / 1000.0) {  // Per millisecond
+                global_state_.in_spike = true;
+                global_state_.spike_start_time = current_time;
+
+                // Spike duration: 100ms - 5 seconds
+                std::uniform_real_distribution<double> duration_dist(
+                    100.0 * 1e6,  // 100ms in ns
+                    5000.0 * 1e6  // 5s in ns
+                );
+                global_state_.spike_duration =
+                    static_cast<uint64_t>(duration_dist(rng_));
+
+                // Spike multiplier: 3x - 20x
+                std::uniform_real_distribution<double> mult_dist(3.0, 20.0);
+                global_state_.spike_multiplier = mult_dist(rng_);
+
+                LOG_WARN("Global latency spike started: {:.1f}x for {:.1f}ms",
+                        global_state_.spike_multiplier,
+                        global_state_.spike_duration / 1e6);
+            }
+        }
+    }
+
+    double sampleBaseLatency(const std::string& symbol) {
+        // Symbol-specific base latency
+        std::lognormal_distribution<double> dist(std::log(105.0), 0.35);
+        return std::exp(dist(rng_));
+    }
+
+    GlobalState global_state_;
+    std::mutex state_mutex_;
+
+    std::mt19937_64 rng_{12345};
+    std::uniform_real_distribution<double> uniform_dist_{0.0, 1.0};
+};
+
+================================================================================
+PROCESSING LATENCY SIMULATION
+================================================================================
+
+Simulate our own processing delays (strategy computation, order validation).
+
+class ProcessingLatencySimulator {
+public:
+    // Model processing latency as function of market state complexity
+    uint64_t sampleProcessingLatency(const OrderBook& book,
+                                    size_t num_pending_orders) {
+        // Base processing: 10-30 us
+        std::uniform_real_distribution<double> base_dist(10.0, 30.0);
+        double processing_us = base_dist(rng_);
+
+        // Additional latency for deep book analysis
+        size_t book_depth = book.getBidDepth() + book.getAskDepth();
+        if (book_depth > 5) {
+            processing_us += (book_depth - 5) * 2.0;  // 2us per level
+        }
+
+        // Additional latency for managing many orders
+        if (num_pending_orders > 10) {
+            processing_us += (num_pending_orders - 10) * 1.5;  // 1.5us per order
+        }
+
+        // Occasional GC pause or cache miss (1% of time)
+        if (uniform_dist_(rng_) < 0.01) {
+            processing_us += 100.0 + uniform_dist_(rng_) * 500.0;  // 100-600us spike
+        }
+
+        return static_cast<uint64_t>(processing_us * 1000.0);
+    }
+
+private:
+    std::mt19937_64 rng_{12345};
+    std::uniform_real_distribution<double> uniform_dist_{0.0, 1.0};
+};
+
+================================================================================
+COMBINED LATENCY MODEL
+================================================================================
+
+class CombinedLatencySimulator : public LatencySimulator {
+public:
+    CombinedLatencySimulator()
+        : network_model_(std::make_unique<ParametricLatencyModel>(
+              ParametricLatencyModel::Parameters{}))
+        , processing_model_(std::make_unique<ProcessingLatencySimulator>())
+    {}
+
+    uint64_t sampleLatency(uint64_t current_time,
+                          const std::string& symbol) override {
+        // Network latency (to exchange and back)
+        uint64_t network_latency = network_model_->sampleLatency(current_time, symbol);
+
+        // Exchange queue latency (correlated with network spikes)
+        uint64_t queue_latency = sampleQueueLatency(network_latency);
+
+        return network_latency + queue_latency;
+    }
+
+    uint64_t sampleTotalLatency(uint64_t current_time,
+                               const std::string& symbol,
+                               const OrderBook& book,
+                               size_t num_pending_orders) {
+        // Network + queue
+        uint64_t network_queue = sampleLatency(current_time, symbol);
+
+        // Processing
+        uint64_t processing = processing_model_->sampleProcessingLatency(
+            book, num_pending_orders
+        );
+
+        return network_queue + processing;
+    }
+
+private:
+    uint64_t sampleQueueLatency(uint64_t network_latency) {
+        // Queue latency correlates with network latency
+        // When network is congested, exchange queue is also congested
+
+        double base_queue_us = 25.0;  // Baseline queue time
+
+        if (network_latency > 500000) {  // 500us network spike
+            // During spike: queue is 2-5x longer
+            std::uniform_real_distribution<double> mult_dist(2.0, 5.0);
+            base_queue_us *= mult_dist(rng_);
+        }
+
+        std::lognormal_distribution<double> dist(
+            std::log(base_queue_us),
+            0.3
+        );
+
+        return static_cast<uint64_t>(std::exp(dist(rng_)) * 1000.0);
+    }
+
+    std::unique_ptr<ParametricLatencyModel> network_model_;
+    std::unique_ptr<ProcessingLatencySimulator> processing_model_;
+
+    std::mt19937_64 rng_{12345};
+};
+
+================================================================================
+LATENCY VALIDATION
+================================================================================
+
+// Compare simulated vs actual latencies
+class LatencyValidator {
+public:
+    void addActualLatency(uint64_t latency_ns) {
+        actual_latencies_.push_back(latency_ns / 1000.0);  // Convert to us
+    }
+
+    void addSimulatedLatency(uint64_t latency_ns) {
+        simulated_latencies_.push_back(latency_ns / 1000.0);
+    }
+
+    void validate() {
+        if (actual_latencies_.empty() || simulated_latencies_.empty()) {
+            LOG_ERROR("Insufficient data for validation");
+            return;
+        }
+
+        // Compare distributions
+        auto actual_stats = computeStats(actual_latencies_);
+        auto sim_stats = computeStats(simulated_latencies_);
+
+        LOG_INFO("=== Latency Validation ===");
+        LOG_INFO("Actual vs Simulated:");
+        LOG_INFO("  Mean:   {:.2f} vs {:.2f} us ({:.1f}% diff)",
+                actual_stats.mean, sim_stats.mean,
+                100.0 * std::abs(actual_stats.mean - sim_stats.mean) / actual_stats.mean);
+        LOG_INFO("  Median: {:.2f} vs {:.2f} us ({:.1f}% diff)",
+                actual_stats.p50, sim_stats.p50,
+                100.0 * std::abs(actual_stats.p50 - sim_stats.p50) / actual_stats.p50);
+        LOG_INFO("  P95:    {:.2f} vs {:.2f} us ({:.1f}% diff)",
+                actual_stats.p95, sim_stats.p95,
+                100.0 * std::abs(actual_stats.p95 - sim_stats.p95) / actual_stats.p95);
+        LOG_INFO("  P99:    {:.2f} vs {:.2f} us ({:.1f}% diff)",
+                actual_stats.p99, sim_stats.p99,
+                100.0 * std::abs(actual_stats.p99 - sim_stats.p99) / actual_stats.p99);
+
+        // KS test for distribution similarity
+        double ks_stat = kolmogorovSmirnovTest(actual_latencies_, simulated_latencies_);
+        LOG_INFO("  KS statistic: {:.4f} (closer to 0 = better match)", ks_stat);
+    }
+
+private:
+    struct Stats {
+        double mean, p50, p95, p99;
+    };
+
+    Stats computeStats(std::vector<double> data) {
+        std::sort(data.begin(), data.end());
+
+        Stats stats;
+        stats.mean = std::accumulate(data.begin(), data.end(), 0.0) / data.size();
+        stats.p50 = data[data.size() / 2];
+        stats.p95 = data[static_cast<size_t>(data.size() * 0.95)];
+        stats.p99 = data[static_cast<size_t>(data.size() * 0.99)];
+
+        return stats;
+    }
+
+    double kolmogorovSmirnovTest(const std::vector<double>& a,
+                                 const std::vector<double>& b) {
+        // Simplified KS test implementation
+        std::vector<double> sorted_a = a;
+        std::vector<double> sorted_b = b;
+        std::sort(sorted_a.begin(), sorted_a.end());
+        std::sort(sorted_b.begin(), sorted_b.end());
+
+        double max_diff = 0.0;
+        size_t i = 0, j = 0;
+
+        while (i < sorted_a.size() && j < sorted_b.size()) {
+            double cdf_a = static_cast<double>(i) / sorted_a.size();
+            double cdf_b = static_cast<double>(j) / sorted_b.size();
+
+            max_diff = std::max(max_diff, std::abs(cdf_a - cdf_b));
+
+            if (sorted_a[i] < sorted_b[j]) {
+                i++;
+            } else {
+                j++;
+            }
+        }
+
+        return max_diff;
+    }
+
+    std::vector<double> actual_latencies_;
+    std::vector<double> simulated_latencies_;
+};
+
+================================================================================
+NEXT: Read 05_market_conditions.txt for replaying specific market scenarios
+================================================================================

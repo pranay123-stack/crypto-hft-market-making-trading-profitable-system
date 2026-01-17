@@ -1,0 +1,2389 @@
+================================================================================
+MONITORING AND ALERTING DURING RECOVERY
+================================================================================
+
+Author: HFT System Architecture Team
+Last Updated: 2025-11-25
+Version: 1.0
+Category: System Resume & Recovery
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+
+1. Detecting Failures (Watchdog, Heartbeat, Health Checks)
+2. Alerting Stakeholders During Outage
+3. Recovery Progress Tracking
+4. Post-Recovery Health Validation
+5. Dashboards for Recovery Status
+6. Automated vs Manual Recovery Decision
+7. Escalation During Recovery Failures
+8. Best Practices & Checklists
+
+================================================================================
+1. DETECTING FAILURES (WATCHDOG, HEARTBEAT, HEALTH CHECKS)
+================================================================================
+
+1.1 IMPORTANCE OF FAST FAILURE DETECTION
+-----------------------------------------
+
+Detection Speed Matters:
+------------------------
+Every millisecond counts in HFT!
+
+Detection delay = 300ms → Total RTO ≥ 300ms
+Detection delay = 5 sec → Total RTO ≥ 5 sec
+Detection delay = 1 min → Total RTO ≥ 1 min
+
+Example:
+--------
+System crashes at 10:00:00.000
+Detection at 10:00:05.000 (5 second delay)
+Recovery complete at 10:00:35.000
+
+Total downtime: 35 seconds (could have been 30 seconds!)
+
+Goal: Detect failures in <1 second
+
+1.2 FAILURE DETECTION MECHANISMS
+---------------------------------
+
+Mechanism 1: Heartbeat
+----------------------
+System sends periodic "I'm alive" messages
+
+Advantages:
+- Simple to implement
+- Low overhead
+- Works across network
+
+Disadvantages:
+- Delayed detection (waiting for missed heartbeat)
+- False positives (network glitch)
+
+Implementation:
+---------------
+class HeartbeatSender {
+private:
+    std::chrono::milliseconds interval_{100};  // 100ms heartbeat
+    std::atomic<bool> running_{true};
+    std::thread heartbeat_thread_;
+    uint64_t sequence_number_{0};
+
+public:
+    void start() {
+        heartbeat_thread_ = std::thread([this]() {
+            run_heartbeat_loop();
+        });
+    }
+
+    void stop() {
+        running_ = false;
+        if (heartbeat_thread_.joinable()) {
+            heartbeat_thread_.join();
+        }
+    }
+
+private:
+    void run_heartbeat_loop() {
+        while (running_) {
+            send_heartbeat();
+            std::this_thread::sleep_for(interval_);
+        }
+    }
+
+    void send_heartbeat() {
+        Heartbeat hb{
+            .sequence_number = sequence_number_++,
+            .timestamp = now_utc(),
+            .system_id = get_system_id(),
+            .load_avg = get_load_average(),
+            .memory_usage = get_memory_usage(),
+            .active_threads = get_active_thread_count()
+        };
+
+        // Send via UDP multicast for low latency
+        udp_socket_->send_to(serialize(hb), monitor_endpoint_);
+    }
+};
+
+class HeartbeatMonitor {
+private:
+    std::chrono::milliseconds timeout_{300};  // 3 missed heartbeats
+    std::map<string, timestamp_t> last_heartbeat_;
+    std::mutex mtx_;
+
+public:
+    void record_heartbeat(const string& system_id) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        last_heartbeat_[system_id] = now_utc();
+    }
+
+    bool is_system_alive(const string& system_id) {
+        std::lock_guard<std::mutex> lock(mtx_);
+
+        auto it = last_heartbeat_.find(system_id);
+        if (it == last_heartbeat_.end()) {
+            return false;  // Never seen
+        }
+
+        auto elapsed = now_utc() - it->second;
+        return elapsed < timeout_;
+    }
+
+    void monitor_all_systems() {
+        while (running_) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+            std::lock_guard<std::mutex> lock(mtx_);
+
+            for (const auto& [system_id, last_hb] : last_heartbeat_) {
+                auto elapsed = now_utc() - last_hb;
+
+                if (elapsed > timeout_) {
+                    LOG_CRITICAL("System {} heartbeat timeout! Last seen {} ms ago",
+                               system_id, elapsed.count());
+
+                    // Trigger failover
+                    trigger_failover(system_id);
+
+                    // Alert
+                    send_alert("HEARTBEAT_TIMEOUT", system_id);
+                }
+            }
+        }
+    }
+};
+
+Mechanism 2: Health Checks
+---------------------------
+External system periodically checks if system is healthy
+
+Advantages:
+- Can check actual functionality (not just "alive")
+- Can detect degraded performance
+- Independent monitoring
+
+Disadvantages:
+- Adds load to system
+- Slightly slower than heartbeat
+
+Implementation:
+---------------
+class HealthCheckEndpoint {
+public:
+    struct HealthStatus {
+        bool overall_healthy;
+        map<string, bool> component_health;
+        map<string, double> metrics;
+        timestamp_t check_time;
+    };
+
+    HealthStatus check_health() {
+        HealthStatus status;
+        status.check_time = now_utc();
+        status.overall_healthy = true;
+
+        // Check market data feed
+        bool md_healthy = check_market_data_health();
+        status.component_health["market_data"] = md_healthy;
+        if (!md_healthy) status.overall_healthy = false;
+
+        // Check exchange connectivity
+        bool exchange_healthy = check_exchange_health();
+        status.component_health["exchange"] = exchange_healthy;
+        if (!exchange_healthy) status.overall_healthy = false;
+
+        // Check order processing
+        bool order_healthy = check_order_processing_health();
+        status.component_health["orders"] = order_healthy;
+        if (!order_healthy) status.overall_healthy = false;
+
+        // Check risk system
+        bool risk_healthy = check_risk_health();
+        status.component_health["risk"] = risk_healthy;
+        if (!risk_healthy) status.overall_healthy = false;
+
+        // Collect metrics
+        status.metrics["order_latency_p99_us"] = get_order_latency_p99();
+        status.metrics["market_data_lag_us"] = get_market_data_lag();
+        status.metrics["cpu_usage_pct"] = get_cpu_usage();
+        status.metrics["memory_usage_pct"] = get_memory_usage();
+
+        return status;
+    }
+
+private:
+    bool check_market_data_health() {
+        // Market data should be current (< 1 second old)
+        for (const auto& symbol : get_subscribed_symbols()) {
+            auto last_update = market_data_->get_last_update(symbol);
+            auto age = now_utc() - last_update;
+
+            if (age > std::chrono::seconds(1)) {
+                LOG_WARN("Stale market data for {}: {} ms old",
+                        symbol, duration_cast<milliseconds>(age).count());
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool check_exchange_health() {
+        // All exchange connections should be up
+        for (const auto& exchange : exchanges_) {
+            if (!exchange->is_connected()) {
+                LOG_ERROR("Exchange {} not connected", exchange->get_name());
+                return false;
+            }
+
+            // Test with a ping or balance query
+            try {
+                exchange->query_account_balance();
+            } catch (const std::exception& ex) {
+                LOG_ERROR("Exchange {} not responding: {}",
+                         exchange->get_name(), ex.what());
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool check_order_processing_health() {
+        // Order processing latency should be < 1ms
+        auto latency = get_order_processing_latency_p99();
+
+        if (latency > std::chrono::milliseconds(1)) {
+            LOG_WARN("High order processing latency: {} ms", latency.count());
+            return false;
+        }
+
+        // Order queue should not be backed up
+        auto queue_depth = get_order_queue_depth();
+
+        if (queue_depth > 1000) {
+            LOG_ERROR("Order queue backed up: {} orders", queue_depth);
+            return false;
+        }
+
+        return true;
+    }
+
+    bool check_risk_health() {
+        // Risk system should be responding
+        try {
+            auto risk_status = risk_manager_->get_status();
+            return risk_status.is_operational;
+        } catch (const std::exception& ex) {
+            LOG_ERROR("Risk system not responding: {}", ex.what());
+            return false;
+        }
+    }
+};
+
+// HTTP endpoint for health checks
+void setup_health_check_endpoint() {
+    // GET /health returns JSON
+    http_server_->add_route("GET", "/health", [](auto& req, auto& res) {
+        auto health = health_checker_->check_health();
+
+        json response = {
+            {"healthy", health.overall_healthy},
+            {"timestamp", health.check_time.count()},
+            {"components", health.component_health},
+            {"metrics", health.metrics}
+        };
+
+        res.status = health.overall_healthy ? 200 : 503;
+        res.body = response.dump();
+        res.headers["Content-Type"] = "application/json";
+    });
+}
+
+Mechanism 3: Watchdog
+---------------------
+External process monitors the system and restarts if dead
+
+Advantages:
+- Independent (can detect even if main process hung)
+- Can automatically restart
+- Works even if system can't send heartbeat
+
+Disadvantages:
+- Requires separate process
+- Can cause unnecessary restarts (false positives)
+
+Implementation (bash):
+----------------------
+#!/bin/bash
+# watchdog.sh
+
+PROCESS_NAME="trading_engine"
+CHECK_INTERVAL=1  # seconds
+MAX_RESTARTS=5
+RESTART_COUNT=0
+RESTART_WINDOW=300  # 5 minutes
+
+# Track restart times
+declare -a RESTART_TIMES
+
+while true; do
+    # Check if process is running
+    if ! pgrep -x "$PROCESS_NAME" > /dev/null; then
+        echo "[$(date)] Process $PROCESS_NAME not running!"
+
+        # Check if we've restarted too many times recently
+        NOW=$(date +%s)
+        RECENT_RESTARTS=0
+
+        for restart_time in "${RESTART_TIMES[@]}"; do
+            if [ $((NOW - restart_time)) -lt $RESTART_WINDOW ]; then
+                RECENT_RESTARTS=$((RECENT_RESTARTS + 1))
+            fi
+        done
+
+        if [ $RECENT_RESTARTS -ge $MAX_RESTARTS ]; then
+            echo "[$(date)] Too many restarts ($RECENT_RESTARTS in ${RESTART_WINDOW}s), giving up!"
+            echo "[$(date)] Sending alert..."
+
+            # Send critical alert
+            curl -X POST http://alerting:9093/alert \
+                -d "{\"alert\": \"watchdog_gave_up\", \"process\": \"$PROCESS_NAME\"}"
+
+            # Exit watchdog (require manual intervention)
+            exit 1
+        fi
+
+        echo "[$(date)] Attempting restart (attempt $((RECENT_RESTARTS + 1))/$MAX_RESTARTS)..."
+
+        # Restart process
+        systemctl start $PROCESS_NAME
+
+        # Record restart time
+        RESTART_TIMES+=($NOW)
+
+        # Alert
+        curl -X POST http://alerting:9093/alert \
+            -d "{\"alert\": \"process_restarted\", \"process\": \"$PROCESS_NAME\"}"
+    else
+        # Process is running, check if it's responsive
+        HEALTH=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:9090/health)
+
+        if [ "$HEALTH" != "200" ]; then
+            echo "[$(date)] Process running but unhealthy (health check returned $HEALTH)"
+            echo "[$(date)] Killing and restarting..."
+
+            # Kill the process
+            killall -9 $PROCESS_NAME
+
+            # Let the next iteration restart it
+        fi
+    fi
+
+    sleep $CHECK_INTERVAL
+done
+
+Mechanism 4: Process Monitoring (systemd)
+------------------------------------------
+Use systemd to automatically restart crashed processes
+
+/etc/systemd/system/trading-engine.service:
+-------------------------------------------
+[Unit]
+Description=Trading Engine
+After=network.target postgresql.service redis.service
+
+[Service]
+Type=simple
+User=trading
+WorkingDirectory=/opt/trading
+ExecStart=/opt/trading/bin/trading_engine
+Restart=always
+RestartSec=5
+StartLimitInterval=300
+StartLimitBurst=5
+
+# Watchdog integration
+WatchdogSec=10
+NotifyAccess=main
+
+# Resource limits
+LimitNOFILE=1000000
+LimitMEMLOCK=infinity
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+
+Mechanism 5: Liveness Probe (Kubernetes)
+-----------------------------------------
+If running in Kubernetes, use liveness probes
+
+kubernetes-deployment.yaml:
+---------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: trading-engine
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: trading-engine
+  template:
+    metadata:
+      labels:
+        app: trading-engine
+    spec:
+      containers:
+      - name: trading-engine
+        image: trading-engine:latest
+        ports:
+        - containerPort: 9090
+
+        # Liveness probe (restart if unhealthy)
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 9090
+          initialDelaySeconds: 30
+          periodSeconds: 5
+          timeoutSeconds: 2
+          failureThreshold: 3
+
+        # Readiness probe (remove from load balancer if not ready)
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 9090
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 2
+          failureThreshold: 2
+
+        # Startup probe (allow slow startup)
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 9090
+          initialDelaySeconds: 0
+          periodSeconds: 5
+          failureThreshold: 60  # 5 minutes to start
+
+1.3 MULTI-LAYER FAILURE DETECTION
+----------------------------------
+
+Use multiple detection mechanisms for redundancy:
+
+Layer 1: Internal self-monitoring (milliseconds)
+    - Watchdog timer within process
+    - Deadlock detection
+    - Memory corruption detection
+
+Layer 2: Heartbeat (100-300ms)
+    - Fast network-based detection
+    - Detects process crash/hang
+
+Layer 3: Health checks (1-5 seconds)
+    - Functional testing
+    - Detects degraded performance
+
+Layer 4: External watchdog (5-10 seconds)
+    - Independent process
+    - Last resort restart
+
+Layer 5: Manual monitoring (minutes)
+    - Operations team reviewing dashboards
+    - Catch subtle issues
+
+1.4 DETECTING DIFFERENT FAILURE TYPES
+--------------------------------------
+
+Crash (Process Exit):
+- Detection: Watchdog notices process missing
+- Time: <1 second
+- Action: Automatic restart
+
+Hang (Process Alive but Not Responding):
+- Detection: Health check timeout
+- Time: 1-5 seconds
+- Action: Kill and restart
+
+Performance Degradation:
+- Detection: Latency metrics exceed threshold
+- Time: 5-30 seconds
+- Action: Alert, possible graceful restart
+
+Network Partition:
+- Detection: Exchange heartbeat timeout
+- Time: 1-5 seconds
+- Action: Reconnect, possible failover
+
+Memory Leak:
+- Detection: Memory usage trend
+- Time: Minutes to hours
+- Action: Schedule restart during low-volume
+
+Disk Full:
+- Detection: Disk space monitoring
+- Time: Minutes
+- Action: Cleanup, alert
+
+Database Connection Loss:
+- Detection: Query timeout
+- Time: 1-5 seconds
+- Action: Reconnect, queue writes
+
+================================================================================
+2. ALERTING STAKEHOLDERS DURING OUTAGE
+================================================================================
+
+2.1 ALERT SEVERITY LEVELS
+--------------------------
+
+P0 - CRITICAL: System completely down, immediate action required
+    - All trading halted
+    - Multiple exchange connections lost
+    - Data corruption detected
+    - Action: Page on-call engineer immediately
+    - Escalate to management within 5 minutes
+
+P1 - HIGH: Major functionality impaired, urgent action required
+    - Single exchange connection lost
+    - Recovery in progress
+    - Position discrepancy detected
+    - Action: Alert on-call engineer
+    - Escalate if not resolved in 15 minutes
+
+P2 - MEDIUM: Degraded performance, action required soon
+    - High latency (>10ms)
+    - Memory usage high (>80%)
+    - Non-critical component failure
+    - Action: Create ticket, alert team via Slack
+    - Resolve within 1 hour
+
+P3 - LOW: Minor issue, informational
+    - Occasional timeout
+    - Non-critical warning log
+    - Action: Log, review in daily standup
+
+2.2 WHO TO ALERT
+----------------
+
+Incident Severity vs Recipients:
+
+P0 (Critical):
+    - On-call engineer (PagerDuty)
+    - Backup on-call (PagerDuty)
+    - Team lead (phone)
+    - CTO (phone)
+    - Risk manager (phone)
+    - Compliance officer (email)
+    - All team members (Slack)
+
+P1 (High):
+    - On-call engineer (PagerDuty)
+    - Team lead (Slack)
+    - Team members (Slack)
+
+P2 (Medium):
+    - Team channel (Slack)
+    - Create Jira ticket
+
+P3 (Low):
+    - Log only
+    - Weekly summary email
+
+2.3 ALERT CONTENT
+-----------------
+
+Critical alerts should include:
+
+1. What happened
+2. When it happened
+3. Impact (what's broken)
+4. Current status (recovering? down?)
+5. Actions taken so far
+6. Estimated time to recovery
+7. Link to runbook
+8. Link to dashboard
+
+Example Alert:
+--------------
+Subject: [P0] Trading System Primary Down - Failover in Progress
+
+What: Primary trading system crashed (SEGFAULT)
+When: 2025-11-25 10:15:23 UTC
+Impact: All trading halted for 12 seconds, now running on backup
+Status: Backup system promoted to primary at 10:15:35 UTC
+Actions:
+  - Automatic failover completed
+  - Positions reconciled, all match exchange
+  - Trading resumed at 10:15:40 UTC
+  - Primary system being investigated
+ETA: Primary system repair: 30 minutes
+Runbook: https://wiki.trading.com/runbooks/system-crash
+Dashboard: https://grafana.trading.com/d/recovery
+
+On-call: Alice (alice@trading.com, +1-555-0100)
+Backup: Bob (bob@trading.com, +1-555-0101)
+
+2.4 ALERT IMPLEMENTATION
+-------------------------
+
+class AlertManager {
+public:
+    enum Severity { P0_CRITICAL, P1_HIGH, P2_MEDIUM, P3_LOW };
+
+    struct Alert {
+        Severity severity;
+        string title;
+        string description;
+        string impact;
+        string current_status;
+        vector<string> actions_taken;
+        string eta;
+        string runbook_url;
+        string dashboard_url;
+        timestamp_t alert_time;
+    };
+
+    void send_alert(const Alert& alert) {
+        LOG_CRITICAL("ALERT [{}]: {}", severity_string(alert.severity),
+                    alert.title);
+
+        // Send to appropriate channels based on severity
+        switch (alert.severity) {
+        case P0_CRITICAL:
+            page_on_call(alert);
+            page_backup_on_call(alert);
+            call_team_lead(alert);
+            call_cto(alert);
+            slack_all_team(alert);
+            email_compliance(alert);
+            break;
+
+        case P1_HIGH:
+            page_on_call(alert);
+            slack_team(alert);
+            break;
+
+        case P2_MEDIUM:
+            slack_team(alert);
+            create_jira_ticket(alert);
+            break;
+
+        case P3_LOW:
+            log_alert(alert);
+            break;
+        }
+
+        // Store alert in database for history
+        db_->insert_alert(alert);
+
+        // Update dashboard
+        update_alert_dashboard(alert);
+    }
+
+private:
+    void page_on_call(const Alert& alert) {
+        // Send to PagerDuty
+        json payload = {
+            {"routing_key", config_->pagerduty_key},
+            {"event_action", "trigger"},
+            {"payload", {
+                {"summary", alert.title},
+                {"severity", severity_string(alert.severity)},
+                {"source", "trading-system"},
+                {"custom_details", {
+                    {"description", alert.description},
+                    {"impact", alert.impact},
+                    {"runbook", alert.runbook_url}
+                }}
+            }}
+        };
+
+        http_client_->post("https://events.pagerduty.com/v2/enqueue",
+                          payload.dump());
+    }
+
+    void slack_team(const Alert& alert) {
+        json payload = {
+            {"text", format("[{}] {}", severity_string(alert.severity),
+                           alert.title)},
+            {"attachments", {
+                {
+                    {"color", severity_color(alert.severity)},
+                    {"fields", {
+                        {{"title", "Description"}, {"value", alert.description}},
+                        {{"title", "Impact"}, {"value", alert.impact}},
+                        {{"title", "Status"}, {"value", alert.current_status}},
+                        {{"title", "ETA"}, {"value", alert.eta}},
+                        {{"title", "Runbook"}, {"value", alert.runbook_url}},
+                        {{"title", "Dashboard"}, {"value", alert.dashboard_url}}
+                    }}
+                }
+            }}
+        };
+
+        http_client_->post(config_->slack_webhook_url, payload.dump());
+    }
+
+    void call_team_lead(const Alert& alert) {
+        // Use Twilio to make phone call
+        json payload = {
+            {"to", config_->team_lead_phone},
+            {"from", config_->twilio_phone},
+            {"twiml", format(
+                "<Response>"
+                "  <Say>Critical alert: {}</Say>"
+                "  <Pause length='2'/>"
+                "  <Say>Description: {}</Say>"
+                "  <Pause length='2'/>"
+                "  <Say>Press 1 to acknowledge, press 2 to escalate</Say>"
+                "  <Gather numDigits='1' action='/twilio/handle'/>"
+                "</Response>",
+                alert.title, alert.description
+            )}
+        };
+
+        http_client_->post("https://api.twilio.com/2010-04-01/Accounts/"
+                          + config_->twilio_account + "/Calls.json",
+                          payload.dump());
+    }
+};
+
+2.5 ALERT ESCALATION
+--------------------
+
+Escalation policy:
+
+P0 Alert:
+---------
+Time 0: Page on-call
+Time +2 min: Page backup on-call if no ack
+Time +5 min: Call team lead
+Time +10 min: Call CTO
+Time +15 min: Call CEO (if trading still down)
+
+P1 Alert:
+---------
+Time 0: Page on-call
+Time +5 min: Page backup on-call if no ack
+Time +15 min: Escalate to team lead
+
+P2 Alert:
+---------
+Time 0: Slack team
+Time +1 hour: Escalate to team lead if unresolved
+
+Implementation:
+---------------
+class AlertEscalation {
+private:
+    struct EscalationRule {
+        Severity severity;
+        std::chrono::seconds delay;
+        std::function<void(const Alert&)> action;
+    };
+
+    vector<EscalationRule> rules_ = {
+        // P0 escalation
+        {P0_CRITICAL, 0s, [this](auto& a) { page_on_call(a); }},
+        {P0_CRITICAL, 120s, [this](auto& a) { page_backup_on_call(a); }},
+        {P0_CRITICAL, 300s, [this](auto& a) { call_team_lead(a); }},
+        {P0_CRITICAL, 600s, [this](auto& a) { call_cto(a); }},
+        {P0_CRITICAL, 900s, [this](auto& a) { call_ceo(a); }},
+
+        // P1 escalation
+        {P1_HIGH, 0s, [this](auto& a) { page_on_call(a); }},
+        {P1_HIGH, 300s, [this](auto& a) { page_backup_on_call(a); }},
+        {P1_HIGH, 900s, [this](auto& a) { escalate_to_team_lead(a); }},
+
+        // P2 escalation
+        {P2_MEDIUM, 0s, [this](auto& a) { slack_team(a); }},
+        {P2_MEDIUM, 3600s, [this](auto& a) { escalate_to_team_lead(a); }}
+    };
+
+public:
+    void handle_alert(const Alert& alert) {
+        // Schedule escalations
+        for (const auto& rule : rules_) {
+            if (rule.severity == alert.severity) {
+                schedule_escalation(alert, rule);
+            }
+        }
+    }
+
+private:
+    void schedule_escalation(const Alert& alert, const EscalationRule& rule) {
+        std::thread([alert, rule]() {
+            std::this_thread::sleep_for(rule.delay);
+
+            // Check if alert still active (not acknowledged)
+            if (is_alert_active(alert.alert_id)) {
+                rule.action(alert);
+            }
+        }).detach();
+    }
+};
+
+2.6 ALERT FATIGUE PREVENTION
+-----------------------------
+
+Problem: Too many alerts → Team ignores them
+
+Solutions:
+----------
+1. Use appropriate severity levels
+   - Don't make everything P0
+   - Most alerts should be P2 or P3
+
+2. Aggregate similar alerts
+   - Don't send 100 alerts for same issue
+   - Group and send summary
+
+3. Use rate limiting
+   - Max N alerts per hour
+
+4. Implement snoozing
+   - Can temporarily disable noisy alerts
+
+5. Regular alert review
+   - Weekly review of all alerts
+   - Tune thresholds
+   - Delete unnecessary alerts
+
+Implementation:
+---------------
+class AlertDeduplication {
+private:
+    struct AlertKey {
+        string alert_type;
+        string source;
+
+        bool operator<(const AlertKey& other) const {
+            return std::tie(alert_type, source) <
+                   std::tie(other.alert_type, other.source);
+        }
+    };
+
+    std::map<AlertKey, timestamp_t> recent_alerts_;
+    std::chrono::seconds dedup_window_{300};  // 5 minutes
+
+public:
+    bool should_send_alert(const Alert& alert) {
+        AlertKey key{alert.alert_type, alert.source};
+
+        auto it = recent_alerts_.find(key);
+        if (it == recent_alerts_.end()) {
+            // First time seeing this alert, send it
+            recent_alerts_[key] = now_utc();
+            return true;
+        }
+
+        auto elapsed = now_utc() - it->second;
+        if (elapsed > dedup_window_) {
+            // Last alert was > 5 minutes ago, send new one
+            recent_alerts_[key] = now_utc();
+            return true;
+        }
+
+        // Duplicate alert within window, suppress
+        LOG_DEBUG("Suppressing duplicate alert: {}", alert.title);
+        return false;
+    }
+};
+
+================================================================================
+3. RECOVERY PROGRESS TRACKING
+================================================================================
+
+3.1 WHY TRACK RECOVERY PROGRESS
+--------------------------------
+
+During recovery, stakeholders want to know:
+- Is recovery happening?
+- How far along is it?
+- When will it be complete?
+- Any issues encountered?
+
+Benefits:
+- Reduces anxiety/uncertainty
+- Helps coordinate response
+- Provides data for post-mortem
+- Enables automated decisions
+
+3.2 RECOVERY PROGRESS STATES
+-----------------------------
+
+State Machine:
+--------------
+HEALTHY
+  ↓ (failure detected)
+FAILURE_DETECTED
+  ↓ (recovery initiated)
+RECOVERY_IN_PROGRESS
+  ↓ (recovery complete)
+VALIDATING
+  ↓ (validation passed)
+RECOVERED
+  ↓ (monitoring)
+HEALTHY
+
+Or:
+RECOVERY_IN_PROGRESS
+  ↓ (recovery failed)
+RECOVERY_FAILED
+  ↓ (manual intervention)
+MANUAL_RECOVERY
+
+3.3 RECOVERY PROGRESS TRACKING IMPLEMENTATION
+----------------------------------------------
+
+class RecoveryProgressTracker {
+public:
+    enum State {
+        HEALTHY,
+        FAILURE_DETECTED,
+        RECOVERY_IN_PROGRESS,
+        VALIDATING,
+        RECOVERED,
+        RECOVERY_FAILED,
+        MANUAL_RECOVERY
+    };
+
+    struct ProgressUpdate {
+        State current_state;
+        int progress_percentage;  // 0-100
+        string current_step;
+        string status_message;
+        timestamp_t last_update;
+        vector<string> completed_steps;
+        vector<string> remaining_steps;
+        optional<timestamp_t> estimated_completion;
+    };
+
+private:
+    std::atomic<State> current_state_{HEALTHY};
+    ProgressUpdate current_progress_;
+    std::mutex progress_mtx_;
+    vector<std::function<void(const ProgressUpdate&)>> observers_;
+
+public:
+    void report_failure() {
+        update_state(FAILURE_DETECTED, 0, "Failure detected", "Initiating recovery");
+    }
+
+    void start_recovery(const vector<string>& steps) {
+        std::lock_guard<std::mutex> lock(progress_mtx_);
+
+        current_progress_.remaining_steps = steps;
+        current_progress_.completed_steps.clear();
+
+        update_state(RECOVERY_IN_PROGRESS, 0, "Starting recovery",
+                    format("Recovery started, {} steps to complete", steps.size()));
+    }
+
+    void complete_step(const string& step) {
+        std::lock_guard<std::mutex> lock(progress_mtx_);
+
+        // Move step from remaining to completed
+        auto it = std::find(current_progress_.remaining_steps.begin(),
+                           current_progress_.remaining_steps.end(),
+                           step);
+        if (it != current_progress_.remaining_steps.end()) {
+            current_progress_.remaining_steps.erase(it);
+            current_progress_.completed_steps.push_back(step);
+        }
+
+        // Calculate progress
+        int total_steps = current_progress_.completed_steps.size() +
+                         current_progress_.remaining_steps.size();
+        int progress_pct = (100 * current_progress_.completed_steps.size()) / total_steps;
+
+        // Estimate completion time
+        auto elapsed = now_utc() - current_progress_.last_update;
+        auto remaining_time = elapsed * current_progress_.remaining_steps.size();
+        current_progress_.estimated_completion = now_utc() + remaining_time;
+
+        update_state(RECOVERY_IN_PROGRESS, progress_pct,
+                    format("Completed: {}", step),
+                    format("{}/{} steps complete",
+                          current_progress_.completed_steps.size(),
+                          total_steps));
+    }
+
+    void start_validation() {
+        update_state(VALIDATING, 95, "Validating recovered state",
+                    "Running validation checks");
+    }
+
+    void recovery_complete() {
+        update_state(RECOVERED, 100, "Recovery complete",
+                    "System fully recovered and operational");
+
+        // After monitoring period, return to healthy
+        std::thread([this]() {
+            std::this_thread::sleep_for(std::chrono::minutes(5));
+            update_state(HEALTHY, 100, "System healthy",
+                        "Normal operation resumed");
+        }).detach();
+    }
+
+    void recovery_failed(const string& reason) {
+        update_state(RECOVERY_FAILED, -1, "Recovery failed", reason);
+    }
+
+    ProgressUpdate get_progress() {
+        std::lock_guard<std::mutex> lock(progress_mtx_);
+        return current_progress_;
+    }
+
+    void add_observer(std::function<void(const ProgressUpdate&)> observer) {
+        observers_.push_back(observer);
+    }
+
+private:
+    void update_state(State new_state, int progress_pct,
+                     const string& step, const string& message) {
+        current_state_ = new_state;
+
+        std::lock_guard<std::mutex> lock(progress_mtx_);
+        current_progress_.current_state = new_state;
+        current_progress_.progress_percentage = progress_pct;
+        current_progress_.current_step = step;
+        current_progress_.status_message = message;
+        current_progress_.last_update = now_utc();
+
+        LOG_INFO("[RECOVERY] [{}%] {}: {}",
+                progress_pct, step, message);
+
+        // Notify observers
+        for (const auto& observer : observers_) {
+            observer(current_progress_);
+        }
+
+        // Update monitoring
+        metrics_->gauge("recovery.progress_pct", progress_pct);
+        metrics_->gauge("recovery.state", static_cast<int>(new_state));
+    }
+};
+
+Usage:
+------
+RecoveryProgressTracker tracker;
+
+// Set up observer to send progress updates
+tracker.add_observer([](const auto& progress) {
+    // Send progress to Slack
+    slack_->send_message(format(
+        "Recovery Progress: {}% - {}",
+        progress.progress_percentage,
+        progress.status_message
+    ));
+
+    // Update dashboard
+    dashboard_->update_recovery_status(progress);
+});
+
+// During recovery
+tracker.report_failure();
+tracker.start_recovery({"Load checkpoint", "Reconcile positions",
+                       "Restore orders", "Validate state"});
+
+tracker.complete_step("Load checkpoint");
+tracker.complete_step("Reconcile positions");
+tracker.complete_step("Restore orders");
+
+tracker.start_validation();
+tracker.recovery_complete();
+
+3.4 RECOVERY PROGRESS API
+--------------------------
+
+HTTP endpoint for querying recovery status:
+
+void setup_recovery_status_endpoint() {
+    // GET /recovery/status
+    http_server_->add_route("GET", "/recovery/status",
+        [](auto& req, auto& res) {
+            auto progress = recovery_tracker_->get_progress();
+
+            json response = {
+                {"state", state_to_string(progress.current_state)},
+                {"progress_percentage", progress.progress_percentage},
+                {"current_step", progress.current_step},
+                {"status_message", progress.status_message},
+                {"last_update", progress.last_update.count()},
+                {"completed_steps", progress.completed_steps},
+                {"remaining_steps", progress.remaining_steps}
+            };
+
+            if (progress.estimated_completion.has_value()) {
+                response["estimated_completion"] =
+                    progress.estimated_completion->count();
+            }
+
+            res.status = 200;
+            res.body = response.dump();
+            res.headers["Content-Type"] = "application/json";
+        }
+    );
+}
+
+Query with curl:
+----------------
+$ curl http://localhost:9090/recovery/status
+
+{
+  "state": "RECOVERY_IN_PROGRESS",
+  "progress_percentage": 60,
+  "current_step": "Reconciling positions",
+  "status_message": "3/5 steps complete",
+  "last_update": 1732550123456,
+  "completed_steps": [
+    "Load checkpoint",
+    "Connect to exchanges",
+    "Restore orders"
+  ],
+  "remaining_steps": [
+    "Reconcile positions",
+    "Validate state"
+  ],
+  "estimated_completion": 1732550183456
+}
+
+3.5 RECOVERY PROGRESS LOGGING
+------------------------------
+
+Log detailed progress for post-mortem analysis:
+
+2025-11-25 10:15:23.123 [RECOVERY] [0%] Failure detected: Primary system crashed
+2025-11-25 10:15:23.456 [RECOVERY] [0%] Starting recovery: 5 steps to complete
+2025-11-25 10:15:25.789 [RECOVERY] [20%] Completed: Load checkpoint
+2025-11-25 10:15:28.012 [RECOVERY] [40%] Completed: Connect to exchanges
+2025-11-25 10:15:30.345 [RECOVERY] [60%] Completed: Restore orders
+2025-11-25 10:15:45.678 [RECOVERY] [80%] Completed: Reconcile positions
+2025-11-25 10:15:50.901 [RECOVERY] [95%] Validating recovered state
+2025-11-25 10:15:55.234 [RECOVERY] [100%] Recovery complete: System fully recovered
+
+Total recovery time: 32.111 seconds
+
+================================================================================
+4. POST-RECOVERY HEALTH VALIDATION
+================================================================================
+
+4.1 WHY POST-RECOVERY VALIDATION IS CRITICAL
+---------------------------------------------
+
+Just because system is "up" doesn't mean it's healthy!
+
+Must validate:
+- All components operational
+- State is correct
+- Performance is acceptable
+- No subtle corruption
+
+Example failure:
+----------------
+System recovered from crash
+All processes running
+But: Positions were wrong!
+Result: Traded with incorrect risk exposure for 10 minutes
+
+Lesson: ALWAYS validate after recovery!
+
+4.2 POST-RECOVERY VALIDATION CHECKLIST
+---------------------------------------
+
+Immediate (first 60 seconds):
+[ ] All processes running
+[ ] All connections established
+[ ] Positions match exchange
+[ ] Open orders restored
+[ ] Market data flowing
+
+Short-term (first 5 minutes):
+[ ] Order routing working
+[ ] Fills being processed correctly
+[ ] Risk checks functioning
+[ ] P&L calculations accurate
+[ ] Latency within normal range
+
+Medium-term (first 30 minutes):
+[ ] No memory leaks
+[ ] No stuck threads
+[ ] No error spikes in logs
+[ ] Strategy behaving normally
+[ ] No unusual market impact
+
+4.3 AUTOMATED POST-RECOVERY VALIDATION
+---------------------------------------
+
+class PostRecoveryValidator {
+public:
+    struct ValidationResult {
+        bool passed;
+        map<string, bool> checks;
+        vector<string> errors;
+        vector<string> warnings;
+        timestamp_t validation_time;
+    };
+
+    ValidationResult run_full_validation() {
+        LOG_INFO("Starting post-recovery validation...");
+
+        ValidationResult result;
+        result.validation_time = now_utc();
+        result.passed = true;
+
+        // Run all validation checks
+        result.checks["processes"] = validate_processes();
+        result.checks["connectivity"] = validate_connectivity();
+        result.checks["positions"] = validate_positions();
+        result.checks["orders"] = validate_orders();
+        result.checks["market_data"] = validate_market_data();
+        result.checks["order_routing"] = validate_order_routing();
+        result.checks["risk_system"] = validate_risk_system();
+        result.checks["pnl"] = validate_pnl();
+        result.checks["performance"] = validate_performance();
+
+        // Check if any validation failed
+        for (const auto& [check_name, passed] : result.checks) {
+            if (!passed) {
+                result.passed = false;
+                result.errors.push_back(
+                    format("Validation failed: {}", check_name)
+                );
+            }
+        }
+
+        if (result.passed) {
+            LOG_INFO("Post-recovery validation PASSED");
+        } else {
+            LOG_ERROR("Post-recovery validation FAILED");
+            for (const auto& error : result.errors) {
+                LOG_ERROR("  - {}", error);
+            }
+        }
+
+        return result;
+    }
+
+private:
+    bool validate_processes() {
+        // Check all required processes are running
+        vector<string> required_processes = {
+            "trading_engine",
+            "market_data_feed",
+            "risk_manager",
+            "order_router"
+        };
+
+        for (const auto& process : required_processes) {
+            if (!is_process_running(process)) {
+                LOG_ERROR("Process not running: {}", process);
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    bool validate_connectivity() {
+        // Validate all external connections
+        if (!validate_exchange_connections()) return false;
+        if (!validate_database_connection()) return false;
+        if (!validate_message_queue_connection()) return false;
+
+        return true;
+    }
+
+    bool validate_order_routing() {
+        // Test order routing with a small test order
+        LOG_INFO("Testing order routing...");
+
+        try {
+            // Send test order (will be cancelled immediately)
+            auto order_id = send_test_order("TEST", OrderSide::BUY, 1, 1.0);
+
+            // Wait for acknowledgement
+            auto ack_received = wait_for_order_ack(order_id, 1000ms);
+
+            if (!ack_received) {
+                LOG_ERROR("Test order not acknowledged within 1 second");
+                return false;
+            }
+
+            // Cancel test order
+            cancel_order(order_id);
+
+            LOG_INFO("Order routing test passed");
+            return true;
+        }
+        catch (const std::exception& ex) {
+            LOG_ERROR("Order routing test failed: {}", ex.what());
+            return false;
+        }
+    }
+
+    bool validate_performance() {
+        // Check latency metrics
+        auto order_latency_p99 = metrics_->get_percentile("order_latency", 99);
+
+        if (order_latency_p99 > 10ms) {  // 10ms threshold
+            LOG_WARN("High order latency: {} ms", order_latency_p99.count());
+            return false;
+        }
+
+        // Check CPU usage
+        auto cpu_usage = get_cpu_usage();
+
+        if (cpu_usage > 80.0) {
+            LOG_WARN("High CPU usage: {}%", cpu_usage);
+            return false;
+        }
+
+        // Check memory usage
+        auto memory_usage = get_memory_usage();
+
+        if (memory_usage > 80.0) {
+            LOG_WARN("High memory usage: {}%", memory_usage);
+            return false;
+        }
+
+        return true;
+    }
+};
+
+4.4 GRADUAL RESUMPTION
+-----------------------
+
+Don't immediately resume full trading after recovery!
+
+Phase 1: Monitoring Only (2 minutes)
+- Don't send any orders
+- Watch market data
+- Validate all state
+- Check for any issues
+
+Phase 2: Reduced Size (5 minutes)
+- Start trading at 10% of normal size
+- Monitor closely
+- Verify fills processed correctly
+- Check P&L updates
+
+Phase 3: Normal Size (if all good)
+- Gradually ramp up to 100%
+- Continue monitoring
+
+Implementation:
+---------------
+class GradualResumption {
+private:
+    enum Phase {
+        MONITORING_ONLY,
+        REDUCED_SIZE,
+        NORMAL_SIZE
+    };
+
+    std::atomic<Phase> current_phase_{MONITORING_ONLY};
+    std::atomic<double> size_multiplier_{0.0};
+
+public:
+    void start_gradual_resumption() {
+        // Phase 1: Monitoring only (2 minutes)
+        current_phase_ = MONITORING_ONLY;
+        size_multiplier_ = 0.0;
+        LOG_INFO("Phase 1: Monitoring only (2 minutes)");
+
+        std::thread([this]() {
+            std::this_thread::sleep_for(std::chrono::minutes(2));
+
+            // Validate before proceeding
+            if (!validate_system()) {
+                LOG_ERROR("Validation failed, staying in monitoring mode");
+                return;
+            }
+
+            // Phase 2: Reduced size (5 minutes)
+            current_phase_ = REDUCED_SIZE;
+            size_multiplier_ = 0.1;  // 10% of normal
+            LOG_INFO("Phase 2: Reduced size (5 minutes, 10% of normal)");
+
+            std::this_thread::sleep_for(std::chrono::minutes(5));
+
+            // Validate again
+            if (!validate_system()) {
+                LOG_ERROR("Validation failed, staying at reduced size");
+                return;
+            }
+
+            // Phase 3: Normal size
+            current_phase_ = NORMAL_SIZE;
+            size_multiplier_ = 1.0;  // 100%
+            LOG_INFO("Phase 3: Normal size (100%)");
+        }).detach();
+    }
+
+    bool should_trade() {
+        return current_phase_ != MONITORING_ONLY;
+    }
+
+    double get_size_multiplier() {
+        return size_multiplier_;
+    }
+};
+
+Usage in order sizing:
+----------------------
+double calculate_order_size(const string& symbol) {
+    double base_size = strategy_->calculate_size(symbol);
+
+    // Apply gradual resumption multiplier
+    double multiplier = gradual_resumption_->get_size_multiplier();
+
+    return base_size * multiplier;
+}
+
+================================================================================
+5. DASHBOARDS FOR RECOVERY STATUS
+================================================================================
+
+5.1 RECOVERY DASHBOARD REQUIREMENTS
+------------------------------------
+
+Essential information:
+- Current system state (healthy/recovering/failed)
+- Recovery progress (if in progress)
+- Time since failure detected
+- Estimated time to recovery
+- Current recovery step
+- Key metrics (positions, orders, connections)
+- Recent alerts
+- Historical recovery times
+
+5.2 GRAFANA DASHBOARD CONFIG
+-----------------------------
+
+Dashboard panels:
+
+Panel 1: System State (Gauge)
+------------------------------
+Query: recovery_state
+Display:
+- GREEN: Healthy (0)
+- YELLOW: Recovery in progress (1)
+- RED: Failed (2)
+
+Panel 2: Recovery Progress (Graph + Bar)
+-----------------------------------------
+Query: recovery_progress_pct
+Display: 0-100% progress bar with timeline
+
+Panel 3: Recovery Timeline (Timeline)
+--------------------------------------
+Shows:
+- Failure detected (timestamp)
+- Recovery started (timestamp)
+- Current step
+- Estimated completion
+
+Panel 4: Key Metrics (Stats)
+-----------------------------
+- Positions accuracy: OK/MISMATCH
+- Open orders: 25 (as expected)
+- Exchange connections: 3/3 UP
+- Market data lag: 12ms (normal)
+
+Panel 5: Recovery History (Table)
+----------------------------------
+Shows last 10 recoveries:
+- Date/time
+- Failure type
+- RTO achieved
+- Success/failure
+
+Panel 6: Alerts (List)
+----------------------
+Recent alerts related to recovery
+
+Panel 7: Logs (Scrolling)
+--------------------------
+Live log stream filtered for recovery events
+
+Grafana JSON:
+-------------
+{
+  "dashboard": {
+    "title": "Recovery Status",
+    "uid": "recovery-status",
+    "tags": ["recovery", "monitoring"],
+    "timezone": "utc",
+    "panels": [
+      {
+        "id": 1,
+        "title": "System State",
+        "type": "gauge",
+        "gridPos": {"x": 0, "y": 0, "w": 6, "h": 4},
+        "targets": [{
+          "expr": "recovery_system_state",
+          "refId": "A"
+        }],
+        "fieldConfig": {
+          "defaults": {
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"value": 0, "color": "green"},
+                {"value": 1, "color": "yellow"},
+                {"value": 2, "color": "red"}
+              ]
+            },
+            "mappings": [
+              {"value": 0, "text": "HEALTHY"},
+              {"value": 1, "text": "RECOVERING"},
+              {"value": 2, "text": "FAILED"}
+            ]
+          }
+        }
+      },
+      {
+        "id": 2,
+        "title": "Recovery Progress",
+        "type": "bargauge",
+        "gridPos": {"x": 6, "y": 0, "w": 10, "h": 4},
+        "targets": [{
+          "expr": "recovery_progress_pct",
+          "refId": "A"
+        }],
+        "options": {
+          "displayMode": "gradient",
+          "orientation": "horizontal",
+          "minVizWidth": 0,
+          "minVizHeight": 10
+        },
+        "fieldConfig": {
+          "defaults": {
+            "min": 0,
+            "max": 100,
+            "unit": "percent"
+          }
+        }
+      },
+      {
+        "id": 3,
+        "title": "Recovery Timeline",
+        "type": "timeseries",
+        "gridPos": {"x": 0, "y": 4, "w": 16, "h": 6},
+        "targets": [
+          {
+            "expr": "recovery_progress_pct",
+            "legendFormat": "Progress %",
+            "refId": "A"
+          },
+          {
+            "expr": "recovery_rto_seconds",
+            "legendFormat": "RTO (seconds)",
+            "refId": "B"
+          }
+        ]
+      },
+      {
+        "id": 4,
+        "title": "Key Metrics",
+        "type": "stat",
+        "gridPos": {"x": 16, "y": 0, "w": 8, "h": 10},
+        "targets": [
+          {
+            "expr": "position_match_status",
+            "legendFormat": "Positions",
+            "refId": "A"
+          },
+          {
+            "expr": "count(open_orders)",
+            "legendFormat": "Open Orders",
+            "refId": "B"
+          },
+          {
+            "expr": "sum(exchange_connection_status)",
+            "legendFormat": "Exchange Connections",
+            "refId": "C"
+          },
+          {
+            "expr": "market_data_lag_ms",
+            "legendFormat": "Market Data Lag (ms)",
+            "refId": "D"
+          }
+        ]
+      },
+      {
+        "id": 5,
+        "title": "Recovery History",
+        "type": "table",
+        "gridPos": {"x": 0, "y": 10, "w": 24, "h": 6},
+        "targets": [{
+          "expr": "recovery_history",
+          "format": "table",
+          "refId": "A"
+        }],
+        "transformations": [
+          {
+            "id": "organize",
+            "options": {
+              "excludeByName": {},
+              "indexByName": {},
+              "renameByName": {
+                "timestamp": "Date/Time",
+                "failure_type": "Failure Type",
+                "rto_seconds": "RTO (s)",
+                "success": "Status"
+              }
+            }
+          }
+        ]
+      }
+    ],
+    "refresh": "5s"
+  }
+}
+
+5.3 CUSTOM WEB DASHBOARD
+-------------------------
+
+Simple HTML dashboard for recovery status:
+
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Recovery Status</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background: #1e1e1e;
+            color: #ffffff;
+            margin: 20px;
+        }
+
+        .status-card {
+            background: #2d2d2d;
+            border-radius: 8px;
+            padding: 20px;
+            margin: 20px 0;
+            border-left: 5px solid #4caf50;
+        }
+
+        .status-card.recovering {
+            border-left-color: #ff9800;
+        }
+
+        .status-card.failed {
+            border-left-color: #f44336;
+        }
+
+        .progress-bar {
+            width: 100%;
+            height: 30px;
+            background: #444;
+            border-radius: 15px;
+            overflow: hidden;
+            margin: 10px 0;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #4caf50, #8bc34a);
+            transition: width 0.5s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+        }
+
+        .metric {
+            display: inline-block;
+            background: #333;
+            padding: 10px 20px;
+            margin: 5px;
+            border-radius: 5px;
+        }
+
+        .metric.ok { border-left: 3px solid #4caf50; }
+        .metric.warn { border-left: 3px solid #ff9800; }
+        .metric.error { border-left: 3px solid #f44336; }
+    </style>
+</head>
+<body>
+    <h1>System Recovery Status</h1>
+
+    <div id="status-card" class="status-card">
+        <h2 id="state">System State: <span id="state-text">HEALTHY</span></h2>
+
+        <div id="progress-container" style="display:none;">
+            <div class="progress-bar">
+                <div class="progress-fill" id="progress-fill">
+                    <span id="progress-text">0%</span>
+                </div>
+            </div>
+            <p id="current-step"></p>
+            <p id="status-message"></p>
+            <p id="eta"></p>
+        </div>
+    </div>
+
+    <div class="status-card">
+        <h2>Key Metrics</h2>
+        <div id="metrics"></div>
+    </div>
+
+    <div class="status-card">
+        <h2>Recent Events</h2>
+        <div id="events"></div>
+    </div>
+
+    <script>
+        function updateStatus() {
+            fetch('/recovery/status')
+                .then(response => response.json())
+                .then(data => {
+                    const card = document.getElementById('status-card');
+                    const stateText = document.getElementById('state-text');
+                    const progressContainer = document.getElementById('progress-container');
+
+                    // Update state
+                    stateText.textContent = data.state;
+
+                    if (data.state === 'HEALTHY') {
+                        card.className = 'status-card';
+                        progressContainer.style.display = 'none';
+                    } else if (data.state === 'RECOVERY_IN_PROGRESS') {
+                        card.className = 'status-card recovering';
+                        progressContainer.style.display = 'block';
+
+                        // Update progress bar
+                        const progressFill = document.getElementById('progress-fill');
+                        const progressText = document.getElementById('progress-text');
+                        progressFill.style.width = data.progress_percentage + '%';
+                        progressText.textContent = data.progress_percentage + '%';
+
+                        // Update step info
+                        document.getElementById('current-step').textContent =
+                            'Current Step: ' + data.current_step;
+                        document.getElementById('status-message').textContent =
+                            data.status_message;
+
+                        if (data.estimated_completion) {
+                            const eta = new Date(data.estimated_completion);
+                            document.getElementById('eta').textContent =
+                                'ETA: ' + eta.toLocaleTimeString();
+                        }
+                    } else if (data.state === 'RECOVERY_FAILED') {
+                        card.className = 'status-card failed';
+                        progressContainer.style.display = 'none';
+                    }
+                })
+                .catch(error => console.error('Error fetching status:', error));
+        }
+
+        function updateMetrics() {
+            fetch('/metrics')
+                .then(response => response.json())
+                .then(data => {
+                    const metricsDiv = document.getElementById('metrics');
+                    metricsDiv.innerHTML = '';
+
+                    for (const [key, value] of Object.entries(data)) {
+                        const metric = document.createElement('div');
+                        metric.className = 'metric ' + (value.status || 'ok');
+                        metric.innerHTML = `<strong>${key}:</strong> ${value.value}`;
+                        metricsDiv.appendChild(metric);
+                    }
+                })
+                .catch(error => console.error('Error fetching metrics:', error));
+        }
+
+        // Update every 2 seconds
+        setInterval(() => {
+            updateStatus();
+            updateMetrics();
+        }, 2000);
+
+        // Initial update
+        updateStatus();
+        updateMetrics();
+    </script>
+</body>
+</html>
+
+5.4 MOBILE ALERTS
+------------------
+
+Send recovery status to mobile devices:
+
+class MobileAlertSender {
+public:
+    void send_recovery_started() {
+        send_push_notification(
+            "Recovery Started",
+            "System recovery in progress. Monitoring closely.",
+            NotificationPriority::HIGH
+        );
+    }
+
+    void send_recovery_progress(int percentage) {
+        if (percentage % 25 == 0) {  // Update at 25%, 50%, 75%
+            send_push_notification(
+                format("Recovery {}% Complete", percentage),
+                "Recovery progressing normally.",
+                NotificationPriority::MEDIUM
+            );
+        }
+    }
+
+    void send_recovery_complete() {
+        send_push_notification(
+            "Recovery Complete",
+            "System fully recovered. All validations passed.",
+            NotificationPriority::HIGH
+        );
+    }
+
+    void send_recovery_failed() {
+        send_push_notification(
+            "Recovery Failed",
+            "System recovery failed. Manual intervention required!",
+            NotificationPriority::CRITICAL
+        );
+    }
+
+private:
+    void send_push_notification(const string& title, const string& body,
+                                NotificationPriority priority) {
+        // Use Firebase Cloud Messaging or similar
+        json payload = {
+            {"notification", {
+                {"title", title},
+                {"body", body},
+                {"priority", priority_string(priority)}
+            }},
+            {"data", {
+                {"timestamp", now_utc().count()},
+                {"type", "recovery_status"}
+            }}
+        };
+
+        http_client_->post("https://fcm.googleapis.com/fcm/send",
+                          payload.dump(),
+                          {{"Authorization", "key=" + config_->fcm_key}});
+    }
+};
+
+================================================================================
+6. AUTOMATED VS MANUAL RECOVERY DECISION
+================================================================================
+
+6.1 DECISION CRITERIA
+----------------------
+
+Automated Recovery (Hot/Warm):
+- Clean failure (known cause)
+- Recent checkpoint available
+- All data intact
+- Low risk of further damage
+- RTO target can be met
+
+Manual Recovery (Cold):
+- Unknown failure cause
+- Data corruption suspected
+- Multiple failures
+- High risk scenario
+- Automated recovery failed
+
+6.2 DECISION LOGIC
+------------------
+
+class RecoveryDecisionMaker {
+public:
+    enum Decision {
+        AUTO_HOT_RESTART,
+        AUTO_WARM_RESTART,
+        AUTO_COLD_RESTART,
+        MANUAL_INTERVENTION
+    };
+
+    Decision decide_recovery_method(const FailureInfo& failure) {
+        // Check if backup is available and healthy
+        if (backup_system_->is_available() &&
+            backup_system_->is_synced()) {
+            LOG_INFO("Backup available, using hot restart");
+            return AUTO_HOT_RESTART;
+        }
+
+        // Check if recent checkpoint available
+        auto checkpoint = get_latest_checkpoint();
+        if (checkpoint.has_value() &&
+            is_checkpoint_recent(checkpoint.value())) {
+            LOG_INFO("Recent checkpoint available, using warm restart");
+            return AUTO_WARM_RESTART;
+        }
+
+        // Check failure severity
+        if (failure.is_data_corruption()) {
+            LOG_WARN("Data corruption detected, manual intervention needed");
+            return MANUAL_INTERVENTION;
+        }
+
+        // Check if automated recovery has failed recently
+        if (get_recent_recovery_failure_count() >= 3) {
+            LOG_ERROR("Too many recent recovery failures, manual intervention needed");
+            return MANUAL_INTERVENTION;
+        }
+
+        // Check market conditions
+        if (is_high_volatility()) {
+            LOG_WARN("High volatility, preferring manual intervention");
+            return MANUAL_INTERVENTION;
+        }
+
+        // Default to cold restart
+        LOG_INFO("No better option, using cold restart");
+        return AUTO_COLD_RESTART;
+    }
+
+private:
+    bool is_checkpoint_recent(const Checkpoint& cp) {
+        auto age = now_utc() - cp.timestamp;
+        return age < std::chrono::minutes(5);
+    }
+
+    bool is_high_volatility() {
+        // Check if market is unusually volatile
+        auto volatility = market_data_->get_current_volatility();
+        auto avg_volatility = market_data_->get_average_volatility();
+
+        return volatility > avg_volatility * 2.0;
+    }
+};
+
+6.3 HUMAN-IN-THE-LOOP FOR CRITICAL DECISIONS
+---------------------------------------------
+
+For critical scenarios, require human approval:
+
+class HumanInTheLoopDecision {
+public:
+    bool should_proceed_with_recovery(Decision decision) {
+        if (decision == MANUAL_INTERVENTION) {
+            // Always require human approval
+            return wait_for_human_approval();
+        }
+
+        // For automated recovery during market hours, get approval
+        if (is_market_open() && decision != AUTO_HOT_RESTART) {
+            return wait_for_human_approval();
+        }
+
+        // Otherwise, proceed automatically
+        return true;
+    }
+
+private:
+    bool wait_for_human_approval() {
+        LOG_CRITICAL("Human approval required for recovery decision");
+
+        // Send alert requesting approval
+        alert_manager_->send_alert(Alert{
+            .severity = P0_CRITICAL,
+            .title = "Recovery Approval Required",
+            .description = "System needs human approval to proceed with recovery",
+            .runbook_url = "https://wiki/recovery-approval"
+        });
+
+        // Wait for approval (timeout after 5 minutes)
+        auto timeout = now_utc() + std::chrono::minutes(5);
+
+        while (now_utc() < timeout) {
+            if (check_approval_received()) {
+                LOG_INFO("Human approval received");
+                return true;
+            }
+
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+
+        LOG_ERROR("Human approval timeout");
+        return false;
+    }
+
+    bool check_approval_received() {
+        // Check if approval button clicked in dashboard
+        // or approval command received via CLI
+        return approval_received_;
+    }
+};
+
+6.4 RECOVERY DECISION FLOWCHART
+--------------------------------
+
+                [Failure Detected]
+                       |
+                       v
+          Is backup available & synced?
+                 /         \
+               YES          NO
+               /             \
+              v               v
+        Hot Restart     Is checkpoint recent?
+                             /         \
+                           YES          NO
+                           /             \
+                          v               v
+                    Warm Restart    Is data corrupted?
+                                         /         \
+                                       YES          NO
+                                       /             \
+                                      v               v
+                             Manual        Have recent failures?
+                             Intervention       /         \
+                                              YES          NO
+                                              /             \
+                                             v               v
+                                      Manual           Cold Restart
+                                      Intervention
+
+================================================================================
+7. ESCALATION DURING RECOVERY FAILURES
+================================================================================
+
+7.1 ESCALATION TRIGGERS
+------------------------
+
+Trigger escalation when:
+1. Recovery takes longer than expected (RTO exceeded by 50%)
+2. Recovery fails (automated recovery unsuccessful)
+3. Repeated recovery attempts fail (3+ failures)
+4. Data corruption detected during recovery
+5. Critical validation fails after recovery
+6. Human intervention timeout (no response)
+
+7.2 ESCALATION LEVELS
+----------------------
+
+Level 1: On-call engineer
+- Handles initial recovery
+- Has authority to initiate automated recovery
+- Escalates if needed
+
+Level 2: Team lead
+- Escalated if Level 1 can't resolve in 15 minutes
+- Can make decisions on manual interventions
+- Can call in additional engineers
+
+Level 3: Engineering Manager
+- Escalated if Level 2 can't resolve in 30 minutes
+- Can authorize emergency procedures
+- Coordinates with other departments
+
+Level 4: CTO
+- Escalated if system still down after 1 hour
+- Makes decisions on business impact
+- Coordinates with executive team
+
+Level 5: CEO
+- Escalated for prolonged outages (>2 hours)
+- Makes decisions on external communication
+- Handles regulatory notifications
+
+7.3 ESCALATION IMPLEMENTATION
+------------------------------
+
+class EscalationManager {
+private:
+    struct EscalationLevel {
+        string name;
+        string contact;
+        std::chrono::minutes threshold;
+        std::function<void()> notify_function;
+    };
+
+    vector<EscalationLevel> levels_ = {
+        {"On-call Engineer", "alice@trading.com", 0min,
+         [this]() { notify_on_call(); }},
+
+        {"Team Lead", "bob@trading.com", 15min,
+         [this]() { notify_team_lead(); }},
+
+        {"Engineering Manager", "carol@trading.com", 30min,
+         [this]() { notify_manager(); }},
+
+        {"CTO", "dave@trading.com", 60min,
+         [this]() { notify_cto(); }},
+
+        {"CEO", "eve@trading.com", 120min,
+         [this]() { notify_ceo(); }}
+    };
+
+    timestamp_t failure_start_time_;
+    int current_level_ = 0;
+
+public:
+    void start_escalation() {
+        failure_start_time_ = now_utc();
+        current_level_ = 0;
+
+        // Notify first level immediately
+        levels_[0].notify_function();
+
+        // Start escalation monitoring
+        std::thread([this]() {
+            monitor_escalation();
+        }).detach();
+    }
+
+private:
+    void monitor_escalation() {
+        while (current_level_ < levels_.size() - 1) {
+            std::this_thread::sleep_for(std::chrono::minutes(1));
+
+            auto elapsed = now_utc() - failure_start_time_;
+            auto elapsed_minutes = duration_cast<minutes>(elapsed).count();
+
+            // Check if we should escalate to next level
+            if (current_level_ + 1 < levels_.size() &&
+                elapsed_minutes >= levels_[current_level_ + 1].threshold.count()) {
+
+                current_level_++;
+
+                LOG_CRITICAL("Escalating to level {}: {}",
+                           current_level_ + 1,
+                           levels_[current_level_].name);
+
+                levels_[current_level_].notify_function();
+            }
+        }
+    }
+
+    void notify_on_call() {
+        page("On-call Engineer", "alice@trading.com", "System failure detected");
+    }
+
+    void notify_team_lead() {
+        page("Team Lead", "bob@trading.com",
+            "Recovery not complete after 15 minutes, escalating");
+        call_phone("+1-555-0102");
+    }
+
+    void notify_manager() {
+        page("Engineering Manager", "carol@trading.com",
+            "Recovery not complete after 30 minutes, escalating");
+        call_phone("+1-555-0103");
+    }
+
+    void notify_cto() {
+        page("CTO", "dave@trading.com",
+            "System still down after 1 hour, critical escalation");
+        call_phone("+1-555-0104");
+        send_sms("+1-555-0104", "CRITICAL: Trading system down >1 hour");
+    }
+
+    void notify_ceo() {
+        page("CEO", "eve@trading.com",
+            "System still down after 2 hours, executive notification");
+        call_phone("+1-555-0105");
+        send_sms("+1-555-0105", "CRITICAL: Trading system down >2 hours");
+    }
+};
+
+7.4 RECOVERY FAILURE HANDLING
+------------------------------
+
+When recovery fails:
+
+1. Log failure details
+2. Preserve state for investigation
+3. Try alternative recovery method
+4. Escalate to human
+5. Document what was tried
+
+class RecoveryFailureHandler {
+public:
+    void handle_recovery_failure(const string& recovery_type,
+                                const string& failure_reason) {
+        LOG_CRITICAL("Recovery failed: type={}, reason={}",
+                    recovery_type, failure_reason);
+
+        // Log detailed failure info
+        log_failure_details(recovery_type, failure_reason);
+
+        // Preserve state for investigation
+        preserve_failed_state();
+
+        // Try alternative recovery
+        if (recovery_type == "HOT") {
+            LOG_INFO("Hot restart failed, trying warm restart");
+            try_recovery("WARM");
+        } else if (recovery_type == "WARM") {
+            LOG_INFO("Warm restart failed, trying cold restart");
+            try_recovery("COLD");
+        } else {
+            LOG_ERROR("Cold restart failed, manual intervention required");
+            escalate_to_manual();
+        }
+    }
+
+private:
+    void preserve_failed_state() {
+        // Take snapshot of system state at failure
+        string snapshot_dir = format("/var/lib/trading/failed_recovery_{}",
+                                    now_utc().count());
+
+        system(format("mkdir -p {}", snapshot_dir).c_str());
+
+        // Copy logs
+        system(format("cp -r /var/log/trading/* {}/logs/", snapshot_dir).c_str());
+
+        // Copy state files
+        system(format("cp -r /var/lib/trading/state/* {}/state/", snapshot_dir).c_str());
+
+        // Dump core
+        system(format("gcore -o {}/core $(pidof trading_engine)", snapshot_dir).c_str());
+
+        LOG_INFO("Failed state preserved in {}", snapshot_dir);
+    }
+
+    void escalate_to_manual() {
+        alert_manager_->send_alert(Alert{
+            .severity = P0_CRITICAL,
+            .title = "Automated Recovery Failed - Manual Intervention Required",
+            .description = "All automated recovery attempts failed. "
+                          "System requires manual investigation and recovery.",
+            .runbook_url = "https://wiki/manual-recovery"
+        });
+
+        escalation_manager_->start_escalation();
+    }
+};
+
+================================================================================
+8. BEST PRACTICES & CHECKLISTS
+================================================================================
+
+8.1 MONITORING BEST PRACTICES
+------------------------------
+
+1. Monitor at multiple levels
+   - System level (CPU, memory, disk)
+   - Application level (latency, throughput)
+   - Business level (P&L, positions, risk)
+
+2. Use multiple detection mechanisms
+   - Heartbeat for fast detection
+   - Health checks for functional validation
+   - Watchdog for independent monitoring
+
+3. Set appropriate thresholds
+   - Not too sensitive (false positives)
+   - Not too lenient (miss real issues)
+   - Test and tune regularly
+
+4. Log everything
+   - All state changes
+   - All recovery attempts
+   - All decisions made
+
+5. Have redundant monitoring
+   - Multiple monitoring systems
+   - External monitoring (outside your network)
+   - Independent alert paths
+
+8.2 ALERTING BEST PRACTICES
+----------------------------
+
+1. Use appropriate severity
+   - Reserve P0 for true emergencies
+   - Most alerts should be P2 or P3
+
+2. Include actionable information
+   - What happened
+   - What to do about it
+   - Link to runbook
+
+3. Avoid alert fatigue
+   - Deduplicate alerts
+   - Rate limit alerts
+   - Regular alert review
+
+4. Test alert delivery
+   - Monthly test pages
+   - Verify all contact methods work
+   - Test escalation paths
+
+5. Document alert response
+   - What to do for each alert
+   - Who to contact
+   - How to resolve
+
+8.3 RECOVERY MONITORING CHECKLIST
+----------------------------------
+
+Before Recovery:
+[ ] Monitoring systems operational
+[ ] Alerts configured correctly
+[ ] Dashboards accessible
+[ ] On-call engineer notified
+[ ] Escalation paths tested
+
+During Recovery:
+[ ] Progress tracked and logged
+[ ] Stakeholders updated regularly
+[ ] Dashboards showing current state
+[ ] Alerts going to right people
+[ ] No false alarms
+
+After Recovery:
+[ ] Post-recovery validation complete
+[ ] All stakeholders notified
+[ ] Incident documented
+[ ] Metrics updated
+[ ] Lessons learned captured
+
+8.4 TROUBLESHOOTING MONITORING ISSUES
+--------------------------------------
+
+Problem: False positive alerts
+Solution:
+- Adjust thresholds
+- Add hysteresis (require N consecutive failures)
+- Improve health check logic
+
+Problem: Missed failures
+Solution:
+- Reduce heartbeat interval
+- Add more health checks
+- Review monitoring coverage
+
+Problem: Alert delivery failures
+Solution:
+- Use multiple alert channels
+- Test delivery regularly
+- Have backup alert methods
+
+Problem: Dashboard not updating
+Solution:
+- Check metrics pipeline
+- Verify Grafana connectivity
+- Review query syntax
+
+Problem: Escalation not working
+Solution:
+- Test escalation path
+- Verify contact information current
+- Check timeout values
+
+================================================================================
+END OF DOCUMENT
+================================================================================

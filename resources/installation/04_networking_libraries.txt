@@ -1,0 +1,673 @@
+================================================================================
+NETWORKING LIBRARIES FOR HIGH-FREQUENCY TRADING
+================================================================================
+
+OVERVIEW
+--------
+This guide covers installation of networking libraries essential for HFT:
+- libcurl: HTTP/REST APIs (exchange connectivity)
+- Boost.Beast: High-performance HTTP/WebSocket
+- WebSocket++: Alternative WebSocket library
+- libquic: QUIC protocol support
+- ZeroMQ: Message queuing
+- nanomsg/nng: High-performance messaging
+
+PREREQUISITES
+-------------
+- Completed: 01_package_managers.txt, 02_cpp_dependencies.txt
+- OpenSSL installed
+- CMake 3.28+
+
+LIBCURL (HTTP/HTTPS CLIENT)
+============================
+
+Installation via Package Manager:
+---------------------------------
+# Ubuntu/Debian
+sudo apt install -y libcurl4-openssl-dev
+
+# RHEL/CentOS
+sudo dnf install -y libcurl-devel
+
+Installation from Source (for custom optimizations):
+---------------------------------------------------
+cd /tmp
+wget https://curl.se/download/curl-8.5.0.tar.gz
+tar -xzf curl-8.5.0.tar.gz
+cd curl-8.5.0
+
+./configure \
+    --prefix=/usr/local \
+    --enable-optimize \
+    --enable-http \
+    --enable-https \
+    --enable-ipv6 \
+    --with-ssl=/usr \
+    --enable-symbol-hiding \
+    --disable-ftp \
+    --disable-file \
+    --disable-ldap \
+    --disable-rtsp \
+    --disable-dict \
+    --disable-telnet \
+    --disable-tftp \
+    --disable-pop3 \
+    --disable-imap \
+    --disable-smtp \
+    CFLAGS="-O3 -march=native -flto" \
+    CXXFLAGS="-O3 -march=native -flto"
+
+make -j $(nproc)
+sudo make install
+sudo ldconfig
+
+Verification:
+------------
+curl-config --version
+curl-config --libs
+
+CMake Integration:
+-----------------
+find_package(CURL REQUIRED)
+target_link_libraries(your_target CURL::libcurl)
+
+HFT Usage Example:
+-----------------
+#include <curl/curl.h>
+#include <string>
+#include <sstream>
+
+class HTTPClient {
+private:
+    CURL* curl;
+    struct curl_slist* headers;
+
+    static size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* userp) {
+        ((std::string*)userp)->append((char*)contents, size * nmemb);
+        return size * nmemb;
+    }
+
+public:
+    HTTPClient() {
+        curl = curl_easy_init();
+        headers = nullptr;
+
+        // Performance optimizations
+        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+        curl_easy_setopt(curl, CURLOPT_TCP_NODELAY, 1L);
+        curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 5000L);
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 2000L);
+
+        // Connection reuse
+        curl_easy_setopt(curl, CURLOPT_FORBID_REUSE, 0L);
+        curl_easy_setopt(curl, CURLOPT_FRESH_CONNECT, 0L);
+    }
+
+    std::string GET(const std::string& url) {
+        std::string response;
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+
+        CURLcode res = curl_easy_perform(curl);
+        if(res != CURLE_OK) {
+            throw std::runtime_error(curl_easy_strerror(res));
+        }
+        return response;
+    }
+
+    ~HTTPClient() {
+        if(headers) curl_slist_free_all(headers);
+        if(curl) curl_easy_cleanup(curl);
+    }
+};
+
+
+BOOST.BEAST (HTTP/WEBSOCKET)
+=============================
+
+Installation:
+------------
+# Boost.Beast is part of Boost (already installed)
+# If not installed:
+vcpkg install boost-beast:x64-linux-hft
+
+# Or system package:
+sudo apt install -y libboost-all-dev
+
+CMake Integration:
+-----------------
+find_package(Boost REQUIRED COMPONENTS system)
+target_link_libraries(your_target Boost::system Boost::beast)
+
+Beast WebSocket Client Example:
+-------------------------------
+#include <boost/beast/core.hpp>
+#include <boost/beast/websocket.hpp>
+#include <boost/asio/connect.hpp>
+#include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/ssl.hpp>
+#include <iostream>
+
+namespace beast = boost::beast;
+namespace http = beast::http;
+namespace websocket = beast::websocket;
+namespace net = boost::asio;
+namespace ssl = boost::asio::ssl;
+using tcp = boost::asio::ip::tcp;
+
+class WebSocketClient {
+private:
+    net::io_context ioc;
+    ssl::context ctx{ssl::context::tlsv12_client};
+    websocket::stream<beast::ssl_stream<tcp::socket>> ws{ioc, ctx};
+
+public:
+    WebSocketClient() {
+        ctx.set_verify_mode(ssl::verify_none);  // For dev only
+    }
+
+    void connect(const std::string& host, const std::string& port, const std::string& path) {
+        // Resolve
+        tcp::resolver resolver{ioc};
+        auto results = resolver.resolve(host, port);
+
+        // Connect
+        auto ep = net::connect(get_lowest_layer(ws), results);
+
+        // SSL handshake
+        ws.next_layer().handshake(ssl::stream_base::client);
+
+        // WebSocket handshake
+        ws.handshake(host, path);
+
+        // Optimize for low latency
+        beast::websocket::stream_base::timeout opt{
+            std::chrono::seconds(30),  // handshake timeout
+            beast::websocket::stream_base::none(),  // idle timeout disabled
+            false  // keep_alive_pings disabled for speed
+        };
+        ws.set_option(opt);
+
+        // Disable compression for speed
+        websocket::permessage_deflate pmd;
+        pmd.client_enable = false;
+        ws.set_option(pmd);
+    }
+
+    void send(const std::string& message) {
+        ws.write(net::buffer(message));
+    }
+
+    std::string receive() {
+        beast::flat_buffer buffer;
+        ws.read(buffer);
+        return beast::buffers_to_string(buffer.data());
+    }
+
+    void close() {
+        ws.close(websocket::close_code::normal);
+    }
+};
+
+
+WEBSOCKET++ (ALTERNATIVE)
+=========================
+
+Installation via vcpkg:
+----------------------
+vcpkg install websocketpp:x64-linux-hft
+
+Installation from Source:
+-------------------------
+cd /tmp
+git clone https://github.com/zaphoyd/websocketpp.git
+cd websocketpp
+mkdir build && cd build
+
+cmake .. \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=/usr/local \
+    -GNinja
+
+ninja
+sudo ninja install
+
+CMake Integration:
+-----------------
+find_package(websocketpp REQUIRED)
+target_include_directories(your_target PRIVATE ${WEBSOCKETPP_INCLUDE_DIR})
+target_link_libraries(your_target pthread boost_system ssl crypto)
+
+WebSocket++ Client Example:
+---------------------------
+#include <websocketpp/config/asio_client.hpp>
+#include <websocketpp/client.hpp>
+#include <iostream>
+
+typedef websocketpp::client<websocketpp::config::asio_tls_client> client;
+
+class ExchangeWebSocket {
+private:
+    client c;
+    websocketpp::connection_hdl hdl;
+
+    void on_open(websocketpp::connection_hdl hdl) {
+        std::cout << "Connected" << std::endl;
+    }
+
+    void on_message(websocketpp::connection_hdl hdl, client::message_ptr msg) {
+        // Process market data
+        std::cout << "Received: " << msg->get_payload() << std::endl;
+    }
+
+public:
+    ExchangeWebSocket() {
+        c.init_asio();
+        c.set_open_handler(bind(&ExchangeWebSocket::on_open, this, ::_1));
+        c.set_message_handler(bind(&ExchangeWebSocket::on_message, this, ::_1, ::_2));
+
+        // Performance settings
+        c.set_tcp_pre_init_handler([](websocketpp::connection_hdl) {
+            // TCP optimizations will be applied here
+        });
+    }
+
+    void connect(const std::string& uri) {
+        websocketpp::lib::error_code ec;
+        client::connection_ptr con = c.get_connection(uri, ec);
+
+        if (ec) {
+            throw std::runtime_error(ec.message());
+        }
+
+        // Optimize TCP settings
+        con->set_tcp_no_delay(true);
+
+        hdl = con->get_handle();
+        c.connect(con);
+    }
+
+    void run() {
+        c.run();
+    }
+
+    void send(const std::string& message) {
+        c.send(hdl, message, websocketpp::frame::opcode::text);
+    }
+};
+
+
+ZEROMQ (MESSAGE QUEUING)
+========================
+
+Installation via Package Manager:
+---------------------------------
+# Ubuntu/Debian
+sudo apt install -y libzmq3-dev libzmq5
+
+# RHEL/CentOS
+sudo dnf install -y zeromq-devel
+
+Installation from Source:
+-------------------------
+cd /tmp
+wget https://github.com/zeromq/libzmq/releases/download/v4.3.5/zeromq-4.3.5.tar.gz
+tar -xzf zeromq-4.3.5.tar.gz
+cd zeromq-4.3.5
+
+./configure \
+    --prefix=/usr/local \
+    --enable-static \
+    --disable-shared \
+    CFLAGS="-O3 -march=native" \
+    CXXFLAGS="-O3 -march=native"
+
+make -j $(nproc)
+sudo make install
+
+# Install C++ binding (cppzmq)
+cd /tmp
+git clone https://github.com/zeromq/cppzmq.git
+cd cppzmq
+mkdir build && cd build
+
+cmake .. \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=/usr/local \
+    -GNinja
+
+ninja
+sudo ninja install
+
+CMake Integration:
+-----------------
+find_package(cppzmq REQUIRED)
+target_link_libraries(your_target cppzmq)
+
+ZeroMQ HFT Example (Publish-Subscribe):
+---------------------------------------
+#include <zmq.hpp>
+#include <string>
+#include <iostream>
+
+// Publisher (market data feed)
+class MarketDataPublisher {
+private:
+    zmq::context_t ctx{1};
+    zmq::socket_t socket{ctx, zmq::socket_type::pub};
+
+public:
+    MarketDataPublisher(const std::string& endpoint) {
+        // Bind to endpoint
+        socket.bind(endpoint);
+
+        // Performance settings
+        int hwm = 1000;
+        socket.set(zmq::sockopt::sndhwm, hwm);
+
+        int linger = 0;
+        socket.set(zmq::sockopt::linger, linger);
+    }
+
+    void publish_tick(const std::string& symbol, double price) {
+        std::string message = symbol + " " + std::to_string(price);
+        zmq::message_t msg(message.data(), message.size());
+        socket.send(msg, zmq::send_flags::dontwait);
+    }
+};
+
+// Subscriber (trading strategy)
+class MarketDataSubscriber {
+private:
+    zmq::context_t ctx{1};
+    zmq::socket_t socket{ctx, zmq::socket_type::sub};
+
+public:
+    MarketDataSubscriber(const std::string& endpoint, const std::string& symbol) {
+        socket.connect(endpoint);
+        socket.set(zmq::sockopt::subscribe, symbol);
+
+        // Performance settings
+        int hwm = 1000;
+        socket.set(zmq::sockopt::rcvhwm, hwm);
+    }
+
+    std::pair<std::string, double> receive_tick() {
+        zmq::message_t msg;
+        auto result = socket.recv(msg, zmq::recv_flags::none);
+
+        std::string data(static_cast<char*>(msg.data()), msg.size());
+        size_t pos = data.find(' ');
+        std::string symbol = data.substr(0, pos);
+        double price = std::stod(data.substr(pos + 1));
+
+        return {symbol, price};
+    }
+};
+
+
+NANOMSG/NNG (SCALABILITY PROTOCOLS)
+===================================
+
+Installation (nng - next generation):
+-------------------------------------
+cd /tmp
+git clone https://github.com/nanomsg/nng.git
+cd nng
+mkdir build && cd build
+
+cmake .. \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=/usr/local \
+    -DBUILD_SHARED_LIBS=OFF \
+    -DNNG_ENABLE_TLS=ON \
+    -GNinja
+
+ninja
+sudo ninja install
+
+CMake Integration:
+-----------------
+find_package(nng REQUIRED)
+target_link_libraries(your_target nng::nng)
+
+NNG Example (Request-Reply):
+----------------------------
+#include <nng/nng.h>
+#include <nng/protocol/reqrep0/req.h>
+#include <nng/protocol/reqrep0/rep.h>
+#include <string>
+
+class OrderService {
+private:
+    nng_socket sock;
+
+public:
+    OrderService(const std::string& url) {
+        nng_rep0_open(&sock);
+        nng_listen(sock, url.c_str(), NULL, 0);
+
+        // Set timeout
+        nng_duration timeout = 1000;  // 1 second
+        nng_socket_set_ms(sock, NNG_OPT_RECVTIMEO, timeout);
+    }
+
+    void process_orders() {
+        while(true) {
+            char* buf = nullptr;
+            size_t sz;
+
+            int rv = nng_recv(sock, &buf, &sz, NNG_FLAG_ALLOC);
+            if (rv == 0) {
+                // Process order
+                std::string order(buf, sz);
+                nng_free(buf, sz);
+
+                // Send response
+                std::string response = "Order processed";
+                nng_send(sock, (void*)response.data(), response.size(), 0);
+            }
+        }
+    }
+
+    ~OrderService() {
+        nng_close(sock);
+    }
+};
+
+
+ASIO STANDALONE (BOOST-FREE ASYNC I/O)
+=======================================
+
+Installation:
+------------
+cd /tmp
+git clone https://github.com/chriskohlhoff/asio.git
+cd asio/asio
+./autogen.sh
+./configure --prefix=/usr/local --with-boost=no
+make -j $(nproc)
+sudo make install
+
+CMake Integration:
+-----------------
+find_package(asio REQUIRED)
+target_compile_definitions(your_target PRIVATE ASIO_STANDALONE)
+target_include_directories(your_target PRIVATE ${ASIO_INCLUDE_DIR})
+
+ASIO TCP Client Example:
+------------------------
+#define ASIO_STANDALONE
+#include <asio.hpp>
+#include <iostream>
+
+class AsyncTCPClient {
+private:
+    asio::io_context io_context;
+    asio::ip::tcp::socket socket{io_context};
+    asio::ip::tcp::resolver resolver{io_context};
+
+public:
+    void connect(const std::string& host, const std::string& port) {
+        auto endpoints = resolver.resolve(host, port);
+        asio::connect(socket, endpoints);
+
+        // Set TCP_NODELAY for low latency
+        asio::ip::tcp::no_delay option(true);
+        socket.set_option(option);
+    }
+
+    void async_read(std::function<void(const std::string&)> callback) {
+        auto buffer = std::make_shared<asio::streambuf>();
+        asio::async_read_until(socket, *buffer, '\n',
+            [this, buffer, callback](const std::error_code& ec, std::size_t bytes) {
+                if (!ec) {
+                    std::istream is(buffer.get());
+                    std::string line;
+                    std::getline(is, line);
+                    callback(line);
+                }
+            });
+    }
+
+    void run() {
+        io_context.run();
+    }
+};
+
+
+PERFORMANCE OPTIMIZATION
+========================
+
+TCP Socket Tuning:
+-----------------
+# System-wide TCP optimizations for HFT
+
+# Create optimization script
+cat > /tmp/tcp_tuning.sh << 'EOF'
+#!/bin/bash
+
+# Increase TCP buffer sizes
+sudo sysctl -w net.core.rmem_max=134217728
+sudo sysctl -w net.core.wmem_max=134217728
+sudo sysctl -w net.ipv4.tcp_rmem="4096 87380 67108864"
+sudo sysctl -w net.ipv4.tcp_wmem="4096 65536 67108864"
+
+# Enable TCP fast open
+sudo sysctl -w net.ipv4.tcp_fastopen=3
+
+# Disable slow start after idle
+sudo sysctl -w net.ipv4.tcp_slow_start_after_idle=0
+
+# Increase connection backlog
+sudo sysctl -w net.core.somaxconn=4096
+sudo sysctl -w net.ipv4.tcp_max_syn_backlog=8192
+
+# Reduce TIME_WAIT sockets
+sudo sysctl -w net.ipv4.tcp_fin_timeout=10
+sudo sysctl -w net.ipv4.tcp_tw_reuse=1
+
+# Make permanent
+sudo tee -a /etc/sysctl.conf << 'SYSCTL'
+net.core.rmem_max=134217728
+net.core.wmem_max=134217728
+net.ipv4.tcp_rmem=4096 87380 67108864
+net.ipv4.tcp_wmem=4096 65536 67108864
+net.ipv4.tcp_fastopen=3
+net.ipv4.tcp_slow_start_after_idle=0
+net.core.somaxconn=4096
+net.ipv4.tcp_max_syn_backlog=8192
+net.ipv4.tcp_fin_timeout=10
+net.ipv4.tcp_tw_reuse=1
+SYSCTL
+
+EOF
+
+chmod +x /tmp/tcp_tuning.sh
+sudo /tmp/tcp_tuning.sh
+
+
+TESTING AND BENCHMARKING
+=========================
+
+Network Latency Test:
+--------------------
+# Install iperf3 for throughput testing
+sudo apt install -y iperf3
+
+# Server
+iperf3 -s
+
+# Client
+iperf3 -c <server_ip> -t 60 -P 10
+
+WebSocket Latency Test:
+-----------------------
+cat > /tmp/ws_latency_test.cpp << 'EOF'
+#include <boost/beast/core.hpp>
+#include <boost/beast/websocket.hpp>
+#include <boost/asio/connect.hpp>
+#include <chrono>
+#include <iostream>
+
+namespace beast = boost::beast;
+namespace websocket = beast::websocket;
+namespace net = boost::asio;
+using tcp = boost::asio::ip::tcp;
+
+int main() {
+    net::io_context ioc;
+    tcp::resolver resolver{ioc};
+    websocket::stream<tcp::socket> ws{ioc};
+
+    // Connect
+    auto results = resolver.resolve("echo.websocket.org", "80");
+    net::connect(ws.next_layer(), results);
+    ws.handshake("echo.websocket.org", "/");
+
+    // Benchmark
+    const int iterations = 1000;
+    auto start = std::chrono::high_resolution_clock::now();
+
+    for(int i = 0; i < iterations; ++i) {
+        ws.write(net::buffer("test"));
+        beast::flat_buffer buffer;
+        ws.read(buffer);
+    }
+
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+
+    std::cout << "Average latency: " << duration.count() / iterations << " µs\n";
+
+    ws.close(websocket::close_code::normal);
+    return 0;
+}
+EOF
+
+
+VERIFICATION
+============
+
+Test All Libraries:
+------------------
+# libcurl
+curl --version
+
+# Boost.Beast (test by including header)
+echo '#include <boost/beast.hpp>' | g++ -std=c++23 -x c++ - -c
+
+# WebSocket++
+echo '#include <websocketpp/client.hpp>' | g++ -std=c++23 -x c++ - -c
+
+# ZeroMQ
+pkg-config --libs libzmq
+
+# Test compilation
+g++ -std=c++23 /tmp/ws_latency_test.cpp -lboost_system -pthread -o /tmp/ws_test
+
+================================================================================
+Next: 05_monitoring_stack.txt
+================================================================================

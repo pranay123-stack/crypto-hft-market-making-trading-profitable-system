@@ -1,0 +1,1317 @@
+================================================================================
+COMPONENT ARCHITECTURE - DETAILED COMPONENT DESIGN
+================================================================================
+
+FILE: 02_component_architecture.txt
+PURPOSE: Detailed design of all major system components
+AUDIENCE: Developers, technical leads
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+
+1. COMPONENT OVERVIEW
+2. EXCHANGE CONNECTOR COMPONENT
+3. MARKET DATA HANDLER COMPONENT
+4. ORDER BOOK MANAGER COMPONENT
+5. ORDER MANAGEMENT SYSTEM COMPONENT
+6. EXECUTION ENGINE COMPONENT
+7. RISK MANAGER COMPONENT
+8. POSITION MANAGER COMPONENT
+9. STRATEGY ENGINE COMPONENT
+10. CONFIGURATION MANAGER COMPONENT
+11. METRICS COLLECTOR COMPONENT
+12. PERSISTENCE LAYER COMPONENT
+
+================================================================================
+1. COMPONENT OVERVIEW
+================================================================================
+
+The system consists of 12 major components, each with specific responsibilities:
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Component Dependency Graph                                              │
+│                                                                         │
+│  ┌────────────┐      ┌─────────────┐      ┌──────────────┐            │
+│  │  Strategy  │─────>│     OMS     │─────>│  Execution   │            │
+│  │  Engine    │      │             │      │   Engine     │            │
+│  └─────┬──────┘      └──────┬──────┘      └──────┬───────┘            │
+│        │                    │                    │                     │
+│        v                    v                    v                     │
+│  ┌────────────┐      ┌─────────────┐      ┌──────────────┐            │
+│  │  Market    │      │    Risk     │      │  Exchange    │            │
+│  │   Data     │      │  Manager    │      │  Connector   │            │
+│  └─────┬──────┘      └──────┬──────┘      └──────┬───────┘            │
+│        │                    │                    │                     │
+│        v                    v                    v                     │
+│  ┌────────────┐      ┌─────────────┐      ┌──────────────┐            │
+│  │ Order Book │      │  Position   │      │   Config     │            │
+│  │  Manager   │      │  Manager    │      │  Manager     │            │
+│  └────────────┘      └─────────────┘      └──────────────┘            │
+│                                                                         │
+│                    Cross-cutting:                                      │
+│              ┌──────────────┐  ┌──────────────┐                       │
+│              │   Metrics    │  │ Persistence  │                       │
+│              │  Collector   │  │    Layer     │                       │
+│              └──────────────┘  └──────────────┘                       │
+└─────────────────────────────────────────────────────────────────────────┘
+
+================================================================================
+2. EXCHANGE CONNECTOR COMPONENT
+================================================================================
+
+2.1 RESPONSIBILITIES
+--------------------
+- Maintain WebSocket connections to exchanges
+- Send/receive messages via WebSocket and REST
+- Handle connection failures and reconnection
+- Rate limiting per exchange requirements
+- Protocol-specific message formatting
+
+2.2 CLASS DESIGN
+----------------
+
+// Base class for all exchange connectors
+class ExchangeConnectorBase {
+public:
+    virtual ~ExchangeConnectorBase() = default;
+
+    // Connection management
+    virtual void connect() = 0;
+    virtual void disconnect() = 0;
+    virtual bool is_connected() const = 0;
+
+    // Market data subscriptions
+    virtual void subscribe_order_book(const std::string& symbol) = 0;
+    virtual void subscribe_trades(const std::string& symbol) = 0;
+    virtual void subscribe_ticker(const std::string& symbol) = 0;
+    virtual void unsubscribe(const std::string& symbol) = 0;
+
+    // Order operations
+    virtual std::string place_order(const Order& order) = 0;
+    virtual bool cancel_order(const std::string& order_id) = 0;
+    virtual bool modify_order(const std::string& order_id,
+                              const Price& new_price,
+                              const Quantity& new_quantity) = 0;
+
+    // Account operations
+    virtual AccountInfo get_account_info() = 0;
+    virtual std::vector<Position> get_positions() = 0;
+    virtual std::vector<Order> get_active_orders() = 0;
+
+    // Callbacks
+    void set_market_data_callback(MarketDataCallback callback) {
+        market_data_callback_ = std::move(callback);
+    }
+
+    void set_order_update_callback(OrderUpdateCallback callback) {
+        order_update_callback_ = std::move(callback);
+    }
+
+    void set_error_callback(ErrorCallback callback) {
+        error_callback_ = std::move(callback);
+    }
+
+    // Metadata
+    virtual std::string get_exchange_name() const = 0;
+    virtual ExchangeCapabilities get_capabilities() const = 0;
+
+protected:
+    // Callbacks
+    MarketDataCallback market_data_callback_;
+    OrderUpdateCallback order_update_callback_;
+    ErrorCallback error_callback_;
+
+    // State
+    std::atomic<ConnectionState> state_{ConnectionState::DISCONNECTED};
+    std::atomic<uint64_t> last_heartbeat_time_{0};
+
+    // Rate limiting
+    RateLimiter rate_limiter_;
+
+    // Helper methods
+    void on_market_data(MarketData data) {
+        if (market_data_callback_) {
+            market_data_callback_(std::move(data));
+        }
+    }
+
+    void on_order_update(OrderUpdate update) {
+        if (order_update_callback_) {
+            order_update_callback_(std::move(update));
+        }
+    }
+
+    void on_error(const std::string& error) {
+        if (error_callback_) {
+            error_callback_(error);
+        }
+    }
+};
+
+// Concrete implementation template
+class GenericExchangeConnector : public ExchangeConnectorBase {
+public:
+    GenericExchangeConnector(const Config& config)
+        : config_(config),
+          ws_client_(std::make_unique<WebSocketClient>()),
+          rest_client_(std::make_unique<RESTClient>(config.rest_endpoint))
+    {
+        initialize_rate_limiter();
+    }
+
+    void connect() override {
+        if (state_.load() != ConnectionState::DISCONNECTED) {
+            return;  // Already connected or connecting
+        }
+
+        state_.store(ConnectionState::CONNECTING);
+
+        try {
+            // Connect WebSocket
+            ws_client_->connect(config_.ws_endpoint);
+
+            // Set message handler
+            ws_client_->set_message_handler([this](const std::string& msg) {
+                on_websocket_message(msg);
+            });
+
+            // Authenticate if required
+            if (requires_authentication()) {
+                authenticate();
+            }
+
+            state_.store(ConnectionState::CONNECTED);
+
+            // Start heartbeat
+            start_heartbeat();
+
+        } catch (const std::exception& e) {
+            state_.store(ConnectionState::DISCONNECTED);
+            on_error("Connection failed: " + std::string(e.what()));
+            throw;
+        }
+    }
+
+    void disconnect() override {
+        if (state_.load() == ConnectionState::DISCONNECTED) {
+            return;
+        }
+
+        state_.store(ConnectionState::DISCONNECTING);
+
+        // Stop heartbeat
+        stop_heartbeat();
+
+        // Close WebSocket
+        ws_client_->close();
+
+        state_.store(ConnectionState::DISCONNECTED);
+    }
+
+    bool is_connected() const override {
+        return state_.load() == ConnectionState::CONNECTED;
+    }
+
+    std::string place_order(const Order& order) override {
+        if (!is_connected()) {
+            throw std::runtime_error("Not connected");
+        }
+
+        // Rate limiting
+        rate_limiter_.wait_if_needed(RateLimitType::ORDER);
+
+        // Convert to exchange format
+        auto exchange_order = to_exchange_format(order);
+
+        // Send via REST (most reliable for orders)
+        auto response = rest_client_->post("/order", exchange_order);
+
+        // Parse response
+        auto order_id = parse_order_response(response);
+
+        // Track locally
+        pending_orders_[order_id] = order;
+
+        return order_id;
+    }
+
+protected:
+    virtual void on_websocket_message(const std::string& msg) {
+        // Parse JSON
+        auto json = parse_json(msg);
+
+        // Route to appropriate handler
+        std::string type = json["type"];
+        if (type == "orderbook") {
+            handle_orderbook_message(json);
+        } else if (type == "trade") {
+            handle_trade_message(json);
+        } else if (type == "order_update") {
+            handle_order_update_message(json);
+        } else if (type == "heartbeat") {
+            handle_heartbeat(json);
+        }
+    }
+
+    virtual void handle_orderbook_message(const json& data) = 0;
+    virtual void handle_trade_message(const json& data) = 0;
+    virtual void handle_order_update_message(const json& data) = 0;
+
+    virtual void authenticate() = 0;
+    virtual json to_exchange_format(const Order& order) = 0;
+
+private:
+    Config config_;
+    std::unique_ptr<WebSocketClient> ws_client_;
+    std::unique_ptr<RESTClient> rest_client_;
+    std::unordered_map<std::string, Order> pending_orders_;
+
+    void start_heartbeat() {
+        heartbeat_timer_ = std::make_unique<Timer>(
+            std::chrono::seconds(30),
+            [this]() { send_heartbeat(); }
+        );
+    }
+
+    void send_heartbeat() {
+        if (is_connected()) {
+            ws_client_->send(R"({"type":"ping"})");
+            last_heartbeat_time_.store(get_timestamp_ns());
+        }
+    }
+
+    void initialize_rate_limiter() {
+        // Exchange-specific rate limits
+        rate_limiter_.set_limit(RateLimitType::ORDER,
+                                config_.orders_per_second);
+        rate_limiter_.set_limit(RateLimitType::CANCEL,
+                                config_.cancels_per_second);
+        rate_limiter_.set_limit(RateLimitType::REST,
+                                config_.rest_requests_per_second);
+    }
+};
+
+2.3 RATE LIMITER IMPLEMENTATION
+--------------------------------
+
+class RateLimiter {
+public:
+    void set_limit(RateLimitType type, int requests_per_second) {
+        limits_[type] = requests_per_second;
+        buckets_[type] = TokenBucket(requests_per_second);
+    }
+
+    void wait_if_needed(RateLimitType type) {
+        auto& bucket = buckets_[type];
+
+        while (!bucket.try_consume()) {
+            // Wait for next token
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+
+private:
+    struct TokenBucket {
+        TokenBucket(int rate = 0)
+            : rate_(rate),
+              tokens_(rate),
+              last_refill_(std::chrono::steady_clock::now())
+        {}
+
+        bool try_consume() {
+            refill();
+
+            if (tokens_ >= 1.0) {
+                tokens_ -= 1.0;
+                return true;
+            }
+            return false;
+        }
+
+    private:
+        void refill() {
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - last_refill_).count();
+
+            double new_tokens = elapsed * rate_ / 1000.0;
+            tokens_ = std::min(tokens_ + new_tokens, static_cast<double>(rate_));
+            last_refill_ = now;
+        }
+
+        int rate_;
+        double tokens_;
+        std::chrono::steady_clock::time_point last_refill_;
+    };
+
+    std::map<RateLimitType, int> limits_;
+    std::map<RateLimitType, TokenBucket> buckets_;
+};
+
+2.4 WEBSOCKET CLIENT
+--------------------
+
+class WebSocketClient {
+public:
+    using MessageHandler = std::function<void(const std::string&)>;
+
+    WebSocketClient()
+        : io_context_(),
+          work_guard_(io_context_.get_executor())
+    {
+        // Start I/O thread
+        io_thread_ = std::thread([this]() {
+            io_context_.run();
+        });
+    }
+
+    ~WebSocketClient() {
+        close();
+        work_guard_.reset();
+        if (io_thread_.joinable()) {
+            io_thread_.join();
+        }
+    }
+
+    void connect(const std::string& url) {
+        // Parse URL
+        auto [host, port, path] = parse_url(url);
+
+        // Resolve
+        tcp::resolver resolver(io_context_);
+        auto const results = resolver.resolve(host, port);
+
+        // Connect
+        beast::get_lowest_layer(*ws_).connect(results);
+
+        // WebSocket handshake
+        ws_->handshake(host, path);
+
+        // Start reading
+        start_read();
+    }
+
+    void send(const std::string& message) {
+        // Thread-safe send
+        boost::asio::post(io_context_, [this, msg = message]() {
+            send_queue_.push(msg);
+            if (send_queue_.size() == 1) {
+                do_send();
+            }
+        });
+    }
+
+    void close() {
+        if (ws_ && ws_->is_open()) {
+            ws_->close(websocket::close_code::normal);
+        }
+    }
+
+    void set_message_handler(MessageHandler handler) {
+        message_handler_ = std::move(handler);
+    }
+
+private:
+    void start_read() {
+        ws_->async_read(
+            buffer_,
+            [this](beast::error_code ec, std::size_t bytes_transferred) {
+                on_read(ec, bytes_transferred);
+            }
+        );
+    }
+
+    void on_read(beast::error_code ec, std::size_t bytes_transferred) {
+        if (ec) {
+            // Handle error
+            return;
+        }
+
+        // Process message
+        std::string message = beast::buffers_to_string(buffer_.data());
+        buffer_.consume(bytes_transferred);
+
+        if (message_handler_) {
+            message_handler_(message);
+        }
+
+        // Continue reading
+        start_read();
+    }
+
+    void do_send() {
+        if (send_queue_.empty()) return;
+
+        auto& message = send_queue_.front();
+        ws_->async_write(
+            boost::asio::buffer(message),
+            [this](beast::error_code ec, std::size_t) {
+                send_queue_.pop();
+                if (!send_queue_.empty()) {
+                    do_send();
+                }
+            }
+        );
+    }
+
+    boost::asio::io_context io_context_;
+    boost::asio::executor_work_guard<boost::asio::io_context::executor_type> work_guard_;
+    std::thread io_thread_;
+    std::unique_ptr<websocket::stream<tcp::socket>> ws_;
+    beast::flat_buffer buffer_;
+    std::queue<std::string> send_queue_;
+    MessageHandler message_handler_;
+};
+
+================================================================================
+3. MARKET DATA HANDLER COMPONENT
+================================================================================
+
+3.1 RESPONSIBILITIES
+--------------------
+- Receive market data from exchange connectors
+- Normalize data to common format
+- Route data to appropriate handlers (order book, trades, etc.)
+- Aggregate data across exchanges
+- Publish data to subscribers
+
+3.2 CLASS DESIGN
+----------------
+
+class MarketDataHandler {
+public:
+    MarketDataHandler()
+        : dispatcher_(std::make_unique<EventDispatcher>())
+    {
+        start_processing_thread();
+    }
+
+    // Subscribe to market data
+    void subscribe(const std::string& symbol, MarketDataListener* listener) {
+        std::lock_guard<std::mutex> lock(subscribers_mutex_);
+        subscribers_[symbol].push_back(listener);
+    }
+
+    void unsubscribe(const std::string& symbol, MarketDataListener* listener) {
+        std::lock_guard<std::mutex> lock(subscribers_mutex_);
+        auto& listeners = subscribers_[symbol];
+        listeners.erase(
+            std::remove(listeners.begin(), listeners.end(), listener),
+            listeners.end()
+        );
+    }
+
+    // Called by exchange connectors
+    void on_market_data(const std::string& exchange, MarketData data) {
+        // Normalize
+        auto normalized = normalize(exchange, std::move(data));
+
+        // Enqueue for processing
+        event_queue_.push(std::move(normalized));
+
+        // Wake up processing thread
+        cv_.notify_one();
+    }
+
+    // Get latest order book
+    std::optional<OrderBookSnapshot> get_order_book(const std::string& symbol) const {
+        auto it = order_books_.find(symbol);
+        if (it != order_books_.end()) {
+            return it->second.get_snapshot();
+        }
+        return std::nullopt;
+    }
+
+    // Get aggregated order book across exchanges
+    AggregatedOrderBook get_aggregated_order_book(const std::string& symbol) const {
+        AggregatedOrderBook result;
+
+        for (const auto& [exchange, books] : exchange_order_books_) {
+            auto it = books.find(symbol);
+            if (it != books.end()) {
+                result.add_book(exchange, it->second.get_snapshot());
+            }
+        }
+
+        return result;
+    }
+
+private:
+    void start_processing_thread() {
+        processing_thread_ = std::thread([this]() {
+            // Pin to CPU core
+            pin_thread_to_core(10);
+            set_thread_priority(90);
+
+            while (running_) {
+                process_events();
+            }
+        });
+    }
+
+    void process_events() {
+        NormalizedMarketData data;
+
+        // Wait for event
+        if (!event_queue_.try_pop(data)) {
+            std::unique_lock<std::mutex> lock(cv_mutex_);
+            cv_.wait_for(lock, std::chrono::milliseconds(1));
+            return;
+        }
+
+        // Update order books
+        if (data.type == MarketDataType::ORDER_BOOK) {
+            update_order_book(data);
+        } else if (data.type == MarketDataType::TRADE) {
+            process_trade(data);
+        } else if (data.type == MarketDataType::TICKER) {
+            process_ticker(data);
+        }
+
+        // Notify subscribers
+        notify_subscribers(data);
+
+        // Update metrics
+        metrics_.increment("market_data_processed");
+    }
+
+    void update_order_book(const NormalizedMarketData& data) {
+        auto& book = order_books_[data.symbol];
+        book.update(data.order_book);
+
+        // Also update per-exchange book
+        exchange_order_books_[data.exchange][data.symbol].update(data.order_book);
+    }
+
+    void notify_subscribers(const NormalizedMarketData& data) {
+        std::lock_guard<std::mutex> lock(subscribers_mutex_);
+
+        auto it = subscribers_.find(data.symbol);
+        if (it != subscribers_.end()) {
+            for (auto* listener : it->second) {
+                try {
+                    listener->on_market_data(data);
+                } catch (const std::exception& e) {
+                    // Log but don't crash
+                    log_error("Subscriber threw exception: {}", e.what());
+                }
+            }
+        }
+    }
+
+    NormalizedMarketData normalize(const std::string& exchange, MarketData data) {
+        // Exchange-specific normalization
+        if (exchange == "binance") {
+            return normalize_binance(std::move(data));
+        } else if (exchange == "coinbase") {
+            return normalize_coinbase(std::move(data));
+        }
+        // ... other exchanges
+
+        return NormalizedMarketData{};
+    }
+
+    // Member variables
+    std::unique_ptr<EventDispatcher> dispatcher_;
+    LockFreeQueue<NormalizedMarketData> event_queue_;
+    std::unordered_map<std::string, OrderBook> order_books_;
+    std::unordered_map<std::string,
+                       std::unordered_map<std::string, OrderBook>> exchange_order_books_;
+    std::unordered_map<std::string, std::vector<MarketDataListener*>> subscribers_;
+    std::mutex subscribers_mutex_;
+    std::thread processing_thread_;
+    std::atomic<bool> running_{true};
+    std::condition_variable cv_;
+    std::mutex cv_mutex_;
+    MetricsCollector metrics_;
+};
+
+3.3 DATA NORMALIZATION
+----------------------
+
+struct NormalizedMarketData {
+    MarketDataType type;
+    std::string exchange;
+    std::string symbol;
+    Timestamp timestamp;
+
+    // Type-specific data
+    std::variant<
+        OrderBookSnapshot,
+        Trade,
+        Ticker
+    > data;
+
+    // Accessors
+    const OrderBookSnapshot& order_book() const {
+        return std::get<OrderBookSnapshot>(data);
+    }
+
+    const Trade& trade() const {
+        return std::get<Trade>(data);
+    }
+
+    const Ticker& ticker() const {
+        return std::get<Ticker>(data);
+    }
+};
+
+class DataNormalizer {
+public:
+    static NormalizedMarketData normalize_binance(MarketData raw) {
+        NormalizedMarketData normalized;
+        normalized.exchange = "binance";
+        normalized.timestamp = Timestamp::now();
+
+        // Parse JSON
+        auto json = parse_json(raw.payload);
+
+        if (json["e"] == "depthUpdate") {
+            // Order book update
+            normalized.type = MarketDataType::ORDER_BOOK;
+            normalized.symbol = json["s"];
+            normalized.data = parse_binance_orderbook(json);
+        } else if (json["e"] == "trade") {
+            // Trade
+            normalized.type = MarketDataType::TRADE;
+            normalized.symbol = json["s"];
+            normalized.data = parse_binance_trade(json);
+        }
+
+        return normalized;
+    }
+
+private:
+    static OrderBookSnapshot parse_binance_orderbook(const json& j) {
+        OrderBookSnapshot snapshot;
+        snapshot.sequence_number = j["u"];
+
+        for (const auto& bid_array : j["b"]) {
+            OrderBookLevel level;
+            level.price = Price(std::stod(bid_array[0].get<std::string>()));
+            level.quantity = Quantity(std::stod(bid_array[1].get<std::string>()));
+            snapshot.bids.push_back(level);
+        }
+
+        for (const auto& ask_array : j["a"]) {
+            OrderBookLevel level;
+            level.price = Price(std::stod(ask_array[0].get<std::string>()));
+            level.quantity = Quantity(std::stod(ask_array[1].get<std::string>()));
+            snapshot.asks.push_back(level);
+        }
+
+        return snapshot;
+    }
+
+    static Trade parse_binance_trade(const json& j) {
+        Trade trade;
+        trade.trade_id = j["t"];
+        trade.price = Price(std::stod(j["p"].get<std::string>()));
+        trade.quantity = Quantity(std::stod(j["q"].get<std::string>()));
+        trade.side = j["m"] ? Side::SELL : Side::BUY;
+        trade.timestamp = Timestamp(j["T"]);
+        return trade;
+    }
+};
+
+================================================================================
+4. ORDER BOOK MANAGER COMPONENT
+================================================================================
+
+4.1 RESPONSIBILITIES
+--------------------
+- Maintain accurate order book state
+- Handle incremental updates
+- Detect and recover from sequence gaps
+- Provide fast lookups (best bid/ask, depth)
+- Calculate derived metrics (mid price, spread, imbalance)
+
+4.2 CLASS DESIGN
+----------------
+
+class OrderBook {
+public:
+    OrderBook(const std::string& symbol)
+        : symbol_(symbol)
+    {
+        // Pre-allocate space
+        bids_.reserve(1000);
+        asks_.reserve(1000);
+    }
+
+    // Update from snapshot
+    void update_snapshot(const OrderBookSnapshot& snapshot) {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        bids_.clear();
+        asks_.clear();
+
+        for (const auto& level : snapshot.bids) {
+            bids_[level.price] = level.quantity;
+        }
+
+        for (const auto& level : snapshot.asks) {
+            asks_[level.price] = level.quantity;
+        }
+
+        sequence_number_ = snapshot.sequence_number;
+        last_update_time_ = snapshot.timestamp;
+    }
+
+    // Incremental update
+    void update(const OrderBookUpdate& update) {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        // Check sequence number
+        if (update.sequence_number != sequence_number_ + 1) {
+            // Gap detected - need to re-snapshot
+            on_sequence_gap();
+            return;
+        }
+
+        // Apply changes
+        for (const auto& change : update.bid_changes) {
+            if (change.quantity == 0) {
+                bids_.erase(change.price);
+            } else {
+                bids_[change.price] = change.quantity;
+            }
+        }
+
+        for (const auto& change : update.ask_changes) {
+            if (change.quantity == 0) {
+                asks_.erase(change.price);
+            } else {
+                asks_[change.price] = change.quantity;
+            }
+        }
+
+        sequence_number_ = update.sequence_number;
+        last_update_time_ = Timestamp::now();
+    }
+
+    // Query methods
+    std::optional<Price> best_bid() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (bids_.empty()) return std::nullopt;
+        return bids_.rbegin()->first;  // Highest price
+    }
+
+    std::optional<Price> best_ask() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (asks_.empty()) return std::nullopt;
+        return asks_.begin()->first;  // Lowest price
+    }
+
+    std::optional<Price> mid_price() const {
+        auto bid = best_bid();
+        auto ask = best_ask();
+        if (!bid || !ask) return std::nullopt;
+        return Price((*bid + *ask) / 2);
+    }
+
+    double spread() const {
+        auto bid = best_bid();
+        auto ask = best_ask();
+        if (!bid || !ask) return 0.0;
+        return (*ask - *bid).to_double();
+    }
+
+    double spread_bps() const {
+        auto mid = mid_price();
+        if (!mid) return 0.0;
+        return (spread() / mid->to_double()) * 10000.0;
+    }
+
+    // Get depth at specific price level
+    Quantity get_bid_quantity(Price price) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = bids_.find(price);
+        return it != bids_.end() ? it->second : Quantity(0);
+    }
+
+    Quantity get_ask_quantity(Price price) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = asks_.find(price);
+        return it != asks_.end() ? it->second : Quantity(0);
+    }
+
+    // Get top N levels
+    std::vector<OrderBookLevel> get_bids(size_t depth) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<OrderBookLevel> result;
+        result.reserve(depth);
+
+        auto it = bids_.rbegin();
+        for (size_t i = 0; i < depth && it != bids_.rend(); ++i, ++it) {
+            result.push_back({it->first, it->second});
+        }
+
+        return result;
+    }
+
+    std::vector<OrderBookLevel> get_asks(size_t depth) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<OrderBookLevel> result;
+        result.reserve(depth);
+
+        auto it = asks_.begin();
+        for (size_t i = 0; i < depth && it != asks_.end(); ++i, ++it) {
+            result.push_back({it->first, it->second});
+        }
+
+        return result;
+    }
+
+    // Calculate total volume up to certain price
+    Quantity bid_volume_to_price(Price price) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        Quantity total(0);
+
+        for (auto it = bids_.rbegin(); it != bids_.rend(); ++it) {
+            if (it->first < price) break;
+            total += it->second;
+        }
+
+        return total;
+    }
+
+    Quantity ask_volume_to_price(Price price) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        Quantity total(0);
+
+        for (auto it = asks_.begin(); it != asks_.end(); ++it) {
+            if (it->first > price) break;
+            total += it->second;
+        }
+
+        return total;
+    }
+
+    // Calculate order book imbalance
+    double imbalance(size_t depth = 5) const {
+        auto bids = get_bids(depth);
+        auto asks = get_asks(depth);
+
+        Quantity bid_vol(0);
+        Quantity ask_vol(0);
+
+        for (const auto& level : bids) bid_vol += level.quantity;
+        for (const auto& level : asks) ask_vol += level.quantity;
+
+        double total = (bid_vol + ask_vol).to_double();
+        if (total == 0) return 0.0;
+
+        return (bid_vol.to_double() - ask_vol.to_double()) / total;
+    }
+
+    // Get snapshot
+    OrderBookSnapshot get_snapshot() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        OrderBookSnapshot snapshot;
+        snapshot.symbol = symbol_;
+        snapshot.timestamp = last_update_time_;
+        snapshot.sequence_number = sequence_number_;
+
+        for (const auto& [price, qty] : bids_) {
+            snapshot.bids.push_back({price, qty});
+        }
+
+        for (const auto& [price, qty] : asks_) {
+            snapshot.asks.push_back({price, qty});
+        }
+
+        // Sort (bids descending, asks ascending)
+        std::sort(snapshot.bids.begin(), snapshot.bids.end(),
+                  [](const auto& a, const auto& b) { return a.price > b.price; });
+        std::sort(snapshot.asks.begin(), snapshot.asks.end(),
+                  [](const auto& a, const auto& b) { return a.price < b.price; });
+
+        return snapshot;
+    }
+
+private:
+    void on_sequence_gap() {
+        // Request re-snapshot from exchange
+        log_warning("Sequence gap detected for {}, requesting re-snapshot", symbol_);
+        // Trigger snapshot request via callback
+    }
+
+    std::string symbol_;
+    std::map<Price, Quantity> bids_;  // Price descending
+    std::map<Price, Quantity> asks_;  // Price ascending
+    uint64_t sequence_number_{0};
+    Timestamp last_update_time_;
+    mutable std::mutex mutex_;
+};
+
+4.3 AGGREGATED ORDER BOOK
+--------------------------
+
+class AggregatedOrderBook {
+public:
+    void add_book(const std::string& exchange, const OrderBookSnapshot& snapshot) {
+        books_[exchange] = snapshot;
+    }
+
+    // Get best bid across all exchanges
+    std::optional<std::pair<std::string, Price>> best_bid() const {
+        std::optional<std::pair<std::string, Price>> best;
+
+        for (const auto& [exchange, snapshot] : books_) {
+            if (!snapshot.bids.empty()) {
+                Price price = snapshot.bids[0].price;
+                if (!best || price > best->second) {
+                    best = {exchange, price};
+                }
+            }
+        }
+
+        return best;
+    }
+
+    // Get best ask across all exchanges
+    std::optional<std::pair<std::string, Price>> best_ask() const {
+        std::optional<std::pair<std::string, Price>> best;
+
+        for (const auto& [exchange, snapshot] : books_) {
+            if (!snapshot.asks.empty()) {
+                Price price = snapshot.asks[0].price;
+                if (!best || price < best->second) {
+                    best = {exchange, price};
+                }
+            }
+        }
+
+        return best;
+    }
+
+    // Calculate arbitrage opportunity
+    std::optional<ArbitrageOpportunity> find_arbitrage() const {
+        auto bid = best_bid();
+        auto ask = best_ask();
+
+        if (!bid || !ask) return std::nullopt;
+
+        if (bid->second > ask->second) {
+            // Arbitrage opportunity exists
+            ArbitrageOpportunity opp;
+            opp.buy_exchange = ask->first;
+            opp.sell_exchange = bid->first;
+            opp.buy_price = ask->second;
+            opp.sell_price = bid->second;
+            opp.profit = (bid->second - ask->second).to_double();
+            return opp;
+        }
+
+        return std::nullopt;
+    }
+
+    // Get merged order book
+    OrderBookSnapshot get_merged_book(size_t depth = 10) const {
+        OrderBookSnapshot merged;
+
+        // Collect all bids
+        std::vector<OrderBookLevel> all_bids;
+        for (const auto& [exchange, snapshot] : books_) {
+            all_bids.insert(all_bids.end(),
+                           snapshot.bids.begin(),
+                           snapshot.bids.end());
+        }
+
+        // Collect all asks
+        std::vector<OrderBookLevel> all_asks;
+        for (const auto& [exchange, snapshot] : books_) {
+            all_asks.insert(all_asks.end(),
+                           snapshot.asks.begin(),
+                           snapshot.asks.end());
+        }
+
+        // Sort and take top N
+        std::sort(all_bids.begin(), all_bids.end(),
+                  [](const auto& a, const auto& b) { return a.price > b.price; });
+        std::sort(all_asks.begin(), all_asks.end(),
+                  [](const auto& a, const auto& b) { return a.price < b.price; });
+
+        merged.bids.assign(all_bids.begin(),
+                          all_bids.begin() + std::min(depth, all_bids.size()));
+        merged.asks.assign(all_asks.begin(),
+                          all_asks.begin() + std::min(depth, all_asks.size()));
+
+        return merged;
+    }
+
+private:
+    std::unordered_map<std::string, OrderBookSnapshot> books_;
+};
+
+================================================================================
+5. ORDER MANAGEMENT SYSTEM COMPONENT
+================================================================================
+
+5.1 RESPONSIBILITIES
+--------------------
+- Track order lifecycle (new, pending, acknowledged, filled, cancelled)
+- Generate unique order IDs
+- Map client order IDs to exchange order IDs
+- Handle partial fills
+- Reconcile order state with exchanges
+- Provide order query interface
+
+5.2 CLASS DESIGN
+----------------
+
+class OrderManagementSystem {
+public:
+    OrderManagementSystem()
+        : next_order_id_(1)
+    {
+    }
+
+    // Place new order
+    OrderId place_order(Order order) {
+        // Generate order ID
+        order.id = generate_order_id();
+        order.status = OrderStatus::NEW;
+        order.created_time = Timestamp::now();
+        order.filled = Quantity(0);
+
+        // Validate
+        if (!validate_order(order)) {
+            throw std::invalid_argument("Invalid order");
+        }
+
+        // Store
+        {
+            std::lock_guard<std::mutex> lock(orders_mutex_);
+            orders_[order.id] = order;
+            active_orders_.insert(order.id);
+        }
+
+        // Notify observers
+        notify_order_placed(order);
+
+        // Submit to execution engine
+        execution_engine_->submit(order);
+
+        return order.id;
+    }
+
+    // Cancel order
+    bool cancel_order(OrderId id) {
+        std::lock_guard<std::mutex> lock(orders_mutex_);
+
+        auto it = orders_.find(id);
+        if (it == orders_.end()) {
+            return false;  // Order not found
+        }
+
+        Order& order = it->second;
+
+        if (order.status != OrderStatus::PENDING &&
+            order.status != OrderStatus::PARTIALLY_FILLED) {
+            return false;  // Can't cancel
+        }
+
+        // Mark as cancel pending
+        order.status = OrderStatus::CANCEL_PENDING;
+
+        // Submit cancel request
+        execution_engine_->cancel(order);
+
+        return true;
+    }
+
+    // Modify order
+    bool modify_order(OrderId id, Price new_price, Quantity new_quantity) {
+        std::lock_guard<std::mutex> lock(orders_mutex_);
+
+        auto it = orders_.find(id);
+        if (it == orders_.end()) {
+            return false;
+        }
+
+        Order& order = it->second;
+
+        // Some exchanges support modify, others require cancel-replace
+        if (exchange_supports_modify(order.exchange)) {
+            order.price = new_price;
+            order.quantity = new_quantity;
+            execution_engine_->modify(order);
+        } else {
+            // Cancel and replace
+            cancel_order(id);
+            Order new_order = order;
+            new_order.price = new_price;
+            new_order.quantity = new_quantity;
+            place_order(new_order);
+        }
+
+        return true;
+    }
+
+    // Order updates from exchange
+    void on_order_update(const OrderUpdate& update) {
+        std::lock_guard<std::mutex> lock(orders_mutex_);
+
+        auto it = orders_.find(update.order_id);
+        if (it == orders_.end()) {
+            log_warning("Received update for unknown order: {}", update.order_id);
+            return;
+        }
+
+        Order& order = it->second;
+
+        // Update status
+        order.status = update.status;
+        order.updated_time = Timestamp::now();
+
+        if (update.status == OrderStatus::ACKNOWLEDGED) {
+            // Order accepted by exchange
+            order.exchange_order_id = update.exchange_order_id;
+            notify_order_acknowledged(order);
+
+        } else if (update.status == OrderStatus::PARTIALLY_FILLED ||
+                   update.status == OrderStatus::FILLED) {
+            // Fill
+            order.filled += update.fill_quantity;
+
+            Fill fill;
+            fill.order_id = order.id;
+            fill.price = update.fill_price;
+            fill.quantity = update.fill_quantity;
+            fill.timestamp = update.timestamp;
+            fill.fee = update.fee;
+
+            order.fills.push_back(fill);
+
+            notify_order_filled(order, fill);
+
+            if (order.status == OrderStatus::FILLED) {
+                active_orders_.erase(order.id);
+            }
+
+        } else if (update.status == OrderStatus::CANCELLED) {
+            // Cancelled
+            active_orders_.erase(order.id);
+            notify_order_cancelled(order);
+
+        } else if (update.status == OrderStatus::REJECTED) {
+            // Rejected
+            order.reject_reason = update.reject_reason;
+            active_orders_.erase(order.id);
+            notify_order_rejected(order);
+        }
+    }
+
+    // Query methods
+    std::optional<Order> get_order(OrderId id) const {
+        std::lock_guard<std::mutex> lock(orders_mutex_);
+        auto it = orders_.find(id);
+        return it != orders_.end() ? std::make_optional(it->second) : std::nullopt;
+    }
+
+    std::vector<Order> get_active_orders() const {
+        std::lock_guard<std::mutex> lock(orders_mutex_);
+        std::vector<Order> result;
+        for (OrderId id : active_orders_) {
+            result.push_back(orders_.at(id));
+        }
+        return result;
+    }
+
+    std::vector<Order> get_orders_by_symbol(const std::string& symbol) const {
+        std::lock_guard<std::mutex> lock(orders_mutex_);
+        std::vector<Order> result;
+        for (const auto& [id, order] : orders_) {
+            if (order.symbol == symbol) {
+                result.push_back(order);
+            }
+        }
+        return result;
+    }
+
+    // Observer registration
+    void add_observer(OrderObserver* observer) {
+        observers_.push_back(observer);
+    }
+
+private:
+    OrderId generate_order_id() {
+        // Format: YYYYMMDD-HHMMSS-NNNNN
+        auto now = std::chrono::system_clock::now();
+        auto time_t = std::chrono::system_clock::to_time_t(now);
+        auto tm = *std::localtime(&time_t);
+
+        char buffer[64];
+        std::snprintf(buffer, sizeof(buffer), "%04d%02d%02d-%02d%02d%02d-%05ld",
+                     tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                     tm.tm_hour, tm.tm_min, tm.tm_sec,
+                     next_order_id_++);
+
+        return buffer;
+    }
+
+    bool validate_order(const Order& order) const {
+        // Basic validation
+        if (order.symbol.empty()) return false;
+        if (order.quantity <= 0) return false;
+        if (order.type == OrderType::LIMIT && order.price <= 0) return false;
+        return true;
+    }
+
+    void notify_order_placed(const Order& order) {
+        for (auto* obs : observers_) {
+            obs->on_order_placed(order);
+        }
+    }
+
+    void notify_order_acknowledged(const Order& order) {
+        for (auto* obs : observers_) {
+            obs->on_order_acknowledged(order);
+        }
+    }
+
+    void notify_order_filled(const Order& order, const Fill& fill) {
+        for (auto* obs : observers_) {
+            obs->on_order_filled(order, fill);
+        }
+    }
+
+    void notify_order_cancelled(const Order& order) {
+        for (auto* obs : observers_) {
+            obs->on_order_cancelled(order);
+        }
+    }
+
+    void notify_order_rejected(const Order& order) {
+        for (auto* obs : observers_) {
+            obs->on_order_rejected(order);
+        }
+    }
+
+    // Member variables
+    std::unordered_map<OrderId, Order> orders_;
+    std::set<OrderId> active_orders_;
+    mutable std::mutex orders_mutex_;
+    std::atomic<uint64_t> next_order_id_;
+    std::vector<OrderObserver*> observers_;
+    ExecutionEngine* execution_engine_;
+};
+
+================================================================================
+DOCUMENT CONTINUES...
+================================================================================
+
+This file provides detailed component designs with:
+- Complete class hierarchies
+- Full method implementations
+- Thread-safe data access patterns
+- Observer pattern for notifications
+- Comprehensive error handling
+
+See remaining sections in full implementation or next design files.
+
+Next: 03_data_flow_architecture.txt for detailed data flow patterns

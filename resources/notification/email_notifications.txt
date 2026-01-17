@@ -1,0 +1,1132 @@
+================================================================================
+                      EMAIL NOTIFICATIONS - COMPLETE GUIDE
+================================================================================
+
+VERSION: 2.1.0
+LAST UPDATED: 2025-11-25
+STATUS: PRODUCTION
+MAINTAINER: Infrastructure Team
+
+================================================================================
+                              TABLE OF CONTENTS
+================================================================================
+
+1. Email Channel Overview
+2. SMTP Configuration
+3. C++ Email Implementation
+4. HTML Email Templates
+5. Plain Text Fallback
+6. Attachment Support
+7. Email Authentication (SPF, DKIM, DMARC)
+8. Rate Limiting & Throttling
+9. Bounce Handling
+10. Email Testing & Debugging
+11. Production Deployment
+12. Monitoring & Metrics
+
+================================================================================
+                       1. EMAIL CHANNEL OVERVIEW
+================================================================================
+
+Email is the primary notification channel for:
+- Detailed incident reports
+- Daily/weekly summaries
+- Audit logs
+- Non-urgent alerts (P3, P4)
+- Backup channel for critical alerts (P1, P2)
+
+CHARACTERISTICS:
+
+Latency: 2-10 seconds
+Reliability: 99.9%
+Cost: Low (SMTP server hosting)
+Limitations:
+- Not suitable for time-critical alerts
+- Possible delivery delays
+- Spam filter issues
+- Inbox fatigue if overused
+
+SMTP PROVIDERS:
+
+Internal SMTP Server (Recommended for HFT)
+- Full control over delivery
+- No rate limits
+- Low latency
+- Requires maintenance
+
+SendGrid
+- Reliable cloud service
+- Good deliverability
+- Rate limits on free tier
+- Cost: $15-$90/month
+
+Amazon SES
+- Scalable and reliable
+- Low cost: $0.10 per 1000 emails
+- Requires AWS account
+- Good integration with AWS services
+
+Mailgun
+- Developer-friendly API
+- Good documentation
+- Cost: $35+/month
+- Excellent tracking features
+
+================================================================================
+                         2. SMTP CONFIGURATION
+================================================================================
+
+CONFIGURATION FILE: /etc/hft/channels/email.conf
+
+# SMTP Server Settings
+smtp.host = smtp.company.com
+smtp.port = 587                    # 587 for STARTTLS, 465 for SSL/TLS
+smtp.use_tls = true
+smtp.verify_certificate = true
+
+# Authentication
+smtp.username = hft-alerts@company.com
+smtp.password = ${SMTP_PASSWORD}   # Load from environment variable
+smtp.auth_method = plain           # plain, login, cram-md5
+
+# Sender Information
+email.from_address = hft-alerts@company.com
+email.from_name = HFT Trading System
+email.reply_to = devops@company.com
+
+# Email Formatting
+email.include_html = true
+email.include_plaintext = true
+email.charset = utf-8
+email.priority = normal            # low, normal, high
+
+# Rate Limiting (per recipient)
+email.max_per_minute = 10
+email.max_per_hour = 100
+email.max_per_day = 500
+
+# Retry Configuration
+email.retry_attempts = 3
+email.retry_delay_ms = 1000
+email.retry_backoff_multiplier = 2.0
+email.timeout_seconds = 30
+
+# Connection Pooling
+email.connection_pool_size = 5
+email.connection_max_idle_seconds = 300
+email.connection_keepalive = true
+
+# Advanced Settings
+email.enable_dkim = true
+email.dkim_selector = hft
+email.dkim_private_key_path = /etc/hft/dkim/private.key
+email.track_opens = false          # Disable for privacy
+email.track_clicks = false
+
+# Recipient Settings
+email.default_recipients = team@company.com
+email.cc_recipients =              # Empty by default
+email.bcc_recipients = audit@company.com  # For compliance
+
+# Template Settings
+email.template_directory = /etc/hft/email_templates/
+email.default_template = default.html
+
+ENVIRONMENT VARIABLES:
+
+export SMTP_HOST=smtp.company.com
+export SMTP_PORT=587
+export SMTP_USER=hft-alerts@company.com
+export SMTP_PASSWORD='your_secure_password_here'
+export EMAIL_FROM=hft-alerts@company.com
+
+================================================================================
+                      3. C++ EMAIL IMPLEMENTATION
+================================================================================
+
+HEADER FILE: email_channel.hpp
+
+#ifndef HFT_EMAIL_CHANNEL_HPP
+#define HFT_EMAIL_CHANNEL_HPP
+
+#include "channel_interface.hpp"
+#include <curl/curl.h>
+#include <string>
+#include <vector>
+#include <memory>
+#include <mutex>
+#include <queue>
+#include <chrono>
+
+namespace hft {
+namespace notification {
+
+struct EmailConfig {
+    std::string smtp_host;
+    uint16_t smtp_port{587};
+    bool use_tls{true};
+    bool verify_cert{true};
+
+    std::string username;
+    std::string password;
+
+    std::string from_address;
+    std::string from_name;
+    std::string reply_to;
+
+    bool include_html{true};
+    bool include_plaintext{true};
+
+    uint32_t max_per_minute{10};
+    uint32_t max_per_hour{100};
+
+    uint32_t retry_attempts{3};
+    std::chrono::milliseconds retry_delay{1000};
+    double retry_backoff{2.0};
+    std::chrono::seconds timeout{30};
+
+    size_t connection_pool_size{5};
+    std::chrono::seconds connection_max_idle{300};
+
+    bool enable_dkim{false};
+    std::string dkim_selector;
+    std::string dkim_private_key_path;
+
+    std::string template_directory;
+};
+
+struct EmailMessage {
+    std::string to;
+    std::vector<std::string> cc;
+    std::vector<std::string> bcc;
+    std::string subject;
+    std::string body_html;
+    std::string body_text;
+    std::string message_id;
+    std::map<std::string, std::string> headers;
+
+    struct Attachment {
+        std::string filename;
+        std::string content_type;
+        std::vector<uint8_t> data;
+    };
+    std::vector<Attachment> attachments;
+};
+
+class SMTPConnection {
+public:
+    SMTPConnection(const EmailConfig& config);
+    ~SMTPConnection();
+
+    bool connect();
+    void disconnect();
+    bool is_connected() const;
+
+    bool send(const EmailMessage& message);
+
+private:
+    CURL* curl_{nullptr};
+    EmailConfig config_;
+    bool connected_{false};
+    std::chrono::steady_clock::time_point last_used_;
+
+    std::string build_mime_message(const EmailMessage& msg);
+    std::string encode_base64(const std::vector<uint8_t>& data);
+    bool perform_smtp_transaction(const std::string& mime_message,
+                                   const EmailMessage& msg);
+};
+
+class SMTPConnectionPool {
+public:
+    explicit SMTPConnectionPool(const EmailConfig& config, size_t pool_size);
+    ~SMTPConnectionPool();
+
+    std::shared_ptr<SMTPConnection> acquire();
+    void release(std::shared_ptr<SMTPConnection> conn);
+
+    size_t available_count() const;
+    size_t total_count() const;
+
+private:
+    EmailConfig config_;
+    size_t pool_size_;
+    std::queue<std::shared_ptr<SMTPConnection>> available_;
+    std::vector<std::shared_ptr<SMTPConnection>> all_connections_;
+    mutable std::mutex mutex_;
+    std::condition_variable cv_;
+
+    void cleanup_idle_connections();
+};
+
+class EmailChannel : public INotificationChannel {
+public:
+    explicit EmailChannel(const EmailConfig& config);
+    ~EmailChannel() override;
+
+    // INotificationChannel interface
+    DispatchResult send(const Alert& alert,
+                       const std::vector<std::string>& recipients) override;
+
+    bool health_check() override;
+    ChannelMetrics get_metrics() const override;
+    void set_config(const ChannelConfig& config) override;
+    ChannelConfig get_config() const override;
+
+    bool start() override;
+    void stop() override;
+    bool is_running() const override;
+
+    ChannelType get_type() const override { return ChannelType::Email; }
+    std::string get_name() const override { return "Email"; }
+
+private:
+    EmailConfig config_;
+    std::unique_ptr<SMTPConnectionPool> connection_pool_;
+    std::atomic<bool> running_{false};
+
+    // Rate limiting
+    struct RateLimitBucket {
+        std::atomic<uint32_t> count{0};
+        std::chrono::steady_clock::time_point window_start;
+        std::mutex mutex;
+    };
+    std::unordered_map<std::string, RateLimitBucket> rate_limits_;
+    mutable std::shared_mutex rate_limits_mutex_;
+
+    // Metrics
+    mutable ChannelMetrics metrics_;
+
+    // Helper methods
+    EmailMessage create_email_message(const Alert& alert,
+                                     const std::string& recipient);
+    std::string render_html_body(const Alert& alert);
+    std::string render_text_body(const Alert& alert);
+    bool check_rate_limit(const std::string& recipient);
+    void update_rate_limit(const std::string& recipient);
+    std::string generate_message_id();
+    void add_standard_headers(EmailMessage& msg);
+};
+
+} // namespace notification
+} // namespace hft
+
+#endif // HFT_EMAIL_CHANNEL_HPP
+
+IMPLEMENTATION FILE: email_channel.cpp
+
+#include "email_channel.hpp"
+#include <spdlog/spdlog.h>
+#include <openssl/bio.h>
+#include <openssl/evp.h>
+#include <sstream>
+#include <iomanip>
+#include <random>
+
+namespace hft {
+namespace notification {
+
+// ============================================================================
+// SMTPConnection Implementation
+// ============================================================================
+
+SMTPConnection::SMTPConnection(const EmailConfig& config)
+    : config_(config) {
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+    curl_ = curl_easy_init();
+
+    if (!curl_) {
+        throw std::runtime_error("Failed to initialize CURL");
+    }
+}
+
+SMTPConnection::~SMTPConnection() {
+    disconnect();
+    if (curl_) {
+        curl_easy_cleanup(curl_);
+    }
+}
+
+bool SMTPConnection::connect() {
+    if (connected_) {
+        return true;
+    }
+
+    // Build SMTP URL
+    std::string url = (config_.use_tls ? "smtps://" : "smtp://") +
+                      config_.smtp_host + ":" + std::to_string(config_.smtp_port);
+
+    curl_easy_setopt(curl_, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl_, CURLOPT_USERNAME, config_.username.c_str());
+    curl_easy_setopt(curl_, CURLOPT_PASSWORD, config_.password.c_str());
+
+    if (config_.use_tls) {
+        curl_easy_setopt(curl_, CURLOPT_USE_SSL, CURLUSESSL_ALL);
+    }
+
+    if (!config_.verify_cert) {
+        curl_easy_setopt(curl_, CURLOPT_SSL_VERIFYPEER, 0L);
+        curl_easy_setopt(curl_, CURLOPT_SSL_VERIFYHOST, 0L);
+    }
+
+    curl_easy_setopt(curl_, CURLOPT_TIMEOUT, config_.timeout.count());
+
+    connected_ = true;
+    last_used_ = std::chrono::steady_clock::now();
+
+    spdlog::info("SMTP connection established to {}", config_.smtp_host);
+    return true;
+}
+
+void SMTPConnection::disconnect() {
+    if (connected_) {
+        // CURL handles disconnection automatically
+        connected_ = false;
+        spdlog::info("SMTP connection closed");
+    }
+}
+
+bool SMTPConnection::is_connected() const {
+    return connected_;
+}
+
+bool SMTPConnection::send(const EmailMessage& message) {
+    if (!is_connected() && !connect()) {
+        return false;
+    }
+
+    std::string mime_message = build_mime_message(message);
+
+    bool success = perform_smtp_transaction(mime_message, message);
+
+    last_used_ = std::chrono::steady_clock::now();
+
+    return success;
+}
+
+std::string SMTPConnection::build_mime_message(const EmailMessage& msg) {
+    std::ostringstream mime;
+
+    // Headers
+    mime << "From: " << config_.from_name << " <" << config_.from_address << ">\r\n";
+    mime << "To: <" << msg.to << ">\r\n";
+
+    if (!msg.cc.empty()) {
+        mime << "Cc: ";
+        for (size_t i = 0; i < msg.cc.size(); ++i) {
+            if (i > 0) mime << ", ";
+            mime << "<" << msg.cc[i] << ">";
+        }
+        mime << "\r\n";
+    }
+
+    mime << "Subject: " << msg.subject << "\r\n";
+    mime << "Message-ID: <" << msg.message_id << ">\r\n";
+    mime << "Date: " << get_rfc2822_date() << "\r\n";
+    mime << "MIME-Version: 1.0\r\n";
+
+    if (!config_.reply_to.empty()) {
+        mime << "Reply-To: <" << config_.reply_to << ">\r\n";
+    }
+
+    // Custom headers
+    for (const auto& [key, value] : msg.headers) {
+        mime << key << ": " << value << "\r\n";
+    }
+
+    // Multipart boundary
+    std::string boundary = "----=_Part_" + generate_random_string(16);
+
+    if (msg.attachments.empty() && config_.include_html && config_.include_plaintext) {
+        // Multipart/alternative for HTML and plain text
+        mime << "Content-Type: multipart/alternative; boundary=\"" << boundary << "\"\r\n\r\n";
+
+        // Plain text part
+        mime << "--" << boundary << "\r\n";
+        mime << "Content-Type: text/plain; charset=utf-8\r\n";
+        mime << "Content-Transfer-Encoding: quoted-printable\r\n\r\n";
+        mime << msg.body_text << "\r\n\r\n";
+
+        // HTML part
+        mime << "--" << boundary << "\r\n";
+        mime << "Content-Type: text/html; charset=utf-8\r\n";
+        mime << "Content-Transfer-Encoding: quoted-printable\r\n\r\n";
+        mime << msg.body_html << "\r\n\r\n";
+
+        mime << "--" << boundary << "--\r\n";
+
+    } else if (!msg.attachments.empty()) {
+        // Multipart/mixed for attachments
+        mime << "Content-Type: multipart/mixed; boundary=\"" << boundary << "\"\r\n\r\n";
+
+        // Body part
+        mime << "--" << boundary << "\r\n";
+        mime << "Content-Type: text/html; charset=utf-8\r\n\r\n";
+        mime << msg.body_html << "\r\n\r\n";
+
+        // Attachments
+        for (const auto& attachment : msg.attachments) {
+            mime << "--" << boundary << "\r\n";
+            mime << "Content-Type: " << attachment.content_type << "; name=\""
+                 << attachment.filename << "\"\r\n";
+            mime << "Content-Transfer-Encoding: base64\r\n";
+            mime << "Content-Disposition: attachment; filename=\""
+                 << attachment.filename << "\"\r\n\r\n";
+            mime << encode_base64(attachment.data) << "\r\n\r\n";
+        }
+
+        mime << "--" << boundary << "--\r\n";
+
+    } else {
+        // Simple message
+        mime << "Content-Type: text/html; charset=utf-8\r\n\r\n";
+        mime << msg.body_html << "\r\n";
+    }
+
+    return mime.str();
+}
+
+std::string SMTPConnection::encode_base64(const std::vector<uint8_t>& data) {
+    BIO* b64 = BIO_new(BIO_f_base64());
+    BIO* bio = BIO_new(BIO_s_mem());
+    bio = BIO_push(b64, bio);
+
+    BIO_set_flags(bio, BIO_FLAGS_BASE64_NO_NL);
+    BIO_write(bio, data.data(), data.size());
+    BIO_flush(bio);
+
+    BUF_MEM* buffer_ptr;
+    BIO_get_mem_ptr(bio, &buffer_ptr);
+
+    std::string result(buffer_ptr->data, buffer_ptr->length);
+
+    BIO_free_all(bio);
+
+    return result;
+}
+
+bool SMTPConnection::perform_smtp_transaction(const std::string& mime_message,
+                                              const EmailMessage& msg) {
+    // Set recipients
+    struct curl_slist* recipients = nullptr;
+    recipients = curl_slist_append(recipients, msg.to.c_str());
+    for (const auto& cc : msg.cc) {
+        recipients = curl_slist_append(recipients, cc.c_str());
+    }
+    for (const auto& bcc : msg.bcc) {
+        recipients = curl_slist_append(recipients, bcc.c_str());
+    }
+
+    curl_easy_setopt(curl_, CURLOPT_MAIL_FROM, config_.from_address.c_str());
+    curl_easy_setopt(curl_, CURLOPT_MAIL_RCPT, recipients);
+
+    // Set message data
+    struct UploadStatus {
+        const char* data;
+        size_t size;
+        size_t pos;
+    };
+
+    UploadStatus upload_ctx;
+    upload_ctx.data = mime_message.c_str();
+    upload_ctx.size = mime_message.size();
+    upload_ctx.pos = 0;
+
+    curl_easy_setopt(curl_, CURLOPT_READFUNCTION, [](void* ptr, size_t size,
+                     size_t nmemb, void* userp) -> size_t {
+        UploadStatus* upload = static_cast<UploadStatus*>(userp);
+        size_t room = size * nmemb;
+
+        if (room < 1 || upload->pos >= upload->size) {
+            return 0;
+        }
+
+        size_t len = std::min(room, upload->size - upload->pos);
+        memcpy(ptr, upload->data + upload->pos, len);
+        upload->pos += len;
+
+        return len;
+    });
+
+    curl_easy_setopt(curl_, CURLOPT_READDATA, &upload_ctx);
+    curl_easy_setopt(curl_, CURLOPT_UPLOAD, 1L);
+
+    // Verbose output for debugging
+    curl_easy_setopt(curl_, CURLOPT_VERBOSE, 0L);
+
+    // Perform the send
+    CURLcode res = curl_easy_perform(curl_);
+
+    curl_slist_free_all(recipients);
+
+    if (res != CURLE_OK) {
+        spdlog::error("SMTP send failed: {}", curl_easy_strerror(res));
+        return false;
+    }
+
+    long response_code;
+    curl_easy_getinfo(curl_, CURLINFO_RESPONSE_CODE, &response_code);
+
+    if (response_code >= 200 && response_code < 300) {
+        spdlog::info("Email sent successfully to {}", msg.to);
+        return true;
+    } else {
+        spdlog::error("SMTP server returned error code: {}", response_code);
+        return false;
+    }
+}
+
+// ============================================================================
+// EmailChannel Implementation
+// ============================================================================
+
+EmailChannel::EmailChannel(const EmailConfig& config)
+    : config_(config) {
+}
+
+EmailChannel::~EmailChannel() {
+    stop();
+}
+
+bool EmailChannel::start() {
+    if (running_.load(std::memory_order_acquire)) {
+        return true;
+    }
+
+    // Initialize connection pool
+    connection_pool_ = std::make_unique<SMTPConnectionPool>(
+        config_, config_.connection_pool_size);
+
+    running_.store(true, std::memory_order_release);
+
+    spdlog::info("Email channel started");
+    return true;
+}
+
+void EmailChannel::stop() {
+    if (!running_.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    running_.store(false, std::memory_order_release);
+
+    connection_pool_.reset();
+
+    spdlog::info("Email channel stopped");
+}
+
+bool EmailChannel::is_running() const {
+    return running_.load(std::memory_order_acquire);
+}
+
+DispatchResult EmailChannel::send(const Alert& alert,
+                                  const std::vector<std::string>& recipients) {
+    auto start_time = std::chrono::steady_clock::now();
+
+    DispatchResult result;
+    result.channel = ChannelType::Email;
+
+    if (!is_running()) {
+        result.success = false;
+        result.error_message = "Email channel not running";
+        return result;
+    }
+
+    // Send to each recipient
+    bool all_success = true;
+    std::string combined_errors;
+
+    for (const auto& recipient : recipients) {
+        // Check rate limit
+        if (!check_rate_limit(recipient)) {
+            spdlog::warn("Rate limit exceeded for recipient: {}", recipient);
+            all_success = false;
+            combined_errors += "Rate limit exceeded for " + recipient + "; ";
+            metrics_.rate_limited_count++;
+            continue;
+        }
+
+        // Create email message
+        EmailMessage msg = create_email_message(alert, recipient);
+
+        // Acquire connection from pool
+        auto conn = connection_pool_->acquire();
+        if (!conn) {
+            spdlog::error("Failed to acquire SMTP connection");
+            all_success = false;
+            combined_errors += "Connection pool exhausted; ";
+            continue;
+        }
+
+        // Send email
+        bool send_success = conn->send(msg);
+
+        // Release connection back to pool
+        connection_pool_->release(conn);
+
+        if (send_success) {
+            update_rate_limit(recipient);
+            metrics_.sent_count++;
+        } else {
+            all_success = false;
+            combined_errors += "Failed to send to " + recipient + "; ";
+            metrics_.failed_count++;
+        }
+    }
+
+    auto end_time = std::chrono::steady_clock::now();
+    result.latency = std::chrono::duration_cast<std::chrono::milliseconds>(
+        end_time - start_time);
+
+    result.success = all_success;
+    if (!all_success) {
+        result.error_message = combined_errors;
+    }
+
+    return result;
+}
+
+EmailMessage EmailChannel::create_email_message(const Alert& alert,
+                                               const std::string& recipient) {
+    EmailMessage msg;
+
+    msg.to = recipient;
+    msg.subject = "[" + severity_to_string(alert.severity) + "] " + alert.title;
+    msg.body_html = render_html_body(alert);
+    msg.body_text = render_text_body(alert);
+    msg.message_id = generate_message_id();
+
+    add_standard_headers(msg);
+
+    return msg;
+}
+
+std::string EmailChannel::render_html_body(const Alert& alert) {
+    std::ostringstream html;
+
+    // Determine color based on severity
+    std::string color;
+    switch (alert.severity) {
+    case AlertSeverity::P1: color = "#dc3545"; break; // Red
+    case AlertSeverity::P2: color = "#fd7e14"; break; // Orange
+    case AlertSeverity::P3: color = "#ffc107"; break; // Yellow
+    case AlertSeverity::P4: color = "#28a745"; break; // Green
+    }
+
+    html << R"(
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <style>
+        body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
+        .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+        .header { background: )" << color << R"(; color: white; padding: 20px; border-radius: 5px 5px 0 0; }
+        .content { background: #f9f9f9; padding: 20px; border: 1px solid #ddd; border-top: none; }
+        .footer { background: #f1f1f1; padding: 10px; text-align: center; font-size: 12px; border-radius: 0 0 5px 5px; }
+        .severity { font-size: 24px; font-weight: bold; }
+        .details { margin-top: 20px; }
+        .detail-row { margin: 10px 0; }
+        .label { font-weight: bold; color: #555; }
+        .value { color: #333; }
+        table { width: 100%; border-collapse: collapse; margin-top: 15px; }
+        th, td { padding: 10px; text-align: left; border-bottom: 1px solid #ddd; }
+        th { background-color: #f2f2f2; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div class="severity">)" << severity_to_string(alert.severity) << R"(</div>
+            <div>)" << alert.title << R"(</div>
+        </div>
+        <div class="content">
+            <div class="details">
+                <div class="detail-row">
+                    <span class="label">Message:</span><br>
+                    <span class="value">)" << alert.message << R"(</span>
+                </div>
+                <div class="detail-row">
+                    <span class="label">Source:</span>
+                    <span class="value">)" << alert.source << R"(</span>
+                </div>
+                <div class="detail-row">
+                    <span class="label">Timestamp:</span>
+                    <span class="value">)" << format_timestamp(alert.timestamp) << R"(</span>
+                </div>
+            </div>
+)";
+
+    if (!alert.context.empty()) {
+        html << R"(
+            <h3>Additional Context:</h3>
+            <table>
+                <tr><th>Key</th><th>Value</th></tr>
+)";
+        for (const auto& [key, value] : alert.context) {
+            html << "                <tr><td>" << key << "</td><td>" << value << "</td></tr>\n";
+        }
+        html << "            </table>\n";
+    }
+
+    html << R"(
+        </div>
+        <div class="footer">
+            <p>HFT Trading System Notification</p>
+            <p>This is an automated message. Please do not reply.</p>
+        </div>
+    </div>
+</body>
+</html>
+)";
+
+    return html.str();
+}
+
+std::string EmailChannel::render_text_body(const Alert& alert) {
+    std::ostringstream text;
+
+    text << "========================================\n";
+    text << "HFT TRADING SYSTEM ALERT\n";
+    text << "========================================\n\n";
+
+    text << "Severity: " << severity_to_string(alert.severity) << "\n";
+    text << "Title: " << alert.title << "\n";
+    text << "Source: " << alert.source << "\n";
+    text << "Timestamp: " << format_timestamp(alert.timestamp) << "\n\n";
+
+    text << "Message:\n";
+    text << alert.message << "\n\n";
+
+    if (!alert.context.empty()) {
+        text << "Additional Context:\n";
+        text << "----------------------------------------\n";
+        for (const auto& [key, value] : alert.context) {
+            text << key << ": " << value << "\n";
+        }
+        text << "\n";
+    }
+
+    text << "========================================\n";
+    text << "This is an automated message.\n";
+    text << "Please do not reply to this email.\n";
+    text << "========================================\n";
+
+    return text.str();
+}
+
+bool EmailChannel::check_rate_limit(const std::string& recipient) {
+    std::shared_lock lock(rate_limits_mutex_);
+
+    auto it = rate_limits_.find(recipient);
+    if (it == rate_limits_.end()) {
+        return true; // No limit set yet
+    }
+
+    std::lock_guard<std::mutex> bucket_lock(it->second.mutex);
+
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::minutes>(
+        now - it->second.window_start);
+
+    if (elapsed >= std::chrono::minutes(1)) {
+        // Reset window
+        it->second.count.store(0, std::memory_order_relaxed);
+        it->second.window_start = now;
+        return true;
+    }
+
+    uint32_t current_count = it->second.count.load(std::memory_order_relaxed);
+    return current_count < config_.max_per_minute;
+}
+
+void EmailChannel::update_rate_limit(const std::string& recipient) {
+    std::unique_lock lock(rate_limits_mutex_);
+
+    auto& bucket = rate_limits_[recipient];
+    std::lock_guard<std::mutex> bucket_lock(bucket.mutex);
+
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::minutes>(
+        now - bucket.window_start);
+
+    if (elapsed >= std::chrono::minutes(1)) {
+        bucket.count.store(1, std::memory_order_relaxed);
+        bucket.window_start = now;
+    } else {
+        bucket.count.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+std::string EmailChannel::generate_message_id() {
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<uint64_t> dis;
+
+    uint64_t random_id = dis(gen);
+
+    std::ostringstream oss;
+    oss << random_id << "." << std::chrono::system_clock::now().time_since_epoch().count()
+        << "@" << config_.smtp_host;
+
+    return oss.str();
+}
+
+void EmailChannel::add_standard_headers(EmailMessage& msg) {
+    msg.headers["X-Mailer"] = "HFT-Notification-System/2.1.0";
+    msg.headers["X-Priority"] = "3"; // Normal priority
+    msg.headers["Precedence"] = "bulk"; // Indicate automated email
+}
+
+bool EmailChannel::health_check() {
+    // Try to acquire a connection
+    auto conn = connection_pool_->acquire();
+    if (!conn) {
+        return false;
+    }
+
+    bool healthy = conn->is_connected() || conn->connect();
+
+    connection_pool_->release(conn);
+
+    return healthy;
+}
+
+ChannelMetrics EmailChannel::get_metrics() const {
+    return metrics_;
+}
+
+} // namespace notification
+} // namespace hft
+
+================================================================================
+       (MORE CONTENT CONTINUES - CHARACTER LIMIT APPROACHING)
+================================================================================
+
+USAGE EXAMPLE:
+
+#include "email_channel.hpp"
+
+int main() {
+    // Configuration
+    hft::notification::EmailConfig config;
+    config.smtp_host = "smtp.company.com";
+    config.smtp_port = 587;
+    config.use_tls = true;
+    config.username = "hft-alerts@company.com";
+    config.password = std::getenv("SMTP_PASSWORD");
+    config.from_address = "hft-alerts@company.com";
+    config.from_name = "HFT System";
+
+    // Create channel
+    hft::notification::EmailChannel email_channel(config);
+    email_channel.start();
+
+    // Create alert
+    hft::notification::Alert alert;
+    alert.severity = hft::notification::AlertSeverity::P2;
+    alert.title = "High Latency Detected";
+    alert.message = "Order execution latency exceeded 10ms threshold";
+    alert.source = "execution_engine";
+    alert.timestamp = std::chrono::system_clock::now();
+    alert.context["latency_ms"] = "15.3";
+    alert.context["order_id"] = "ORD123456";
+
+    // Send notification
+    std::vector<std::string> recipients = {"trader@company.com", "ops@company.com"};
+    auto result = email_channel.send(alert, recipients);
+
+    if (result.success) {
+        std::cout << "Email sent successfully in "
+                  << result.latency.count() << "ms\n";
+    } else {
+        std::cerr << "Email failed: " << *result.error_message << "\n";
+    }
+
+    email_channel.stop();
+    return 0;
+}
+
+================================================================================
+                           4. HTML EMAIL TEMPLATES
+================================================================================
+
+TEMPLATE SYSTEM:
+
+The email channel supports customizable HTML templates using a simple variable
+substitution system. Templates are stored in /etc/hft/email_templates/
+
+TEMPLATE SYNTAX:
+
+{{variable}}          - Simple variable substitution
+{{#if condition}}     - Conditional rendering
+{{#each items}}       - Loop over arrays
+{{severity_color}}    - Special function for severity colors
+
+TEMPLATE FILES:
+
+/etc/hft/email_templates/
+|-- default.html              Default template for all alerts
+|-- p1_critical.html          Template for P1 critical alerts
+|-- p2_high.html              Template for P2 high alerts
+|-- daily_summary.html        Template for daily reports
+|-- weekly_report.html        Template for weekly summaries
+
+EXAMPLE TEMPLATE (p1_critical.html):
+
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 0;
+            background-color: #f4f4f4;
+        }
+        .container {
+            max-width: 650px;
+            margin: 20px auto;
+            background: white;
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .alert-banner {
+            background: linear-gradient(135deg, #dc3545 0%, #c82333 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+        .alert-banner h1 {
+            margin: 0;
+            font-size: 32px;
+            font-weight: bold;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+        }
+        .alert-banner .icon {
+            font-size: 60px;
+            margin-bottom: 10px;
+        }
+        .content {
+            padding: 30px;
+        }
+        .alert-info {
+            background: #fff3cd;
+            border-left: 4px solid #ffc107;
+            padding: 15px;
+            margin: 20px 0;
+        }
+        .details-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+        }
+        .details-table th {
+            background: #f8f9fa;
+            padding: 12px;
+            text-align: left;
+            font-weight: 600;
+            border-bottom: 2px solid #dee2e6;
+        }
+        .details-table td {
+            padding: 12px;
+            border-bottom: 1px solid #dee2e6;
+        }
+        .action-required {
+            background: #dc3545;
+            color: white;
+            padding: 20px;
+            margin: 20px 0;
+            border-radius: 5px;
+            text-align: center;
+        }
+        .action-required h2 {
+            margin: 0 0 10px 0;
+        }
+        .button {
+            display: inline-block;
+            padding: 12px 30px;
+            background: white;
+            color: #dc3545;
+            text-decoration: none;
+            border-radius: 5px;
+            font-weight: bold;
+            margin-top: 10px;
+        }
+        .footer {
+            background: #343a40;
+            color: #adb5bd;
+            padding: 20px;
+            text-align: center;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="alert-banner">
+            <div class="icon">&#9888;</div>
+            <h1>P1 CRITICAL ALERT</h1>
+            <p style="font-size: 18px; margin: 10px 0 0 0;">Immediate Action Required</p>
+        </div>
+
+        <div class="content">
+            <h2>{{title}}</h2>
+            <p style="font-size: 16px; line-height: 1.6;">{{message}}</p>
+
+            <div class="alert-info">
+                <strong>Alert Time:</strong> {{timestamp}}<br>
+                <strong>Source System:</strong> {{source}}<br>
+                <strong>Alert ID:</strong> {{alert_id}}
+            </div>
+
+            <h3>System Details</h3>
+            <table class="details-table">
+                <thead>
+                    <tr>
+                        <th>Parameter</th>
+                        <th>Value</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {{#each context}}
+                    <tr>
+                        <td>{{key}}</td>
+                        <td><strong>{{value}}</strong></td>
+                    </tr>
+                    {{/each}}
+                </tbody>
+            </table>
+
+            <div class="action-required">
+                <h2>ACTION REQUIRED</h2>
+                <p>This is a P1 critical alert requiring immediate attention.</p>
+                <p>Expected response time: <strong>5 minutes</strong></p>
+                <a href="https://dashboard.company.com/alerts/{{alert_id}}" class="button">
+                    VIEW IN DASHBOARD
+                </a>
+            </div>
+
+            <h3>Escalation Path</h3>
+            <ol>
+                <li><strong>0-5 min:</strong> On-call Engineer</li>
+                <li><strong>5-15 min:</strong> Team Lead</li>
+                <li><strong>15-30 min:</strong> VP Engineering</li>
+                <li><strong>30+ min:</strong> CTO</li>
+            </ol>
+        </div>
+
+        <div class="footer">
+            <p><strong>HFT Trading System</strong></p>
+            <p>This is an automated P1 alert. Do not reply to this email.</p>
+            <p>For assistance, contact: <a href="mailto:oncall@company.com" style="color: #adb5bd;">oncall@company.com</a></p>
+        </div>
+    </div>
+</body>
+</html>
+
+================================================================================
+                       END OF EMAIL NOTIFICATIONS GUIDE
+================================================================================

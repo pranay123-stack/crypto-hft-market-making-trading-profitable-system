@@ -1,0 +1,1022 @@
+================================================================================
+REGULATORY COMPLIANCE FRAMEWORK
+MiFID II, Dodd-Frank, and Global Trading Regulations
+High-Frequency Trading System Compliance
+================================================================================
+
+OVERVIEW
+--------
+Comprehensive regulatory compliance implementation covering MiFID II (European
+Markets), Dodd-Frank Act (U.S. Markets), SEC regulations, CFTC rules, and
+international trading regulations for HFT operations.
+
+================================================================================
+SECTION 1: MiFID II COMPLIANCE
+================================================================================
+
+1.1 TRANSACTION REPORTING (RTS 22)
+-----------------------------------
+
+Required Fields for Transaction Reports:
+
+struct MiFIDIITransactionReport {
+    // Identification of Trading Venue
+    char trading_venue[4];                // MIC code (ISO 10383)
+    char venue_transaction_id[52];        // Venue-assigned ID
+
+    // Instrument Identification
+    char isin[12];                        // ISIN code
+    char instrument_classification[6];    // CFI code (ISO 10962)
+
+    // Buyer/Seller Identification
+    char buyer_id[20];                    // LEI or national code
+    char buyer_decision_maker[20];        // Investment firm LEI
+    char buyer_country[2];                // ISO 3166-1 alpha-2
+    char seller_id[20];                   // LEI or national code
+    char seller_decision_maker[20];       // Investment firm LEI
+    char seller_country[2];               // ISO 3166-1 alpha-2
+
+    // Transmission Details
+    char transmitting_firm_buyer[20];     // LEI
+    char transmitting_firm_seller[20];    // LEI
+
+    // Transaction Details
+    char trading_date_time[27];           // ISO 8601 with microseconds
+    char trading_capacity;                // 'D'eal on own account, 'M'atching
+    int64_t quantity;                     // Quantity in instrument units
+    char quantity_currency[3];            // ISO 4217 currency code
+    char derivative_notation;             // Applicable for derivatives
+    double price;                         // Transaction price
+    char price_currency[3];               // ISO 4217 currency code
+    double price_notation;                // For derivatives
+    char venue_type;                      // Trading venue type
+
+    // Order Details
+    char order_id[52];                    // Unique order identifier
+    char investment_decision_within_firm[20]; // Algo/trader ID
+    char execution_decision_within_firm[20];  // Algo/execution ID
+
+    // Algorithmic Trading Flags
+    bool waiver_indicator;                // Price waiver claimed
+    bool short_selling_indicator;         // Short sale
+    bool oti_indicator;                   // OTC post-trade indicator
+    bool commodity_derivative_indicator;
+    bool securities_financing_transaction;
+
+    // Additional Flags
+    char algo_indicator;                  // 'H'uman or 'A'lgo
+    char trading_decision_algo_id[20];    // Algorithm ID if applicable
+    char execution_decision_algo_id[20];  // Execution algo ID
+
+    // MiFID II Specific
+    char complex_trade_component_id[52];  // For complex trades
+    bool aggregated_order;                // Order aggregation flag
+};
+
+
+Implementation:
+
+class MiFIDIIReporter {
+public:
+    MiFIDIIReporter(const std::string& lei_code,
+                    const std::string& nca_endpoint)
+        : firm_lei_(lei_code)
+        , nca_endpoint_(nca_endpoint)
+        , reporting_queue_(100000)
+    {
+        // Start reporting thread
+        reporting_thread_ = std::thread(&MiFIDIIReporter::ReportingLoop, this);
+    }
+
+    void ReportTransaction(const Execution& exec, const Order& order) {
+        MiFIDIITransactionReport report{};
+
+        // Populate trading venue
+        strcpy(report.trading_venue, GetMICCode(exec.exchange).c_str());
+        strcpy(report.venue_transaction_id, exec.exchange_trade_id.c_str());
+
+        // Instrument identification
+        strcpy(report.isin, GetISIN(order.symbol).c_str());
+        strcpy(report.instrument_classification, GetCFICode(order.symbol).c_str());
+
+        // Buyer/Seller identification (LEI codes)
+        if (order.side == 'B') {
+            strcpy(report.buyer_id, firm_lei_.c_str());
+            strcpy(report.buyer_decision_maker, firm_lei_.c_str());
+            strcpy(report.buyer_country, "GB");
+            strcpy(report.seller_id, exec.counterparty_lei.c_str());
+        } else {
+            strcpy(report.seller_id, firm_lei_.c_str());
+            strcpy(report.seller_decision_maker, firm_lei_.c_str());
+            strcpy(report.seller_country, "GB");
+            strcpy(report.buyer_id, exec.counterparty_lei.c_str());
+        }
+
+        // Transmission details
+        strcpy(report.transmitting_firm_buyer, firm_lei_.c_str());
+        strcpy(report.transmitting_firm_seller, firm_lei_.c_str());
+
+        // Transaction timing (ISO 8601 with microsecond precision)
+        FormatTimestampISO8601(exec.execution_time_ns,
+                              report.trading_date_time);
+
+        // Transaction details
+        report.trading_capacity = 'D';  // Deal on own account (principal)
+        report.quantity = exec.quantity;
+        strcpy(report.quantity_currency, GetCurrency(order.symbol).c_str());
+        report.price = exec.price;
+        strcpy(report.price_currency, GetCurrency(order.symbol).c_str());
+
+        // Order identification
+        strcpy(report.order_id, order.id.c_str());
+
+        // Algorithmic trading identifiers
+        strcpy(report.investment_decision_within_firm,
+               order.algo_id.c_str());
+        strcpy(report.execution_decision_within_firm,
+               order.execution_algo_id.c_str());
+
+        // Flags
+        report.waiver_indicator = false;
+        report.short_selling_indicator = (order.side == 'S' &&
+                                         order.is_short_sale);
+        report.oti_indicator = false;
+
+        // Algo indicators
+        report.algo_indicator = 'A';  // Algorithmic trading
+        strcpy(report.trading_decision_algo_id, order.algo_id.c_str());
+        strcpy(report.execution_decision_algo_id,
+               order.execution_algo_id.c_str());
+
+        // Queue for submission to NCA
+        EnqueueReport(report);
+    }
+
+private:
+    void ReportingLoop() {
+        while (running_) {
+            MiFIDIITransactionReport report;
+            if (reporting_queue_.try_dequeue(report)) {
+                // Submit to National Competent Authority
+                SubmitToNCA(report);
+
+                // Store locally for audit
+                StoreReport(report);
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        }
+    }
+
+    void SubmitToNCA(const MiFIDIITransactionReport& report) {
+        // Format as ISO 20022 XML message
+        std::string xml_message = FormatAsISO20022(report);
+
+        // Submit via secure connection (TLS 1.3)
+        HTTPSClient client(nca_endpoint_);
+        auto response = client.Post("/transaction-reports", xml_message);
+
+        if (response.status_code == 200) {
+            LOG_INFO("MiFID II report submitted successfully: "
+                    << report.venue_transaction_id);
+        } else {
+            LOG_ERROR("MiFID II report submission failed: "
+                     << response.status_code << " - " << response.body);
+            // Queue for retry
+            retry_queue_.enqueue(report);
+        }
+    }
+
+    std::string FormatAsISO20022(const MiFIDIITransactionReport& report) {
+        // Generate ISO 20022 XML (auth.031.001.01 message type)
+        std::stringstream xml;
+        xml << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
+        xml << "<Document xmlns=\"urn:iso:std:iso:20022:tech:xsd:auth.031.001.01\">\n";
+        xml << "  <FinInstrmRptgTxRpt>\n";
+        xml << "    <Tx>\n";
+        xml << "      <TxId>" << report.venue_transaction_id << "</TxId>\n";
+        xml << "      <ExctgPty>" << report.transmitting_firm_buyer << "</ExctgPty>\n";
+        xml << "      <InvstmtPtyInd>true</InvstmtPtyInd>\n";
+        xml << "      <SubmitgPty>" << firm_lei_ << "</SubmitgPty>\n";
+        xml << "      <Buyr>\n";
+        xml << "        <AcctOwnr>\n";
+        xml << "          <Id>\n";
+        xml << "            <LEI>" << report.buyer_id << "</LEI>\n";
+        xml << "          </Id>\n";
+        xml << "        </AcctOwnr>\n";
+        xml << "      </Buyr>\n";
+        xml << "      <Sellr>\n";
+        xml << "        <AcctOwnr>\n";
+        xml << "          <Id>\n";
+        xml << "            <LEI>" << report.seller_id << "</LEI>\n";
+        xml << "          </Id>\n";
+        xml << "        </AcctOwnr>\n";
+        xml << "      </Sellr>\n";
+        xml << "      <TradDt>" << report.trading_date_time << "</TradDt>\n";
+        xml << "      <FinInstrm>\n";
+        xml << "        <ISIN>" << report.isin << "</ISIN>\n";
+        xml << "      </FinInstrm>\n";
+        xml << "      <Qty>" << report.quantity << "</Qty>\n";
+        xml << "      <Pric>" << report.price << "</Pric>\n";
+        xml << "      <TradgCpcty>" << report.trading_capacity << "</TradgCpcty>\n";
+        xml << "      <TradgVn>\n";
+        xml << "        <MktIdCd>" << report.trading_venue << "</MktIdCd>\n";
+        xml << "      </TradgVn>\n";
+        xml << "    </Tx>\n";
+        xml << "  </FinInstrmRptgTxRpt>\n";
+        xml << "</Document>\n";
+
+        return xml.str();
+    }
+
+    std::string firm_lei_;
+    std::string nca_endpoint_;
+    moodycamel::ConcurrentQueue<MiFIDIITransactionReport> reporting_queue_;
+    moodycamel::ConcurrentQueue<MiFIDIITransactionReport> retry_queue_;
+    std::thread reporting_thread_;
+    std::atomic<bool> running_{true};
+};
+
+
+1.2 CLOCK SYNCHRONIZATION REQUIREMENTS (RTS 25)
+------------------------------------------------
+
+MiFID II Clock Synchronization Standards:
+
+Trading Activity Level          | Clock Accuracy Required
+--------------------------------|-------------------------
+High-frequency (HFT)            | 100 microseconds to UTC
+Non-HFT trading                 | 1 millisecond to UTC
+Order receipt/transmission      | 1 second to UTC
+Record keeping                  | 1 second to UTC
+
+
+Implementation:
+
+class MiFIDIIClockSynchronization {
+public:
+    MiFIDIIClockSynchronization() {
+        // Configure multiple NTP servers (Stratum 1)
+        ntp_servers_ = {
+            "ntp1.mifid.eu",
+            "ntp2.mifid.eu",
+            "time.google.com",
+            "time.cloudflare.com"
+        };
+
+        // Start monitoring thread
+        monitoring_thread_ = std::thread(
+            &MiFIDIIClockSynchronization::MonitorClockAccuracy, this);
+    }
+
+    void ValidateClockAccuracy() {
+        // Query multiple NTP sources
+        std::vector<int64_t> offsets;
+
+        for (const auto& server : ntp_servers_) {
+            int64_t offset_us = QueryNTPServer(server);
+            offsets.push_back(offset_us);
+        }
+
+        // Calculate median offset
+        std::sort(offsets.begin(), offsets.end());
+        int64_t median_offset = offsets[offsets.size() / 2];
+
+        // Check compliance
+        if (std::abs(median_offset) > 100) {  // 100 microseconds
+            LOG_CRITICAL("MiFID II clock synchronization violation: "
+                        << median_offset << " microseconds");
+
+            // Halt trading
+            EmergencyTradingHalt("CLOCK_SYNC_VIOLATION");
+
+            // Alert operations
+            SendAlertToOperations("MiFID II clock drift exceeded");
+        }
+
+        // Log synchronization status
+        LogClockSyncStatus(median_offset, offsets);
+    }
+
+private:
+    void MonitorClockAccuracy() {
+        while (running_) {
+            ValidateClockAccuracy();
+
+            // Check every 10 seconds
+            std::this_thread::sleep_for(std::chrono::seconds(10));
+        }
+    }
+
+    int64_t QueryNTPServer(const std::string& server) {
+        // Implement NTP query (using chrony or ntpd)
+        // Return offset in microseconds
+
+        struct ntpPacket {
+            uint8_t li_vn_mode;
+            uint8_t stratum;
+            uint8_t poll;
+            uint8_t precision;
+            uint32_t rootDelay;
+            uint32_t rootDispersion;
+            uint32_t refId;
+            uint64_t refTm;
+            uint64_t origTm;
+            uint64_t rxTm;
+            uint64_t txTm;
+        } packet{};
+
+        // Send NTP request and calculate offset
+        // Implementation omitted for brevity
+
+        return 0;  // Placeholder
+    }
+
+    std::vector<std::string> ntp_servers_;
+    std::thread monitoring_thread_;
+    std::atomic<bool> running_{true};
+};
+
+
+1.3 ORDER RECORD KEEPING (RTS 24)
+----------------------------------
+
+Required Order Records (Maintain for 5 years):
+
+class MiFIDIIOrderRecordKeeping {
+public:
+    struct OrderRecord {
+        // Client identification
+        char client_id[20];               // LEI or national ID
+        char client_name[100];
+        char client_classification;        // 'P'rofessional, 'R'etail
+
+        // Trading capacity
+        char trading_capacity;            // 'A'gent or 'P'rincipal
+
+        // Decision makers
+        char investment_decision_maker[20];
+        char execution_decision_maker[20];
+
+        // Instrument details
+        char instrument_isin[12];
+        char instrument_name[100];
+
+        // Order details
+        char order_id[52];
+        char side;                        // 'B'uy or 'S'ell
+        int64_t quantity;
+        double limit_price;
+        char order_type[10];
+        char time_in_force[10];
+
+        // Timestamps (all in UTC, microsecond precision)
+        char order_receipt_time[27];
+        char order_submission_time[27];
+        char order_completion_time[27];
+
+        // Venue information
+        char trading_venue[4];            // MIC code
+
+        // Validity period
+        char validity_start[27];
+        char validity_end[27];
+
+        // Order events
+        std::vector<std::string> order_modifications;
+        std::vector<std::string> order_cancellations;
+        std::vector<std::string> order_executions;
+    };
+
+    void RecordOrder(const Order& order, const Client& client) {
+        OrderRecord record{};
+
+        // Populate all required fields
+        strcpy(record.client_id, client.lei.c_str());
+        strcpy(record.client_name, client.name.c_str());
+        record.client_classification = client.classification;
+
+        record.trading_capacity = 'P';  // Principal
+
+        strcpy(record.investment_decision_maker, order.algo_id.c_str());
+        strcpy(record.execution_decision_maker, order.execution_algo_id.c_str());
+
+        strcpy(record.instrument_isin, GetISIN(order.symbol).c_str());
+        strcpy(record.instrument_name, order.symbol.c_str());
+
+        strcpy(record.order_id, order.id.c_str());
+        record.side = order.side;
+        record.quantity = order.quantity;
+        record.limit_price = order.limit_price;
+        strcpy(record.order_type, order.type.c_str());
+        strcpy(record.time_in_force, order.tif.c_str());
+
+        FormatTimestampISO8601(order.creation_time_ns,
+                              record.order_receipt_time);
+        FormatTimestampISO8601(order.submission_time_ns,
+                              record.order_submission_time);
+
+        strcpy(record.trading_venue, GetMICCode(order.exchange).c_str());
+
+        // Store in compliance database (5-year retention)
+        StoreOrderRecord(record);
+    }
+};
+
+
+================================================================================
+SECTION 2: DODD-FRANK ACT COMPLIANCE
+================================================================================
+
+2.1 SWAP DATA REPORTING (PART 45)
+----------------------------------
+
+struct SwapDataReport {
+    // Primary Economic Terms
+    char unique_transaction_identifier[52]; // UTI
+    char prior_uti[52];                   // If UTI changes
+
+    // Counterparty Information
+    char counterparty1_lei[20];
+    char counterparty2_lei[20];
+    char reporting_counterparty_lei[20];
+
+    // Execution Details
+    char execution_timestamp[27];         // ISO 8601
+    char effective_date[11];              // YYYY-MM-DD
+    char maturity_date[11];
+
+    // Product Details
+    char asset_class[20];                 // Rates, Credit, Equity, etc.
+    char product_id[12];                  // ISIN or other
+    char underlying_asset[100];
+
+    // Notional Amount
+    double notional_amount_leg1;
+    char notional_currency_leg1[3];
+    double notional_amount_leg2;
+    char notional_currency_leg2[3];
+
+    // Price/Rate
+    double price;
+    char price_unit[20];
+    double fixed_rate;
+    char floating_rate_index[50];
+
+    // Settlement
+    char settlement_currency[3];
+    char settlement_location[2];          // Country code
+
+    // Collateralization
+    char collateralization_type;          // 'U'ncollateralized, etc.
+    double collateral_value;
+
+    // Clearing
+    bool cleared;
+    char clearing_organization[20];       // LEI if cleared
+
+    // Trading venue
+    char execution_venue_type;            // 'S'EF, 'D'CF, etc.
+    char venue_identifier[20];
+
+    // Block trade indicator
+    bool block_trade;
+
+    // Action type
+    char action_type[20];                 // NEW, MODIFY, TERMINATE, etc.
+};
+
+
+class DoddFrankSwapReporter {
+public:
+    DoddFrankSwapReporter(const std::string& lei,
+                         const std::string& sdr_endpoint)
+        : firm_lei_(lei)
+        , sdr_endpoint_(sdr_endpoint)
+    {
+        reporting_thread_ = std::thread(
+            &DoddFrankSwapReporter::ReportingLoop, this);
+    }
+
+    void ReportSwapTransaction(const SwapTransaction& swap) {
+        SwapDataReport report{};
+
+        // Generate UTI (Unique Transaction Identifier)
+        GenerateUTI(swap, report.unique_transaction_identifier);
+
+        // Counterparty information
+        strcpy(report.counterparty1_lei, firm_lei_.c_str());
+        strcpy(report.counterparty2_lei, swap.counterparty_lei.c_str());
+        strcpy(report.reporting_counterparty_lei, firm_lei_.c_str());
+
+        // Execution details
+        FormatTimestampISO8601(swap.execution_time_ns,
+                              report.execution_timestamp);
+        strcpy(report.effective_date, swap.effective_date.c_str());
+        strcpy(report.maturity_date, swap.maturity_date.c_str());
+
+        // Product details
+        strcpy(report.asset_class, swap.asset_class.c_str());
+        strcpy(report.product_id, swap.product_id.c_str());
+        strcpy(report.underlying_asset, swap.underlying.c_str());
+
+        // Notional amounts
+        report.notional_amount_leg1 = swap.notional_leg1;
+        strcpy(report.notional_currency_leg1, swap.currency_leg1.c_str());
+        report.notional_amount_leg2 = swap.notional_leg2;
+        strcpy(report.notional_currency_leg2, swap.currency_leg2.c_str());
+
+        // Pricing
+        report.price = swap.price;
+        report.fixed_rate = swap.fixed_rate;
+        strcpy(report.floating_rate_index, swap.floating_index.c_str());
+
+        // Settlement
+        strcpy(report.settlement_currency, swap.settlement_currency.c_str());
+        strcpy(report.settlement_location, swap.settlement_country.c_str());
+
+        // Clearing information
+        report.cleared = swap.cleared;
+        if (swap.cleared) {
+            strcpy(report.clearing_organization, swap.dco_lei.c_str());
+        }
+
+        // Venue information
+        report.execution_venue_type = swap.venue_type;
+        strcpy(report.venue_identifier, swap.venue_id.c_str());
+
+        report.block_trade = swap.is_block;
+        strcpy(report.action_type, "NEW");
+
+        // Submit to Swap Data Repository
+        SubmitToSDR(report);
+    }
+
+private:
+    void SubmitToSDR(const SwapDataReport& report) {
+        // Format as FpML (Financial Products Markup Language)
+        std::string fpml_message = FormatAsFpML(report);
+
+        // Submit to SDR within regulatory timeframe
+        // Real-time for cleared swaps, T+1 for uncleared
+        HTTPSClient client(sdr_endpoint_);
+        auto response = client.Post("/swap-reports", fpml_message);
+
+        if (response.status_code == 200) {
+            LOG_INFO("Swap data reported successfully: "
+                    << report.unique_transaction_identifier);
+        } else {
+            LOG_ERROR("Swap data reporting failed: "
+                     << response.status_code);
+            // Queue for retry
+            retry_queue_.enqueue(report);
+        }
+    }
+
+    void GenerateUTI(const SwapTransaction& swap, char* uti) {
+        // UTI format: LEI + timestamp + sequence
+        std::stringstream ss;
+        ss << firm_lei_
+           << std::setfill('0') << std::setw(14) << swap.execution_time_ns
+           << std::setfill('0') << std::setw(8) << swap.sequence_number;
+        strcpy(uti, ss.str().c_str());
+    }
+
+    std::string FormatAsFpML(const SwapDataReport& report) {
+        // Generate FpML XML format
+        // Implementation omitted for brevity
+        return "";
+    }
+
+    std::string firm_lei_;
+    std::string sdr_endpoint_;
+    std::thread reporting_thread_;
+    moodycamel::ConcurrentQueue<SwapDataReport> retry_queue_;
+};
+
+
+2.2 VOLCKER RULE COMPLIANCE
+----------------------------
+
+Prohibition on proprietary trading with exemptions for:
+- Market making
+- Underwriting
+- Risk-mitigating hedging
+- Trading in government obligations
+
+class VolckerRuleCompliance {
+public:
+    enum class TradingActivity {
+        MARKET_MAKING,
+        HEDGING,
+        UNDERWRITING,
+        GOVERNMENT_SECURITIES,
+        PROPRIETARY_TRADING  // Generally prohibited
+    };
+
+    struct TradingActivityClassification {
+        TradingActivity activity_type;
+        std::string justification;
+        bool compliant;
+        std::vector<std::string> supporting_evidence;
+    };
+
+    TradingActivityClassification ClassifyTrade(const Order& order) {
+        TradingActivityClassification classification{};
+
+        // Market making determination
+        if (IsMarketMakingActivity(order)) {
+            classification.activity_type = TradingActivity::MARKET_MAKING;
+            classification.compliant = ValidateMarketMakingRequirements(order);
+            classification.justification =
+                "Providing liquidity with continuous two-sided quotes";
+        }
+        // Hedging determination
+        else if (IsHedgingActivity(order)) {
+            classification.activity_type = TradingActivity::HEDGING;
+            classification.compliant = ValidateHedgingRequirements(order);
+            classification.justification =
+                "Risk-mitigating hedge for specific position";
+        }
+        // Government securities
+        else if (IsGovernmentSecurity(order.symbol)) {
+            classification.activity_type = TradingActivity::GOVERNMENT_SECURITIES;
+            classification.compliant = true;
+            classification.justification = "U.S. Government obligation";
+        }
+        // Proprietary trading (prohibited)
+        else {
+            classification.activity_type = TradingActivity::PROPRIETARY_TRADING;
+            classification.compliant = false;
+            classification.justification =
+                "Does not qualify for Volcker Rule exemption";
+        }
+
+        return classification;
+    }
+
+private:
+    bool IsMarketMakingActivity(const Order& order) {
+        // Check market making criteria:
+        // 1. Routine and ongoing dealer activities
+        // 2. Managing market risk
+        // 3. Providing liquidity
+        // 4. Maintaining two-sided quotes
+
+        auto recent_quotes = GetRecentQuotes(order.symbol,
+                                            std::chrono::minutes(5));
+
+        // Must have posted both bid and ask quotes
+        bool has_two_sided_quotes =
+            HasBidQuotes(recent_quotes) && HasAskQuotes(recent_quotes);
+
+        // Check quote continuity
+        bool continuous_quoting =
+            QuoteGapAnalysis(recent_quotes) < std::chrono::seconds(10);
+
+        return has_two_sided_quotes && continuous_quoting;
+    }
+
+    bool ValidateMarketMakingRequirements(const Order& order) {
+        // Validate Volcker Rule market making requirements
+        // 1. Not designed to exceed RENTD
+        // 2. Compensation arrangements comply
+        // 3. Clear written policies
+
+        return true;  // Simplified
+    }
+};
+
+
+================================================================================
+SECTION 3: SEC REGULATIONS
+================================================================================
+
+3.1 RULE 15c3-5 (MARKET ACCESS RULE)
+-------------------------------------
+
+Risk Management Controls Required:
+
+class SECRule15c35Compliance {
+public:
+    struct PreTradeRiskControls {
+        // Financial risk controls
+        bool credit_threshold_check;
+        bool capital_threshold_check;
+        bool position_limit_check;
+        bool order_size_limit_check;
+
+        // Regulatory controls
+        bool restricted_security_check;
+        bool short_sale_requirement_check;
+        bool trading_halt_check;
+
+        // Duplicate order prevention
+        bool duplicate_order_check;
+
+        // Erroneous order prevention
+        bool price_reasonability_check;
+        bool quantity_reasonability_check;
+
+        // Results
+        bool all_checks_passed;
+        std::vector<std::string> failed_checks;
+    };
+
+    PreTradeRiskControls ExecutePreTradeChecks(const Order& order) {
+        PreTradeRiskControls controls{};
+
+        // Credit threshold check
+        controls.credit_threshold_check =
+            CheckCreditThreshold(order.account_id, order.quantity * order.limit_price);
+        if (!controls.credit_threshold_check) {
+            controls.failed_checks.push_back("Credit threshold exceeded");
+        }
+
+        // Capital threshold check
+        controls.capital_threshold_check = CheckCapitalAdequacy();
+        if (!controls.capital_threshold_check) {
+            controls.failed_checks.push_back("Capital threshold exceeded");
+        }
+
+        // Position limit check
+        controls.position_limit_check =
+            CheckPositionLimit(order.symbol, order.quantity, order.side);
+        if (!controls.position_limit_check) {
+            controls.failed_checks.push_back("Position limit exceeded");
+        }
+
+        // Order size limit check
+        controls.order_size_limit_check =
+            CheckOrderSizeLimit(order.quantity, order.symbol);
+        if (!controls.order_size_limit_check) {
+            controls.failed_checks.push_back("Order size limit exceeded");
+        }
+
+        // Restricted security check
+        controls.restricted_security_check =
+            !IsRestrictedSecurity(order.symbol);
+        if (!controls.restricted_security_check) {
+            controls.failed_checks.push_back("Restricted security");
+        }
+
+        // Short sale requirement check (Reg SHO)
+        if (order.side == 'S') {
+            controls.short_sale_requirement_check =
+                CheckShortSaleRequirements(order);
+            if (!controls.short_sale_requirement_check) {
+                controls.failed_checks.push_back("Short sale violation");
+            }
+        } else {
+            controls.short_sale_requirement_check = true;
+        }
+
+        // Trading halt check
+        controls.trading_halt_check = !IsTradingHalted(order.symbol);
+        if (!controls.trading_halt_check) {
+            controls.failed_checks.push_back("Trading halted");
+        }
+
+        // Duplicate order check
+        controls.duplicate_order_check = !IsDuplicateOrder(order);
+        if (!controls.duplicate_order_check) {
+            controls.failed_checks.push_back("Duplicate order detected");
+        }
+
+        // Erroneous order checks
+        controls.price_reasonability_check =
+            CheckPriceReasonability(order.symbol, order.limit_price);
+        if (!controls.price_reasonability_check) {
+            controls.failed_checks.push_back("Price outside reasonable range");
+        }
+
+        controls.quantity_reasonability_check =
+            CheckQuantityReasonability(order.symbol, order.quantity);
+        if (!controls.quantity_reasonability_check) {
+            controls.failed_checks.push_back("Quantity outside reasonable range");
+        }
+
+        // Overall result
+        controls.all_checks_passed = controls.failed_checks.empty();
+
+        // Log all checks
+        LogRiskControls(order, controls);
+
+        return controls;
+    }
+
+private:
+    bool CheckPriceReasonability(const std::string& symbol, double price) {
+        // Check against National Best Bid Offer (NBBO)
+        auto nbbo = GetNBBO(symbol);
+
+        double mid = (nbbo.bid + nbbo.ask) / 2.0;
+        double threshold = 0.10;  // 10% from mid
+
+        return (price >= mid * (1 - threshold) &&
+                price <= mid * (1 + threshold));
+    }
+
+    bool CheckQuantityReasonability(const std::string& symbol, int64_t qty) {
+        // Check against average daily volume
+        int64_t adv = GetAverageDailyVolume(symbol, 30);
+
+        // Order should not exceed 10% of ADV
+        return qty <= (adv * 0.10);
+    }
+
+    bool CheckShortSaleRequirements(const Order& order) {
+        // Reg SHO locate requirement
+        if (order.is_short_sale) {
+            return HasSecurityLocate(order.symbol, order.quantity);
+        }
+        return true;
+    }
+};
+
+
+3.2 REGULATION SHO (SHORT SELLING)
+-----------------------------------
+
+class RegulationSHOCompliance {
+public:
+    // Locate requirement (Rule 203(b)(1))
+    struct LocateRecord {
+        char symbol[16];
+        int64_t quantity;
+        char locate_source[64];
+        uint64_t locate_timestamp_ns;
+        char locate_id[36];
+        bool locate_valid;
+    };
+
+    bool ObtainLocate(const std::string& symbol, int64_t quantity) {
+        LocateRecord record{};
+        strcpy(record.symbol, symbol.c_str());
+        record.quantity = quantity;
+        record.locate_timestamp_ns = GetNanosecondTimestamp();
+
+        // Request locate from prime broker
+        bool located = RequestLocateFromBroker(symbol, quantity);
+
+        if (located) {
+            strcpy(record.locate_source, "PRIME_BROKER");
+            GenerateUUID(record.locate_id);
+            record.locate_valid = true;
+
+            // Store locate record
+            StoreLocateRecord(record);
+
+            LOG_INFO("Short sale locate obtained: " << symbol
+                    << " qty=" << quantity);
+            return true;
+        }
+
+        return false;
+    }
+
+    // Close-out requirement (Rule 204)
+    void MonitorFailToDeliver() {
+        // Check for fails-to-deliver
+        auto ftd_positions = GetFailToDeliverPositions();
+
+        for (const auto& ftd : ftd_positions) {
+            if (ftd.age_days >= 13) {  // T+13 for threshold securities
+                LOG_CRITICAL("Fail-to-deliver close-out required: "
+                           << ftd.symbol << " qty=" << ftd.quantity);
+
+                // Execute buy-in
+                ExecuteBuyIn(ftd);
+            }
+        }
+    }
+};
+
+
+================================================================================
+SECTION 4: CFTC REGULATIONS (COMMODITIES/FUTURES)
+================================================================================
+
+4.1 REGULATION AT (AUTOMATED TRADING)
+--------------------------------------
+
+class RegulationATCompliance {
+public:
+    // Pre-trade risk controls
+    struct ATRiskControls {
+        // Maximum order size
+        int64_t max_order_size;
+
+        // Maximum order message rate
+        uint32_t max_message_rate_per_second;
+
+        // Maximum daily volume
+        int64_t max_daily_volume;
+
+        // Fat finger checks
+        double max_price_deviation_percent;
+        double max_order_value;
+
+        // Position limits
+        int64_t max_position_size;
+    };
+
+    bool ValidateAlgorithmicTrading(const Order& order,
+                                   const ATRiskControls& controls) {
+        // Order size check
+        if (order.quantity > controls.max_order_size) {
+            LOG_WARN("Reg AT: Order size exceeds limit");
+            return false;
+        }
+
+        // Message rate throttling
+        if (GetCurrentMessageRate() > controls.max_message_rate_per_second) {
+            LOG_WARN("Reg AT: Message rate exceeds limit");
+            return false;
+        }
+
+        // Daily volume check
+        int64_t daily_volume = GetTodayVolume(order.symbol);
+        if (daily_volume + order.quantity > controls.max_daily_volume) {
+            LOG_WARN("Reg AT: Daily volume exceeds limit");
+            return false;
+        }
+
+        return true;
+    }
+
+    // Development and testing requirements
+    struct AlgorithmTesting {
+        std::string algorithm_id;
+        std::string test_environment;
+        std::vector<std::string> test_scenarios;
+        bool stress_testing_completed;
+        bool market_condition_testing_completed;
+        std::string sign_off_by;
+        uint64_t sign_off_timestamp_ns;
+    };
+};
+
+
+================================================================================
+SECTION 5: GLOBAL REGULATORY COMPLIANCE
+================================================================================
+
+5.1 CROSS-BORDER COMPLIANCE FRAMEWORK
+--------------------------------------
+
+class GlobalRegulatoryCompliance {
+public:
+    struct RegionSpecificRequirements {
+        std::string region;
+        std::vector<std::string> applicable_regulations;
+        std::vector<std::string> reporting_obligations;
+        std::vector<std::string> required_licenses;
+    };
+
+    std::vector<RegionSpecificRequirements> GetApplicableRegulations(
+        const Order& order) {
+
+        std::vector<RegionSpecificRequirements> requirements;
+
+        // Determine jurisdictions based on:
+        // 1. Client location
+        // 2. Execution venue
+        // 3. Instrument type
+        // 4. Counterparty location
+
+        if (IsEUVenue(order.exchange)) {
+            RegionSpecificRequirements eu_req;
+            eu_req.region = "EU";
+            eu_req.applicable_regulations = {
+                "MiFID II", "EMIR", "MAR", "GDPR"
+            };
+            eu_req.reporting_obligations = {
+                "Transaction Reporting (ARM)",
+                "Trade Reporting (Trade Repository)",
+                "Reference Data (FIRDS)"
+            };
+            requirements.push_back(eu_req);
+        }
+
+        if (IsUSVenue(order.exchange)) {
+            RegionSpecificRequirements us_req;
+            us_req.region = "US";
+            us_req.applicable_regulations = {
+                "Dodd-Frank", "SEC Rules", "CFTC Regulations"
+            };
+            us_req.reporting_obligations = {
+                "CAT Reporting",
+                "OATS Reporting",
+                "Blue Sheet Reporting"
+            };
+            requirements.push_back(us_req);
+        }
+
+        return requirements;
+    }
+};
+
+================================================================================
+END OF DOCUMENT
+================================================================================

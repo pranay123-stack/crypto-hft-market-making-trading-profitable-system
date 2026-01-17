@@ -1,0 +1,977 @@
+================================================================================
+LINKING FOR HFT SYSTEMS
+================================================================================
+
+OVERVIEW
+--------
+Linking is the final stage of building C++ applications, combining object files
+and libraries into executable binaries. For HFT systems, linking strategy impacts
+startup time, memory footprint, deployment portability, and runtime performance.
+This guide covers static vs dynamic linking, RPATH configuration, symbol
+visibility, and advanced linking techniques.
+
+================================================================================
+SECTION 1: LINKING BASICS
+================================================================================
+
+1.1 STATIC LINKING
+------------------
+
+Purpose: Embed all libraries into binary
+Advantages: Self-contained, faster loading, no runtime dependencies
+Disadvantages: Larger binaries, no shared library updates
+
+```bash
+# Static linking with GCC
+g++ -static main.cpp -o trading_engine
+
+# Link specific libraries statically
+g++ main.cpp -Wl,-Bstatic -lboost_system -Wl,-Bdynamic -lpthread -o trading_engine
+
+# Link against static library archives
+g++ main.cpp /usr/local/lib/libspdlog.a -o trading_engine
+```
+
+CMake static linking:
+
+```cmake
+# Create static library
+add_library(hft_core STATIC
+    core/logger.cpp
+    core/config.cpp
+    core/time_utils.cpp
+)
+
+# Link statically
+add_executable(trading_engine main.cpp)
+target_link_libraries(trading_engine PRIVATE hft_core)
+
+# Force static linking for all libraries
+set(CMAKE_FIND_LIBRARY_SUFFIXES ".a")
+set(BUILD_SHARED_LIBS OFF)
+
+# Link with static runtime (GCC)
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static-libgcc -static-libstdc++")
+```
+
+1.2 DYNAMIC LINKING
+-------------------
+
+Purpose: Load shared libraries at runtime
+Advantages: Smaller binaries, shared memory, easy updates
+Disadvantages: Runtime dependencies, slower startup
+
+```bash
+# Dynamic linking (default)
+g++ main.cpp -o trading_engine -lboost_system -lpthread
+
+# Explicit shared library
+g++ main.cpp -Wl,-Bdynamic -lboost_system -o trading_engine
+```
+
+CMake dynamic linking:
+
+```cmake
+# Create shared library
+add_library(hft_core SHARED
+    core/logger.cpp
+    core/config.cpp
+)
+
+# Version shared library
+set_target_properties(hft_core PROPERTIES
+    VERSION 1.0.0
+    SOVERSION 1
+)
+
+# Link dynamically
+add_executable(trading_engine main.cpp)
+target_link_libraries(trading_engine PRIVATE hft_core)
+```
+
+Checking dependencies:
+
+```bash
+# List dynamic dependencies
+ldd trading_engine
+
+# Detailed dependency tree
+lddtree trading_engine
+
+# Check if statically linked
+file trading_engine
+# Should show "statically linked" or "dynamically linked"
+
+# Find library location
+ldd trading_engine | grep boost
+```
+
+1.3 MIXED LINKING
+-----------------
+
+Best practice for HFT: Static for custom libs, dynamic for system libs
+
+```bash
+# Mix static and dynamic linking
+g++ main.cpp \
+    -Wl,-Bstatic \
+    -lhft_core \
+    -lhft_market_data \
+    -Wl,-Bdynamic \
+    -lpthread \
+    -ldl \
+    -lrt \
+    -o trading_engine
+```
+
+CMake mixed linking:
+
+```cmake
+# Custom libraries: static
+add_library(hft_core STATIC core.cpp)
+add_library(hft_execution STATIC execution.cpp)
+
+# System libraries: dynamic (imported targets)
+find_package(Threads REQUIRED)
+find_package(Boost REQUIRED COMPONENTS system thread)
+
+add_executable(trading_engine main.cpp)
+target_link_libraries(trading_engine
+    PRIVATE
+        # Static custom libraries
+        hft_core
+        hft_execution
+        # Dynamic system libraries
+        Threads::Threads
+        Boost::system
+        Boost::thread
+)
+```
+
+================================================================================
+SECTION 2: RPATH CONFIGURATION
+================================================================================
+
+2.1 UNDERSTANDING RPATH
+------------------------
+
+RPATH: Runtime library search path embedded in binary
+RUNPATH: Similar to RPATH but lower precedence
+
+Search order:
+1. RPATH (unless RUNPATH exists)
+2. LD_LIBRARY_PATH environment variable
+3. RUNPATH
+4. /etc/ld.so.cache
+5. /lib, /usr/lib
+
+```bash
+# View RPATH/RUNPATH
+readelf -d trading_engine | grep -E "RPATH|RUNPATH"
+objdump -x trading_engine | grep -E "RPATH|RUNPATH"
+
+# Check library search path
+LD_DEBUG=libs ./trading_engine 2>&1 | grep searching
+```
+
+2.2 SETTING RPATH
+-----------------
+
+Command line:
+
+```bash
+# Set RPATH during linking
+g++ main.cpp -o trading_engine \
+    -Wl,-rpath,/opt/hft/lib \
+    -Wl,-rpath,/usr/local/lib \
+    -L/opt/hft/lib \
+    -lhft_core
+
+# Use $ORIGIN for relative paths
+g++ main.cpp -o trading_engine \
+    -Wl,-rpath,'$ORIGIN' \
+    -Wl,-rpath,'$ORIGIN/../lib' \
+    -L./lib -lhft_core
+```
+
+CMake RPATH configuration:
+
+```cmake
+# Don't skip RPATH
+set(CMAKE_SKIP_RPATH FALSE)
+
+# Use RPATH for build tree
+set(CMAKE_SKIP_BUILD_RPATH FALSE)
+
+# Don't use install RPATH during build
+set(CMAKE_BUILD_WITH_INSTALL_RPATH FALSE)
+
+# Set install RPATH
+set(CMAKE_INSTALL_RPATH "${CMAKE_INSTALL_PREFIX}/lib")
+
+# Add automatic RPATH for dependencies
+set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+
+# Use new RUNPATH instead of RPATH
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--enable-new-dtags")
+
+# Or use old RPATH
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--disable-new-dtags")
+```
+
+Per-target RPATH:
+
+```cmake
+add_executable(trading_engine main.cpp)
+
+set_target_properties(trading_engine PROPERTIES
+    INSTALL_RPATH "/opt/hft/lib:/usr/local/lib"
+    INSTALL_RPATH_USE_LINK_PATH TRUE
+    BUILD_WITH_INSTALL_RPATH FALSE
+)
+
+# Use $ORIGIN for portable binaries
+set_target_properties(trading_engine PROPERTIES
+    INSTALL_RPATH "$ORIGIN:$ORIGIN/../lib"
+)
+```
+
+2.3 MODIFYING RPATH POST-BUILD
+-------------------------------
+
+```bash
+# View current RPATH
+chrpath -l trading_engine
+
+# Change RPATH
+chrpath -r /opt/hft/lib trading_engine
+
+# Remove RPATH
+chrpath -d trading_engine
+
+# patchelf (more powerful)
+patchelf --print-rpath trading_engine
+patchelf --set-rpath /opt/hft/lib:/usr/local/lib trading_engine
+patchelf --remove-rpath trading_engine
+
+# Add to existing RPATH
+patchelf --set-rpath "$(patchelf --print-rpath trading_engine):/new/path" trading_engine
+```
+
+2.4 PRODUCTION RPATH STRATEGY
+------------------------------
+
+HFT deployment RPATH strategy:
+
+```cmake
+# Production RPATH configuration
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    # Absolute paths for production
+    set(CMAKE_INSTALL_RPATH
+        "/opt/hft/lib"
+        "/opt/hft/third_party/lib"
+    )
+else()
+    # Relative paths for development
+    set(CMAKE_INSTALL_RPATH
+        "$ORIGIN/../lib"
+        "$ORIGIN/../third_party/lib"
+    )
+endif()
+
+set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+set(CMAKE_SKIP_BUILD_RPATH FALSE)
+set(CMAKE_BUILD_WITH_INSTALL_RPATH FALSE)
+```
+
+Deployment script with RPATH:
+
+```bash
+#!/bin/bash
+# deploy.sh
+
+INSTALL_PREFIX="/opt/hft"
+BINARY="trading_engine"
+
+# Copy binary
+cp build/bin/$BINARY $INSTALL_PREFIX/bin/
+
+# Set production RPATH
+patchelf --set-rpath "$INSTALL_PREFIX/lib:$INSTALL_PREFIX/third_party/lib" \
+    $INSTALL_PREFIX/bin/$BINARY
+
+# Verify
+echo "RPATH set to:"
+patchelf --print-rpath $INSTALL_PREFIX/bin/$BINARY
+
+# Verify all dependencies are found
+ldd $INSTALL_PREFIX/bin/$BINARY
+```
+
+================================================================================
+SECTION 3: SYMBOL VISIBILITY
+================================================================================
+
+3.1 SYMBOL VISIBILITY BASICS
+-----------------------------
+
+Default visibility: All symbols exported
+Hidden visibility: Symbols not exported (smaller, faster)
+
+```cpp
+// Export symbol
+__attribute__((visibility("default"))) void public_function();
+
+// Hide symbol
+__attribute__((visibility("hidden"))) void internal_function();
+
+// Macros for portability
+#define HFT_API __attribute__((visibility("default")))
+#define HFT_LOCAL __attribute__((visibility("hidden")))
+
+// Usage
+HFT_API void api_function();
+HFT_LOCAL void internal_helper();
+```
+
+Compiler flags:
+
+```bash
+# Hide symbols by default
+g++ -fvisibility=hidden -fvisibility-inlines-hidden main.cpp
+
+# Export only marked symbols
+g++ -fvisibility=hidden main.cpp -o libhft.so
+```
+
+CMake visibility configuration:
+
+```cmake
+# Set default visibility to hidden
+set(CMAKE_CXX_VISIBILITY_PRESET hidden)
+set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
+
+# Or per-target
+set_target_properties(hft_core PROPERTIES
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON
+)
+```
+
+3.2 EXPORT HEADERS
+------------------
+
+Generate export headers:
+
+```cmake
+include(GenerateExportHeader)
+
+add_library(hft_core SHARED core.cpp)
+
+generate_export_header(hft_core
+    BASE_NAME HFT
+    EXPORT_FILE_NAME ${CMAKE_BINARY_DIR}/generated/hft_export.h
+)
+
+target_include_directories(hft_core PUBLIC
+    ${CMAKE_BINARY_DIR}/generated
+)
+```
+
+Generated hft_export.h:
+
+```cpp
+#pragma once
+
+#ifdef HFT_STATIC_DEFINE
+#  define HFT_EXPORT
+#  define HFT_NO_EXPORT
+#else
+#  ifndef HFT_EXPORT
+#    ifdef hft_core_EXPORTS
+        /* We are building this library */
+#      define HFT_EXPORT __attribute__((visibility("default")))
+#    else
+        /* We are using this library */
+#      define HFT_EXPORT __attribute__((visibility("default")))
+#    endif
+#  endif
+#  ifndef HFT_NO_EXPORT
+#    define HFT_NO_EXPORT __attribute__((visibility("hidden")))
+#  endif
+#endif
+```
+
+Usage:
+
+```cpp
+#include "hft_export.h"
+
+// Public API
+class HFT_EXPORT OrderManager {
+public:
+    void submit_order(const Order& order);
+};
+
+// Internal implementation
+class HFT_NO_EXPORT OrderManagerImpl {
+    // Hidden from public API
+};
+```
+
+3.3 SYMBOL VERSIONING
+----------------------
+
+Version symbols for library compatibility:
+
+```cpp
+// version.map
+LIBHFT_1.0 {
+    global:
+        *OrderManager*;
+        *MarketDataHandler*;
+    local:
+        *;
+};
+
+LIBHFT_2.0 {
+    global:
+        *AdvancedOrderManager*;
+} LIBHFT_1.0;
+```
+
+Link with version script:
+
+```bash
+g++ -shared -o libhft.so.1.0 *.o -Wl,--version-script=version.map
+
+# Symlinks
+ln -s libhft.so.1.0 libhft.so.1
+ln -s libhft.so.1 libhft.so
+```
+
+CMake version script:
+
+```cmake
+add_library(hft_core SHARED ${SOURCES})
+
+set_target_properties(hft_core PROPERTIES
+    VERSION 1.0.0
+    SOVERSION 1
+    LINK_FLAGS "-Wl,--version-script=${CMAKE_SOURCE_DIR}/version.map"
+)
+```
+
+3.4 CHECKING SYMBOLS
+--------------------
+
+```bash
+# List all symbols
+nm trading_engine
+
+# List dynamic symbols
+nm -D libhft.so
+
+# List only exported symbols
+readelf -s --wide libhft.so | grep GLOBAL
+
+# Check symbol type
+nm trading_engine | grep function_name
+
+# List undefined symbols (dependencies)
+nm -u trading_engine
+
+# Check symbol visibility
+objdump -T libhft.so | grep function_name
+```
+
+================================================================================
+SECTION 4: LINKER OPTIMIZATION
+================================================================================
+
+4.1 LINK-TIME OPTIMIZATION (LTO)
+---------------------------------
+
+```bash
+# GCC LTO
+g++ -flto -fuse-linker-plugin -O3 *.cpp -o trading_engine
+
+# Parallel LTO
+g++ -flto=$(nproc) -fuse-linker-plugin -O3 *.cpp -o trading_engine
+
+# Clang ThinLTO
+clang++ -flto=thin -O3 *.cpp -o trading_engine
+```
+
+CMake LTO:
+
+```cmake
+# Enable LTO globally
+set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+
+# Or per-configuration
+set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+
+# Or per-target
+set_target_properties(trading_engine PROPERTIES
+    INTERPROCEDURAL_OPTIMIZATION TRUE
+)
+```
+
+4.2 DEAD CODE ELIMINATION
+--------------------------
+
+```bash
+# Function and data sections
+g++ -ffunction-sections -fdata-sections *.cpp \
+    -Wl,--gc-sections -o trading_engine
+
+# Check size savings
+g++ *.cpp -o trading_engine_normal
+g++ -ffunction-sections -fdata-sections *.cpp \
+    -Wl,--gc-sections -o trading_engine_optimized
+
+ls -lh trading_engine_*
+```
+
+CMake dead code elimination:
+
+```cmake
+add_compile_options(-ffunction-sections -fdata-sections)
+add_link_options(-Wl,--gc-sections)
+
+# Print removed sections
+add_link_options(-Wl,--print-gc-sections)
+```
+
+4.3 LINKER SCRIPTS
+------------------
+
+Custom memory layout:
+
+```
+/* linker.ld */
+SECTIONS
+{
+    .text.hot : {
+        *(.text.hot)      /* Hot code together */
+        *(.text.startup)
+    }
+
+    .text : {
+        *(.text)          /* Regular code */
+    }
+
+    .text.cold : {
+        *(.text.cold)     /* Cold code separate */
+        *(.text.unlikely)
+    }
+
+    .rodata : {
+        *(.rodata*)       /* Read-only data */
+    }
+
+    .data : {
+        *(.data*)         /* Initialized data */
+    }
+
+    .bss : {
+        *(.bss*)          /* Uninitialized data */
+    }
+}
+```
+
+Usage:
+
+```bash
+g++ *.cpp -Wl,-T,linker.ld -o trading_engine
+```
+
+In code:
+
+```cpp
+// Place hot functions in .text.hot section
+__attribute__((section(".text.hot")))
+void process_market_data() {
+    // Frequently called
+}
+
+__attribute__((section(".text.cold")))
+void handle_rare_error() {
+    // Rarely called
+}
+```
+
+4.4 LINKER FLAGS OPTIMIZATION
+------------------------------
+
+Production linker flags:
+
+```bash
+g++ *.cpp -o trading_engine \
+    -Wl,-O1 \                      # Optimize linker operation
+    -Wl,--as-needed \              # Don't link unused libraries
+    -Wl,--sort-common \            # Sort common symbols
+    -Wl,--hash-style=gnu \         # Faster symbol lookup
+    -Wl,--gc-sections \            # Remove unused sections
+    -Wl,--icf=all \                # Identical code folding
+    -Wl,-z,relro \                 # Relocation read-only
+    -Wl,-z,now \                   # Resolve all symbols at load
+    -Wl,--build-id=sha1            # Build ID for debugging
+```
+
+CMake linker flags:
+
+```cmake
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} \
+    -Wl,-O1 \
+    -Wl,--as-needed \
+    -Wl,--sort-common \
+    -Wl,--hash-style=gnu"
+)
+
+# Release-specific
+set(CMAKE_EXE_LINKER_FLAGS_RELEASE "${CMAKE_EXE_LINKER_FLAGS_RELEASE} \
+    -Wl,--gc-sections \
+    -Wl,--icf=all \
+    -Wl,-z,relro \
+    -Wl,-z,now"
+)
+```
+
+================================================================================
+SECTION 5: ADVANCED LINKING TECHNIQUES
+================================================================================
+
+5.1 GOLD LINKER
+---------------
+
+Faster alternative to GNU ld:
+
+```bash
+# Use Gold linker
+g++ -fuse-ld=gold *.cpp -o trading_engine
+
+# Gold-specific optimizations
+g++ -fuse-ld=gold *.cpp -o trading_engine \
+    -Wl,--threads \
+    -Wl,--thread-count=8 \
+    -Wl,--icf=all
+```
+
+CMake Gold linker:
+
+```cmake
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fuse-ld=gold")
+
+# Parallel Gold linking
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} \
+    -Wl,--threads \
+    -Wl,--thread-count=8"
+)
+```
+
+5.2 LLD LINKER (LLVM)
+---------------------
+
+Fast modern linker:
+
+```bash
+# Install LLD
+sudo apt-get install lld
+
+# Use LLD with Clang
+clang++ -fuse-ld=lld *.cpp -o trading_engine
+
+# Use LLD with GCC
+g++ -fuse-ld=lld *.cpp -o trading_engine
+
+# LLD parallel linking (automatic)
+clang++ -fuse-ld=lld -O3 *.cpp -o trading_engine
+```
+
+CMake LLD:
+
+```cmake
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fuse-ld=lld")
+```
+
+5.3 MOLD LINKER
+---------------
+
+Ultra-fast modern linker:
+
+```bash
+# Install mold
+sudo apt-get install mold
+
+# Use mold
+g++ -fuse-ld=mold *.cpp -o trading_engine
+clang++ -fuse-ld=mold *.cpp -o trading_engine
+
+# Benchmark linkers
+time g++ -fuse-ld=ld *.cpp -o trading_engine_ld
+time g++ -fuse-ld=gold *.cpp -o trading_engine_gold
+time g++ -fuse-ld=lld *.cpp -o trading_engine_lld
+time g++ -fuse-ld=mold *.cpp -o trading_engine_mold
+```
+
+5.4 PRELINK
+-----------
+
+Pre-resolve symbols for faster startup:
+
+```bash
+# Install prelink
+sudo apt-get install prelink
+
+# Prelink binary
+prelink -v trading_engine
+
+# Prelink all binaries in directory
+prelink -avmR
+
+# Verify prelinking
+readelf -d trading_engine | grep PRELINK
+
+# Undo prelinking
+prelink -u trading_engine
+```
+
+================================================================================
+SECTION 6: LIBRARY MANAGEMENT
+================================================================================
+
+6.1 LIBRARY SEARCH
+------------------
+
+```bash
+# Add library search path
+g++ main.cpp -L/opt/hft/lib -lhft_core
+
+# Multiple search paths
+g++ main.cpp \
+    -L/opt/hft/lib \
+    -L/usr/local/lib \
+    -lhft_core \
+    -lspdlog
+
+# Check where libraries are found
+LD_DEBUG=libs ./trading_engine 2>&1 | grep searching
+```
+
+CMake library search:
+
+```cmake
+# Add library search paths
+link_directories(/opt/hft/lib /usr/local/lib)
+
+# Better: use imported targets
+find_library(HFT_CORE_LIB hft_core PATHS /opt/hft/lib)
+add_library(hft_core UNKNOWN IMPORTED)
+set_target_properties(hft_core PROPERTIES
+    IMPORTED_LOCATION ${HFT_CORE_LIB}
+)
+```
+
+6.2 LIBRARY LOAD ORDER
+----------------------
+
+Order matters for resolving symbols:
+
+```bash
+# Correct order: dependencies last
+g++ main.cpp -lhft_execution -lhft_core -lpthread
+
+# Wrong order: unresolved symbols
+g++ main.cpp -lpthread -lhft_core -lhft_execution  # May fail
+
+# Force multiple passes (not recommended)
+g++ main.cpp -Wl,--start-group -lhft_execution -lhft_core -Wl,--end-group
+```
+
+6.3 WEAK SYMBOLS
+----------------
+
+Optional dependencies:
+
+```cpp
+// Declare weak symbol
+extern "C" __attribute__((weak)) void optional_function();
+
+void process() {
+    if (optional_function != nullptr) {
+        optional_function();  // Use if available
+    } else {
+        // Fallback implementation
+    }
+}
+```
+
+Link with optional library:
+
+```bash
+# optional_function provided by liboptional.so
+g++ main.cpp -loptional -o trading_engine  # Uses optional_function
+
+# Without library
+g++ main.cpp -o trading_engine  # Uses fallback
+```
+
+================================================================================
+SECTION 7: TROUBLESHOOTING
+================================================================================
+
+7.1 COMMON LINKING ERRORS
+--------------------------
+
+Error: undefined reference to symbol
+
+```bash
+# Find which library contains symbol
+nm -D /usr/lib/libboost_system.so | grep symbol_name
+
+# Add missing library
+g++ main.cpp -lboost_system
+```
+
+Error: cannot find -llibname
+
+```bash
+# Check library search paths
+ldconfig -v | grep libname
+
+# Add library path
+g++ main.cpp -L/usr/local/lib -llibname
+
+# Or update LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
+```
+
+Error: version mismatch
+
+```bash
+# Check library version
+objdump -p /usr/lib/libboost_system.so | grep SONAME
+
+# Check binary requirements
+objdump -p trading_engine | grep NEEDED
+
+# Update library or rebuild
+```
+
+7.2 DEBUGGING LINKING
+---------------------
+
+```bash
+# Verbose linking
+g++ -Wl,--verbose main.cpp -o trading_engine
+
+# Print linker commands
+g++ -Wl,--trace main.cpp -o trading_engine
+
+# Check link order
+g++ -Wl,--print-map main.cpp -o trading_engine > link.map
+
+# Verify symbols resolved
+nm -u trading_engine  # Should be empty
+```
+
+7.3 RUNTIME DEBUGGING
+---------------------
+
+```bash
+# Debug library loading
+LD_DEBUG=all ./trading_engine 2>&1 | less
+LD_DEBUG=libs ./trading_engine 2>&1 | grep searching
+LD_DEBUG=bindings ./trading_engine 2>&1 | grep symbol
+
+# Check actual library loaded
+lsof -p $(pgrep trading_engine) | grep "\.so"
+
+# Preload library
+LD_PRELOAD=/path/to/custom.so ./trading_engine
+```
+
+================================================================================
+SECTION 8: BEST PRACTICES FOR HFT
+================================================================================
+
+8.1 DEPLOYMENT STRATEGY
+-----------------------
+
+Recommended: Mixed static/dynamic linking
+
+```cmake
+# Static: Custom HFT libraries (complete control)
+add_library(hft_core STATIC core.cpp)
+add_library(hft_execution STATIC execution.cpp)
+add_library(hft_strategy STATIC strategy.cpp)
+
+# Dynamic: System libraries (security updates)
+find_package(Threads REQUIRED)
+
+add_executable(trading_engine main.cpp)
+target_link_libraries(trading_engine
+    PRIVATE
+        hft_core           # Static
+        hft_execution      # Static
+        hft_strategy       # Static
+        Threads::Threads   # Dynamic
+        ${CMAKE_DL_LIBS}   # Dynamic
+)
+
+# Portable RPATH
+set_target_properties(trading_engine PROPERTIES
+    INSTALL_RPATH "$ORIGIN/../lib"
+)
+```
+
+8.2 OPTIMIZATION CHECKLIST
+---------------------------
+
+```
+[ ] LTO enabled for release builds
+[ ] Dead code elimination enabled
+[ ] Symbol visibility set to hidden by default
+[ ] Linker optimization flags applied
+[ ] Fast linker (LLD/Gold/Mold) used
+[ ] RPATH configured for deployment
+[ ] Symbols stripped from production binary
+[ ] Library dependencies minimized
+[ ] Static linking for critical libraries
+[ ] No undefined symbols (nm -u shows nothing)
+```
+
+8.3 MONITORING
+--------------
+
+```bash
+#!/bin/bash
+# link_metrics.sh
+
+BINARY="$1"
+
+echo "=== Link Metrics ==="
+echo ""
+
+echo "Binary size: $(du -h $BINARY | cut -f1)"
+echo "Text section size: $(size $BINARY | tail -1 | awk '{print $1}') bytes"
+echo ""
+
+echo "Dependencies:"
+ldd $BINARY | wc -l
+echo ""
+
+echo "Symbols:"
+echo "  Total: $(nm $BINARY | wc -l)"
+echo "  Undefined: $(nm -u $BINARY | wc -l)"
+echo ""
+
+echo "RPATH:"
+readelf -d $BINARY | grep RPATH || echo "  None"
+```
+
+================================================================================
+Last Updated: 2025-11-25
+Version: 1.0.0

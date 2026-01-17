@@ -1,0 +1,668 @@
+================================================================================
+                      DATA PARTITIONING STRATEGIES
+                Time, Symbol, and Exchange Partitioning
+================================================================================
+
+PURPOSE: Proper partitioning enables efficient queries, parallel processing,
+and data lifecycle management for tick data.
+
+================================================================================
+                         TABLE OF CONTENTS
+================================================================================
+
+1. Partitioning Overview
+2. Time-Based Partitioning
+3. Symbol-Based Partitioning
+4. Exchange-Based Partitioning
+5. Composite Partitioning
+6. Implementation Examples
+7. Query Optimization
+8. Lifecycle Management
+
+================================================================================
+                   1. PARTITIONING OVERVIEW
+================================================================================
+
+WHY PARTITION TICK DATA:
+------------------------
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    PARTITIONING BENEFITS                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  1. QUERY PERFORMANCE                                                       │
+│     • Only read relevant partitions (partition pruning)                    │
+│     • Parallel reads across partitions                                      │
+│     • Index per partition = smaller indexes                                 │
+│                                                                             │
+│  2. DATA LIFECYCLE                                                          │
+│     • Drop old partitions = instant deletion                               │
+│     • Tier partitions to different storage                                  │
+│     • Archive partitions independently                                      │
+│                                                                             │
+│  3. OPERATIONAL                                                             │
+│     • Backup specific time ranges                                           │
+│     • Repair individual partitions                                          │
+│     • Load balance across storage                                           │
+│                                                                             │
+│  TYPICAL PARTITION SIZES:                                                   │
+│  ─────────────────────────────────────────────────────────────────────────│
+│  Strategy        │ Partition Size │ Partitions/Year │ Query Selectivity   │
+│  Daily           │ 5-50 GB        │ 365             │ Time-focused        │
+│  Hourly          │ 200MB-2GB      │ 8,760           │ Intraday analysis   │
+│  Symbol          │ Varies         │ 100-1000        │ Symbol-focused      │
+│  Exchange+Day    │ 1-10 GB        │ ~1,500          │ Exchange-focused    │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+================================================================================
+                   2. TIME-BASED PARTITIONING
+================================================================================
+
+DAILY PARTITIONING (RECOMMENDED):
+---------------------------------
+
+```
+/data/ticks/
+├── 2025-11-24/
+│   ├── ticks.parquet
+│   ├── trades.parquet
+│   └── orderbook.parquet
+├── 2025-11-25/
+│   ├── ticks.parquet
+│   ├── trades.parquet
+│   └── orderbook.parquet
+└── 2025-11-26/
+    ├── ticks.parquet
+    ├── trades.parquet
+    └── orderbook.parquet
+```
+
+HOURLY PARTITIONING (HIGH VOLUME):
+----------------------------------
+
+```
+/data/ticks/
+└── 2025-11-26/
+    ├── 00/
+    │   └── ticks.parquet
+    ├── 01/
+    │   └── ticks.parquet
+    ...
+    └── 23/
+        └── ticks.parquet
+```
+
+IMPLEMENTATION:
+---------------
+
+```cpp
+class TimePartitioner {
+public:
+    enum class Granularity {
+        HOURLY,
+        DAILY,
+        WEEKLY,
+        MONTHLY
+    };
+
+    TimePartitioner(
+        const std::string& base_path,
+        Granularity granularity = Granularity::DAILY
+    ) : base_path_(base_path), granularity_(granularity) {}
+
+    std::string get_partition_path(int64_t timestamp_ns) {
+        auto time_point = std::chrono::system_clock::time_point(
+            std::chrono::nanoseconds(timestamp_ns)
+        );
+        auto time_t = std::chrono::system_clock::to_time_t(time_point);
+        std::tm tm = *std::gmtime(&time_t);
+
+        std::ostringstream path;
+        path << base_path_ << "/";
+
+        switch (granularity_) {
+            case Granularity::HOURLY:
+                path << std::put_time(&tm, "%Y-%m-%d/%H");
+                break;
+            case Granularity::DAILY:
+                path << std::put_time(&tm, "%Y-%m-%d");
+                break;
+            case Granularity::WEEKLY:
+                // ISO week number
+                path << std::put_time(&tm, "%Y-W%V");
+                break;
+            case Granularity::MONTHLY:
+                path << std::put_time(&tm, "%Y-%m");
+                break;
+        }
+
+        return path.str();
+    }
+
+    // Get partitions for time range
+    std::vector<std::string> get_partitions(
+        int64_t start_ns,
+        int64_t end_ns
+    ) {
+        std::vector<std::string> partitions;
+
+        int64_t increment_ns;
+        switch (granularity_) {
+            case Granularity::HOURLY:
+                increment_ns = 3600'000'000'000LL;
+                break;
+            case Granularity::DAILY:
+                increment_ns = 86400'000'000'000LL;
+                break;
+            case Granularity::WEEKLY:
+                increment_ns = 604800'000'000'000LL;
+                break;
+            case Granularity::MONTHLY:
+                increment_ns = 2592000'000'000'000LL;  // ~30 days
+                break;
+        }
+
+        for (int64_t ts = start_ns; ts <= end_ns; ts += increment_ns) {
+            std::string path = get_partition_path(ts);
+            if (partitions.empty() || partitions.back() != path) {
+                partitions.push_back(path);
+            }
+        }
+
+        return partitions;
+    }
+
+private:
+    std::string base_path_;
+    Granularity granularity_;
+};
+```
+
+================================================================================
+                   3. SYMBOL-BASED PARTITIONING
+================================================================================
+
+SYMBOL PARTITIONING:
+--------------------
+
+```
+/data/ticks/2025-11-26/
+├── BTCUSDT/
+│   └── ticks.parquet
+├── ETHUSDT/
+│   └── ticks.parquet
+├── BNBUSDT/
+│   └── ticks.parquet
+└── ...
+```
+
+SYMBOL HASH PARTITIONING (MANY SYMBOLS):
+----------------------------------------
+
+```
+/data/ticks/2025-11-26/
+├── partition_00/   # Symbols with hash % 16 == 0
+├── partition_01/   # Symbols with hash % 16 == 1
+├── partition_02/
+...
+└── partition_15/
+```
+
+IMPLEMENTATION:
+---------------
+
+```cpp
+class SymbolPartitioner {
+public:
+    SymbolPartitioner(
+        const std::string& base_path,
+        int num_buckets = 16
+    ) : base_path_(base_path), num_buckets_(num_buckets) {}
+
+    // Direct symbol partitioning
+    std::string get_symbol_path(
+        const std::string& date,
+        const std::string& symbol
+    ) {
+        return base_path_ + "/" + date + "/" + symbol;
+    }
+
+    // Hash-based partitioning for many symbols
+    std::string get_hash_partition_path(
+        const std::string& date,
+        const std::string& symbol
+    ) {
+        int bucket = std::hash<std::string>{}(symbol) % num_buckets_;
+        return base_path_ + "/" + date + "/partition_" +
+               std::to_string(bucket);
+    }
+
+    // Get all partitions that might contain a symbol
+    std::vector<std::string> get_partitions_for_symbols(
+        const std::string& date,
+        const std::vector<std::string>& symbols
+    ) {
+        std::set<int> buckets;
+        for (const auto& symbol : symbols) {
+            buckets.insert(std::hash<std::string>{}(symbol) % num_buckets_);
+        }
+
+        std::vector<std::string> partitions;
+        for (int bucket : buckets) {
+            partitions.push_back(
+                base_path_ + "/" + date + "/partition_" + std::to_string(bucket)
+            );
+        }
+
+        return partitions;
+    }
+
+private:
+    std::string base_path_;
+    int num_buckets_;
+};
+```
+
+================================================================================
+                   4. EXCHANGE-BASED PARTITIONING
+================================================================================
+
+EXCHANGE PARTITIONING:
+----------------------
+
+```
+/data/ticks/
+├── binance/
+│   ├── 2025-11-24/
+│   ├── 2025-11-25/
+│   └── 2025-11-26/
+├── coinbase/
+│   ├── 2025-11-24/
+│   ├── 2025-11-25/
+│   └── 2025-11-26/
+└── kraken/
+    ├── 2025-11-24/
+    ├── 2025-11-25/
+    └── 2025-11-26/
+```
+
+BENEFITS:
+---------
+- Each exchange has different data formats/volumes
+- Easy to add/remove exchanges
+- Query specific exchange without touching others
+- Different retention policies per exchange
+
+================================================================================
+                   5. COMPOSITE PARTITIONING
+================================================================================
+
+RECOMMENDED: EXCHANGE + DATE + SYMBOL HASH
+------------------------------------------
+
+```
+/data/ticks/
+├── binance/
+│   └── 2025-11-26/
+│       ├── bucket_00/
+│       │   ├── BTCUSDT.parquet
+│       │   └── ETHUSDT.parquet
+│       ├── bucket_01/
+│       ...
+│       └── bucket_15/
+├── coinbase/
+│   └── 2025-11-26/
+│       ├── bucket_00/
+│       ...
+└── kraken/
+    └── 2025-11-26/
+        ...
+```
+
+IMPLEMENTATION:
+---------------
+
+```cpp
+class CompositePartitioner {
+public:
+    struct PartitionKey {
+        std::string exchange;
+        std::string date;
+        std::string symbol;
+    };
+
+    CompositePartitioner(
+        const std::string& base_path,
+        int symbol_buckets = 16
+    ) : base_path_(base_path), symbol_buckets_(symbol_buckets) {}
+
+    std::string get_partition_path(const PartitionKey& key) {
+        int bucket = std::hash<std::string>{}(key.symbol) % symbol_buckets_;
+
+        std::ostringstream path;
+        path << base_path_ << "/"
+             << key.exchange << "/"
+             << key.date << "/"
+             << "bucket_" << std::setw(2) << std::setfill('0') << bucket << "/"
+             << key.symbol << ".parquet";
+
+        return path.str();
+    }
+
+    // Get all partitions matching query
+    std::vector<std::string> get_partitions(
+        const std::vector<std::string>& exchanges,
+        const std::string& start_date,
+        const std::string& end_date,
+        const std::vector<std::string>& symbols
+    ) {
+        std::vector<std::string> partitions;
+
+        // Get date range
+        auto dates = get_dates_in_range(start_date, end_date);
+
+        // Get symbol buckets
+        std::set<int> buckets;
+        if (symbols.empty()) {
+            // All buckets
+            for (int i = 0; i < symbol_buckets_; i++) buckets.insert(i);
+        } else {
+            for (const auto& symbol : symbols) {
+                buckets.insert(std::hash<std::string>{}(symbol) % symbol_buckets_);
+            }
+        }
+
+        // Generate all partition paths
+        for (const auto& exchange : exchanges) {
+            for (const auto& date : dates) {
+                for (int bucket : buckets) {
+                    std::ostringstream path;
+                    path << base_path_ << "/"
+                         << exchange << "/"
+                         << date << "/"
+                         << "bucket_" << std::setw(2) << std::setfill('0') << bucket;
+                    partitions.push_back(path.str());
+                }
+            }
+        }
+
+        return partitions;
+    }
+
+private:
+    std::vector<std::string> get_dates_in_range(
+        const std::string& start,
+        const std::string& end
+    ) {
+        // Parse dates and generate range
+        std::vector<std::string> dates;
+        // ... implementation
+        return dates;
+    }
+
+    std::string base_path_;
+    int symbol_buckets_;
+};
+```
+
+================================================================================
+                   6. IMPLEMENTATION EXAMPLES
+================================================================================
+
+PARQUET PARTITIONED WRITER:
+---------------------------
+
+```cpp
+#include <arrow/api.h>
+#include <parquet/arrow/writer.h>
+
+class PartitionedParquetWriter {
+public:
+    PartitionedParquetWriter(const CompositePartitioner& partitioner)
+        : partitioner_(partitioner) {}
+
+    void write(const std::vector<Tick>& ticks) {
+        // Group ticks by partition
+        std::map<std::string, std::vector<Tick>> partition_data;
+
+        for (const auto& tick : ticks) {
+            auto key = CompositePartitioner::PartitionKey{
+                .exchange = tick.exchange,
+                .date = timestamp_to_date(tick.timestamp_ns),
+                .symbol = tick.symbol
+            };
+            std::string path = partitioner_.get_partition_path(key);
+            partition_data[path].push_back(tick);
+        }
+
+        // Write each partition
+        for (auto& [path, data] : partition_data) {
+            write_partition(path, data);
+        }
+    }
+
+private:
+    void write_partition(
+        const std::string& path,
+        const std::vector<Tick>& ticks
+    ) {
+        // Create directory if needed
+        std::filesystem::create_directories(
+            std::filesystem::path(path).parent_path()
+        );
+
+        // Convert to Arrow table
+        auto table = ticks_to_arrow_table(ticks);
+
+        // Write Parquet file
+        std::shared_ptr<arrow::io::FileOutputStream> outfile;
+        PARQUET_ASSIGN_OR_THROW(
+            outfile,
+            arrow::io::FileOutputStream::Open(path)
+        );
+
+        PARQUET_THROW_NOT_OK(
+            parquet::arrow::WriteTable(
+                *table,
+                arrow::default_memory_pool(),
+                outfile,
+                1024 * 1024  // row group size
+            )
+        );
+    }
+
+    std::shared_ptr<arrow::Table> ticks_to_arrow_table(
+        const std::vector<Tick>& ticks
+    ) {
+        // Build Arrow arrays from tick data
+        // ... implementation
+        return nullptr;
+    }
+
+    CompositePartitioner partitioner_;
+};
+```
+
+================================================================================
+                   7. QUERY OPTIMIZATION
+================================================================================
+
+PARTITION PRUNING:
+------------------
+
+```cpp
+class PartitionPruningOptimizer {
+public:
+    // Prune partitions based on query predicates
+    std::vector<std::string> optimize_query(
+        const std::vector<std::string>& all_partitions,
+        const QueryPredicate& predicate
+    ) {
+        std::vector<std::string> pruned;
+
+        for (const auto& partition : all_partitions) {
+            // Extract partition info from path
+            auto info = parse_partition_path(partition);
+
+            // Check if partition could contain matching data
+            if (matches_predicate(info, predicate)) {
+                pruned.push_back(partition);
+            }
+        }
+
+        return pruned;
+    }
+
+private:
+    struct PartitionInfo {
+        std::string exchange;
+        std::string date;
+        int symbol_bucket;
+    };
+
+    PartitionInfo parse_partition_path(const std::string& path) {
+        // Parse path like "/data/binance/2025-11-26/bucket_05/"
+        // ... implementation
+        return {};
+    }
+
+    bool matches_predicate(
+        const PartitionInfo& info,
+        const QueryPredicate& pred
+    ) {
+        // Check exchange filter
+        if (!pred.exchanges.empty() &&
+            pred.exchanges.find(info.exchange) == pred.exchanges.end()) {
+            return false;
+        }
+
+        // Check date range
+        if (info.date < pred.start_date || info.date > pred.end_date) {
+            return false;
+        }
+
+        // Check symbol bucket
+        if (!pred.symbols.empty()) {
+            bool bucket_match = false;
+            for (const auto& symbol : pred.symbols) {
+                int bucket = std::hash<std::string>{}(symbol) % 16;
+                if (bucket == info.symbol_bucket) {
+                    bucket_match = true;
+                    break;
+                }
+            }
+            if (!bucket_match) return false;
+        }
+
+        return true;
+    }
+};
+```
+
+PARALLEL PARTITION READS:
+-------------------------
+
+```cpp
+class ParallelPartitionReader {
+public:
+    std::vector<Tick> read_partitions(
+        const std::vector<std::string>& partitions,
+        int num_threads = 8
+    ) {
+        std::vector<std::vector<Tick>> results(partitions.size());
+
+        #pragma omp parallel for num_threads(num_threads)
+        for (size_t i = 0; i < partitions.size(); i++) {
+            results[i] = read_partition(partitions[i]);
+        }
+
+        // Merge results
+        std::vector<Tick> merged;
+        for (auto& r : results) {
+            merged.insert(merged.end(), r.begin(), r.end());
+        }
+
+        // Sort by timestamp
+        std::sort(merged.begin(), merged.end(),
+            [](const Tick& a, const Tick& b) {
+                return a.timestamp_ns < b.timestamp_ns;
+            }
+        );
+
+        return merged;
+    }
+
+private:
+    std::vector<Tick> read_partition(const std::string& path) {
+        // Read parquet/binary file
+        // ... implementation
+        return {};
+    }
+};
+```
+
+================================================================================
+                   8. LIFECYCLE MANAGEMENT
+================================================================================
+
+PARTITION LIFECYCLE:
+--------------------
+
+```cpp
+class PartitionLifecycleManager {
+public:
+    struct Policy {
+        int hot_days = 7;         // Keep on SSD
+        int warm_days = 30;       // Keep on HDD
+        int cold_days = 365;      // Keep in archive
+        int delete_days = 2555;   // 7 years, then delete
+    };
+
+    PartitionLifecycleManager(
+        const std::string& base_path,
+        const Policy& policy
+    ) : base_path_(base_path), policy_(policy) {}
+
+    void apply_lifecycle() {
+        auto today = std::chrono::system_clock::now();
+        auto partitions = list_all_partitions();
+
+        for (const auto& partition : partitions) {
+            auto partition_date = parse_date(partition);
+            auto age_days = days_between(partition_date, today);
+
+            if (age_days > policy_.delete_days) {
+                delete_partition(partition);
+            } else if (age_days > policy_.cold_days) {
+                move_to_cold(partition);
+            } else if (age_days > policy_.warm_days) {
+                move_to_warm(partition);
+            }
+            // Hot partitions stay where they are
+        }
+    }
+
+    void drop_partition(const std::string& date) {
+        // Instant deletion by removing directory
+        std::filesystem::remove_all(base_path_ + "/" + date);
+    }
+
+private:
+    void move_to_cold(const std::string& partition) {
+        // Compress with high ratio
+        // Move to S3 Glacier or similar
+    }
+
+    void move_to_warm(const std::string& partition) {
+        // Move from SSD to HDD
+        // Or compress with medium ratio
+    }
+
+    std::string base_path_;
+    Policy policy_;
+};
+```
+
+================================================================================
+                         END OF DOCUMENT
+================================================================================

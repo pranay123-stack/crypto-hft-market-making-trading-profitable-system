@@ -1,0 +1,944 @@
+================================================================================
+CLOUD DEPLOYMENT FOR HFT SYSTEMS
+================================================================================
+Complete guide for deploying HFT trading systems on AWS, GCP, and Azure with
+infrastructure provisioning, networking, and optimization for low latency.
+
+Last Updated: 2025-11-25
+================================================================================
+
+TABLE OF CONTENTS
+================================================================================
+1. AWS Deployment Architecture
+2. GCP Deployment Architecture
+3. Azure Deployment Architecture
+4. Multi-Cloud Strategy
+5. Network Optimization
+6. Cost Optimization
+7. Disaster Recovery
+8. Migration Strategies
+
+================================================================================
+1. AWS DEPLOYMENT ARCHITECTURE
+================================================================================
+
+# terraform/aws/production.tfvars
+aws_region = "us-east-1"
+environment = "production"
+
+# VPC Configuration
+vpc_cidr = "10.0.0.0/16"
+availability_zones = ["us-east-1a", "us-east-1b", "us-east-1c"]
+private_subnet_cidrs = ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"]
+public_subnet_cidrs  = ["10.0.101.0/24", "10.0.102.0/24", "10.0.103.0/24"]
+
+# EKS Configuration
+kubernetes_version = "1.28"
+node_instance_types = {
+  trading_engine = ["c6i.4xlarge", "c6i.8xlarge"]
+  general        = ["t3.xlarge"]
+}
+
+# RDS Configuration
+rds_instance_class = "db.r6i.4xlarge"
+rds_allocated_storage = 1000
+rds_iops = 32000
+rds_multi_az = true
+
+# ElastiCache Configuration
+redis_node_type = "cache.r6g.2xlarge"
+redis_num_cache_nodes = 3
+
+# Alert email
+alert_email = "alerts@hft-trading.example.com"
+
+---
+# AWS Architecture Components
+# scripts/deploy-aws-full-stack.sh
+#!/bin/bash
+set -e
+
+ENVIRONMENT=${1:-production}
+
+echo "Deploying full HFT stack to AWS..."
+echo "Environment: ${ENVIRONMENT}"
+
+# Step 1: Deploy VPC and networking
+echo "Step 1/6: Deploying VPC and networking..."
+terraform -chdir=terraform/aws apply \
+    -target=module.vpc \
+    -var-file=environments/${ENVIRONMENT}.tfvars \
+    -auto-approve
+
+# Step 2: Deploy EKS cluster
+echo "Step 2/6: Deploying EKS cluster..."
+terraform -chdir=terraform/aws apply \
+    -target=module.eks \
+    -var-file=environments/${ENVIRONMENT}.tfvars \
+    -auto-approve
+
+# Update kubeconfig
+aws eks update-kubeconfig \
+    --region us-east-1 \
+    --name hft-trading-${ENVIRONMENT}
+
+# Step 3: Deploy RDS PostgreSQL
+echo "Step 3/6: Deploying RDS..."
+terraform -chdir=terraform/aws apply \
+    -target=module.rds \
+    -var-file=environments/${ENVIRONMENT}.tfvars \
+    -auto-approve
+
+# Step 4: Deploy ElastiCache Redis
+echo "Step 4/6: Deploying ElastiCache..."
+terraform -chdir=terraform/aws apply \
+    -target=module.redis \
+    -var-file=environments/${ENVIRONMENT}.tfvars \
+    -auto-approve
+
+# Step 5: Deploy monitoring stack
+echo "Step 5/6: Deploying monitoring..."
+helm install prometheus prometheus-community/kube-prometheus-stack \
+    --namespace monitoring \
+    --create-namespace \
+    --values helm/monitoring/values-aws.yaml
+
+# Step 6: Deploy application
+echo "Step 6/6: Deploying application..."
+helm install hft-trading ./helm/hft-trading \
+    --namespace hft-trading \
+    --create-namespace \
+    --values environments/${ENVIRONMENT}.yaml
+
+echo "AWS deployment complete!"
+
+---
+# AWS-specific optimizations
+# terraform/aws/ec2-optimization.tf
+
+# Placement groups for low latency
+resource "aws_placement_group" "trading_engine" {
+  name     = "hft-trading-placement-group"
+  strategy = "cluster"
+
+  tags = {
+    Name = "HFT Trading Placement Group"
+  }
+}
+
+# Enhanced networking
+resource "aws_ec2_instance_state" "trading_nodes" {
+  for_each = toset(data.aws_instances.trading_nodes.ids)
+
+  instance_id = each.key
+  state       = "running"
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+# EBS optimized instances
+resource "aws_launch_template" "trading_engine" {
+  name_prefix   = "hft-trading-"
+  instance_type = "c6i.8xlarge"
+
+  block_device_mappings {
+    device_name = "/dev/xvda"
+
+    ebs {
+      volume_size           = 200
+      volume_type           = "gp3"
+      iops                  = 16000
+      throughput            = 1000
+      encrypted             = true
+      delete_on_termination = true
+    }
+  }
+
+  network_interfaces {
+    associate_public_ip_address = false
+    delete_on_termination       = true
+    device_index                = 0
+
+    # Enable enhanced networking
+    interface_type = "efa"  # Elastic Fabric Adapter for ultra-low latency
+  }
+
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 1
+  }
+
+  tag_specifications {
+    resource_type = "instance"
+
+    tags = {
+      Name = "HFT Trading Engine"
+    }
+  }
+
+  user_data = base64encode(<<-EOF
+    #!/bin/bash
+    # Optimize network stack
+    sysctl -w net.core.somaxconn=4096
+    sysctl -w net.ipv4.tcp_max_syn_backlog=8192
+    sysctl -w net.core.rmem_max=16777216
+    sysctl -w net.core.wmem_max=16777216
+
+    # Set CPU governor to performance
+    echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+
+    # Configure huge pages
+    echo 1024 > /proc/sys/vm/nr_hugepages
+
+    # Disable transparent huge pages
+    echo never > /sys/kernel/mm/transparent_hugepage/enabled
+  EOF
+  )
+}
+
+---
+# AWS Direct Connect for exchange connectivity
+# terraform/aws/direct-connect.tf
+resource "aws_dx_connection" "exchange" {
+  name      = "hft-exchange-connection"
+  bandwidth = "10Gbps"
+  location  = "EqDC2"  # Equinix DC2 (example)
+
+  tags = {
+    Name = "HFT Exchange Direct Connect"
+  }
+}
+
+resource "aws_dx_private_virtual_interface" "exchange" {
+  connection_id = aws_dx_connection.exchange.id
+  name          = "hft-exchange-vif"
+
+  vlan     = 100
+  bgp_asn  = 65000
+  bgp_auth_key = var.bgp_auth_key
+
+  address_family = "ipv4"
+  amazon_address = "169.254.1.1/30"
+  customer_address = "169.254.1.2/30"
+
+  vpn_gateway_id = aws_vpn_gateway.main.id
+}
+
+# VPN Gateway
+resource "aws_vpn_gateway" "main" {
+  vpc_id = module.vpc.vpc_id
+
+  tags = {
+    Name = "HFT Trading VPN Gateway"
+  }
+}
+
+---
+# AWS Global Accelerator for multi-region
+# terraform/aws/global-accelerator.tf
+resource "aws_globalaccelerator_accelerator" "trading" {
+  name            = "hft-trading-accelerator"
+  ip_address_type = "IPV4"
+  enabled         = true
+
+  attributes {
+    flow_logs_enabled   = true
+    flow_logs_s3_bucket = aws_s3_bucket.flow_logs.bucket
+    flow_logs_s3_prefix = "global-accelerator/"
+  }
+}
+
+resource "aws_globalaccelerator_listener" "trading" {
+  accelerator_arn = aws_globalaccelerator_accelerator.trading.id
+  protocol        = "TCP"
+
+  port_range {
+    from_port = 443
+    to_port   = 443
+  }
+}
+
+resource "aws_globalaccelerator_endpoint_group" "us_east" {
+  listener_arn = aws_globalaccelerator_listener.trading.id
+
+  endpoint_group_region = "us-east-1"
+  traffic_dial_percentage = 100
+
+  health_check_interval_seconds = 10
+  health_check_path            = "/health"
+  health_check_protocol        = "HTTPS"
+
+  endpoint_configuration {
+    endpoint_id = aws_lb.trading_nlb_us_east.arn
+    weight      = 100
+  }
+}
+
+================================================================================
+2. GCP DEPLOYMENT ARCHITECTURE
+================================================================================
+
+# terraform/gcp/production.tfvars
+project_id = "hft-trading-prod"
+region     = "us-central1"
+environment = "production"
+
+# GKE Configuration
+gke_cluster_name = "hft-trading-prod"
+kubernetes_version = "1.28"
+
+node_pools = {
+  trading_engine = {
+    machine_type   = "c2-standard-16"
+    min_node_count = 3
+    max_node_count = 10
+    disk_size_gb   = 200
+    disk_type      = "pd-ssd"
+  }
+}
+
+# Cloud SQL Configuration
+sql_tier = "db-custom-16-65536"
+sql_disk_size = 1000
+sql_disk_type = "PD_SSD"
+
+# Memorystore Redis
+redis_tier = "STANDARD_HA"
+redis_memory_size_gb = 16
+
+---
+# GCP deployment script
+# scripts/deploy-gcp-full-stack.sh
+#!/bin/bash
+set -e
+
+PROJECT_ID=${1:-hft-trading-prod}
+REGION=${2:-us-central1}
+
+echo "Deploying full HFT stack to GCP..."
+echo "Project: ${PROJECT_ID}"
+echo "Region: ${REGION}"
+
+# Authenticate
+gcloud auth login
+gcloud config set project ${PROJECT_ID}
+
+# Enable required APIs
+gcloud services enable \
+    container.googleapis.com \
+    compute.googleapis.com \
+    sqladmin.googleapis.com \
+    redis.googleapis.com \
+    monitoring.googleapis.com \
+    logging.googleapis.com
+
+# Deploy infrastructure
+terraform -chdir=terraform/gcp init
+terraform -chdir=terraform/gcp apply \
+    -var="project_id=${PROJECT_ID}" \
+    -var="region=${REGION}" \
+    -auto-approve
+
+# Get cluster credentials
+gcloud container clusters get-credentials hft-trading-prod \
+    --region ${REGION} \
+    --project ${PROJECT_ID}
+
+# Deploy application
+helm install hft-trading ./helm/hft-trading \
+    --namespace hft-trading \
+    --create-namespace \
+    --values environments/production.yaml
+
+echo "GCP deployment complete!"
+
+---
+# GCP-specific optimizations
+# terraform/gcp/networking-optimization.tf
+
+# Premium tier networking for lowest latency
+resource "google_compute_network" "vpc" {
+  name                    = "hft-trading-vpc"
+  auto_create_subnetworks = false
+  routing_mode            = "REGIONAL"
+
+  # Premium tier for optimal routing
+  network_firewall_policy_enforcement_order = "AFTER_CLASSIC_FIREWALL"
+}
+
+# Cloud Interconnect for exchange connectivity
+resource "google_compute_interconnect_attachment" "exchange" {
+  name   = "hft-exchange-interconnect"
+  region = var.region
+
+  type = "PARTNER"
+  edge_availability_domain = "AVAILABILITY_DOMAIN_1"
+
+  admin_enabled = true
+  bandwidth     = "BPS_10G"
+
+  router = google_compute_router.interconnect.id
+}
+
+resource "google_compute_router" "interconnect" {
+  name    = "hft-interconnect-router"
+  network = google_compute_network.vpc.id
+  region  = var.region
+
+  bgp {
+    asn = 65000
+  }
+}
+
+# Dedicated CPU nodes for ultra-low latency
+resource "google_container_node_pool" "trading_dedicated" {
+  name       = "trading-dedicated"
+  location   = var.region
+  cluster    = google_container_cluster.primary.name
+  node_count = 3
+
+  node_config {
+    machine_type = "c2-standard-16"
+
+    # Sole tenant nodes for dedicated hardware
+    node_group = google_compute_node_group.trading.name
+
+    # Local SSD for ultra-fast storage
+    local_ssd_count = 2
+
+    labels = {
+      workload = "trading-engine"
+      dedicated = "true"
+    }
+
+    taint {
+      key    = "dedicated"
+      value  = "trading-engine"
+      effect = "NO_SCHEDULE"
+    }
+  }
+}
+
+resource "google_compute_node_group" "trading" {
+  name = "hft-trading-node-group"
+  zone = "${var.region}-a"
+
+  node_template = google_compute_node_template.trading.id
+
+  size = 3
+}
+
+resource "google_compute_node_template" "trading" {
+  name = "hft-trading-node-template"
+
+  node_type = "c2-node-60-240"
+
+  cpu_overcommit_type = "NONE"
+}
+
+================================================================================
+3. AZURE DEPLOYMENT ARCHITECTURE
+================================================================================
+
+# terraform/azure/production.tfvars
+location            = "East US"
+environment         = "production"
+resource_group_name = "hft-trading-prod"
+
+# AKS Configuration
+aks_cluster_name       = "hft-trading-prod"
+kubernetes_version     = "1.28"
+aks_node_count         = 3
+aks_node_vm_size       = "Standard_F16s_v2"  # Compute-optimized
+
+# Azure Database for PostgreSQL
+postgres_sku_name = "GP_Gen5_16"
+postgres_storage_mb = 1024000
+
+# Azure Cache for Redis
+redis_sku_name     = "Premium"
+redis_family       = "P"
+redis_capacity     = 4
+
+---
+# Azure deployment script
+# scripts/deploy-azure-full-stack.sh
+#!/bin/bash
+set -e
+
+RESOURCE_GROUP=${1:-hft-trading-prod}
+LOCATION=${2:-eastus}
+
+echo "Deploying full HFT stack to Azure..."
+echo "Resource Group: ${RESOURCE_GROUP}"
+echo "Location: ${LOCATION}"
+
+# Login to Azure
+az login
+
+# Create resource group
+az group create \
+    --name ${RESOURCE_GROUP} \
+    --location ${LOCATION}
+
+# Deploy infrastructure
+terraform -chdir=terraform/azure init
+terraform -chdir=terraform/azure apply \
+    -var="resource_group_name=${RESOURCE_GROUP}" \
+    -var="location=${LOCATION}" \
+    -auto-approve
+
+# Get AKS credentials
+az aks get-credentials \
+    --resource-group ${RESOURCE_GROUP} \
+    --name hft-trading-prod
+
+# Deploy application
+helm install hft-trading ./helm/hft-trading \
+    --namespace hft-trading \
+    --create-namespace \
+    --values environments/production.yaml
+
+echo "Azure deployment complete!"
+
+---
+# Azure-specific optimizations
+# terraform/azure/networking-optimization.tf
+
+# Accelerated Networking
+resource "azurerm_network_interface" "trading" {
+  name                = "hft-trading-nic"
+  location            = var.location
+  resource_group_name = var.resource_group_name
+
+  enable_accelerated_networking = true
+  enable_ip_forwarding         = false
+
+  ip_configuration {
+    name                          = "internal"
+    subnet_id                     = azurerm_subnet.private.id
+    private_ip_address_allocation = "Dynamic"
+  }
+}
+
+# Ultra SSD for ultra-low latency storage
+resource "azurerm_managed_disk" "trading_data" {
+  name                 = "hft-trading-data"
+  location             = var.location
+  resource_group_name  = var.resource_group_name
+  storage_account_type = "UltraSSD_LRS"
+  create_option        = "Empty"
+  disk_size_gb         = 1024
+
+  disk_iops_read_write = 160000
+  disk_mbps_read_write = 2000
+}
+
+# Proximity Placement Group
+resource "azurerm_proximity_placement_group" "trading" {
+  name                = "hft-trading-ppg"
+  location            = var.location
+  resource_group_name = var.resource_group_name
+}
+
+# ExpressRoute for exchange connectivity
+resource "azurerm_express_route_circuit" "exchange" {
+  name                  = "hft-exchange-circuit"
+  resource_group_name   = var.resource_group_name
+  location              = var.location
+  service_provider_name = "Equinix"
+  peering_location      = "New York"
+  bandwidth_in_mbps     = 10000
+
+  sku {
+    tier   = "Premium"
+    family = "MeteredData"
+  }
+}
+
+================================================================================
+4. MULTI-CLOUD STRATEGY
+================================================================================
+
+# Multi-cloud deployment with Terraform
+# terraform/multi-cloud/main.tf
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+    azurerm = {
+      source  = "hashicorp/azurerm"
+      version = "~> 3.0"
+    }
+  }
+}
+
+# Deploy to AWS (primary)
+module "aws_primary" {
+  source = "../aws"
+  providers = {
+    aws = aws.us_east_1
+  }
+
+  environment = "production-aws"
+  is_primary  = true
+}
+
+# Deploy to GCP (secondary)
+module "gcp_secondary" {
+  source = "../gcp"
+  providers = {
+    google = google
+  }
+
+  environment = "production-gcp"
+  is_primary  = false
+}
+
+# Deploy to Azure (DR)
+module "azure_dr" {
+  source = "../azure"
+  providers = {
+    azurerm = azurerm
+  }
+
+  environment = "production-azure-dr"
+  is_primary  = false
+}
+
+---
+# Multi-cloud traffic routing with DNS
+# terraform/multi-cloud/route53.tf
+resource "aws_route53_zone" "main" {
+  name = "trading.example.com"
+}
+
+# Geolocation routing
+resource "aws_route53_record" "aws_us" {
+  zone_id = aws_route53_zone.main.zone_id
+  name    = "api.trading.example.com"
+  type    = "A"
+
+  set_identifier = "aws-us-east-1"
+  geolocation_routing_policy {
+    continent = "NA"
+  }
+
+  alias {
+    name                   = module.aws_primary.lb_dns_name
+    zone_id                = module.aws_primary.lb_zone_id
+    evaluate_target_health = true
+  }
+}
+
+resource "aws_route53_record" "gcp_eu" {
+  zone_id = aws_route53_zone.main.zone_id
+  name    = "api.trading.example.com"
+  type    = "A"
+
+  set_identifier = "gcp-europe"
+  geolocation_routing_policy {
+    continent = "EU"
+  }
+
+  alias {
+    name                   = module.gcp_secondary.lb_ip
+    zone_id                = module.gcp_secondary.lb_zone_id
+    evaluate_target_health = true
+  }
+}
+
+# Failover routing
+resource "aws_route53_health_check" "aws_primary" {
+  fqdn              = module.aws_primary.lb_dns_name
+  port              = 443
+  type              = "HTTPS"
+  resource_path     = "/health"
+  failure_threshold = 3
+  request_interval  = 10
+}
+
+resource "aws_route53_record" "failover_primary" {
+  zone_id = aws_route53_zone.main.zone_id
+  name    = "trading.example.com"
+  type    = "A"
+
+  set_identifier = "primary"
+  failover_routing_policy {
+    type = "PRIMARY"
+  }
+
+  health_check_id = aws_route53_health_check.aws_primary.id
+
+  alias {
+    name                   = module.aws_primary.lb_dns_name
+    zone_id                = module.aws_primary.lb_zone_id
+    evaluate_target_health = true
+  }
+}
+
+resource "aws_route53_record" "failover_secondary" {
+  zone_id = aws_route53_zone.main.zone_id
+  name    = "trading.example.com"
+  type    = "A"
+
+  set_identifier = "secondary"
+  failover_routing_policy {
+    type = "SECONDARY"
+  }
+
+  alias {
+    name                   = module.gcp_secondary.lb_ip
+    zone_id                = module.gcp_secondary.lb_zone_id
+    evaluate_target_health = true
+  }
+}
+
+================================================================================
+5. NETWORK OPTIMIZATION
+================================================================================
+
+# Network latency optimization checklist
+# docs/network-optimization.md
+
+## Physical Layer Optimization
+1. Colocation with exchange
+   - Place servers in same data center as exchange
+   - Use cross-connects for direct connectivity
+   - Minimize fiber distance
+
+2. Network Interface Cards (NICs)
+   - Use kernel bypass (DPDK, AF_XDP)
+   - Enable SR-IOV for VMs
+   - Configure RSS (Receive Side Scaling)
+
+3. Network Stack Tuning
+   ```bash
+   # Increase buffer sizes
+   sysctl -w net.core.rmem_max=16777216
+   sysctl -w net.core.wmem_max=16777216
+
+   # TCP tuning
+   sysctl -w net.ipv4.tcp_congestion_control=bbr
+   sysctl -w net.ipv4.tcp_slow_start_after_idle=0
+
+   # Disable unnecessary features
+   ethtool -K eth0 tso off gso off gro off
+   ```
+
+---
+# Cloud-specific network optimization
+# scripts/optimize-aws-network.sh
+#!/bin/bash
+set -e
+
+INSTANCE_ID=$1
+
+# Enable enhanced networking
+aws ec2 modify-instance-attribute \
+    --instance-id ${INSTANCE_ID} \
+    --ena-support
+
+# Enable ENA Express (AWS)
+aws ec2 modify-instance-attribute \
+    --instance-id ${INSTANCE_ID} \
+    --ena-express-support
+
+# Set placement group
+aws ec2 modify-instance-placement \
+    --instance-id ${INSTANCE_ID} \
+    --group-name hft-trading-placement-group
+
+echo "Network optimization complete"
+
+================================================================================
+6. COST OPTIMIZATION
+================================================================================
+
+# Cost optimization strategies
+# scripts/analyze-costs.sh
+#!/bin/bash
+
+# AWS cost analysis
+aws ce get-cost-and-usage \
+    --time-period Start=2024-01-01,End=2024-01-31 \
+    --granularity DAILY \
+    --metrics "BlendedCost" "UnblendedCost" \
+    --group-by Type=DIMENSION,Key=SERVICE
+
+# Identify unused resources
+aws ec2 describe-volumes \
+    --filters Name=status,Values=available \
+    --query 'Volumes[*].[VolumeId,Size,CreateTime]' \
+    --output table
+
+# Reserved instance recommendations
+aws ce get-reservation-purchase-recommendation \
+    --service EC2 \
+    --lookback-period SIXTY_DAYS \
+    --payment-option ALL_UPFRONT
+
+---
+# Spot instance integration for non-critical workloads
+# terraform/aws/spot-instances.tf
+resource "aws_eks_node_group" "spot" {
+  cluster_name    = module.eks.cluster_name
+  node_group_name = "spot-nodes"
+  node_role_arn   = aws_iam_role.node.arn
+  subnet_ids      = module.vpc.private_subnets
+
+  scaling_config {
+    desired_size = 2
+    max_size     = 5
+    min_size     = 1
+  }
+
+  capacity_type  = "SPOT"
+  instance_types = ["c6i.2xlarge", "c6i.4xlarge", "c5.2xlarge"]
+
+  labels = {
+    capacity-type = "spot"
+    workload      = "batch-processing"
+  }
+
+  taint {
+    key    = "spot"
+    value  = "true"
+    effect = "NO_SCHEDULE"
+  }
+}
+
+================================================================================
+7. DISASTER RECOVERY
+================================================================================
+
+# Disaster recovery plan
+# scripts/dr-failover.sh
+#!/bin/bash
+set -e
+
+PRIMARY_REGION="us-east-1"
+DR_REGION="us-west-2"
+
+echo "Initiating disaster recovery failover..."
+echo "Primary: ${PRIMARY_REGION}"
+echo "DR: ${DR_REGION}"
+
+# Step 1: Promote DR database to primary
+aws rds promote-read-replica \
+    --db-instance-identifier hft-trading-dr \
+    --region ${DR_REGION}
+
+# Step 2: Update DNS to point to DR region
+aws route53 change-resource-record-sets \
+    --hosted-zone-id Z123456ABCDEF \
+    --change-batch file://dr-dns-change.json
+
+# Step 3: Scale up DR application
+kubectl scale statefulset trading-engine \
+    --replicas=5 \
+    --context=eks-${DR_REGION}
+
+# Step 4: Verify health
+./scripts/health-check.sh ${DR_REGION}
+
+echo "Failover complete!"
+
+---
+# Automated backups
+# scripts/backup-production.sh
+#!/bin/bash
+set -e
+
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+BACKUP_BUCKET="s3://hft-backups"
+
+# Database backup
+aws rds create-db-snapshot \
+    --db-instance-identifier hft-trading-prod \
+    --db-snapshot-identifier hft-trading-${TIMESTAMP}
+
+# Application state backup
+kubectl exec -n hft-trading trading-engine-0 -- \
+    /app/bin/backup-state --output /tmp/state-${TIMESTAMP}.tar.gz
+
+kubectl cp hft-trading/trading-engine-0:/tmp/state-${TIMESTAMP}.tar.gz \
+    state-${TIMESTAMP}.tar.gz
+
+aws s3 cp state-${TIMESTAMP}.tar.gz \
+    ${BACKUP_BUCKET}/state/state-${TIMESTAMP}.tar.gz
+
+echo "Backup complete: ${TIMESTAMP}"
+
+================================================================================
+8. MIGRATION STRATEGIES
+================================================================================
+
+# Migration from on-premises to cloud
+# scripts/migrate-to-cloud.sh
+#!/bin/bash
+set -e
+
+echo "Starting migration to cloud..."
+
+# Step 1: Setup cloud infrastructure
+./scripts/deploy-aws-full-stack.sh production
+
+# Step 2: Migrate database
+pg_dump -h onprem-db.local -U hftuser hft_trading | \
+    psql -h $(terraform output -raw rds_endpoint) -U hftadmin hft_trading
+
+# Step 3: Sync application data
+aws s3 sync /data/market-data s3://hft-market-data/
+
+# Step 4: Deploy application
+helm install hft-trading ./helm/hft-trading \
+    --namespace hft-trading \
+    --values environments/production.yaml
+
+# Step 5: Run parallel testing
+./scripts/parallel-test.sh onprem cloud
+
+echo "Migration complete!"
+
+================================================================================
+CLOUD DEPLOYMENT BEST PRACTICES
+================================================================================
+
+1. REGION SELECTION
+   - Choose regions closest to exchanges
+   - Consider network latency measurements
+   - Evaluate regulatory requirements
+
+2. RESOURCE OPTIMIZATION
+   - Use compute-optimized instances
+   - Enable enhanced networking
+   - Use placement groups for co-location
+
+3. COST MANAGEMENT
+   - Right-size instances
+   - Use reserved/committed instances for base load
+   - Leverage spot instances for batch workloads
+
+4. HIGH AVAILABILITY
+   - Multi-AZ/zone deployment
+   - Cross-region replication
+   - Automated failover
+
+5. MONITORING
+   - Network latency metrics
+   - Application performance
+   - Cost tracking
+
+================================================================================
+END OF CLOUD DEPLOYMENT GUIDE
+================================================================================

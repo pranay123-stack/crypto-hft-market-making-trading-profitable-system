@@ -1,0 +1,1166 @@
+================================================================================
+                         FAILURE TYPES TAXONOMY
+                   Comprehensive Classification System
+================================================================================
+
+DOCUMENT: Failure Types and Classification
+VERSION: 2.1.0
+LAST UPDATED: 2025-11-26
+SCOPE: HFT System Failure Handling
+
+================================================================================
+                          TABLE OF CONTENTS
+================================================================================
+
+1. Failure Classification Overview
+2. Network Failures
+3. Exchange Failures
+4. System Failures
+5. Data Failures
+6. Strategy Failures
+7. Cascading Failures
+8. Failure Severity Matrix
+9. Code Examples
+
+================================================================================
+                  1. FAILURE CLASSIFICATION OVERVIEW
+================================================================================
+
+FAILURE TAXONOMY HIERARCHY:
+---------------------------
+
+                        ALL FAILURES
+                             |
+        +--------------------+--------------------+
+        |         |          |          |         |
+    NETWORK   EXCHANGE   SYSTEM     DATA    STRATEGY
+        |         |          |          |         |
+    [Types]   [Types]    [Types]    [Types]   [Types]
+
+PRIMARY DIMENSIONS:
+-------------------
+1. SOURCE: Where did the failure originate?
+2. SEVERITY: How critical is the impact?
+3. SCOPE: How widespread is the effect?
+4. DURATION: How long does it persist?
+5. DETECTABILITY: How easily can it be detected?
+6. RECOVERABILITY: How quickly can we recover?
+
+FAILURE ATTRIBUTES:
+-------------------
+
+struct FailureAttributes {
+    FailureType type;              // Network, Exchange, System, Data, Strategy
+    FailureSeverity severity;      // CRITICAL, HIGH, MEDIUM, LOW
+    FailureScope scope;            // SYSTEM_WIDE, COMPONENT, ISOLATED
+    std::chrono::milliseconds expected_duration;
+    bool auto_recoverable;
+    DetectionMethod detection_method;
+    RecoveryStrategy recovery_strategy;
+    std::vector<std::string> affected_components;
+    std::unordered_map<std::string, std::string> metadata;
+};
+
+FAILURE STATE MACHINE:
+----------------------
+
+    [NORMAL] --> [DETECTED] --> [ANALYZING] --> [RECOVERING] --> [RECOVERED]
+                     |              |               |
+                     v              v               v
+                 [ALERT]       [ESCALATE]      [FALLBACK]
+                                                    |
+                                                    v
+                                              [DEGRADED MODE]
+
+================================================================================
+                          2. NETWORK FAILURES
+================================================================================
+
+2.1 CONNECTIVITY FAILURES
+-------------------------
+
+TYPE: Connection Loss
+SEVERITY: CRITICAL
+DETECTION TIME: < 100ms
+RECOVERY TIME: 1-30 seconds
+
+SCENARIOS:
+----------
+1. Complete Network Outage
+   - Physical cable disconnection
+   - Network switch failure
+   - Router failure
+   - ISP outage
+
+2. Partial Connectivity Loss
+   - Specific destination unreachable
+   - DNS resolution failure
+   - Routing table corruption
+   - Firewall misconfiguration
+
+3. Intermittent Connectivity
+   - Flapping network interface
+   - Unstable BGP routes
+   - Load balancer issues
+   - Cable degradation
+
+DETECTION CODE:
+---------------
+
+namespace hft::network {
+
+class ConnectivityMonitor {
+private:
+    struct ConnectionState {
+        std::string endpoint;
+        bool is_connected{false};
+        std::chrono::steady_clock::time_point last_successful;
+        uint64_t failure_count{0};
+        std::chrono::milliseconds avg_rtt{0};
+    };
+
+    std::unordered_map<std::string, ConnectionState> connections_;
+    std::atomic<bool> monitoring_active_{true};
+
+public:
+    void monitor_connection(const std::string& endpoint) {
+        while (monitoring_active_) {
+            auto& state = connections_[endpoint];
+
+            // TCP keepalive check
+            if (!check_tcp_keepalive(endpoint)) {
+                handle_connection_failure(endpoint,
+                    FailureType::NETWORK_CONNECTION_LOST);
+                state.failure_count++;
+                state.is_connected = false;
+
+                // Attempt recovery
+                if (state.failure_count < MAX_RECONNECT_ATTEMPTS) {
+                    attempt_reconnection(endpoint);
+                } else {
+                    escalate_to_failover(endpoint);
+                }
+            } else {
+                state.is_connected = true;
+                state.last_successful = std::chrono::steady_clock::now();
+                state.failure_count = 0;
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    }
+
+    bool check_tcp_keepalive(const std::string& endpoint) {
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) return false;
+
+        // Enable TCP keepalive
+        int keepalive = 1;
+        setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(int));
+
+        // Set keepalive parameters
+        int keepidle = 1;    // Start after 1 second idle
+        int keepintvl = 1;   // Interval between probes
+        int keepcnt = 3;     // Number of probes
+
+        setsockopt(sock, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(int));
+        setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(int));
+        setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(int));
+
+        // Attempt connection with timeout
+        auto result = connect_with_timeout(sock, endpoint,
+            std::chrono::milliseconds(100));
+
+        close(sock);
+        return result;
+    }
+};
+
+} // namespace hft::network
+
+
+2.2 LATENCY FAILURES
+--------------------
+
+TYPE: Excessive Network Latency
+SEVERITY: HIGH
+DETECTION TIME: Real-time (per packet)
+RECOVERY TIME: Variable (depends on cause)
+
+LATENCY THRESHOLDS:
+-------------------
+Network Segment          Normal      Warning     Critical    Action
+--------------------------------------------------------------------------------
+LAN (Same Rack)         < 50μs      > 100μs     > 500μs     Investigate
+LAN (Same DC)           < 200μs     > 500μs     > 2ms       Switch path
+WAN (Cross DC)          < 5ms       > 10ms      > 50ms      Failover
+Exchange API            < 1ms       > 5ms       > 10ms      Circuit break
+
+IMPLEMENTATION:
+---------------
+
+namespace hft::network {
+
+class LatencyMonitor {
+private:
+    struct LatencyStats {
+        std::atomic<uint64_t> samples{0};
+        std::atomic<uint64_t> sum_ns{0};
+        std::atomic<uint64_t> min_ns{UINT64_MAX};
+        std::atomic<uint64_t> max_ns{0};
+
+        // Histogram buckets (microseconds)
+        std::array<std::atomic<uint64_t>, 10> histogram{};
+
+        double get_average_us() const {
+            return samples > 0 ?
+                static_cast<double>(sum_ns) / samples / 1000.0 : 0.0;
+        }
+
+        void record(uint64_t latency_ns) {
+            samples++;
+            sum_ns += latency_ns;
+
+            uint64_t current_min = min_ns.load();
+            while (latency_ns < current_min &&
+                   !min_ns.compare_exchange_weak(current_min, latency_ns));
+
+            uint64_t current_max = max_ns.load();
+            while (latency_ns > current_max &&
+                   !max_ns.compare_exchange_weak(current_max, latency_ns));
+
+            // Update histogram
+            size_t bucket = std::min(latency_ns / 100000, 9UL); // 100μs buckets
+            histogram[bucket]++;
+        }
+    };
+
+    std::unordered_map<std::string, LatencyStats> endpoint_stats_;
+
+public:
+    void measure_latency(const std::string& endpoint) {
+        auto start = std::chrono::high_resolution_clock::now();
+
+        // Send ping packet
+        send_ping(endpoint);
+
+        // Wait for response
+        auto response = receive_pong(endpoint, std::chrono::milliseconds(100));
+
+        auto end = std::chrono::high_resolution_clock::now();
+        auto latency_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            end - start).count();
+
+        endpoint_stats_[endpoint].record(latency_ns);
+
+        // Check thresholds
+        if (latency_ns > CRITICAL_LATENCY_NS) {
+            logger_.critical("Critical latency detected", {
+                {"endpoint", endpoint},
+                {"latency_us", latency_ns / 1000},
+                {"threshold_us", CRITICAL_LATENCY_NS / 1000}
+            });
+
+            // Trigger failover
+            trigger_failover(endpoint, FailureReason::EXCESSIVE_LATENCY);
+        } else if (latency_ns > WARNING_LATENCY_NS) {
+            logger_.warn("High latency detected", {
+                {"endpoint", endpoint},
+                {"latency_us", latency_ns / 1000}
+            });
+        }
+    }
+
+    LatencyReport generate_report(const std::string& endpoint) {
+        const auto& stats = endpoint_stats_[endpoint];
+
+        return LatencyReport{
+            .endpoint = endpoint,
+            .samples = stats.samples.load(),
+            .avg_us = stats.get_average_us(),
+            .min_us = stats.min_ns.load() / 1000.0,
+            .max_us = stats.max_ns.load() / 1000.0,
+            .histogram = get_histogram_copy(stats.histogram)
+        };
+    }
+};
+
+} // namespace hft::network
+
+
+2.3 PACKET LOSS FAILURES
+-------------------------
+
+TYPE: Network Packet Loss
+SEVERITY: MEDIUM to HIGH
+DETECTION TIME: 1-10 seconds (depends on protocol)
+RECOVERY TIME: Immediate to minutes
+
+PACKET LOSS THRESHOLDS:
+-----------------------
+Loss Rate       Impact                      Action
+--------------------------------------------------------------------------------
+< 0.01%        Normal, acceptable           None
+0.01% - 0.1%   Degraded performance        Alert, monitor
+0.1% - 1.0%    Significant impact          Investigate, consider failover
+> 1.0%         Severe degradation          Immediate failover
+
+DETECTION & RECOVERY:
+---------------------
+
+namespace hft::network {
+
+class PacketLossDetector {
+private:
+    struct PacketStats {
+        std::atomic<uint64_t> packets_sent{0};
+        std::atomic<uint64_t> packets_received{0};
+        std::atomic<uint64_t> packets_lost{0};
+        std::atomic<uint64_t> out_of_order{0};
+        std::atomic<uint64_t> duplicates{0};
+
+        double get_loss_rate() const {
+            uint64_t sent = packets_sent.load();
+            return sent > 0 ?
+                static_cast<double>(packets_lost) / sent * 100.0 : 0.0;
+        }
+    };
+
+    std::unordered_map<std::string, PacketStats> stats_;
+
+public:
+    void track_packet(const std::string& endpoint,
+                     uint64_t sequence_number,
+                     bool is_send) {
+        auto& stat = stats_[endpoint];
+
+        if (is_send) {
+            stat.packets_sent++;
+        } else {
+            stat.packets_received++;
+
+            // Check for gaps in sequence numbers
+            uint64_t expected = stat.packets_received.load() - 1;
+            if (sequence_number != expected + 1) {
+                if (sequence_number > expected + 1) {
+                    // Packet loss detected
+                    uint64_t lost = sequence_number - expected - 1;
+                    stat.packets_lost += lost;
+
+                    logger_.warn("Packet loss detected", {
+                        {"endpoint", endpoint},
+                        {"lost_packets", lost},
+                        {"loss_rate", stat.get_loss_rate()}
+                    });
+
+                    handle_packet_loss(endpoint, lost);
+                } else {
+                    // Out of order or duplicate
+                    stat.out_of_order++;
+                }
+            }
+        }
+
+        // Check loss rate threshold
+        double loss_rate = stat.get_loss_rate();
+        if (loss_rate > CRITICAL_LOSS_RATE) {
+            logger_.critical("Critical packet loss rate", {
+                {"endpoint", endpoint},
+                {"loss_rate", loss_rate},
+                {"threshold", CRITICAL_LOSS_RATE}
+            });
+
+            trigger_failover(endpoint, FailureReason::PACKET_LOSS);
+        }
+    }
+
+    void handle_packet_loss(const std::string& endpoint, uint64_t lost_count) {
+        // Request retransmission if protocol supports it
+        if (supports_retransmission(endpoint)) {
+            request_retransmission(endpoint, lost_count);
+        } else {
+            // Request snapshot/resync
+            request_resync(endpoint);
+        }
+    }
+};
+
+} // namespace hft::network
+
+
+2.4 BANDWIDTH SATURATION
+-------------------------
+
+TYPE: Network Bandwidth Exhaustion
+SEVERITY: HIGH
+DETECTION TIME: 1-5 seconds
+RECOVERY TIME: Immediate (traffic shaping) to hours (upgrade)
+
+MONITORING:
+-----------
+
+namespace hft::network {
+
+class BandwidthMonitor {
+private:
+    struct BandwidthStats {
+        std::atomic<uint64_t> bytes_sent{0};
+        std::atomic<uint64_t> bytes_received{0};
+        std::chrono::steady_clock::time_point window_start;
+        uint64_t capacity_bps;
+
+        double get_utilization() const {
+            auto now = std::chrono::steady_clock::now();
+            auto duration = std::chrono::duration_cast<std::chrono::seconds>(
+                now - window_start).count();
+
+            if (duration == 0) return 0.0;
+
+            uint64_t total_bytes = bytes_sent + bytes_received;
+            uint64_t total_bits = total_bytes * 8;
+            uint64_t bps = total_bits / duration;
+
+            return static_cast<double>(bps) / capacity_bps * 100.0;
+        }
+    };
+
+public:
+    void monitor_bandwidth(const std::string& interface) {
+        auto& stats = interface_stats_[interface];
+
+        double utilization = stats.get_utilization();
+
+        if (utilization > 90.0) {
+            logger_.critical("Bandwidth saturation", {
+                {"interface", interface},
+                {"utilization", utilization},
+                {"capacity_gbps", stats.capacity_bps / 1e9}
+            });
+
+            // Apply traffic shaping
+            apply_qos_policy(interface, QoSPolicy::PRIORITIZE_CRITICAL);
+
+            // Alert for capacity planning
+            alert_system_.send_alert(
+                AlertSeverity::P1_CRITICAL,
+                "Bandwidth saturation - capacity upgrade needed",
+                {{"interface", interface}, {"utilization", utilization}}
+            );
+        } else if (utilization > 75.0) {
+            logger_.warn("High bandwidth utilization", {
+                {"interface", interface},
+                {"utilization", utilization}
+            });
+        }
+    }
+};
+
+} // namespace hft::network
+
+================================================================================
+                          3. EXCHANGE FAILURES
+================================================================================
+
+3.1 API ERRORS
+--------------
+
+TYPE: Exchange API Rejection/Error
+SEVERITY: MEDIUM to CRITICAL
+DETECTION TIME: Immediate (response-based)
+RECOVERY TIME: Milliseconds to hours
+
+COMMON ERROR CATEGORIES:
+------------------------
+
+1. AUTHENTICATION ERRORS
+   - Invalid API key
+   - Expired session token
+   - Insufficient permissions
+   - IP whitelist violation
+
+2. RATE LIMIT ERRORS
+   - Order rate limit exceeded
+   - Query rate limit exceeded
+   - Message rate limit exceeded
+   - Cancel rate limit exceeded
+
+3. BUSINESS LOGIC ERRORS
+   - Insufficient funds
+   - Position limit exceeded
+   - Order price out of range
+   - Invalid order parameters
+
+4. SYSTEM ERRORS
+   - Exchange system overload
+   - Maintenance mode
+   - Internal server error
+   - Timeout
+
+ERROR HANDLING IMPLEMENTATION:
+------------------------------
+
+namespace hft::exchange {
+
+class ExchangeErrorHandler {
+private:
+    struct ErrorPolicy {
+        bool is_retriable;
+        std::chrono::milliseconds retry_delay;
+        uint32_t max_retries;
+        bool requires_authentication_refresh;
+        bool triggers_circuit_breaker;
+        FailureSeverity severity;
+    };
+
+    std::unordered_map<int, ErrorPolicy> error_policies_ = {
+        // Authentication errors (40x)
+        {401, {false, 0ms, 0, true, false, FailureSeverity::HIGH}},
+        {403, {false, 0ms, 0, true, false, FailureSeverity::HIGH}},
+
+        // Rate limits (429)
+        {429, {true, 100ms, 5, false, true, FailureSeverity::MEDIUM}},
+
+        // Business logic errors (400)
+        {400, {false, 0ms, 0, false, false, FailureSeverity::LOW}},
+
+        // Server errors (50x)
+        {500, {true, 50ms, 3, false, true, FailureSeverity::HIGH}},
+        {502, {true, 100ms, 5, false, true, FailureSeverity::HIGH}},
+        {503, {true, 200ms, 10, false, true, FailureSeverity::CRITICAL}},
+        {504, {true, 50ms, 3, false, true, FailureSeverity::HIGH}},
+    };
+
+public:
+    void handle_api_error(const ExchangeResponse& response) {
+        int error_code = response.status_code;
+
+        auto policy_it = error_policies_.find(error_code);
+        if (policy_it == error_policies_.end()) {
+            logger_.error("Unknown exchange error code", {
+                {"code", error_code},
+                {"message", response.error_message}
+            });
+            return;
+        }
+
+        const auto& policy = policy_it->second;
+
+        // Log error
+        logger_.log(get_log_level(policy.severity),
+            "Exchange API error", {
+                {"code", error_code},
+                {"message", response.error_message},
+                {"retriable", policy.is_retriable},
+                {"endpoint", response.endpoint}
+            });
+
+        // Refresh authentication if needed
+        if (policy.requires_authentication_refresh) {
+            auth_manager_.refresh_credentials();
+        }
+
+        // Trigger circuit breaker if configured
+        if (policy.triggers_circuit_breaker) {
+            circuit_breaker_.record_failure();
+        }
+
+        // Attempt retry if configured
+        if (policy.is_retriable &&
+            response.retry_count < policy.max_retries) {
+            schedule_retry(response, policy.retry_delay);
+        } else if (policy.is_retriable) {
+            logger_.error("Max retries exceeded", {
+                {"code", error_code},
+                {"retries", response.retry_count}
+            });
+
+            // Escalate to manual intervention
+            alert_system_.send_alert(
+                AlertSeverity::P2_HIGH,
+                "Exchange API failure - manual intervention required",
+                {{"error_code", error_code},
+                 {"endpoint", response.endpoint}}
+            );
+        }
+    }
+};
+
+} // namespace hft::exchange
+
+
+3.2 TRADING HALTS
+-----------------
+
+TYPE: Exchange Trading Halt/Suspension
+SEVERITY: CRITICAL
+DETECTION TIME: Real-time (market data feed)
+RECOVERY TIME: Minutes to hours (exchange-dependent)
+
+HALT TYPES:
+-----------
+1. Single Security Halt (T1/T2/T5/T12)
+2. Market-Wide Circuit Breaker (Level 1/2/3)
+3. Exchange System Halt
+4. Regulatory Halt
+5. News Pending
+
+DETECTION & RESPONSE:
+---------------------
+
+namespace hft::exchange {
+
+class TradingHaltDetector {
+private:
+    enum class HaltType {
+        SINGLE_SECURITY,
+        MARKET_WIDE_LEVEL1,  // 7% drop
+        MARKET_WIDE_LEVEL2,  // 13% drop
+        MARKET_WIDE_LEVEL3,  // 20% drop
+        SYSTEM_HALT,
+        REGULATORY,
+        NEWS_PENDING
+    };
+
+    struct HaltInfo {
+        std::string symbol;
+        HaltType type;
+        std::chrono::system_clock::time_point halt_time;
+        std::optional<std::chrono::system_clock::time_point> resume_time;
+        std::string reason;
+        std::vector<std::string> affected_orders;
+    };
+
+    std::unordered_map<std::string, HaltInfo> active_halts_;
+
+public:
+    void process_market_data_message(const MarketDataMessage& msg) {
+        if (msg.type == MessageType::TRADING_HALT) {
+            handle_trading_halt(msg);
+        } else if (msg.type == MessageType::TRADING_RESUME) {
+            handle_trading_resume(msg);
+        }
+    }
+
+    void handle_trading_halt(const MarketDataMessage& msg) {
+        HaltInfo halt{
+            .symbol = msg.symbol,
+            .type = parse_halt_type(msg.halt_code),
+            .halt_time = std::chrono::system_clock::now(),
+            .reason = msg.halt_reason
+        };
+
+        logger_.critical("Trading halt detected", {
+            {"symbol", halt.symbol},
+            {"type", to_string(halt.type)},
+            {"reason", halt.reason}
+        });
+
+        // Cancel all pending orders for halted security
+        if (halt.type == HaltType::SINGLE_SECURITY) {
+            halt.affected_orders = cancel_pending_orders(halt.symbol);
+        } else if (is_market_wide_halt(halt.type)) {
+            // Market-wide halt - cancel all orders
+            halt.affected_orders = cancel_all_pending_orders();
+
+            // Activate market-wide circuit breaker
+            system_circuit_breaker_.open();
+        }
+
+        active_halts_[halt.symbol] = halt;
+
+        // Send critical alert
+        alert_system_.send_alert(
+            AlertSeverity::P1_CRITICAL,
+            "Trading halt detected",
+            {
+                {"symbol", halt.symbol},
+                {"type", to_string(halt.type)},
+                {"orders_cancelled", halt.affected_orders.size()}
+            },
+            AlertChannel::PAGERDUTY | AlertChannel::SLACK | AlertChannel::SMS
+        );
+
+        // Update risk positions
+        risk_manager_.freeze_positions(halt.symbol);
+    }
+
+    void handle_trading_resume(const MarketDataMessage& msg) {
+        auto it = active_halts_.find(msg.symbol);
+        if (it == active_halts_.end()) {
+            logger_.warn("Trading resume for non-halted symbol", {
+                {"symbol", msg.symbol}
+            });
+            return;
+        }
+
+        it->second.resume_time = std::chrono::system_clock::now();
+        auto halt_duration = *it->second.resume_time - it->second.halt_time;
+
+        logger_.info("Trading resumed", {
+            {"symbol", msg.symbol},
+            {"halt_duration_ms",
+             std::chrono::duration_cast<std::chrono::milliseconds>(
+                 halt_duration).count()}
+        });
+
+        // Reactivate strategies
+        strategy_manager_.resume_trading(msg.symbol);
+
+        // Clear circuit breaker if market-wide
+        if (is_market_wide_halt(it->second.type)) {
+            system_circuit_breaker_.close();
+        }
+
+        active_halts_.erase(it);
+    }
+};
+
+} // namespace hft::exchange
+
+
+3.3 ORDER REJECTION
+-------------------
+
+TYPE: Exchange Order Rejection
+SEVERITY: LOW to MEDIUM
+DETECTION TIME: Immediate
+RECOVERY TIME: Immediate to seconds
+
+REJECTION REASONS:
+------------------
+
+namespace hft::exchange {
+
+enum class OrderRejectReason {
+    // Price validations
+    PRICE_OUT_OF_RANGE,
+    PRICE_NOT_ON_INCREMENT,
+    LIMIT_PRICE_TOO_FAR_FROM_MARKET,
+
+    // Quantity validations
+    QUANTITY_BELOW_MINIMUM,
+    QUANTITY_ABOVE_MAXIMUM,
+    QUANTITY_NOT_ON_INCREMENT,
+
+    // Account/Risk
+    INSUFFICIENT_BUYING_POWER,
+    POSITION_LIMIT_EXCEEDED,
+    ORDER_RATE_LIMIT_EXCEEDED,
+    ACCOUNT_SUSPENDED,
+
+    // Market conditions
+    MARKET_CLOSED,
+    SYMBOL_HALTED,
+    PRE_OPEN_PERIOD,
+
+    // Order parameters
+    INVALID_ORDER_TYPE,
+    INVALID_TIME_IN_FORCE,
+    DUPLICATE_ORDER_ID,
+
+    // System
+    EXCHANGE_SYSTEM_ERROR,
+    TIMEOUT
+};
+
+class OrderRejectionHandler {
+private:
+    struct RejectionStats {
+        std::atomic<uint64_t> total_rejections{0};
+        std::array<std::atomic<uint64_t>,
+                   static_cast<size_t>(OrderRejectReason::TIMEOUT) + 1>
+            rejection_counts{};
+
+        double get_rejection_rate(size_t total_orders) const {
+            return total_orders > 0 ?
+                static_cast<double>(total_rejections) / total_orders * 100.0
+                : 0.0;
+        }
+    };
+
+    RejectionStats stats_;
+
+public:
+    void handle_rejection(const Order& order, OrderRejectReason reason,
+                         const std::string& exchange_message) {
+        stats_.total_rejections++;
+        stats_.rejection_counts[static_cast<size_t>(reason)]++;
+
+        logger_.warn("Order rejected", {
+            {"order_id", order.id},
+            {"symbol", order.symbol},
+            {"reason", to_string(reason)},
+            {"exchange_message", exchange_message},
+            {"price", order.price},
+            {"quantity", order.quantity}
+        });
+
+        // Handle specific rejection types
+        switch (reason) {
+            case OrderRejectReason::PRICE_OUT_OF_RANGE:
+            case OrderRejectReason::LIMIT_PRICE_TOO_FAR_FROM_MARKET:
+                // Reprice and resubmit
+                reprice_and_resubmit(order);
+                break;
+
+            case OrderRejectReason::ORDER_RATE_LIMIT_EXCEEDED:
+                // Activate rate limit protection
+                rate_limiter_.throttle(order.exchange);
+                circuit_breaker_.record_failure();
+                break;
+
+            case OrderRejectReason::POSITION_LIMIT_EXCEEDED:
+            case OrderRejectReason::INSUFFICIENT_BUYING_POWER:
+                // Stop trading strategy
+                strategy_manager_.pause_strategy(order.strategy_id);
+                alert_system_.send_alert(
+                    AlertSeverity::P2_HIGH,
+                    "Risk limit exceeded - strategy paused",
+                    {{"strategy", order.strategy_id},
+                     {"reason", to_string(reason)}}
+                );
+                break;
+
+            case OrderRejectReason::SYMBOL_HALTED:
+            case OrderRejectReason::MARKET_CLOSED:
+                // Don't retry - expected behavior
+                break;
+
+            case OrderRejectReason::EXCHANGE_SYSTEM_ERROR:
+                // Retry with exponential backoff
+                schedule_retry(order, calculate_backoff(order.retry_count));
+                break;
+
+            default:
+                logger_.error("Unhandled rejection reason", {
+                    {"reason", to_string(reason)}
+                });
+        }
+
+        // Check rejection rate threshold
+        double rejection_rate = stats_.get_rejection_rate(
+            order_manager_.get_total_orders());
+
+        if (rejection_rate > CRITICAL_REJECTION_RATE) {
+            logger_.critical("Critical order rejection rate", {
+                {"rate", rejection_rate},
+                {"threshold", CRITICAL_REJECTION_RATE}
+            });
+
+            // Pause all trading
+            system_circuit_breaker_.open();
+            alert_system_.send_alert(
+                AlertSeverity::P1_CRITICAL,
+                "Critical rejection rate - trading paused",
+                {{"rejection_rate", rejection_rate}},
+                AlertChannel::PAGERDUTY | AlertChannel::SMS
+            );
+        }
+    }
+};
+
+} // namespace hft::exchange
+
+================================================================================
+                          4. SYSTEM FAILURES
+================================================================================
+
+4.1 HARDWARE FAILURES
+---------------------
+
+TYPE: Physical Hardware Malfunction
+SEVERITY: CRITICAL
+DETECTION TIME: Milliseconds to seconds
+RECOVERY TIME: Minutes to hours
+
+HARDWARE MONITORING:
+--------------------
+
+namespace hft::system {
+
+class HardwareMonitor {
+private:
+    struct HardwareHealth {
+        // CPU
+        std::vector<double> cpu_temperatures;
+        std::vector<double> cpu_utilization;
+        bool cpu_throttling_detected{false};
+
+        // Memory
+        uint64_t memory_total_bytes;
+        uint64_t memory_available_bytes;
+        uint64_t swap_used_bytes;
+        uint32_t memory_errors{0};
+
+        // Disk
+        std::vector<DiskHealth> disks;
+
+        // Network
+        std::vector<NetworkInterfaceHealth> interfaces;
+
+        // Power
+        bool redundant_power_healthy{true};
+        double ups_battery_percent{100.0};
+    };
+
+public:
+    void monitor_hardware() {
+        // Monitor CPU temperature
+        auto cpu_temps = read_cpu_temperatures();
+        for (size_t i = 0; i < cpu_temps.size(); ++i) {
+            if (cpu_temps[i] > CPU_CRITICAL_TEMP) {
+                logger_.critical("CPU overheating", {
+                    {"core", i},
+                    {"temperature", cpu_temps[i]},
+                    {"threshold", CPU_CRITICAL_TEMP}
+                });
+
+                // Initiate emergency shutdown or failover
+                initiate_emergency_failover("CPU overheating");
+            } else if (cpu_temps[i] > CPU_WARNING_TEMP) {
+                logger_.warn("CPU temperature high", {
+                    {"core", i},
+                    {"temperature", cpu_temps[i]}
+                });
+            }
+        }
+
+        // Monitor memory
+        auto mem_info = read_memory_info();
+        double mem_usage_percent =
+            (1.0 - static_cast<double>(mem_info.available) /
+             mem_info.total) * 100.0;
+
+        if (mem_usage_percent > 95.0) {
+            logger_.critical("Critical memory usage", {
+                {"usage_percent", mem_usage_percent},
+                {"available_mb", mem_info.available / 1024 / 1024}
+            });
+
+            // Trigger memory pressure relief
+            trigger_memory_cleanup();
+        }
+
+        // Check for memory errors (ECC)
+        auto mem_errors = read_ecc_errors();
+        if (mem_errors > 0) {
+            logger_.error("Memory errors detected", {
+                {"ecc_errors", mem_errors}
+            });
+
+            if (mem_errors > CRITICAL_ECC_ERROR_THRESHOLD) {
+                initiate_emergency_failover("Critical memory errors");
+            }
+        }
+
+        // Monitor disk health
+        for (const auto& disk : get_disks()) {
+            auto smart_data = read_smart_data(disk);
+
+            if (smart_data.reallocated_sectors > 0 ||
+                smart_data.pending_sectors > 0 ||
+                smart_data.uncorrectable_sectors > 0) {
+                logger_.error("Disk errors detected", {
+                    {"disk", disk},
+                    {"reallocated", smart_data.reallocated_sectors},
+                    {"pending", smart_data.pending_sectors},
+                    {"uncorrectable", smart_data.uncorrectable_sectors}
+                });
+
+                alert_system_.send_alert(
+                    AlertSeverity::P2_HIGH,
+                    "Disk failure imminent - replacement needed",
+                    {{"disk", disk}, {"smart_data", smart_data.to_json()}}
+                );
+            }
+        }
+    }
+
+    std::vector<double> read_cpu_temperatures() {
+        std::vector<double> temps;
+
+        // Read from /sys/class/thermal/thermal_zone*/temp
+        for (int i = 0; i < get_cpu_count(); ++i) {
+            std::string path = "/sys/class/thermal/thermal_zone" +
+                              std::to_string(i) + "/temp";
+            std::ifstream file(path);
+            if (file) {
+                int temp_millidegrees;
+                file >> temp_millidegrees;
+                temps.push_back(temp_millidegrees / 1000.0);
+            }
+        }
+
+        return temps;
+    }
+};
+
+} // namespace hft::system
+
+
+4.2 MEMORY FAILURES
+-------------------
+
+TYPE: Memory Exhaustion/Corruption
+SEVERITY: CRITICAL
+DETECTION TIME: Immediate (crash) or gradual
+RECOVERY TIME: Seconds to minutes
+
+MEMORY PROTECTION:
+------------------
+
+namespace hft::system {
+
+class MemoryProtection {
+private:
+    struct MemoryPool {
+        void* base_address;
+        size_t total_size;
+        size_t used_size;
+        std::atomic<uint64_t> allocation_count{0};
+        std::atomic<uint64_t> deallocation_count{0};
+
+        bool has_leak() const {
+            return allocation_count > deallocation_count;
+        }
+    };
+
+    std::vector<MemoryPool> pools_;
+
+public:
+    // Pre-allocate memory pools to avoid runtime allocation
+    void initialize_memory_pools() {
+        // Order book pool
+        pools_.push_back(create_pool(
+            "order_book",
+            1024 * 1024 * 1024  // 1GB
+        ));
+
+        // Message pool
+        pools_.push_back(create_pool(
+            "messages",
+            512 * 1024 * 1024  // 512MB
+        ));
+
+        // Lock pages in memory (prevent swapping)
+        for (auto& pool : pools_) {
+            if (mlock(pool.base_address, pool.total_size) != 0) {
+                logger_.error("Failed to lock memory", {
+                    {"errno", errno},
+                    {"error", strerror(errno)}
+                });
+            }
+        }
+
+        // Disable swap for this process
+        if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
+            logger_.warn("Failed to disable swap", {
+                {"errno", errno}
+            });
+        }
+    }
+
+    void detect_memory_leaks() {
+        for (const auto& pool : pools_) {
+            if (pool.has_leak()) {
+                uint64_t leaked = pool.allocation_count -
+                                 pool.deallocation_count;
+
+                logger_.error("Memory leak detected", {
+                    {"pool", pool.name},
+                    {"leaked_allocations", leaked},
+                    {"usage_percent",
+                     static_cast<double>(pool.used_size) /
+                     pool.total_size * 100.0}
+                });
+
+                alert_system_.send_alert(
+                    AlertSeverity::P2_HIGH,
+                    "Memory leak detected - investigation required",
+                    {{"pool", pool.name}, {"leaked", leaked}}
+                );
+            }
+        }
+    }
+};
+
+} // namespace hft::system
+
+================================================================================
+                      5. DATA FAILURES (CONTINUED)
+================================================================================
+
+5.1 FEED CORRUPTION
+-------------------
+
+namespace hft::data {
+
+class DataIntegrityChecker {
+private:
+    struct SequenceGap {
+        uint64_t expected;
+        uint64_t received;
+        std::chrono::steady_clock::time_point detected_at;
+    };
+
+    std::unordered_map<std::string, uint64_t> last_sequences_;
+    std::vector<SequenceGap> detected_gaps_;
+
+public:
+    bool validate_message(const MarketDataMessage& msg) {
+        // Check sequence number
+        auto& last_seq = last_sequences_[msg.feed_id];
+        if (msg.sequence_number != last_seq + 1 && last_seq != 0) {
+            detected_gaps_.push_back({
+                .expected = last_seq + 1,
+                .received = msg.sequence_number,
+                .detected_at = std::chrono::steady_clock::now()
+            });
+
+            logger_.warn("Sequence gap detected", {
+                {"feed", msg.feed_id},
+                {"expected", last_seq + 1},
+                {"received", msg.sequence_number},
+                {"gap_size", msg.sequence_number - last_seq - 1}
+            });
+
+            // Request retransmission
+            request_retransmit(msg.feed_id, last_seq + 1,
+                             msg.sequence_number - 1);
+
+            return false;
+        }
+
+        last_seq = msg.sequence_number;
+
+        // Validate checksum
+        if (msg.has_checksum && !verify_checksum(msg)) {
+            logger_.error("Checksum validation failed", {
+                {"feed", msg.feed_id},
+                {"sequence", msg.sequence_number}
+            });
+            return false;
+        }
+
+        // Validate timestamp (detect stale data)
+        auto now = std::chrono::system_clock::now();
+        auto age = now - msg.exchange_timestamp;
+
+        if (age > MAX_DATA_AGE) {
+            logger_.warn("Stale data detected", {
+                {"feed", msg.feed_id},
+                {"age_ms", std::chrono::duration_cast<
+                    std::chrono::milliseconds>(age).count()}
+            });
+            return false;
+        }
+
+        return true;
+    }
+};
+
+} // namespace hft::data
+
+================================================================================
+                            END OF DOCUMENT
+================================================================================

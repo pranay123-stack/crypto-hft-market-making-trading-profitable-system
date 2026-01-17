@@ -1,0 +1,699 @@
+================================================================================
+                    LINUX PERFORMANCE TUNING COMMANDS
+                    HFT System Optimization Reference
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. CPU Performance Tuning
+2. Memory Optimization
+3. Network Performance
+4. Disk I/O Tuning
+5. Kernel Parameters
+6. Real-Time Tuning
+7. NUMA Optimization
+8. Power Management
+9. Complete Tuning Scripts
+10. Performance Validation
+
+================================================================================
+1. CPU PERFORMANCE TUNING
+================================================================================
+
+1.1 CPU FREQUENCY SCALING
+--------------------------
+
+# Check current CPU frequency governor
+cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+
+# Set performance governor (maximum frequency)
+echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+
+# Verify CPU frequency
+cpupower frequency-info
+
+# Set specific CPU frequency
+cpupower -c all frequency-set -f 3.5GHz
+
+# Disable CPU frequency scaling (for consistent latency)
+for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+    echo performance > $cpu
+done
+
+HFT USE CASE: Lock CPU frequencies to maximum to eliminate frequency
+scaling latency (typically adds 10-50μs jitter)
+
+PERFORMANCE IMPACT: Reduces latency jitter by 30-50%
+
+
+1.2 CPU AFFINITY (ISOLCPUS)
+----------------------------
+
+# Boot parameter in /etc/default/grub
+GRUB_CMDLINE_LINUX="isolcpus=2,3,4,5 nohz_full=2,3,4,5 rcu_nocbs=2,3,4,5"
+
+# Apply grub changes
+sudo update-grub
+sudo reboot
+
+# Verify isolated CPUs
+cat /sys/devices/system/cpu/isolated
+
+# Pin process to specific CPU
+taskset -c 2 ./hft_trading_engine
+
+# Pin running process
+taskset -pc 2 $(pidof trading_engine)
+
+# Advanced: Set CPU affinity with sched_setaffinity
+chrt -f 99 taskset -c 2 ./latency_sensitive_app
+
+HFT USE CASE: Isolate CPUs 2-5 for trading engine, leave 0-1 for OS tasks
+PERFORMANCE IMPACT: Reduces context switches by 90%, latency by 20-40μs
+
+
+1.3 CPU CACHE OPTIMIZATION
+---------------------------
+
+# View CPU cache information
+lscpu | grep -i cache
+cat /sys/devices/system/cpu/cpu0/cache/index*/size
+
+# Check cache misses
+perf stat -e cache-misses,cache-references ./trading_app
+
+# Optimize for cache (compile flags)
+g++ -O3 -march=native -mtune=native -malign-data=cacheline
+
+# Huge pages for reduced TLB misses
+echo 1024 > /proc/sys/vm/nr_hugepages
+echo always > /sys/kernel/mm/transparent_hugepage/enabled
+
+# Mount huge pages
+mkdir -p /mnt/huge
+mount -t hugetlbfs nodev /mnt/huge
+
+HFT USE CASE: Reduce L3 cache misses in order book processing
+PERFORMANCE IMPACT: 15-25% throughput improvement
+
+
+1.4 IRQ AFFINITY
+-----------------
+
+# View IRQ assignments
+cat /proc/interrupts
+
+# Set IRQ affinity for network card
+echo 2 > /proc/irq/125/smp_affinity_list
+
+# Script to distribute IRQs
+#!/bin/bash
+for irq in $(cat /proc/interrupts | grep eth0 | awk '{print $1}' | tr -d ':'); do
+    echo 2 > /proc/irq/$irq/smp_affinity_list
+done
+
+# Check IRQ counts
+watch -n 1 "cat /proc/interrupts | grep -E 'CPU|eth0'"
+
+# Disable irqbalance for manual control
+systemctl stop irqbalance
+systemctl disable irqbalance
+
+HFT USE CASE: Pin network IRQs to CPU adjacent to trading thread
+PERFORMANCE IMPACT: Reduces network processing latency by 5-15μs
+
+
+1.5 CONTEXT SWITCH REDUCTION
+-----------------------------
+
+# Monitor context switches
+vmstat 1 10
+pidstat -w 1
+
+# Reduce context switches via CPU isolation
+# See section 1.2 above
+
+# Check context switch rate
+sar -w 1 10
+
+# Per-process context switches
+cat /proc/$(pidof trading_engine)/status | grep ctxt
+
+# Minimize context switches in code
+nice -n -20 chrt -f 99 taskset -c 2 ./trading_app
+
+HFT USE CASE: Reduce involuntary context switches to near zero
+PERFORMANCE IMPACT: Can reduce P99 latency by 50-100μs
+
+
+================================================================================
+2. MEMORY OPTIMIZATION
+================================================================================
+
+2.1 HUGE PAGES CONFIGURATION
+-----------------------------
+
+# Check huge page size
+grep Hugepagesize /proc/meminfo
+
+# Configure huge pages (2MB pages)
+echo 2048 > /proc/sys/vm/nr_hugepages
+
+# Persistent configuration in /etc/sysctl.conf
+vm.nr_hugepages = 2048
+vm.hugetlb_shm_group = 1001
+
+# Verify huge pages
+grep HugePages /proc/meminfo
+
+# Configure 1GB huge pages
+echo 4 > /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages
+
+# Application usage
+mmap(..., MAP_HUGETLB | MAP_ANONYMOUS, ...)
+
+HFT USE CASE: Allocate 4GB for order book using 2MB pages
+PERFORMANCE IMPACT: 10-20% reduction in memory access latency
+
+
+2.2 MEMORY LOCKING (MLOCKALL)
+------------------------------
+
+# Lock all memory pages to RAM
+setcap cap_ipc_lock=+ep ./trading_engine
+
+# In C++ application
+mlockall(MCL_CURRENT | MCL_FUTURE);
+
+# Check locked memory
+cat /proc/$(pidof trading_engine)/status | grep VmLck
+
+# Set memlock limits in /etc/security/limits.conf
+trading  hard  memlock  unlimited
+trading  soft  memlock  unlimited
+
+# Verify limits
+ulimit -l
+
+HFT USE CASE: Prevent trading engine memory from being swapped
+PERFORMANCE IMPACT: Eliminates page fault latency (1-100ms)
+
+
+2.3 NUMA OPTIMIZATION
+----------------------
+
+# Check NUMA topology
+numactl --hardware
+lscpu | grep NUMA
+
+# Run on specific NUMA node
+numactl --cpunodebind=0 --membind=0 ./trading_app
+
+# Preferred NUMA node
+numactl --preferred=0 ./trading_app
+
+# Interleave memory across nodes
+numactl --interleave=all ./memory_intensive_app
+
+# Check NUMA statistics
+numastat
+numastat -p $(pidof trading_engine)
+
+# Disable NUMA balancing for latency
+echo 0 > /proc/sys/kernel/numa_balancing
+
+HFT USE CASE: Bind trading engine to NUMA node 0 with NIC
+PERFORMANCE IMPACT: Reduces memory latency by 20-40% (remote access)
+
+
+2.4 SWAP MANAGEMENT
+-------------------
+
+# Disable swap completely
+swapoff -a
+
+# Comment out swap in /etc/fstab
+# /dev/sda2  none  swap  sw  0  0
+
+# Set swappiness to minimum
+echo 0 > /proc/sys/vm/swappiness
+
+# Persistent in /etc/sysctl.conf
+vm.swappiness = 0
+
+# Monitor swap usage
+vmstat 1
+free -h
+
+HFT USE CASE: Disable swap to guarantee memory performance
+PERFORMANCE IMPACT: Eliminates worst-case latency spikes
+
+
+2.5 MEMORY COMPACTION
+---------------------
+
+# Compact memory
+echo 1 > /proc/sys/vm/compact_memory
+
+# Disable transparent huge pages (can cause latency)
+echo never > /sys/kernel/mm/transparent_hugepage/enabled
+echo never > /sys/kernel/mm/transparent_hugepage/defrag
+
+# Check memory fragmentation
+cat /proc/buddyinfo
+
+# Minimize page compaction
+vm.compaction_proactiveness = 0
+
+HFT USE CASE: Prevent defrag from causing latency spikes
+PERFORMANCE IMPACT: Eliminates 100-1000μs defrag pauses
+
+
+================================================================================
+3. NETWORK PERFORMANCE TUNING
+================================================================================
+
+3.1 NETWORK BUFFER TUNING
+--------------------------
+
+# Increase socket buffer sizes
+sysctl -w net.core.rmem_max=536870912
+sysctl -w net.core.wmem_max=536870912
+sysctl -w net.core.rmem_default=16777216
+sysctl -w net.core.wmem_default=16777216
+
+# TCP buffer sizes
+sysctl -w net.ipv4.tcp_rmem="4096 87380 268435456"
+sysctl -w net.ipv4.tcp_wmem="4096 65536 268435456"
+
+# Increase backlog
+sysctl -w net.core.netdev_max_backlog=50000
+sysctl -w net.core.somaxconn=4096
+
+HFT USE CASE: Prevent packet drops during market data bursts
+PERFORMANCE IMPACT: Eliminates packet loss up to 10Gbps
+
+
+3.2 NETWORK CARD TUNING
+------------------------
+
+# Check current settings
+ethtool -g eth0
+ethtool -k eth0
+
+# Increase ring buffers
+ethtool -G eth0 rx 4096 tx 4096
+
+# Disable offloading for latency
+ethtool -K eth0 gro off
+ethtool -K eth0 gso off
+ethtool -K eth0 tso off
+ethtool -K eth0 lro off
+
+# Enable hardware timestamping
+ethtool -T eth0
+
+# Optimize interrupts
+ethtool -C eth0 adaptive-rx off adaptive-tx off
+ethtool -C eth0 rx-usecs 0 tx-usecs 0
+
+HFT USE CASE: Minimize NIC processing latency
+PERFORMANCE IMPACT: Reduces NIC latency by 2-5μs
+
+
+3.3 TCP TUNING
+--------------
+
+# Fast TCP connection establishment
+sysctl -w net.ipv4.tcp_fastopen=3
+sysctl -w net.ipv4.tcp_syn_retries=2
+sysctl -w net.ipv4.tcp_synack_retries=2
+
+# Disable slow start
+sysctl -w net.ipv4.tcp_slow_start_after_idle=0
+
+# Optimize TCP timestamps
+sysctl -w net.ipv4.tcp_timestamps=1
+
+# Enable TCP window scaling
+sysctl -w net.ipv4.tcp_window_scaling=1
+
+# Low latency TCP
+sysctl -w net.ipv4.tcp_low_latency=1
+
+HFT USE CASE: Reduce connection latency for FIX sessions
+PERFORMANCE IMPACT: 10-20% reduction in connection time
+
+
+3.4 NETWORK STACK BYPASS
+-------------------------
+
+# Configure DPDK huge pages
+echo 1024 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+
+# Load kernel modules
+modprobe uio
+modprobe igb_uio
+
+# Bind NIC to DPDK
+dpdk-devbind.py --bind=igb_uio 0000:01:00.0
+
+# Verify binding
+dpdk-devbind.py --status
+
+HFT USE CASE: Bypass kernel for ultra-low latency (< 1μs)
+PERFORMANCE IMPACT: 50-70% latency reduction vs kernel stack
+
+
+================================================================================
+4. DISK I/O TUNING
+================================================================================
+
+4.1 I/O SCHEDULER
+-----------------
+
+# Check current scheduler
+cat /sys/block/sda/queue/scheduler
+
+# Set deadline scheduler (low latency)
+echo deadline > /sys/block/sda/queue/scheduler
+
+# For SSD: use noop or none
+echo noop > /sys/block/nvme0n1/queue/scheduler
+
+# Persistent in /etc/rc.local
+echo deadline > /sys/block/sda/queue/scheduler
+
+# Tune deadline scheduler
+echo 1 > /sys/block/sda/queue/iosched/fifo_batch
+echo 10 > /sys/block/sda/queue/iosched/read_expire
+echo 100 > /sys/block/sda/queue/iosched/write_expire
+
+HFT USE CASE: Minimize logging latency for audit trails
+PERFORMANCE IMPACT: 30-50% reduction in write latency
+
+
+4.2 FILESYSTEM TUNING
+----------------------
+
+# Mount with noatime (reduce writes)
+mount -o remount,noatime,nodiratime /dev/sda1 /mnt/data
+
+# XFS tuning for log files
+mkfs.xfs -f -l size=128m,su=64k /dev/sdb1
+mount -o noatime,nodiratime,logbufs=8,logbsize=256k /dev/sdb1 /var/log/trading
+
+# EXT4 tuning
+tune2fs -o journal_data_writeback /dev/sda1
+mount -o data=writeback,noatime,nodiratime /dev/sda1 /mnt
+
+# Disable barriers for performance (risky)
+mount -o nobarrier /dev/sda1 /mnt
+
+HFT USE CASE: Fast logging without compromising read performance
+PERFORMANCE IMPACT: 20-40% improvement in write throughput
+
+
+4.3 READAHEAD TUNING
+--------------------
+
+# Check readahead
+blockdev --getra /dev/sda
+
+# Set readahead (in 512-byte sectors)
+blockdev --setra 256 /dev/sda
+
+# For sequential reads (increase)
+blockdev --setra 8192 /dev/sda
+
+# For random reads (decrease)
+blockdev --setra 128 /dev/sda
+
+HFT USE CASE: Optimize market data replay from disk
+PERFORMANCE IMPACT: 2-3x improvement in sequential read speed
+
+
+================================================================================
+5. KERNEL PARAMETERS (SYSCTL)
+================================================================================
+
+5.1 COMPLETE SYSCTL CONFIGURATION
+----------------------------------
+
+# /etc/sysctl.conf for HFT systems
+
+# Network Performance
+net.core.rmem_max = 536870912
+net.core.wmem_max = 536870912
+net.core.rmem_default = 16777216
+net.core.wmem_default = 16777216
+net.ipv4.tcp_rmem = 4096 87380 268435456
+net.ipv4.tcp_wmem = 4096 65536 268435456
+net.core.netdev_max_backlog = 50000
+net.core.somaxconn = 4096
+net.ipv4.tcp_max_syn_backlog = 8192
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.ip_local_port_range = 10000 65535
+
+# Memory Management
+vm.swappiness = 0
+vm.dirty_ratio = 15
+vm.dirty_background_ratio = 5
+vm.min_free_kbytes = 1048576
+vm.zone_reclaim_mode = 0
+vm.nr_hugepages = 2048
+
+# CPU Scheduling
+kernel.sched_migration_cost_ns = 5000000
+kernel.sched_autogroup_enabled = 0
+kernel.sched_rt_runtime_us = -1
+
+# Security (if needed)
+kernel.randomize_va_space = 0
+
+# File Descriptors
+fs.file-max = 2097152
+fs.nr_open = 2097152
+
+# Apply configuration
+sudo sysctl -p
+
+HFT USE CASE: System-wide optimization for trading platform
+PERFORMANCE IMPACT: Combined 40-60% latency reduction
+
+
+5.2 NETWORK SPECIFIC TUNING
+----------------------------
+
+# Disable IPv6 if not used
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+
+# TCP congestion control
+net.ipv4.tcp_congestion_control = htcp
+
+# Reduce TIME_WAIT sockets
+net.ipv4.tcp_fin_timeout = 10
+net.ipv4.tcp_tw_reuse = 1
+
+# Connection tracking
+net.netfilter.nf_conntrack_max = 1000000
+net.netfilter.nf_conntrack_tcp_timeout_established = 600
+
+HFT USE CASE: Handle high connection rates to exchanges
+PERFORMANCE IMPACT: 30% increase in connection capacity
+
+
+================================================================================
+6. REAL-TIME TUNING
+================================================================================
+
+6.1 REAL-TIME SCHEDULING
+-------------------------
+
+# Set real-time priority
+chrt -f 99 ./trading_engine
+
+# Check scheduling policy
+chrt -p $(pidof trading_engine)
+
+# Allow real-time without sudo
+setcap cap_sys_nice=+ep ./trading_engine
+
+# Configure RT throttling (disable)
+echo -1 > /proc/sys/kernel/sched_rt_runtime_us
+echo 1000000 > /proc/sys/kernel/sched_rt_period_us
+
+# Real-time group scheduling
+echo -1 > /sys/fs/cgroup/cpu/cpu.rt_runtime_us
+
+HFT USE CASE: Guarantee CPU time for order processing
+PERFORMANCE IMPACT: Reduces worst-case latency by 100-500μs
+
+
+6.2 DISABLE UNNECESSARY SERVICES
+---------------------------------
+
+# List running services
+systemctl list-units --type=service --state=running
+
+# Disable unnecessary services
+systemctl disable bluetooth
+systemctl disable cups
+systemctl disable avahi-daemon
+systemctl disable ModemManager
+
+# Stop services immediately
+systemctl stop bluetooth cups avahi-daemon
+
+# Disable GUI (if server)
+systemctl set-default multi-user.target
+
+HFT USE CASE: Reduce background CPU interference
+PERFORMANCE IMPACT: 5-10% reduction in system CPU usage
+
+
+6.3 TICKLESS KERNEL (NOHZ)
+---------------------------
+
+# Boot parameters in /etc/default/grub
+GRUB_CMDLINE_LINUX="nohz=on nohz_full=2,3,4,5 rcu_nocbs=2,3,4,5"
+
+# Apply and reboot
+sudo update-grub
+sudo reboot
+
+# Verify tickless CPUs
+cat /sys/devices/system/cpu/nohz_full
+
+# Force context tracking
+echo NO_HZ_FULL > /sys/kernel/debug/tracing/trace_clock
+
+HFT USE CASE: Eliminate timer interrupts on trading CPUs
+PERFORMANCE IMPACT: Reduces interrupt latency by 10-20μs
+
+
+================================================================================
+7. COMPLETE TUNING SCRIPT
+================================================================================
+
+#!/bin/bash
+# HFT System Optimization Script
+# Run as root or with sudo
+
+set -e
+
+echo "Starting HFT system optimization..."
+
+# 1. CPU Tuning
+echo "Configuring CPU performance..."
+for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+    echo performance > $cpu 2>/dev/null || true
+done
+
+# 2. Disable power management
+echo "Disabling power management..."
+systemctl disable ondemand 2>/dev/null || true
+cpupower frequency-set -g performance 2>/dev/null || true
+
+# 3. Network tuning
+echo "Optimizing network stack..."
+sysctl -w net.core.rmem_max=536870912
+sysctl -w net.core.wmem_max=536870912
+sysctl -w net.core.netdev_max_backlog=50000
+sysctl -w net.ipv4.tcp_slow_start_after_idle=0
+
+# 4. Memory tuning
+echo "Configuring memory..."
+sysctl -w vm.swappiness=0
+echo never > /sys/kernel/mm/transparent_hugepage/enabled
+echo 2048 > /proc/sys/vm/nr_hugepages
+
+# 5. Disable services
+echo "Disabling unnecessary services..."
+systemctl stop irqbalance 2>/dev/null || true
+systemctl disable irqbalance 2>/dev/null || true
+
+# 6. I/O scheduler
+echo "Setting I/O scheduler..."
+for disk in /sys/block/sd*/queue/scheduler; do
+    echo deadline > $disk 2>/dev/null || true
+done
+
+# 7. IRQ affinity (example for eth0)
+echo "Setting IRQ affinity..."
+for irq in $(grep eth0 /proc/interrupts | awk -F: '{print $1}'); do
+    echo 2 > /proc/irq/$irq/smp_affinity_list 2>/dev/null || true
+done
+
+echo "Optimization complete. Reboot recommended."
+
+SAFETY WARNING: Test this script in development before production!
+
+
+================================================================================
+8. PERFORMANCE VALIDATION
+================================================================================
+
+# CPU frequency validation
+cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq
+
+# Context switch rate
+vmstat 1 10 | awk '{print $12}'
+
+# Network drops
+netstat -i | grep -E 'RX-OVR|RX-DRP'
+
+# Memory validation
+grep HugePages /proc/meminfo
+
+# Latency test
+cyclictest -p 99 -t 1 -n -i 1000 -l 100000
+
+# Network latency
+sockperf ping-pong -i 192.168.1.100 -p 12345
+
+HFT USE CASE: Validate system meets < 10μs latency requirements
+PERFORMANCE IMPACT: Verification only, no performance impact
+
+================================================================================
+BEST PRACTICES
+================================================================================
+
+1. Always test changes in development environment first
+2. Document baseline performance before tuning
+3. Make one change at a time and measure impact
+4. Use version control for configuration files
+5. Have rollback procedures ready
+6. Monitor system stability after changes
+7. Consider hardware-specific optimizations
+8. Balance latency vs. throughput based on use case
+9. Regular performance regression testing
+10. Keep kernel and drivers updated
+
+SAFETY WARNINGS
+---------------
+- Disabling swap can cause OOM kills
+- Real-time priorities can hang system if misconfigured
+- CPU isolation requires careful process management
+- Some optimizations trade reliability for performance
+- Always have console access during testing
+- Network tuning can impact other applications
+- Huge pages reduce available memory flexibility
+
+================================================================================
+REFERENCES
+================================================================================
+
+- Linux Kernel Documentation: kernel.org/doc/Documentation
+- DPDK Performance Reports: dpdk.org
+- Red Hat Performance Tuning Guide
+- Intel Network Optimization Guide
+- Solarflare OpenOnload Documentation
+
+Last Updated: 2025-01-25
+Version: 2.0
+Maintainer: HFT Engineering Team
+
+================================================================================

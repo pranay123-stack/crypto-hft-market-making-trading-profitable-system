@@ -1,0 +1,1261 @@
+================================================================================
+BACKTESTING FRAMEWORK FOR HFT SYSTEMS
+Historical Data Replay and Strategy Validation
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Backtesting Architecture
+2. Historical Data Management
+3. Event-Driven Backtesting Engine
+4. Market Replay Simulator
+5. Strategy Backtesting
+6. Performance Metrics
+7. Slippage and Transaction Costs
+8. Parallel Backtesting
+9. Validation and Overfitting Prevention
+10. Reporting and Visualization
+
+================================================================================
+1. BACKTESTING ARCHITECTURE
+================================================================================
+
+1.1 Core Backtesting Components
+--------------------------------
+// include/backtesting/backtest_engine.h
+#ifndef BACKTEST_ENGINE_H
+#define BACKTEST_ENGINE_H
+
+#include <string>
+#include <memory>
+#include <chrono>
+#include <vector>
+#include "market_data_replayer.h"
+#include "strategy_interface.h"
+#include "portfolio_manager.h"
+#include "performance_analyzer.h"
+
+using namespace std::chrono;
+
+struct BacktestConfig {
+    system_clock::time_point start_date;
+    system_clock::time_point end_date;
+    std::vector<std::string> symbols;
+    double initial_capital;
+    double commission_rate;
+    double slippage_bps;
+    bool use_bid_ask;
+    int replay_speed;  // 1 = real-time, 0 = maximum
+    std::string data_directory;
+};
+
+class BacktestEngine {
+public:
+    explicit BacktestEngine(const BacktestConfig& config);
+
+    void addStrategy(std::shared_ptr<Strategy> strategy);
+    void setDataSource(std::shared_ptr<MarketDataReplayer> data_source);
+
+    void run();
+    void pause();
+    void resume();
+    void stop();
+
+    BacktestResults getResults() const;
+    void exportResults(const std::string& output_file);
+
+private:
+    void processEvent(const MarketEvent& event);
+    void updatePortfolio();
+    void recordMetrics();
+
+    BacktestConfig config_;
+    std::shared_ptr<MarketDataReplayer> data_replayer_;
+    std::shared_ptr<Strategy> strategy_;
+    std::shared_ptr<PortfolioManager> portfolio_;
+    std::shared_ptr<PerformanceAnalyzer> analyzer_;
+
+    bool running_;
+    system_clock::time_point current_time_;
+};
+
+#endif // BACKTEST_ENGINE_H
+
+
+1.2 Backtest Engine Implementation
+-----------------------------------
+// src/backtesting/backtest_engine.cpp
+#include "backtest_engine.h"
+#include <iostream>
+#include <fstream>
+
+BacktestEngine::BacktestEngine(const BacktestConfig& config)
+    : config_(config), running_(false) {
+
+    // Initialize portfolio with initial capital
+    portfolio_ = std::make_shared<PortfolioManager>(config.initial_capital);
+
+    // Initialize performance analyzer
+    analyzer_ = std::make_shared<PerformanceAnalyzer>();
+
+    std::cout << "Backtest initialized:" << std::endl;
+    std::cout << "  Capital: $" << config.initial_capital << std::endl;
+    std::cout << "  Commission: " << config.commission_rate * 100 << "%" << std::endl;
+    std::cout << "  Slippage: " << config.slippage_bps << " bps" << std::endl;
+}
+
+void BacktestEngine::run() {
+    if (!data_replayer_) {
+        throw std::runtime_error("Data replayer not set");
+    }
+    if (!strategy_) {
+        throw std::runtime_error("Strategy not set");
+    }
+
+    running_ = true;
+    current_time_ = config_.start_date;
+
+    std::cout << "Starting backtest..." << std::endl;
+    auto start = high_resolution_clock::now();
+
+    data_replayer_->reset();
+    strategy_->onBacktestStart(config_);
+
+    size_t events_processed = 0;
+
+    while (running_ && current_time_ < config_.end_date) {
+        // Get next market event
+        auto event = data_replayer_->getNextEvent();
+
+        if (!event.has_value()) {
+            break;  // No more data
+        }
+
+        current_time_ = event->timestamp;
+        processEvent(*event);
+
+        events_processed++;
+
+        if (events_processed % 100000 == 0) {
+            std::cout << "Processed " << events_processed << " events, "
+                     << "Current time: " << formatTimestamp(current_time_) << std::endl;
+        }
+    }
+
+    strategy_->onBacktestEnd();
+
+    auto end = high_resolution_clock::now();
+    auto duration = duration_cast<milliseconds>(end - start).count();
+
+    std::cout << "Backtest completed:" << std::endl;
+    std::cout << "  Events processed: " << events_processed << std::endl;
+    std::cout << "  Duration: " << duration << " ms" << std::endl;
+    std::cout << "  Events/sec: " << (events_processed * 1000.0 / duration) << std::endl;
+
+    running_ = false;
+}
+
+void BacktestEngine::processEvent(const MarketEvent& event) {
+    // Update portfolio with current market data
+    portfolio_->updateMarketData(event);
+
+    // Feed event to strategy
+    switch (event.type) {
+        case EventType::QUOTE:
+            strategy_->onQuote(event.quote);
+            break;
+
+        case EventType::TRADE:
+            strategy_->onTrade(event.trade);
+            break;
+
+        case EventType::ORDER_BOOK:
+            strategy_->onOrderBook(event.order_book);
+            break;
+    }
+
+    // Process any signals generated by strategy
+    auto signals = strategy_->getSignals();
+    for (const auto& signal : signals) {
+        executeSignal(signal);
+    }
+
+    // Record portfolio state
+    analyzer_->recordSnapshot(portfolio_->getSnapshot(current_time_));
+}
+
+void BacktestEngine::executeSignal(const TradingSignal& signal) {
+    // Apply slippage
+    double execution_price = signal.price;
+
+    if (signal.side == OrderSide::BUY) {
+        execution_price += execution_price * config_.slippage_bps / 10000.0;
+    } else {
+        execution_price -= execution_price * config_.slippage_bps / 10000.0;
+    }
+
+    // Calculate commission
+    double commission = signal.quantity * execution_price * config_.commission_rate;
+
+    // Execute trade
+    Trade trade;
+    trade.symbol = signal.symbol;
+    trade.price = execution_price;
+    trade.quantity = signal.quantity;
+    trade.side = signal.side;
+    trade.commission = commission;
+    trade.timestamp = current_time_;
+
+    portfolio_->executeTrade(trade);
+
+    // Notify strategy of fill
+    Fill fill;
+    fill.order_id = signal.order_id;
+    fill.symbol = signal.symbol;
+    fill.price = execution_price;
+    fill.quantity = signal.quantity;
+    fill.timestamp = current_time_;
+
+    strategy_->onFill(fill);
+}
+
+
+================================================================================
+2. HISTORICAL DATA MANAGEMENT
+================================================================================
+
+2.1 Data Loader
+---------------
+// include/backtesting/data_loader.h
+#ifndef DATA_LOADER_H
+#define DATA_LOADER_H
+
+#include <string>
+#include <vector>
+#include <memory>
+#include "market_data.h"
+
+class DataLoader {
+public:
+    virtual ~DataLoader() = default;
+
+    virtual std::vector<Quote> loadQuotes(
+        const std::string& symbol,
+        const system_clock::time_point& start,
+        const system_clock::time_point& end
+    ) = 0;
+
+    virtual std::vector<Trade> loadTrades(
+        const std::string& symbol,
+        const system_clock::time_point& start,
+        const system_clock::time_point& end
+    ) = 0;
+
+    virtual std::vector<OrderBook> loadOrderBooks(
+        const std::string& symbol,
+        const system_clock::time_point& start,
+        const system_clock::time_point& end
+    ) = 0;
+};
+
+class CSVDataLoader : public DataLoader {
+public:
+    explicit CSVDataLoader(const std::string& data_directory);
+
+    std::vector<Quote> loadQuotes(
+        const std::string& symbol,
+        const system_clock::time_point& start,
+        const system_clock::time_point& end
+    ) override;
+
+    std::vector<Trade> loadTrades(
+        const std::string& symbol,
+        const system_clock::time_point& start,
+        const system_clock::time_point& end
+    ) override;
+
+    std::vector<OrderBook> loadOrderBooks(
+        const std::string& symbol,
+        const system_clock::time_point& start,
+        const system_clock::time_point& end
+    ) override;
+
+private:
+    std::string data_directory_;
+
+    Quote parseQuoteLine(const std::string& line);
+    Trade parseTradeLine(const std::string& line);
+    OrderBook parseOrderBookLine(const std::string& line);
+};
+
+#endif // DATA_LOADER_H
+
+
+2.2 CSV Data Loader Implementation
+-----------------------------------
+// src/backtesting/csv_data_loader.cpp
+#include "data_loader.h"
+#include <fstream>
+#include <sstream>
+#include <algorithm>
+
+CSVDataLoader::CSVDataLoader(const std::string& data_directory)
+    : data_directory_(data_directory) {
+}
+
+std::vector<Quote> CSVDataLoader::loadQuotes(
+    const std::string& symbol,
+    const system_clock::time_point& start,
+    const system_clock::time_point& end
+) {
+    std::vector<Quote> quotes;
+
+    std::string filename = data_directory_ + "/" + symbol + "_quotes.csv";
+    std::ifstream file(filename);
+
+    if (!file.is_open()) {
+        throw std::runtime_error("Cannot open file: " + filename);
+    }
+
+    std::string line;
+    std::getline(file, line);  // Skip header
+
+    while (std::getline(file, line)) {
+        Quote quote = parseQuoteLine(line);
+
+        if (quote.timestamp >= start && quote.timestamp <= end) {
+            quotes.push_back(quote);
+        }
+    }
+
+    std::cout << "Loaded " << quotes.size() << " quotes for " << symbol << std::endl;
+    return quotes;
+}
+
+Quote CSVDataLoader::parseQuoteLine(const std::string& line) {
+    std::stringstream ss(line);
+    std::string field;
+    Quote quote;
+
+    // Format: timestamp,symbol,bid_price,bid_size,ask_price,ask_size
+    std::getline(ss, field, ',');
+    quote.timestamp = parseTimestamp(field);
+
+    std::getline(ss, field, ',');
+    quote.symbol = field;
+
+    std::getline(ss, field, ',');
+    quote.bid_price = std::stod(field);
+
+    std::getline(ss, field, ',');
+    quote.bid_size = std::stoi(field);
+
+    std::getline(ss, field, ',');
+    quote.ask_price = std::stod(field);
+
+    std::getline(ss, field, ',');
+    quote.ask_size = std::stoi(field);
+
+    return quote;
+}
+
+std::vector<Trade> CSVDataLoader::loadTrades(
+    const std::string& symbol,
+    const system_clock::time_point& start,
+    const system_clock::time_point& end
+) {
+    std::vector<Trade> trades;
+
+    std::string filename = data_directory_ + "/" + symbol + "_trades.csv";
+    std::ifstream file(filename);
+
+    if (!file.is_open()) {
+        throw std::runtime_error("Cannot open file: " + filename);
+    }
+
+    std::string line;
+    std::getline(file, line);  // Skip header
+
+    while (std::getline(file, line)) {
+        Trade trade = parseTradeLine(line);
+
+        if (trade.timestamp >= start && trade.timestamp <= end) {
+            trades.push_back(trade);
+        }
+    }
+
+    std::cout << "Loaded " << trades.size() << " trades for " << symbol << std::endl;
+    return trades;
+}
+
+Trade CSVDataLoader::parseTradeLine(const std::string& line) {
+    std::stringstream ss(line);
+    std::string field;
+    Trade trade;
+
+    // Format: timestamp,symbol,price,size,side
+    std::getline(ss, field, ',');
+    trade.timestamp = parseTimestamp(field);
+
+    std::getline(ss, field, ',');
+    trade.symbol = field;
+
+    std::getline(ss, field, ',');
+    trade.price = std::stod(field);
+
+    std::getline(ss, field, ',');
+    trade.size = std::stoi(field);
+
+    std::getline(ss, field, ',');
+    trade.side = (field == "BUY") ? TradeSide::BUY : TradeSide::SELL;
+
+    return trade;
+}
+
+
+2.3 Binary Data Format (Optimized)
+-----------------------------------
+// include/backtesting/binary_data_loader.h
+#ifndef BINARY_DATA_LOADER_H
+#define BINARY_DATA_LOADER_H
+
+#include "data_loader.h"
+#include <memory>
+
+// Binary format for efficient loading
+struct BinaryQuote {
+    uint64_t timestamp_ns;
+    char symbol[16];
+    double bid_price;
+    double ask_price;
+    uint32_t bid_size;
+    uint32_t ask_size;
+} __attribute__((packed));
+
+class BinaryDataLoader : public DataLoader {
+public:
+    explicit BinaryDataLoader(const std::string& data_directory);
+
+    std::vector<Quote> loadQuotes(
+        const std::string& symbol,
+        const system_clock::time_point& start,
+        const system_clock::time_point& end
+    ) override;
+
+    // Convert CSV to binary format for faster loading
+    static void convertCSVToBinary(
+        const std::string& csv_file,
+        const std::string& binary_file
+    );
+
+private:
+    std::string data_directory_;
+};
+
+#endif // BINARY_DATA_LOADER_H
+
+
+================================================================================
+3. EVENT-DRIVEN BACKTESTING ENGINE
+================================================================================
+
+3.1 Market Data Replayer
+-------------------------
+// include/backtesting/market_data_replayer.h
+#ifndef MARKET_DATA_REPLAYER_H
+#define MARKET_DATA_REPLAYER_H
+
+#include <queue>
+#include <optional>
+#include <memory>
+#include "market_data.h"
+#include "data_loader.h"
+
+enum class EventType {
+    QUOTE,
+    TRADE,
+    ORDER_BOOK
+};
+
+struct MarketEvent {
+    EventType type;
+    system_clock::time_point timestamp;
+
+    // Union would be more memory efficient, but this is clearer
+    std::optional<Quote> quote;
+    std::optional<Trade> trade;
+    std::optional<OrderBook> order_book;
+
+    bool operator>(const MarketEvent& other) const {
+        return timestamp > other.timestamp;
+    }
+};
+
+class MarketDataReplayer {
+public:
+    MarketDataReplayer(
+        std::shared_ptr<DataLoader> data_loader,
+        const std::vector<std::string>& symbols,
+        const system_clock::time_point& start,
+        const system_clock::time_point& end
+    );
+
+    void reset();
+    std::optional<MarketEvent> getNextEvent();
+    bool hasMoreEvents() const;
+
+    size_t getTotalEvents() const { return total_events_; }
+    size_t getProcessedEvents() const { return processed_events_; }
+
+private:
+    void loadData();
+    void buildEventQueue();
+
+    std::shared_ptr<DataLoader> data_loader_;
+    std::vector<std::string> symbols_;
+    system_clock::time_point start_time_;
+    system_clock::time_point end_time_;
+
+    // Min-heap for chronological event ordering
+    std::priority_queue<
+        MarketEvent,
+        std::vector<MarketEvent>,
+        std::greater<MarketEvent>
+    > event_queue_;
+
+    size_t total_events_;
+    size_t processed_events_;
+};
+
+#endif // MARKET_DATA_REPLAYER_H
+
+
+3.2 Market Data Replayer Implementation
+----------------------------------------
+// src/backtesting/market_data_replayer.cpp
+#include "market_data_replayer.h"
+#include <iostream>
+
+MarketDataReplayer::MarketDataReplayer(
+    std::shared_ptr<DataLoader> data_loader,
+    const std::vector<std::string>& symbols,
+    const system_clock::time_point& start,
+    const system_clock::time_point& end
+) : data_loader_(data_loader),
+    symbols_(symbols),
+    start_time_(start),
+    end_time_(end),
+    total_events_(0),
+    processed_events_(0) {
+
+    loadData();
+}
+
+void MarketDataReplayer::loadData() {
+    std::cout << "Loading historical data..." << std::endl;
+
+    for (const auto& symbol : symbols_) {
+        // Load quotes
+        auto quotes = data_loader_->loadQuotes(symbol, start_time_, end_time_);
+        for (const auto& quote : quotes) {
+            MarketEvent event;
+            event.type = EventType::QUOTE;
+            event.timestamp = quote.timestamp;
+            event.quote = quote;
+            event_queue_.push(event);
+        }
+
+        // Load trades
+        auto trades = data_loader_->loadTrades(symbol, start_time_, end_time_);
+        for (const auto& trade : trades) {
+            MarketEvent event;
+            event.type = EventType::TRADE;
+            event.timestamp = trade.timestamp;
+            event.trade = trade;
+            event_queue_.push(event);
+        }
+    }
+
+    total_events_ = event_queue_.size();
+    std::cout << "Loaded " << total_events_ << " total events" << std::endl;
+}
+
+std::optional<MarketEvent> MarketDataReplayer::getNextEvent() {
+    if (event_queue_.empty()) {
+        return std::nullopt;
+    }
+
+    MarketEvent event = event_queue_.top();
+    event_queue_.pop();
+    processed_events_++;
+
+    return event;
+}
+
+void MarketDataReplayer::reset() {
+    processed_events_ = 0;
+    // Note: Would need to reload data or save original queue
+}
+
+bool MarketDataReplayer::hasMoreEvents() const {
+    return !event_queue_.empty();
+}
+
+
+================================================================================
+4. STRATEGY BACKTESTING
+================================================================================
+
+4.1 Backtestable Strategy Interface
+------------------------------------
+// include/backtesting/backtestable_strategy.h
+#ifndef BACKTESTABLE_STRATEGY_H
+#define BACKTESTABLE_STRATEGY_H
+
+#include "strategy_interface.h"
+#include "backtest_engine.h"
+
+class BacktestableStrategy : public Strategy {
+public:
+    virtual ~BacktestableStrategy() = default;
+
+    // Backtest lifecycle hooks
+    virtual void onBacktestStart(const BacktestConfig& config) = 0;
+    virtual void onBacktestEnd() = 0;
+
+    // Access to backtest results
+    virtual BacktestMetrics getBacktestMetrics() const = 0;
+};
+
+#endif // BACKTESTABLE_STRATEGY_H
+
+
+4.2 Example: Mean Reversion Strategy Backtest
+----------------------------------------------
+// examples/mean_reversion_backtest.cpp
+#include "backtest_engine.h"
+#include "mean_reversion_strategy.h"
+#include "csv_data_loader.h"
+#include <iostream>
+
+int main() {
+    // Configure backtest
+    BacktestConfig config;
+    config.start_date = parseDate("2024-01-01");
+    config.end_date = parseDate("2024-12-31");
+    config.symbols = {"AAPL", "GOOGL", "MSFT"};
+    config.initial_capital = 1000000.0;
+    config.commission_rate = 0.0005;  // 5 bps
+    config.slippage_bps = 2.0;
+    config.data_directory = "/data/historical";
+
+    // Create backtest engine
+    BacktestEngine engine(config);
+
+    // Load data
+    auto data_loader = std::make_shared<CSVDataLoader>(config.data_directory);
+    auto replayer = std::make_shared<MarketDataReplayer>(
+        data_loader, config.symbols, config.start_date, config.end_date
+    );
+    engine.setDataSource(replayer);
+
+    // Create strategy
+    MeanReversionConfig strategy_config;
+    strategy_config.lookback_period = 20;
+    strategy_config.entry_threshold = 2.0;  // 2 standard deviations
+    strategy_config.exit_threshold = 0.5;
+    strategy_config.position_size = 1000;
+
+    auto strategy = std::make_shared<MeanReversionStrategy>(strategy_config);
+    engine.addStrategy(strategy);
+
+    // Run backtest
+    engine.run();
+
+    // Get results
+    auto results = engine.getResults();
+
+    // Print summary
+    std::cout << "\n=== Backtest Results ===" << std::endl;
+    std::cout << "Total Return: " << results.total_return * 100 << "%" << std::endl;
+    std::cout << "Sharpe Ratio: " << results.sharpe_ratio << std::endl;
+    std::cout << "Max Drawdown: " << results.max_drawdown * 100 << "%" << std::endl;
+    std::cout << "Win Rate: " << results.win_rate * 100 << "%" << std::endl;
+    std::cout << "Total Trades: " << results.total_trades << std::endl;
+    std::cout << "Profit Factor: " << results.profit_factor << std::endl;
+
+    // Export detailed results
+    engine.exportResults("backtest_results.csv");
+
+    return 0;
+}
+
+
+================================================================================
+5. PERFORMANCE METRICS
+================================================================================
+
+5.1 Performance Analyzer
+-------------------------
+// include/backtesting/performance_analyzer.h
+#ifndef PERFORMANCE_ANALYZER_H
+#define PERFORMANCE_ANALYZER_H
+
+#include <vector>
+#include <map>
+#include "portfolio_snapshot.h"
+
+struct BacktestResults {
+    double total_return;
+    double annualized_return;
+    double sharpe_ratio;
+    double sortino_ratio;
+    double max_drawdown;
+    double max_drawdown_duration;
+    double win_rate;
+    double profit_factor;
+    double average_win;
+    double average_loss;
+    int total_trades;
+    int winning_trades;
+    int losing_trades;
+
+    std::vector<double> daily_returns;
+    std::vector<double> equity_curve;
+    std::map<std::string, double> symbol_pnl;
+};
+
+class PerformanceAnalyzer {
+public:
+    PerformanceAnalyzer();
+
+    void recordSnapshot(const PortfolioSnapshot& snapshot);
+    BacktestResults computeResults() const;
+
+    double calculateSharpeRatio(const std::vector<double>& returns, double risk_free_rate = 0.02) const;
+    double calculateSortinoRatio(const std::vector<double>& returns, double risk_free_rate = 0.02) const;
+    double calculateMaxDrawdown(const std::vector<double>& equity_curve) const;
+    double calculateWinRate(const std::vector<Trade>& trades) const;
+
+private:
+    std::vector<PortfolioSnapshot> snapshots_;
+    std::vector<Trade> trades_;
+
+    double calculateAnnualizedReturn(double total_return, int days) const;
+    std::vector<double> calculateDailyReturns() const;
+};
+
+#endif // PERFORMANCE_ANALYZER_H
+
+
+5.2 Performance Metrics Implementation
+---------------------------------------
+// src/backtesting/performance_analyzer.cpp
+#include "performance_analyzer.h"
+#include <cmath>
+#include <algorithm>
+#include <numeric>
+
+PerformanceAnalyzer::PerformanceAnalyzer() {
+}
+
+void PerformanceAnalyzer::recordSnapshot(const PortfolioSnapshot& snapshot) {
+    snapshots_.push_back(snapshot);
+
+    // Record trades
+    for (const auto& trade : snapshot.trades) {
+        trades_.push_back(trade);
+    }
+}
+
+BacktestResults PerformanceAnalyzer::computeResults() const {
+    BacktestResults results;
+
+    if (snapshots_.empty()) {
+        return results;
+    }
+
+    // Calculate equity curve
+    std::vector<double> equity_curve;
+    for (const auto& snapshot : snapshots_) {
+        equity_curve.push_back(snapshot.total_value);
+    }
+    results.equity_curve = equity_curve;
+
+    // Total return
+    double initial_value = equity_curve.front();
+    double final_value = equity_curve.back();
+    results.total_return = (final_value - initial_value) / initial_value;
+
+    // Daily returns
+    results.daily_returns = calculateDailyReturns();
+
+    // Annualized return
+    int trading_days = snapshots_.size();
+    results.annualized_return = calculateAnnualizedReturn(results.total_return, trading_days);
+
+    // Sharpe ratio
+    results.sharpe_ratio = calculateSharpeRatio(results.daily_returns);
+
+    // Sortino ratio
+    results.sortino_ratio = calculateSortinoRatio(results.daily_returns);
+
+    // Max drawdown
+    results.max_drawdown = calculateMaxDrawdown(equity_curve);
+
+    // Trade statistics
+    results.total_trades = trades_.size();
+    results.win_rate = calculateWinRate(trades_);
+
+    int winning = 0;
+    int losing = 0;
+    double total_profit = 0.0;
+    double total_loss = 0.0;
+
+    for (const auto& trade : trades_) {
+        double pnl = trade.pnl;
+        if (pnl > 0) {
+            winning++;
+            total_profit += pnl;
+        } else if (pnl < 0) {
+            losing++;
+            total_loss += std::abs(pnl);
+        }
+    }
+
+    results.winning_trades = winning;
+    results.losing_trades = losing;
+    results.average_win = winning > 0 ? total_profit / winning : 0.0;
+    results.average_loss = losing > 0 ? total_loss / losing : 0.0;
+    results.profit_factor = total_loss > 0 ? total_profit / total_loss : 0.0;
+
+    return results;
+}
+
+double PerformanceAnalyzer::calculateSharpeRatio(
+    const std::vector<double>& returns,
+    double risk_free_rate
+) const {
+    if (returns.empty()) {
+        return 0.0;
+    }
+
+    // Calculate mean return
+    double mean_return = std::accumulate(returns.begin(), returns.end(), 0.0) / returns.size();
+
+    // Calculate standard deviation
+    double sq_sum = 0.0;
+    for (const auto& ret : returns) {
+        sq_sum += (ret - mean_return) * (ret - mean_return);
+    }
+    double std_dev = std::sqrt(sq_sum / returns.size());
+
+    if (std_dev == 0.0) {
+        return 0.0;
+    }
+
+    // Annualized Sharpe ratio
+    double daily_rf = risk_free_rate / 252.0;
+    double sharpe = (mean_return - daily_rf) / std_dev * std::sqrt(252.0);
+
+    return sharpe;
+}
+
+double PerformanceAnalyzer::calculateSortinoRatio(
+    const std::vector<double>& returns,
+    double risk_free_rate
+) const {
+    if (returns.empty()) {
+        return 0.0;
+    }
+
+    double mean_return = std::accumulate(returns.begin(), returns.end(), 0.0) / returns.size();
+
+    // Calculate downside deviation (only negative returns)
+    double downside_sq_sum = 0.0;
+    int downside_count = 0;
+
+    for (const auto& ret : returns) {
+        if (ret < 0) {
+            downside_sq_sum += ret * ret;
+            downside_count++;
+        }
+    }
+
+    if (downside_count == 0) {
+        return 0.0;
+    }
+
+    double downside_dev = std::sqrt(downside_sq_sum / downside_count);
+
+    if (downside_dev == 0.0) {
+        return 0.0;
+    }
+
+    double daily_rf = risk_free_rate / 252.0;
+    double sortino = (mean_return - daily_rf) / downside_dev * std::sqrt(252.0);
+
+    return sortino;
+}
+
+double PerformanceAnalyzer::calculateMaxDrawdown(const std::vector<double>& equity_curve) const {
+    if (equity_curve.empty()) {
+        return 0.0;
+    }
+
+    double max_drawdown = 0.0;
+    double peak = equity_curve[0];
+
+    for (double value : equity_curve) {
+        if (value > peak) {
+            peak = value;
+        }
+
+        double drawdown = (peak - value) / peak;
+        if (drawdown > max_drawdown) {
+            max_drawdown = drawdown;
+        }
+    }
+
+    return max_drawdown;
+}
+
+double PerformanceAnalyzer::calculateWinRate(const std::vector<Trade>& trades) const {
+    if (trades.empty()) {
+        return 0.0;
+    }
+
+    int winning = 0;
+    for (const auto& trade : trades) {
+        if (trade.pnl > 0) {
+            winning++;
+        }
+    }
+
+    return static_cast<double>(winning) / trades.size();
+}
+
+std::vector<double> PerformanceAnalyzer::calculateDailyReturns() const {
+    std::vector<double> returns;
+
+    for (size_t i = 1; i < snapshots_.size(); ++i) {
+        double prev_value = snapshots_[i-1].total_value;
+        double curr_value = snapshots_[i].total_value;
+
+        double ret = (curr_value - prev_value) / prev_value;
+        returns.push_back(ret);
+    }
+
+    return returns;
+}
+
+double PerformanceAnalyzer::calculateAnnualizedReturn(double total_return, int days) const {
+    if (days == 0) {
+        return 0.0;
+    }
+
+    double years = days / 252.0;
+    return std::pow(1.0 + total_return, 1.0 / years) - 1.0;
+}
+
+
+================================================================================
+6. SLIPPAGE AND TRANSACTION COSTS
+================================================================================
+
+6.1 Slippage Models
+-------------------
+// include/backtesting/slippage_model.h
+#ifndef SLIPPAGE_MODEL_H
+#define SLIPPAGE_MODEL_H
+
+#include "market_data.h"
+
+class SlippageModel {
+public:
+    virtual ~SlippageModel() = default;
+
+    virtual double calculateSlippage(
+        const Order& order,
+        const Quote& current_quote
+    ) const = 0;
+};
+
+// Fixed basis points slippage
+class FixedSlippageModel : public SlippageModel {
+public:
+    explicit FixedSlippageModel(double bps) : slippage_bps_(bps) {}
+
+    double calculateSlippage(const Order& order, const Quote& current_quote) const override {
+        double base_price = (order.side == OrderSide::BUY) ? current_quote.ask_price : current_quote.bid_price;
+        return base_price * slippage_bps_ / 10000.0;
+    }
+
+private:
+    double slippage_bps_;
+};
+
+// Volume-based slippage
+class VolumeSlippageModel : public SlippageModel {
+public:
+    VolumeSlippageModel(double base_bps, double volume_impact_factor)
+        : base_bps_(base_bps), volume_impact_(volume_impact_factor) {}
+
+    double calculateSlippage(const Order& order, const Quote& current_quote) const override {
+        double base_price = (order.side == OrderSide::BUY) ? current_quote.ask_price : current_quote.bid_price;
+        int available_liquidity = (order.side == OrderSide::BUY) ? current_quote.ask_size : current_quote.bid_size;
+
+        // Additional slippage based on order size relative to liquidity
+        double volume_ratio = static_cast<double>(order.quantity) / available_liquidity;
+        double additional_bps = volume_impact_ * volume_ratio * 10000;
+
+        double total_bps = base_bps_ + additional_bps;
+        return base_price * total_bps / 10000.0;
+    }
+
+private:
+    double base_bps_;
+    double volume_impact_;
+};
+
+#endif // SLIPPAGE_MODEL_H
+
+
+================================================================================
+7. PARALLEL BACKTESTING
+================================================================================
+
+7.1 Parameter Optimization
+---------------------------
+// include/backtesting/parameter_optimizer.h
+#ifndef PARAMETER_OPTIMIZER_H
+#define PARAMETER_OPTIMIZER_H
+
+#include <vector>
+#include <map>
+#include <thread>
+#include "backtest_engine.h"
+
+struct ParameterSet {
+    std::map<std::string, double> parameters;
+    BacktestResults results;
+    double fitness_score;
+};
+
+class ParameterOptimizer {
+public:
+    ParameterOptimizer(const BacktestConfig& base_config, int num_threads = 8);
+
+    void addParameter(const std::string& name, double min, double max, double step);
+    void setFitnessFunction(std::function<double(const BacktestResults&)> func);
+
+    std::vector<ParameterSet> gridSearch();
+    ParameterSet findOptimal();
+
+private:
+    void runBacktest(ParameterSet& param_set);
+    std::vector<std::map<std::string, double>> generateParameterGrid();
+
+    BacktestConfig base_config_;
+    int num_threads_;
+    std::map<std::string, std::tuple<double, double, double>> parameter_ranges_;
+    std::function<double(const BacktestResults&)> fitness_function_;
+};
+
+#endif // PARAMETER_OPTIMIZER_H
+
+
+7.2 Parallel Backtest Execution
+--------------------------------
+// src/backtesting/parameter_optimizer.cpp
+#include "parameter_optimizer.h"
+#include <iostream>
+#include <future>
+
+ParameterOptimizer::ParameterOptimizer(const BacktestConfig& base_config, int num_threads)
+    : base_config_(base_config), num_threads_(num_threads) {
+
+    // Default fitness: Sharpe ratio
+    fitness_function_ = [](const BacktestResults& results) {
+        return results.sharpe_ratio;
+    };
+}
+
+std::vector<ParameterSet> ParameterOptimizer::gridSearch() {
+    auto parameter_grid = generateParameterGrid();
+    std::vector<ParameterSet> results;
+    results.resize(parameter_grid.size());
+
+    std::cout << "Running grid search with " << parameter_grid.size() << " parameter combinations" << std::endl;
+
+    // Create thread pool
+    std::vector<std::future<void>> futures;
+
+    for (size_t i = 0; i < parameter_grid.size(); ++i) {
+        results[i].parameters = parameter_grid[i];
+
+        // Launch backtest in thread pool
+        auto future = std::async(std::launch::async, [this, &results, i]() {
+            runBacktest(results[i]);
+        });
+
+        futures.push_back(std::move(future));
+
+        // Limit concurrent threads
+        if (futures.size() >= static_cast<size_t>(num_threads_)) {
+            futures.front().wait();
+            futures.erase(futures.begin());
+        }
+    }
+
+    // Wait for remaining threads
+    for (auto& future : futures) {
+        future.wait();
+    }
+
+    // Sort by fitness score
+    std::sort(results.begin(), results.end(),
+        [](const ParameterSet& a, const ParameterSet& b) {
+            return a.fitness_score > b.fitness_score;
+        }
+    );
+
+    return results;
+}
+
+void ParameterOptimizer::runBacktest(ParameterSet& param_set) {
+    // Create strategy with parameters
+    // Run backtest
+    // Calculate fitness score
+
+    // Example implementation
+    BacktestEngine engine(base_config_);
+    // ... configure with param_set.parameters
+    engine.run();
+
+    param_set.results = engine.getResults();
+    param_set.fitness_score = fitness_function_(param_set.results);
+}
+
+
+================================================================================
+8. VALIDATION AND OVERFITTING PREVENTION
+================================================================================
+
+8.1 Walk-Forward Analysis
+--------------------------
+// include/backtesting/walk_forward.h
+#ifndef WALK_FORWARD_H
+#define WALK_FORWARD_H
+
+#include "backtest_engine.h"
+#include "parameter_optimizer.h"
+
+struct WalkForwardConfig {
+    system_clock::time_point start_date;
+    system_clock::time_point end_date;
+    int in_sample_days;
+    int out_sample_days;
+    int num_windows;
+};
+
+class WalkForwardAnalysis {
+public:
+    WalkForwardAnalysis(const WalkForwardConfig& config);
+
+    std::vector<BacktestResults> run();
+    BacktestResults getCombinedResults() const;
+
+private:
+    WalkForwardConfig config_;
+    std::vector<BacktestResults> window_results_;
+};
+
+#endif // WALK_FORWARD_H
+
+
+8.2 Cross-Validation
+---------------------
+TEST(BacktestValidation, CrossValidation) {
+    // Split data into training and test sets
+    auto full_data_range = std::make_pair(parseDate("2024-01-01"), parseDate("2024-12-31"));
+
+    // 70% training, 30% testing
+    auto split_date = parseDate("2024-09-01");
+
+    // Train on first period
+    BacktestConfig train_config;
+    train_config.start_date = full_data_range.first;
+    train_config.end_date = split_date;
+    train_config.symbols = {"AAPL"};
+    train_config.initial_capital = 1000000;
+
+    BacktestEngine train_engine(train_config);
+    train_engine.run();
+    auto train_results = train_engine.getResults();
+
+    // Test on second period
+    BacktestConfig test_config = train_config;
+    test_config.start_date = split_date;
+    test_config.end_date = full_data_range.second;
+
+    BacktestEngine test_engine(test_config);
+    test_engine.run();
+    auto test_results = test_engine.getResults();
+
+    // Compare performance degradation
+    double sharpe_degradation = (train_results.sharpe_ratio - test_results.sharpe_ratio) / train_results.sharpe_ratio;
+
+    std::cout << "Training Sharpe: " << train_results.sharpe_ratio << std::endl;
+    std::cout << "Testing Sharpe: " << test_results.sharpe_ratio << std::endl;
+    std::cout << "Degradation: " << sharpe_degradation * 100 << "%" << std::endl;
+
+    // Alert if significant degradation (possible overfitting)
+    EXPECT_LT(sharpe_degradation, 0.30) << "Significant performance degradation detected";
+}
+
+
+================================================================================
+9. REPORTING AND VISUALIZATION
+================================================================================
+
+9.1 Results Export
+------------------
+void BacktestEngine::exportResults(const std::string& output_file) {
+    std::ofstream file(output_file);
+
+    auto results = getResults();
+
+    // Write summary
+    file << "=== Backtest Summary ===" << std::endl;
+    file << "Total Return," << results.total_return * 100 << "%" << std::endl;
+    file << "Sharpe Ratio," << results.sharpe_ratio << std::endl;
+    file << "Max Drawdown," << results.max_drawdown * 100 << "%" << std::endl;
+    file << "Win Rate," << results.win_rate * 100 << "%" << std::endl;
+    file << std::endl;
+
+    // Write equity curve
+    file << "Date,Equity" << std::endl;
+    for (size_t i = 0; i < results.equity_curve.size(); ++i) {
+        file << formatDate(snapshots_[i].timestamp) << ","
+             << results.equity_curve[i] << std::endl;
+    }
+
+    file << std::endl;
+
+    // Write trade log
+    file << "Timestamp,Symbol,Side,Quantity,Price,PnL" << std::endl;
+    for (const auto& trade : analyzer_->getTrades()) {
+        file << formatTimestamp(trade.timestamp) << ","
+             << trade.symbol << ","
+             << (trade.side == OrderSide::BUY ? "BUY" : "SELL") << ","
+             << trade.quantity << ","
+             << trade.price << ","
+             << trade.pnl << std::endl;
+    }
+}
+
+
+================================================================================
+END OF BACKTESTING FRAMEWORK
+================================================================================

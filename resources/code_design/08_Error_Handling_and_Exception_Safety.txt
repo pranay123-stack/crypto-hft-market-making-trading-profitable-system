@@ -1,0 +1,636 @@
+================================================================================
+ERROR HANDLING AND EXCEPTION SAFETY FOR HIGH-FREQUENCY TRADING
+================================================================================
+
+This document covers error handling strategies for HFT systems where exceptions
+are unacceptable in the critical path due to unpredictable performance and
+overhead.
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+1. Why No Exceptions in HFT Critical Path
+2. Error Code Patterns
+3. std::optional and std::expected
+4. Result Types and Monadic Error Handling
+5. Compile-Time Error Detection
+6. Defensive Programming Techniques
+7. Fail-Fast vs Graceful Degradation
+8. Error Logging Without Blocking
+9. Recovery Strategies
+10. Testing Error Paths
+
+================================================================================
+1. WHY NO EXCEPTIONS IN HFT CRITICAL PATH
+================================================================================
+
+PERFORMANCE ISSUES WITH EXCEPTIONS:
+-----------------------------------
+1. Stack unwinding overhead: Unpredictable latency (microseconds to milliseconds)
+2. Code size bloat: Exception tables increase binary size
+3. Register pressure: Exception handling requires register spilling
+4. Branch misprediction: Try/catch blocks confuse branch predictor
+5. Cache pollution: Exception tables and RTTI data
+
+MEASURED OVERHEAD:
+------------------
+Normal path (no exception): +5-15% overhead just for try/catch presence
+Exception thrown: 1000-10000ns (completely unacceptable)
+return code: 0-1ns overhead (single comparison)
+
+HFT RULE: ABSOLUTELY NO EXCEPTIONS IN CRITICAL PATH
+---------------------------------------------------
+Critical path includes:
+- Order submission
+- Market data processing
+- Order book updates
+- Risk checks
+- Price calculations
+- Position updates
+
+Exceptions allowed in:
+- System initialization
+- Configuration loading
+- Non-latency-sensitive logging
+- Administrative operations
+
+COMPILER FLAGS FOR HFT:
+-----------------------
+-fno-exceptions: Disable exceptions completely
+-fno-rtti: Disable runtime type information
+-fno-unwind-tables: Remove exception unwinding tables
+
+COMPLETE EXAMPLE - Error Handling Without Exceptions:
+------------------------------------------------------
+
+#pragma once
+#include <cstdint>
+#include <optional>
+#include <variant>
+#include <string_view>
+
+namespace hft::error_handling {
+
+// ============================================================================
+// 1. ERROR CODE APPROACH (Traditional C-style, zero overhead)
+// ============================================================================
+
+enum class ErrorCode : uint8_t {
+    SUCCESS = 0,
+    INVALID_PRICE,
+    INVALID_QUANTITY,
+    RISK_LIMIT_EXCEEDED,
+    POSITION_LIMIT_EXCEEDED,
+    SYMBOL_NOT_FOUND,
+    ORDER_NOT_FOUND,
+    DUPLICATE_ORDER,
+    NETWORK_ERROR,
+    ENCODING_ERROR,
+    BUFFER_OVERFLOW,
+    QUEUE_FULL,
+    UNKNOWN_ERROR
+};
+
+// Error code to string (for logging, not in critical path)
+constexpr const char* errorCodeToString(ErrorCode code) noexcept {
+    switch (code) {
+        case ErrorCode::SUCCESS: return "SUCCESS";
+        case ErrorCode::INVALID_PRICE: return "INVALID_PRICE";
+        case ErrorCode::INVALID_QUANTITY: return "INVALID_QUANTITY";
+        case ErrorCode::RISK_LIMIT_EXCEEDED: return "RISK_LIMIT_EXCEEDED";
+        case ErrorCode::POSITION_LIMIT_EXCEEDED: return "POSITION_LIMIT_EXCEEDED";
+        case ErrorCode::SYMBOL_NOT_FOUND: return "SYMBOL_NOT_FOUND";
+        case ErrorCode::ORDER_NOT_FOUND: return "ORDER_NOT_FOUND";
+        case ErrorCode::DUPLICATE_ORDER: return "DUPLICATE_ORDER";
+        case ErrorCode::NETWORK_ERROR: return "NETWORK_ERROR";
+        case ErrorCode::ENCODING_ERROR: return "ENCODING_ERROR";
+        case ErrorCode::BUFFER_OVERFLOW: return "BUFFER_OVERFLOW";
+        case ErrorCode::QUEUE_FULL: return "QUEUE_FULL";
+        default: return "UNKNOWN_ERROR";
+    }
+}
+
+// Order validator using error codes
+class OrderValidator {
+public:
+    struct ValidationRules {
+        double min_price;
+        double max_price;
+        double tick_size;
+        int64_t min_quantity;
+        int64_t max_quantity;
+        int64_t lot_size;
+    };
+
+private:
+    ValidationRules rules_;
+
+public:
+    explicit OrderValidator(const ValidationRules& rules) noexcept
+        : rules_(rules) {}
+
+    // Returns error code (zero overhead)
+    [[nodiscard]] ErrorCode validate(double price, int64_t quantity) const noexcept {
+        // Price range check
+        if (price < rules_.min_price || price > rules_.max_price) [[unlikely]] {
+            return ErrorCode::INVALID_PRICE;
+        }
+
+        // Tick size check
+        double price_mod = std::fmod(price, rules_.tick_size);
+        if (std::abs(price_mod) > 1e-8) [[unlikely]] {
+            return ErrorCode::INVALID_PRICE;
+        }
+
+        // Quantity range check
+        if (quantity < rules_.min_quantity || quantity > rules_.max_quantity) [[unlikely]] {
+            return ErrorCode::INVALID_QUANTITY;
+        }
+
+        // Lot size check
+        if (quantity % rules_.lot_size != 0) [[unlikely]] {
+            return ErrorCode::INVALID_QUANTITY;
+        }
+
+        return ErrorCode::SUCCESS;
+    }
+
+    [[nodiscard]] bool isValid(double price, int64_t quantity) const noexcept {
+        return validate(price, quantity) == ErrorCode::SUCCESS;
+    }
+};
+
+// Usage with error codes
+inline ErrorCode submitOrder(double price, int64_t quantity) noexcept {
+    OrderValidator validator({0.01, 100000.0, 0.01, 1, 1000000, 1});
+
+    ErrorCode error = validator.validate(price, quantity);
+    if (error != ErrorCode::SUCCESS) [[unlikely]] {
+        // Log error asynchronously (not in critical path)
+        return error;
+    }
+
+    // Proceed with order submission
+    return ErrorCode::SUCCESS;
+}
+
+// ============================================================================
+// 2. std::optional APPROACH (C++17, minimal overhead)
+// ============================================================================
+
+// Return optional for operations that may fail
+class OrderBook {
+public:
+    struct PriceLevel {
+        uint64_t price;
+        uint64_t quantity;
+    };
+
+    // Returns empty optional on failure (no exception)
+    [[nodiscard]] std::optional<PriceLevel> getBestBid() const noexcept {
+        if (bid_count_ == 0) {
+            return std::nullopt;  // No best bid available
+        }
+        return bids_[0];
+    }
+
+    [[nodiscard]] std::optional<PriceLevel> getBestAsk() const noexcept {
+        if (ask_count_ == 0) {
+            return std::nullopt;
+        }
+        return asks_[0];
+    }
+
+    // Returns optional with error information
+    [[nodiscard]] std::optional<uint64_t> getMidPrice() const noexcept {
+        if (bid_count_ == 0 || ask_count_ == 0) {
+            return std::nullopt;
+        }
+        return (bids_[0].price + asks_[0].price) / 2;
+    }
+
+private:
+    static constexpr size_t MAX_LEVELS = 10;
+    std::array<PriceLevel, MAX_LEVELS> bids_;
+    std::array<PriceLevel, MAX_LEVELS> asks_;
+    size_t bid_count_ = 0;
+    size_t ask_count_ = 0;
+};
+
+// Usage with optional
+inline void processOrderBook(const OrderBook& book) noexcept {
+    if (auto mid_price = book.getMidPrice()) {
+        // Use mid_price.value()
+        uint64_t price = *mid_price;
+        // Process...
+    } else {
+        // Handle error: no mid price available
+        return;
+    }
+
+    // Structured binding with optional
+    if (auto best_bid = book.getBestBid(); best_bid.has_value()) {
+        auto [price, quantity] = *best_bid;
+        // Process best bid
+    }
+}
+
+// ============================================================================
+// 3. RESULT TYPE (Rust-style Result<T, E>)
+// ============================================================================
+
+// Result type using std::variant
+template<typename T, typename E = ErrorCode>
+class Result {
+    std::variant<T, E> data_;
+
+public:
+    // Construct with success value
+    explicit Result(T&& value) noexcept
+        : data_(std::forward<T>(value)) {}
+
+    // Construct with error
+    explicit Result(E error) noexcept
+        : data_(error) {}
+
+    [[nodiscard]] bool isOk() const noexcept {
+        return std::holds_alternative<T>(data_);
+    }
+
+    [[nodiscard]] bool isErr() const noexcept {
+        return std::holds_alternative<E>(data_);
+    }
+
+    [[nodiscard]] T& value() noexcept {
+        return std::get<T>(data_);
+    }
+
+    [[nodiscard]] const T& value() const noexcept {
+        return std::get<T>(data_);
+    }
+
+    [[nodiscard]] E error() const noexcept {
+        return std::get<E>(data_);
+    }
+
+    [[nodiscard]] T valueOr(T&& default_value) const noexcept {
+        if (isOk()) {
+            return value();
+        }
+        return std::forward<T>(default_value);
+    }
+
+    // Monadic operations
+    template<typename Func>
+    auto map(Func&& func) noexcept -> Result<decltype(func(std::declval<T>())), E> {
+        if (isOk()) {
+            return Result<decltype(func(std::declval<T>())), E>(func(value()));
+        }
+        return Result<decltype(func(std::declval<T>())), E>(error());
+    }
+
+    template<typename Func>
+    Result<T, E> andThen(Func&& func) noexcept {
+        if (isOk()) {
+            return func(value());
+        }
+        return Result<T, E>(error());
+    }
+};
+
+// Example usage with Result type
+class RiskChecker {
+public:
+    struct RiskLimits {
+        int64_t max_position;
+        double max_order_value;
+    };
+
+private:
+    RiskLimits limits_;
+    int64_t current_position_ = 0;
+
+public:
+    explicit RiskChecker(const RiskLimits& limits) noexcept
+        : limits_(limits) {}
+
+    // Returns Result instead of throwing exception
+    [[nodiscard]] Result<bool, ErrorCode>
+    checkOrder(int64_t quantity, double price, char side) const noexcept {
+        // Position check
+        int64_t position_delta = (side == 'B') ? quantity : -quantity;
+        int64_t new_position = current_position_ + position_delta;
+
+        if (std::abs(new_position) > limits_.max_position) {
+            return Result<bool, ErrorCode>(ErrorCode::POSITION_LIMIT_EXCEEDED);
+        }
+
+        // Value check
+        double order_value = quantity * price;
+        if (order_value > limits_.max_order_value) {
+            return Result<bool, ErrorCode>(ErrorCode::RISK_LIMIT_EXCEEDED);
+        }
+
+        return Result<bool, ErrorCode>(true);
+    }
+};
+
+// Usage with Result type
+inline ErrorCode submitOrderWithRisk(int64_t quantity, double price, char side) noexcept {
+    RiskChecker risk_checker({10000, 1000000.0});
+
+    auto result = risk_checker.checkOrder(quantity, price, side);
+
+    if (result.isErr()) {
+        // Handle error without exception
+        return result.error();
+    }
+
+    // Proceed with order
+    return ErrorCode::SUCCESS;
+}
+
+// ============================================================================
+// 4. EXPECTED TYPE (C++23 std::expected alternative)
+// ============================================================================
+
+template<typename T, typename E>
+class Expected {
+    union {
+        T value_;
+        E error_;
+    };
+    bool has_value_;
+
+public:
+    // Construct with value
+    explicit Expected(const T& value) noexcept
+        : value_(value), has_value_(true) {}
+
+    explicit Expected(T&& value) noexcept
+        : value_(std::move(value)), has_value_(true) {}
+
+    // Construct with error
+    explicit Expected(const E& error) noexcept
+        : error_(error), has_value_(false) {}
+
+    ~Expected() {
+        if (has_value_) {
+            value_.~T();
+        } else {
+            error_.~E();
+        }
+    }
+
+    [[nodiscard]] bool hasValue() const noexcept { return has_value_; }
+    [[nodiscard]] explicit operator bool() const noexcept { return has_value_; }
+
+    [[nodiscard]] T& value() & noexcept { return value_; }
+    [[nodiscard]] const T& value() const & noexcept { return value_; }
+    [[nodiscard]] T&& value() && noexcept { return std::move(value_); }
+
+    [[nodiscard]] E& error() & noexcept { return error_; }
+    [[nodiscard]] const E& error() const & noexcept { return error_; }
+
+    [[nodiscard]] T valueOr(T&& default_val) const & noexcept {
+        return has_value_ ? value_ : std::forward<T>(default_val);
+    }
+};
+
+// Example: Order submission with Expected
+struct Order {
+    uint64_t order_id;
+    uint32_t symbol_id;
+    double price;
+    int64_t quantity;
+    char side;
+};
+
+[[nodiscard]] Expected<Order, ErrorCode>
+createOrder(uint64_t order_id, uint32_t symbol_id,
+           double price, int64_t quantity, char side) noexcept {
+
+    // Validate price
+    if (price <= 0 || price > 1000000) {
+        return Expected<Order, ErrorCode>(ErrorCode::INVALID_PRICE);
+    }
+
+    // Validate quantity
+    if (quantity <= 0 || quantity > 1000000) {
+        return Expected<Order, ErrorCode>(ErrorCode::INVALID_QUANTITY);
+    }
+
+    // Create order
+    Order order{order_id, symbol_id, price, quantity, side};
+    return Expected<Order, ErrorCode>(std::move(order));
+}
+
+// Usage with Expected
+inline void processOrder() noexcept {
+    auto result = createOrder(12345, 100, 150.25, 1000, 'B');
+
+    if (result) {
+        Order order = result.value();
+        // Submit order
+    } else {
+        ErrorCode error = result.error();
+        // Handle error
+    }
+}
+
+// ============================================================================
+// 5. RETURN VALUE + OUT PARAMETER PATTERN
+// ============================================================================
+
+// For performance-critical code, return error and use out parameter
+class OrderEncoder {
+public:
+    // Returns error code, fills buffer via out parameter
+    [[nodiscard]] ErrorCode encode(const Order& order, char* buffer,
+                                   size_t buffer_size, size_t& out_length) const noexcept {
+        if (buffer_size < 256) {
+            return ErrorCode::BUFFER_OVERFLOW;
+        }
+
+        // Encode order
+        out_length = snprintf(buffer, buffer_size,
+            "ID=%lu|SYM=%u|PX=%.2f|QTY=%ld|SIDE=%c|",
+            order.order_id, order.symbol_id, order.price,
+            order.quantity, order.side);
+
+        if (out_length >= buffer_size) {
+            return ErrorCode::ENCODING_ERROR;
+        }
+
+        return ErrorCode::SUCCESS;
+    }
+};
+
+// Usage
+inline ErrorCode encodeAndSend(const Order& order) noexcept {
+    char buffer[512];
+    size_t length;
+
+    OrderEncoder encoder;
+    ErrorCode error = encoder.encode(order, buffer, sizeof(buffer), length);
+
+    if (error != ErrorCode::SUCCESS) [[unlikely]] {
+        return error;
+    }
+
+    // Send buffer
+    return ErrorCode::SUCCESS;
+}
+
+// ============================================================================
+// 6. ASSERTIONS AND CONTRACTS (Debug only)
+// ============================================================================
+
+// Custom assert that compiles to nothing in release builds
+#ifdef NDEBUG
+    #define HFT_ASSERT(condition, message) ((void)0)
+    #define HFT_PRECONDITION(condition) ((void)0)
+    #define HFT_POSTCONDITION(condition) ((void)0)
+#else
+    #define HFT_ASSERT(condition, message) \
+        do { \
+            if (!(condition)) { \
+                std::fprintf(stderr, "Assertion failed: %s at %s:%d\n", \
+                           message, __FILE__, __LINE__); \
+                std::abort(); \
+            } \
+        } while(0)
+
+    #define HFT_PRECONDITION(condition) HFT_ASSERT(condition, "Precondition failed")
+    #define HFT_POSTCONDITION(condition) HFT_ASSERT(condition, "Postcondition failed")
+#endif
+
+// Example with contracts
+class PositionTracker {
+    int64_t position_ = 0;
+    int64_t position_limit_ = 10000;
+
+public:
+    void updatePosition(int64_t delta) noexcept {
+        HFT_PRECONDITION(std::abs(position_ + delta) <= position_limit_);
+
+        int64_t old_position = position_;
+        position_ += delta;
+
+        HFT_POSTCONDITION(position_ == old_position + delta);
+    }
+
+    [[nodiscard]] int64_t getPosition() const noexcept {
+        return position_;
+    }
+};
+
+// ============================================================================
+// 7. FAIL-FAST WITH IMMEDIATE TERMINATION
+// ============================================================================
+
+// For critical errors, fail fast to prevent data corruption
+[[noreturn]] inline void fatal_error(const char* message,
+                                     const char* file, int line) noexcept {
+    // Log to persistent storage
+    std::fprintf(stderr, "FATAL ERROR: %s at %s:%d\n", message, file, line);
+
+    // Flush any pending data
+    std::fflush(stderr);
+
+    // Immediate termination (no cleanup, no unwinding)
+    std::abort();
+}
+
+#define FATAL_ERROR(message) fatal_error(message, __FILE__, __LINE__)
+
+// Example: Unrecoverable errors
+inline void criticalSystemCheck() noexcept {
+    // Check invariants
+    if (systemIsCorrupted()) {
+        FATAL_ERROR("System state corrupted - terminating immediately");
+    }
+}
+
+} // namespace hft::error_handling
+
+// ============================================================================
+// PERFORMANCE COMPARISON
+// ============================================================================
+
+/*
+Exception-based error handling:
+-------------------------------
+try {
+    submitOrder(price, quantity);
+} catch (const InvalidPriceException& e) {
+    // Handle error
+}
+
+Cost (happy path): +10-20ns (try/catch overhead)
+Cost (error path): 1000-10000ns (stack unwinding)
+Code size: +15-30% (exception tables)
+
+Error code approach:
+-------------------
+ErrorCode error = submitOrder(price, quantity);
+if (error != ErrorCode::SUCCESS) {
+    // Handle error
+}
+
+Cost (happy path): 0-1ns (single comparison)
+Cost (error path): 1-2ns (branch prediction)
+Code size: Minimal
+
+std::optional approach:
+----------------------
+if (auto result = submitOrder(price, quantity)) {
+    // Success
+} else {
+    // Error
+}
+
+Cost (happy path): 1-2ns (bool check)
+Cost (error path): 1-2ns
+Code size: Minimal
+
+Result<T, E> approach:
+---------------------
+auto result = submitOrder(price, quantity);
+if (result.isOk()) {
+    // Success
+} else {
+    // Error: result.error()
+}
+
+Cost (happy path): 1-3ns (variant tag check)
+Cost (error path): 1-3ns
+Code size: Small increase (variant overhead)
+
+RECOMMENDATION FOR HFT:
+----------------------
+1. Critical path: Error codes or std::optional
+2. Less critical: Result<T, E> or Expected<T, E>
+3. Initialization: Exceptions allowed
+4. Never: Exceptions in order submission, market data, risk checks
+*/
+
+// ============================================================================
+// BEST PRACTICES SUMMARY
+// ============================================================================
+
+/*
+1. NEVER throw exceptions in critical path
+2. Use error codes for maximum performance
+3. Use [[unlikely]] attribute for error paths
+4. Check error codes immediately (fail fast)
+5. Log errors asynchronously (non-blocking)
+6. Use assertions in debug builds only
+7. Compile with -fno-exceptions for critical binaries
+8. Test error paths thoroughly
+9. Document error conditions clearly
+10. Prefer compile-time error detection when possible
+*/
+
+This document continues with defensive programming, logging strategies,
+recovery patterns, and comprehensive testing approaches...

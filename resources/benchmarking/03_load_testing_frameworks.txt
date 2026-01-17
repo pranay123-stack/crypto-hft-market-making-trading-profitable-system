@@ -1,0 +1,1041 @@
+================================================================================
+LOAD TESTING FRAMEWORKS FOR HFT SYSTEMS
+JMETER, GATLING, CUSTOM C++ BENCHMARKS
+================================================================================
+
+TABLE OF CONTENTS
+1. Custom C++ Load Testing Framework
+2. JMeter Integration for HFT
+3. Gatling Scala Framework
+4. Locust Python Framework
+5. Custom Protocol Testing
+6. Load Generation Strategies
+7. Distributed Load Testing
+8. Real-Time Monitoring and Metrics
+
+================================================================================
+1. CUSTOM C++ LOAD TESTING FRAMEWORK
+================================================================================
+
+// High-Performance C++ Load Generator
+// File: cpp_load_framework.hpp
+
+#ifndef CPP_LOAD_FRAMEWORK_HPP
+#define CPP_LOAD_FRAMEWORK_HPP
+
+#include <atomic>
+#include <chrono>
+#include <thread>
+#include <vector>
+#include <functional>
+#include <random>
+#include <memory>
+#include <queue>
+#include <condition_variable>
+
+namespace hft {
+namespace loadtest {
+
+// Load profile configuration
+struct LoadProfile {
+    size_t initial_users;
+    size_t max_users;
+    size_t ramp_up_seconds;
+    size_t steady_state_seconds;
+    size_t ramp_down_seconds;
+
+    // Advanced options
+    size_t think_time_ms;
+    double error_rate_threshold;  // Stop if errors exceed this %
+    bool constant_throughput;     // Maintain constant throughput
+    size_t target_throughput;     // Operations per second
+};
+
+// Load test result metrics
+struct LoadTestMetrics {
+    std::atomic<uint64_t> requests_sent{0};
+    std::atomic<uint64_t> requests_completed{0};
+    std::atomic<uint64_t> requests_failed{0};
+    std::atomic<uint64_t> total_latency_ns{0};
+
+    std::vector<uint64_t> latency_samples;
+    std::mutex latency_mutex;
+
+    std::chrono::steady_clock::time_point start_time;
+    std::chrono::steady_clock::time_point end_time;
+
+    void record_request_start() {
+        requests_sent.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void record_request_complete(uint64_t latency_ns, bool success) {
+        if (success) {
+            requests_completed.fetch_add(1, std::memory_order_relaxed);
+            total_latency_ns.fetch_add(latency_ns, std::memory_order_relaxed);
+
+            std::lock_guard<std::mutex> lock(latency_mutex);
+            latency_samples.push_back(latency_ns);
+        } else {
+            requests_failed.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    double get_success_rate() const {
+        uint64_t total = requests_sent.load();
+        if (total == 0) return 0.0;
+        return (requests_completed.load() * 100.0) / total;
+    }
+
+    double get_average_latency_ms() const {
+        uint64_t completed = requests_completed.load();
+        if (completed == 0) return 0.0;
+        return (total_latency_ns.load() / completed) / 1e6;
+    }
+
+    double get_throughput() const {
+        auto duration = std::chrono::duration_cast<std::chrono::seconds>(
+            end_time - start_time).count();
+        if (duration == 0) return 0.0;
+        return requests_completed.load() / static_cast<double>(duration);
+    }
+};
+
+// Virtual user simulation
+class VirtualUser {
+public:
+    using WorkloadFunction = std::function<bool()>;
+
+    VirtualUser(size_t id, WorkloadFunction workload, LoadTestMetrics& metrics)
+        : user_id(id), workload_func(workload), metrics(metrics),
+          running(false) {}
+
+    void start() {
+        running = true;
+        thread = std::thread([this]() { run(); });
+    }
+
+    void stop() {
+        running = false;
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+
+    bool is_running() const {
+        return running;
+    }
+
+private:
+    size_t user_id;
+    WorkloadFunction workload_func;
+    LoadTestMetrics& metrics;
+    std::atomic<bool> running;
+    std::thread thread;
+
+    void run() {
+        while (running) {
+            auto start = std::chrono::high_resolution_clock::now();
+
+            metrics.record_request_start();
+            bool success = workload_func();
+
+            auto end = std::chrono::high_resolution_clock::now();
+            auto latency = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                end - start).count();
+
+            metrics.record_request_complete(latency, success);
+
+            // Think time between requests
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+};
+
+// Main load test controller
+class LoadTestController {
+public:
+    using WorkloadFunction = VirtualUser::WorkloadFunction;
+
+    LoadTestController(LoadProfile profile, WorkloadFunction workload)
+        : profile(profile), workload_func(workload) {}
+
+    LoadTestMetrics run() {
+        std::cout << "Starting load test...\n";
+        std::cout << "  Initial users: " << profile.initial_users << "\n";
+        std::cout << "  Max users: " << profile.max_users << "\n";
+        std::cout << "  Ramp-up: " << profile.ramp_up_seconds << "s\n";
+        std::cout << "  Steady-state: " << profile.steady_state_seconds << "s\n";
+        std::cout << "  Ramp-down: " << profile.ramp_down_seconds << "s\n\n";
+
+        metrics.start_time = std::chrono::steady_clock::now();
+
+        // Phase 1: Ramp-up
+        ramp_up_phase();
+
+        // Phase 2: Steady state
+        steady_state_phase();
+
+        // Phase 3: Ramp-down
+        ramp_down_phase();
+
+        metrics.end_time = std::chrono::steady_clock::now();
+
+        stop_all_users();
+        print_results();
+
+        return metrics;
+    }
+
+private:
+    LoadProfile profile;
+    WorkloadFunction workload_func;
+    LoadTestMetrics metrics;
+    std::vector<std::unique_ptr<VirtualUser>> users;
+    std::mutex users_mutex;
+
+    void ramp_up_phase() {
+        std::cout << "Phase 1: Ramp-up (" << profile.ramp_up_seconds << "s)\n";
+
+        size_t users_to_add = profile.max_users - profile.initial_users;
+        double interval_seconds = static_cast<double>(profile.ramp_up_seconds) /
+                                 users_to_add;
+
+        // Start initial users
+        for (size_t i = 0; i < profile.initial_users; ++i) {
+            add_user();
+        }
+
+        // Gradually add users
+        for (size_t i = 0; i < users_to_add; ++i) {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(static_cast<int>(interval_seconds * 1000)));
+            add_user();
+
+            // Check error threshold
+            if (check_error_threshold()) {
+                std::cout << "Error threshold exceeded! Stopping ramp-up.\n";
+                return;
+            }
+        }
+    }
+
+    void steady_state_phase() {
+        std::cout << "Phase 2: Steady-state (" << profile.steady_state_seconds << "s)\n";
+
+        auto start = std::chrono::steady_clock::now();
+        auto duration = std::chrono::seconds(profile.steady_state_seconds);
+
+        while (std::chrono::steady_clock::now() - start < duration) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+
+            // Print progress
+            print_real_time_stats();
+
+            // Check error threshold
+            if (check_error_threshold()) {
+                std::cout << "Error threshold exceeded! Stopping test.\n";
+                return;
+            }
+        }
+    }
+
+    void ramp_down_phase() {
+        std::cout << "Phase 3: Ramp-down (" << profile.ramp_down_seconds << "s)\n";
+
+        std::lock_guard<std::mutex> lock(users_mutex);
+        size_t users_to_remove = users.size();
+        double interval_seconds = static_cast<double>(profile.ramp_down_seconds) /
+                                 users_to_remove;
+
+        for (size_t i = 0; i < users_to_remove; ++i) {
+            if (!users.empty()) {
+                users.back()->stop();
+                users.pop_back();
+            }
+
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(static_cast<int>(interval_seconds * 1000)));
+        }
+    }
+
+    void add_user() {
+        std::lock_guard<std::mutex> lock(users_mutex);
+        size_t user_id = users.size();
+        auto user = std::make_unique<VirtualUser>(user_id, workload_func, metrics);
+        user->start();
+        users.push_back(std::move(user));
+    }
+
+    void stop_all_users() {
+        std::lock_guard<std::mutex> lock(users_mutex);
+        for (auto& user : users) {
+            user->stop();
+        }
+        users.clear();
+    }
+
+    bool check_error_threshold() {
+        double success_rate = metrics.get_success_rate();
+        double error_rate = 100.0 - success_rate;
+        return error_rate > profile.error_rate_threshold;
+    }
+
+    void print_real_time_stats() {
+        size_t active_users;
+        {
+            std::lock_guard<std::mutex> lock(users_mutex);
+            active_users = users.size();
+        }
+
+        std::cout << "Active Users: " << active_users
+                  << ", Requests: " << metrics.requests_completed.load()
+                  << ", Success Rate: " << std::fixed << std::setprecision(2)
+                  << metrics.get_success_rate() << "%"
+                  << ", Avg Latency: " << metrics.get_average_latency_ms() << "ms"
+                  << "\n";
+    }
+
+    void print_results() {
+        std::cout << "\n=== Load Test Results ===\n";
+        std::cout << "Total Requests Sent: " << metrics.requests_sent.load() << "\n";
+        std::cout << "Requests Completed: " << metrics.requests_completed.load() << "\n";
+        std::cout << "Requests Failed: " << metrics.requests_failed.load() << "\n";
+        std::cout << "Success Rate: " << std::fixed << std::setprecision(2)
+                  << metrics.get_success_rate() << "%\n";
+        std::cout << "Average Latency: " << metrics.get_average_latency_ms() << " ms\n";
+        std::cout << "Throughput: " << metrics.get_throughput() << " req/s\n";
+    }
+};
+
+} // namespace loadtest
+} // namespace hft
+
+#endif // CPP_LOAD_FRAMEWORK_HPP
+
+================================================================================
+2. JMETER INTEGRATION FOR HFT
+================================================================================
+
+// JMeter Test Plan for HFT System
+// File: hft_jmeter_test_plan.jmx
+
+<?xml version="1.0" encoding="UTF-8"?>
+<jmeterTestPlan version="1.2" properties="5.0">
+  <hashTree>
+    <TestPlan guiclass="TestPlanGui" testclass="TestPlan" testname="HFT System Load Test">
+      <stringProp name="TestPlan.comments">
+        High-Frequency Trading System Load Test
+        Tests order entry, market data, and execution performance
+      </stringProp>
+      <boolProp name="TestPlan.functional_mode">false</boolProp>
+      <boolProp name="TestPlan.serialize_threadgroups">false</boolProp>
+
+      <elementProp name="TestPlan.user_defined_variables" elementType="Arguments">
+        <collectionProp name="Arguments.arguments">
+          <elementProp name="HOST" elementType="Argument">
+            <stringProp name="Argument.name">HOST</stringProp>
+            <stringProp name="Argument.value">localhost</stringProp>
+          </elementProp>
+          <elementProp name="PORT" elementType="Argument">
+            <stringProp name="Argument.name">PORT</stringProp>
+            <stringProp name="Argument.value">8080</stringProp>
+          </elementProp>
+          <elementProp name="PROTOCOL" elementType="Argument">
+            <stringProp name="Argument.name">PROTOCOL</stringProp>
+            <stringProp name="Argument.value">tcp</stringProp>
+          </elementProp>
+        </collectionProp>
+      </elementProp>
+    </TestPlan>
+
+    <hashTree>
+      <!-- Thread Group: Order Entry Load -->
+      <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="Order Entry Load">
+        <stringProp name="ThreadGroup.num_threads">100</stringProp>
+        <stringProp name="ThreadGroup.ramp_time">60</stringProp>
+        <longProp name="ThreadGroup.duration">300</longProp>
+        <boolProp name="ThreadGroup.scheduler">true</boolProp>
+        <stringProp name="ThreadGroup.on_sample_error">continue</stringProp>
+      </ThreadGroup>
+
+      <hashTree>
+        <!-- Custom TCP Sampler for FIX Protocol -->
+        <TCPSampler guiclass="TCPSamplerGui" testclass="TCPSampler" testname="Send Order">
+          <stringProp name="TCPSampler.server">${HOST}</stringProp>
+          <stringProp name="TCPSampler.port">${PORT}</stringProp>
+          <stringProp name="TCPSampler.timeout">5000</stringProp>
+          <stringProp name="TCPSampler.request">
+            8=FIX.4.2|9=145|35=D|49=SENDER|56=TARGET|34=1|52=${__time(yyyyMMdd-HH:mm:ss)}|
+            11=${__Random(1,999999)}|21=1|55=AAPL|54=1|60=${__time(yyyyMMdd-HH:mm:ss)}|
+            38=100|40=2|44=150.50|10=000|
+          </stringProp>
+          <boolProp name="TCPSampler.reUseConnection">true</boolProp>
+          <boolProp name="TCPSampler.closeConnection">false</boolProp>
+        </TCPSampler>
+
+        <!-- Response Assertion -->
+        <ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion">
+          <collectionProp name="Asserion.test_strings">
+            <stringProp name="51">35=8</stringProp> <!-- Execution Report -->
+          </collectionProp>
+          <stringProp name="Assertion.test_field">Assertion.response_data</stringProp>
+        </ResponseAssertion>
+
+        <!-- Constant Throughput Timer -->
+        <ConstantThroughputTimer guiclass="TestBeanGUI" testclass="ConstantThroughputTimer">
+          <intProp name="throughput">10000</intProp> <!-- 10k requests per minute -->
+          <stringProp name="calcMode">all_active_threads</stringProp>
+        </ConstantThroughputTimer>
+      </hashTree>
+
+      <!-- Thread Group: Market Data Subscription -->
+      <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="Market Data Subscription">
+        <stringProp name="ThreadGroup.num_threads">50</stringProp>
+        <stringProp name="ThreadGroup.ramp_time">30</stringProp>
+        <longProp name="ThreadGroup.duration">300</longProp>
+        <boolProp name="ThreadGroup.scheduler">true</boolProp>
+      </ThreadGroup>
+
+      <hashTree>
+        <TCPSampler guiclass="TCPSamplerGui" testclass="TCPSampler" testname="Subscribe Market Data">
+          <stringProp name="TCPSampler.server">${HOST}</stringProp>
+          <stringProp name="TCPSampler.port">9000</stringProp>
+          <stringProp name="TCPSampler.request">
+            8=FIX.4.2|9=100|35=V|49=SENDER|56=TARGET|262=${__Random(1,999999)}|
+            263=1|264=0|146=1|55=AAPL|267=2|269=0|269=1|10=000|
+          </stringProp>
+        </TCPSampler>
+      </hashTree>
+
+      <!-- Listeners -->
+      <ResultCollector guiclass="SummaryReport" testclass="ResultCollector" testname="Summary Report">
+        <boolProp name="ResultCollector.error_logging">false</boolProp>
+        <objProp>
+          <name>saveConfig</name>
+          <value class="SampleSaveConfiguration">
+            <time>true</time>
+            <latency>true</latency>
+            <timestamp>true</timestamp>
+            <success>true</success>
+            <label>true</label>
+            <code>true</code>
+            <message>true</message>
+            <threadName>true</threadName>
+          </value>
+        </objProp>
+        <stringProp name="filename">./results/jmeter_results.csv</stringProp>
+      </ResultCollector>
+
+      <ResultCollector guiclass="GraphVisualizer" testclass="ResultCollector" testname="Graph Results">
+        <boolProp name="ResultCollector.error_logging">false</boolProp>
+        <stringProp name="filename">./results/graph_results.csv</stringProp>
+      </ResultCollector>
+    </hashTree>
+  </hashTree>
+</jmeterTestPlan>
+
+// JMeter Custom Plugin for HFT Metrics
+// File: HFTMetricsPlugin.java
+
+package com.hft.jmeter.plugins;
+
+import org.apache.jmeter.samplers.SampleResult;
+import org.apache.jmeter.visualizers.backend.AbstractBackendListenerClient;
+import org.apache.jmeter.visualizers.backend.BackendListenerContext;
+
+public class HFTMetricsPlugin extends AbstractBackendListenerClient {
+
+    private static final String P50_LATENCY = "P50_Latency";
+    private static final String P95_LATENCY = "P95_Latency";
+    private static final String P99_LATENCY = "P99_Latency";
+    private static final String P999_LATENCY = "P999_Latency";
+
+    private List<Long> latencies = new ArrayList<>();
+
+    @Override
+    public void handleSampleResults(List<SampleResult> sampleResults,
+                                    BackendListenerContext context) {
+        for (SampleResult result : sampleResults) {
+            long latency = result.getTime();
+            synchronized(latencies) {
+                latencies.add(latency);
+            }
+
+            // Check if latency exceeds SLA
+            if (latency > 10) {  // 10ms threshold
+                System.err.println("SLA VIOLATION: Latency " + latency +
+                                 "ms exceeds 10ms threshold");
+            }
+        }
+
+        // Calculate and report percentiles every 1000 samples
+        if (latencies.size() >= 1000) {
+            reportPercentiles();
+            latencies.clear();
+        }
+    }
+
+    private void reportPercentiles() {
+        synchronized(latencies) {
+            Collections.sort(latencies);
+
+            int size = latencies.size();
+            long p50 = latencies.get((int)(size * 0.50));
+            long p95 = latencies.get((int)(size * 0.95));
+            long p99 = latencies.get((int)(size * 0.99));
+            long p999 = latencies.get((int)(size * 0.999));
+
+            System.out.println("Latency Percentiles (ms):");
+            System.out.println("  P50:   " + p50);
+            System.out.println("  P95:   " + p95);
+            System.out.println("  P99:   " + p99);
+            System.out.println("  P99.9: " + p999);
+        }
+    }
+
+    @Override
+    public void setupTest(BackendListenerContext context) throws Exception {
+        latencies.clear();
+    }
+
+    @Override
+    public void teardownTest(BackendListenerContext context) throws Exception {
+        reportPercentiles();
+    }
+}
+
+// JMeter execution script
+// File: run_jmeter_tests.sh
+
+#!/bin/bash
+
+JMETER_HOME="/opt/apache-jmeter"
+TEST_PLAN="hft_jmeter_test_plan.jmx"
+RESULTS_DIR="./jmeter_results"
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+
+# Create results directory
+mkdir -p ${RESULTS_DIR}
+
+# Run JMeter in non-GUI mode for better performance
+${JMETER_HOME}/bin/jmeter -n \
+    -t ${TEST_PLAN} \
+    -l ${RESULTS_DIR}/results_${TIMESTAMP}.jtl \
+    -j ${RESULTS_DIR}/jmeter_${TIMESTAMP}.log \
+    -e -o ${RESULTS_DIR}/html_report_${TIMESTAMP}
+
+# Generate additional reports
+${JMETER_HOME}/bin/jmeter -g ${RESULTS_DIR}/results_${TIMESTAMP}.jtl \
+    -o ${RESULTS_DIR}/dashboard_${TIMESTAMP}
+
+echo "JMeter test completed. Results in ${RESULTS_DIR}"
+
+================================================================================
+3. GATLING SCALA FRAMEWORK
+================================================================================
+
+// Gatling Load Test Scenario for HFT
+// File: HFTLoadSimulation.scala
+
+import io.gatling.core.Predef._
+import io.gatling.http.Predef._
+import scala.concurrent.duration._
+
+class HFTLoadSimulation extends Simulation {
+
+  // HTTP Configuration
+  val httpProtocol = http
+    .baseUrl("http://localhost:8080")
+    .acceptHeader("application/json")
+    .contentTypeHeader("application/json")
+    .userAgentHeader("Gatling HFT Load Test")
+
+  // Scenario 1: Order Entry Load
+  val orderEntryScenario = scenario("Order Entry Load")
+    .exec(
+      http("Place Limit Order")
+        .post("/api/v1/orders")
+        .body(StringBody("""
+          {
+            "symbol": "AAPL",
+            "side": "BUY",
+            "orderType": "LIMIT",
+            "quantity": 100,
+            "price": 150.50,
+            "timeInForce": "DAY"
+          }
+        """))
+        .check(status.is(200))
+        .check(jsonPath("$.orderId").exists)
+        .check(responseTimeInMillis.lte(10)) // Max 10ms latency
+    )
+    .pause(10.milliseconds, 50.milliseconds)
+
+  // Scenario 2: Market Data Query
+  val marketDataScenario = scenario("Market Data Query")
+    .exec(
+      http("Get Order Book")
+        .get("/api/v1/orderbook/${symbol}")
+        .queryParam("depth", "10")
+        .check(status.is(200))
+        .check(jsonPath("$.bids").exists)
+        .check(jsonPath("$.asks").exists)
+        .check(responseTimeInMillis.lte(5)) // Max 5ms latency
+    )
+    .pause(5.milliseconds, 20.milliseconds)
+
+  // Scenario 3: Order Status Check
+  val orderStatusScenario = scenario("Order Status Check")
+    .exec(
+      http("Check Order Status")
+        .get("/api/v1/orders/${orderId}")
+        .check(status.is(200))
+        .check(jsonPath("$.status").in("NEW", "FILLED", "PARTIAL", "CANCELLED"))
+        .check(responseTimeInMillis.lte(2)) // Max 2ms latency
+    )
+    .pause(1.milliseconds, 10.milliseconds)
+
+  // Load Profile: Ramp up to 1000 users over 60 seconds, sustain for 5 minutes
+  setUp(
+    orderEntryScenario.inject(
+      rampUsersPerSec(0) to 500 during (60.seconds),
+      constantUsersPerSec(500) during (5.minutes)
+    ).protocols(httpProtocol),
+
+    marketDataScenario.inject(
+      rampUsersPerSec(0) to 1000 during (60.seconds),
+      constantUsersPerSec(1000) during (5.minutes)
+    ).protocols(httpProtocol),
+
+    orderStatusScenario.inject(
+      rampUsersPerSec(0) to 300 during (60.seconds),
+      constantUsersPerSec(300) during (5.minutes)
+    ).protocols(httpProtocol)
+  ).protocols(httpProtocol)
+   .assertions(
+     global.responseTime.percentile3.lt(10),  // P99 < 10ms
+     global.responseTime.percentile4.lt(50),  // P99.9 < 50ms
+     global.successfulRequests.percent.gt(99.9)  // > 99.9% success
+   )
+}
+
+// Advanced Gatling Simulation with Custom Feeders
+// File: AdvancedHFTSimulation.scala
+
+import io.gatling.core.Predef._
+import io.gatling.http.Predef._
+import scala.concurrent.duration._
+import scala.util.Random
+
+class AdvancedHFTSimulation extends Simulation {
+
+  // Custom feeder for symbols
+  val symbolFeeder = Iterator.continually(Map(
+    "symbol" -> Random.shuffle(List("AAPL", "GOOGL", "MSFT", "AMZN", "TSLA")).head,
+    "price" -> (100 + Random.nextDouble() * 100),
+    "quantity" -> (100 + Random.nextInt(900))
+  ))
+
+  // Custom protocol for binary FIX messages
+  val fixProtocol = http
+    .baseUrl("http://localhost:8080")
+    .contentTypeHeader("application/octet-stream")
+
+  // Heavy load scenario with think time distribution
+  val heavyLoadScenario = scenario("Heavy Load Scenario")
+    .feed(symbolFeeder)
+    .exec(
+      http("Submit Order")
+        .post("/api/v1/orders")
+        .body(StringBody("""{"symbol":"${symbol}","price":${price},"qty":${quantity}}"""))
+        .check(status.is(200))
+    )
+    .pause(1.milliseconds, 5.milliseconds)
+    .repeat(10) {
+      exec(
+        http("Query Order Book")
+          .get("/api/v1/orderbook/${symbol}")
+          .check(status.is(200))
+      )
+      .pause(1.milliseconds)
+    }
+
+  // Spike test: sudden load increase
+  val spikeTestScenario = scenario("Spike Test")
+    .feed(symbolFeeder)
+    .exec(
+      http("Burst Orders")
+        .post("/api/v1/orders/batch")
+        .body(StringBody("""[
+          {"symbol":"${symbol}","price":${price},"qty":${quantity}"},
+          {"symbol":"${symbol}","price":${price},"qty":${quantity}"}
+        ]"""))
+    )
+
+  setUp(
+    heavyLoadScenario.inject(
+      atOnceUsers(100),
+      rampUsers(900) during (30.seconds),
+      constantUsersPerSec(1000) during (2.minutes),
+      rampUsersPerSec(1000) to 5000 during (30.seconds),  // Spike
+      constantUsersPerSec(5000) during (1.minute),
+      rampUsersPerSec(5000) to 1000 during (30.seconds)   // Recovery
+    ),
+    spikeTestScenario.inject(
+      nothingFor(90.seconds),
+      atOnceUsers(1000)  // Sudden spike
+    )
+  ).protocols(fixProtocol)
+   .maxDuration(10.minutes)
+   .assertions(
+     global.responseTime.mean.lt(5),
+     global.responseTime.percentile3.lt(20),
+     global.failedRequests.percent.lt(0.1)
+   )
+}
+
+// Gatling execution script
+// File: run_gatling_tests.sh
+
+#!/bin/bash
+
+GATLING_HOME="/opt/gatling"
+SIMULATION_CLASS="HFTLoadSimulation"
+RESULTS_DIR="./gatling_results"
+
+# Compile Scala simulations
+cd simulations
+scalac -cp "${GATLING_HOME}/lib/*" *.scala
+
+# Run Gatling
+${GATLING_HOME}/bin/gatling.sh \
+    -s ${SIMULATION_CLASS} \
+    -rf ${RESULTS_DIR} \
+    -nr
+
+echo "Gatling test completed. Results in ${RESULTS_DIR}"
+
+================================================================================
+4. LOCUST PYTHON FRAMEWORK
+================================================================================
+
+// Locust Load Test for HFT System
+// File: locustfile.py
+
+from locust import HttpUser, task, between, events
+import json
+import random
+import time
+from datetime import datetime
+
+class HFTUser(HttpUser):
+    wait_time = between(0.001, 0.01)  # 1-10ms between requests
+
+    symbols = ["AAPL", "GOOGL", "MSFT", "AMZN", "TSLA", "META", "NVDA"]
+
+    def on_start(self):
+        """Called when a user starts"""
+        self.client_id = f"client_{random.randint(1000, 9999)}"
+
+    @task(5)
+    def place_order(self):
+        """Place a new order - 50% of requests"""
+        order = {
+            "clientId": self.client_id,
+            "symbol": random.choice(self.symbols),
+            "side": random.choice(["BUY", "SELL"]),
+            "orderType": "LIMIT",
+            "quantity": random.randint(1, 1000) * 100,
+            "price": round(random.uniform(100, 200), 2),
+            "timeInForce": "DAY",
+            "timestamp": int(time.time() * 1e9)
+        }
+
+        with self.client.post("/api/v1/orders",
+                             json=order,
+                             catch_response=True) as response:
+            if response.status_code == 200:
+                response_data = response.json()
+                if response.elapsed.total_seconds() * 1000 > 10:
+                    response.failure("Response time > 10ms")
+            else:
+                response.failure(f"Got status code {response.status_code}")
+
+    @task(3)
+    def get_order_book(self):
+        """Get order book - 30% of requests"""
+        symbol = random.choice(self.symbols)
+        with self.client.get(f"/api/v1/orderbook/{symbol}",
+                            catch_response=True) as response:
+            if response.status_code == 200:
+                if response.elapsed.total_seconds() * 1000 > 5:
+                    response.failure("Order book query > 5ms")
+            else:
+                response.failure(f"Got status code {response.status_code}")
+
+    @task(2)
+    def get_market_data(self):
+        """Get market data - 20% of requests"""
+        symbol = random.choice(self.symbols)
+        with self.client.get(f"/api/v1/market/{symbol}/quote",
+                            catch_response=True) as response:
+            if response.status_code == 200:
+                if response.elapsed.total_seconds() * 1000 > 2:
+                    response.failure("Market data query > 2ms")
+
+# Custom Locust events for HFT metrics
+@events.request.add_listener
+def on_request(request_type, name, response_time, response_length, exception, **kwargs):
+    """Track custom HFT metrics"""
+    if exception:
+        print(f"Request failed: {name} - {exception}")
+
+    # Alert on high latency
+    if response_time > 10:
+        print(f"HIGH LATENCY ALERT: {name} took {response_time}ms")
+
+@events.test_start.add_listener
+def on_test_start(environment, **kwargs):
+    print("HFT Load Test Starting...")
+    print(f"Target host: {environment.host}")
+
+@events.test_stop.add_listener
+def on_test_stop(environment, **kwargs):
+    print("HFT Load Test Completed")
+    print(f"Total requests: {environment.stats.total.num_requests}")
+    print(f"Failure rate: {environment.stats.total.fail_ratio * 100:.2f}%")
+
+# Advanced Locust user with custom load profile
+// File: advanced_locust.py
+
+from locust import HttpUser, task, between, LoadTestShape
+import math
+
+class CustomLoadShape(LoadTestShape):
+    """
+    Custom load shape for HFT testing:
+    - Ramp up to 1000 users in 60 seconds
+    - Maintain 1000 users for 300 seconds
+    - Spike to 5000 users for 60 seconds
+    - Return to 1000 users
+    - Ramp down over 60 seconds
+    """
+
+    stages = [
+        {"duration": 60, "users": 1000, "spawn_rate": 17},     # Ramp up
+        {"duration": 300, "users": 1000, "spawn_rate": 0},     # Steady
+        {"duration": 60, "users": 5000, "spawn_rate": 67},     # Spike
+        {"duration": 120, "users": 1000, "spawn_rate": 67},    # Recovery
+        {"duration": 60, "users": 0, "spawn_rate": 17}         # Ramp down
+    ]
+
+    def tick(self):
+        run_time = self.get_run_time()
+
+        for stage in self.stages:
+            if run_time < stage["duration"]:
+                return (stage["users"], stage["spawn_rate"])
+            run_time -= stage["duration"]
+
+        return None
+
+class HFTLoadTestUser(HttpUser):
+    wait_time = between(0.001, 0.005)  # Ultra-low latency simulation
+
+    @task
+    def hft_order_flow(self):
+        # Simulate HFT order flow pattern
+        for _ in range(10):
+            self.client.post("/api/v1/orders", json={
+                "symbol": "AAPL",
+                "side": "BUY",
+                "quantity": 100,
+                "price": 150.00
+            })
+            time.sleep(0.001)  # 1ms between orders
+
+        # Cancel some orders
+        self.client.delete("/api/v1/orders/latest")
+
+# Run Locust
+// File: run_locust.sh
+
+#!/bin/bash
+
+locust -f locustfile.py \
+    --host=http://localhost:8080 \
+    --users=1000 \
+    --spawn-rate=100 \
+    --run-time=600s \
+    --headless \
+    --csv=locust_results \
+    --html=locust_report.html \
+    --loglevel=INFO
+
+================================================================================
+5. CUSTOM PROTOCOL TESTING
+================================================================================
+
+// FIX Protocol Load Testing
+// File: fix_protocol_load_test.cpp
+
+#include <iostream>
+#include <string>
+#include <vector>
+#include <thread>
+#include <atomic>
+#include <chrono>
+
+namespace hft {
+namespace loadtest {
+
+class FIXMessage {
+public:
+    static std::string create_new_order(const std::string& symbol,
+                                       char side,
+                                       double price,
+                                       int quantity) {
+        std::string msg = "8=FIX.4.2|9=";
+        std::string body =
+            "35=D|"                                    // New Order
+            "49=SENDER|56=TARGET|"
+            "34=1|52=" + get_timestamp() + "|"
+            "11=" + get_order_id() + "|"
+            "21=1|"                                    // Automated execution
+            "55=" + symbol + "|"
+            "54=" + std::string(1, side) + "|"
+            "60=" + get_timestamp() + "|"
+            "38=" + std::to_string(quantity) + "|"
+            "40=2|"                                    // Limit order
+            "44=" + format_price(price) + "|";
+
+        msg += std::to_string(body.length()) + "|" + body;
+        msg += "10=" + calculate_checksum(msg) + "|";
+
+        return msg;
+    }
+
+private:
+    static std::string get_timestamp() {
+        auto now = std::chrono::system_clock::now();
+        auto time_t = std::chrono::system_clock::to_time_t(now);
+        char buffer[32];
+        strftime(buffer, sizeof(buffer), "%Y%m%d-%H:%M:%S", localtime(&time_t));
+        return std::string(buffer);
+    }
+
+    static std::string get_order_id() {
+        static std::atomic<uint64_t> counter{1};
+        return std::to_string(counter.fetch_add(1));
+    }
+
+    static std::string format_price(double price) {
+        char buffer[32];
+        snprintf(buffer, sizeof(buffer), "%.2f", price);
+        return std::string(buffer);
+    }
+
+    static std::string calculate_checksum(const std::string& msg) {
+        int sum = 0;
+        for (char c : msg) {
+            sum += static_cast<unsigned char>(c);
+        }
+        char buffer[4];
+        snprintf(buffer, sizeof(buffer), "%03d", sum % 256);
+        return std::string(buffer);
+    }
+};
+
+class FIXLoadTest {
+public:
+    void run_load_test(size_t num_threads, size_t messages_per_thread) {
+        std::cout << "Starting FIX Protocol Load Test\n";
+        std::cout << "Threads: " << num_threads << "\n";
+        std::cout << "Messages per thread: " << messages_per_thread << "\n\n";
+
+        std::vector<std::thread> threads;
+        std::atomic<uint64_t> total_sent{0};
+
+        auto start = std::chrono::high_resolution_clock::now();
+
+        for (size_t t = 0; t < num_threads; ++t) {
+            threads.emplace_back([&, t]() {
+                for (size_t i = 0; i < messages_per_thread; ++i) {
+                    auto msg = FIXMessage::create_new_order(
+                        "AAPL", '1', 150.50, 100);
+
+                    // Simulate sending to exchange
+                    send_to_exchange(msg);
+
+                    total_sent.fetch_add(1);
+                }
+            });
+        }
+
+        for (auto& thread : threads) {
+            thread.join();
+        }
+
+        auto end = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+            end - start).count();
+
+        std::cout << "Load test completed\n";
+        std::cout << "Total messages: " << total_sent.load() << "\n";
+        std::cout << "Duration: " << duration << " ms\n";
+        std::cout << "Throughput: " << (total_sent.load() * 1000.0 / duration)
+                  << " msg/s\n";
+    }
+
+private:
+    void send_to_exchange(const std::string& msg) {
+        // Simulate network send
+        volatile size_t len = msg.length();
+        (void)len;
+    }
+};
+
+} // namespace loadtest
+} // namespace hft
+
+================================================================================
+6. LOAD TESTING BEST PRACTICES
+================================================================================
+
+FRAMEWORK SELECTION GUIDE:
+=========================
+
+Framework   | Best For                    | Pros                  | Cons
+------------|-----------------------------|-----------------------|------------------
+Custom C++  | Ultra-low latency testing   | Fastest, most control | Complex setup
+JMeter      | Protocol testing (FIX, TCP) | Mature, GUI           | Higher overhead
+Gatling     | HTTP/REST APIs              | Scala DSL, reports    | JVM overhead
+Locust      | Python integration          | Easy scripting        | GIL limitations
+
+LOAD TEST STRATEGY:
+==================
+1. Baseline Test: Establish normal performance
+2. Stress Test: Find breaking point
+3. Spike Test: Sudden load increases
+4. Soak Test: Extended duration (24h+)
+5. Scalability Test: Measure linear scaling
+
+MONITORING DURING LOAD TESTS:
+=============================
+- CPU utilization per core
+- Memory usage and allocation rate
+- Network bandwidth and packet loss
+- Disk I/O and queue depths
+- Application-specific metrics (order book depth, etc.)
+
+SLA VERIFICATION:
+================
+- P99 latency < 10ms
+- P99.9 latency < 50ms
+- Throughput > 100K orders/sec
+- Success rate > 99.99%
+- Zero data loss under load
+
+================================================================================
+END OF LOAD TESTING FRAMEWORKS
+================================================================================

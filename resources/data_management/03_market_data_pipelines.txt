@@ -1,0 +1,1013 @@
+================================================================================
+MARKET DATA PIPELINES FOR HFT SYSTEMS
+Ingestion, Normalization, and Distribution
+================================================================================
+
+OVERVIEW
+--------
+This document provides comprehensive implementations of market data pipelines
+for high-frequency trading systems, covering data ingestion from multiple
+sources, normalization, validation, and distribution to trading strategies.
+
+================================================================================
+1. MARKET DATA PIPELINE ARCHITECTURE
+================================================================================
+
+1.1 PIPELINE COMPONENTS
+-----------------------
+
+┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
+│  Market Data    │────▶│   Ingestion      │────▶│  Normalization  │
+│  Sources        │     │   Gateway        │     │  Engine         │
+└─────────────────┘     └──────────────────┘     └─────────────────┘
+                                                           │
+                                                           ▼
+┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
+│  Strategies     │◀────│   Distribution   │◀────│   Validation    │
+│  & Algorithms   │     │   Layer          │     │   & Enrichment  │
+└─────────────────┘     └──────────────────┘     └─────────────────┘
+                                                           │
+                                                           ▼
+                        ┌──────────────────┐     ┌─────────────────┐
+                        │   Historical     │◀────│   Storage       │
+                        │   Database       │     │   Layer         │
+                        └──────────────────┘     └─────────────────┘
+
+1.2 DATA FLOW REQUIREMENTS
+---------------------------
+
+Performance Requirements:
+- Latency: < 100 microseconds (ingestion to normalization)
+- Throughput: 1M+ messages per second
+- Data loss: Zero tolerance
+- Ordering: Strictly maintained per symbol
+
+Data Quality Requirements:
+- Validation: Real-time anomaly detection
+- Completeness: Gap detection and recovery
+- Accuracy: Cross-feed validation
+- Consistency: Duplicate detection
+
+================================================================================
+2. MARKET DATA SOURCES INTEGRATION
+================================================================================
+
+2.1 FIX PROTOCOL INTEGRATION
+-----------------------------
+
+// C++ FIX Engine for Market Data
+#include <quickfix/Application.h>
+#include <quickfix/MessageCracker.h>
+#include <quickfix/SessionSettings.h>
+#include <quickfix/FileStore.h>
+#include <quickfix/SocketInitiator.h>
+
+class MarketDataFIXApplication : public FIX::Application,
+                                  public FIX::MessageCracker {
+private:
+    MarketDataCallback* callback_;
+    std::unordered_map<std::string, Subscription> subscriptions_;
+
+public:
+    MarketDataFIXApplication(MarketDataCallback* callback)
+        : callback_(callback) {}
+
+    // FIX Session callbacks
+    void onCreate(const FIX::SessionID& sessionID) override {
+        std::cout << "Session created: " << sessionID << std::endl;
+    }
+
+    void onLogon(const FIX::SessionID& sessionID) override {
+        std::cout << "Logon successful: " << sessionID << std::endl;
+        // Subscribe to market data
+        subscribeMarketData(sessionID);
+    }
+
+    void onLogout(const FIX::SessionID& sessionID) override {
+        std::cout << "Logout: " << sessionID << std::endl;
+    }
+
+    void toAdmin(FIX::Message& message, const FIX::SessionID&) override {
+        // Add authentication credentials
+        FIX::Header& header = message.getHeader();
+        if (FIX::MsgType().getValue() == FIX::MsgType_Logon) {
+            message.setField(FIX::Username("your_username"));
+            message.setField(FIX::Password("your_password"));
+        }
+    }
+
+    void toApp(FIX::Message&, const FIX::SessionID&) override {}
+    void fromAdmin(const FIX::Message&, const FIX::SessionID&) override {}
+
+    void fromApp(const FIX::Message& message, const FIX::SessionID& sessionID)
+        override {
+        crack(message, sessionID);
+    }
+
+    // Market Data Messages
+    void onMessage(const FIX44::MarketDataSnapshotFullRefresh& message,
+                   const FIX::SessionID&) {
+        FIX::Symbol symbol;
+        message.getField(symbol);
+
+        MarketDepth depth;
+        depth.symbol = symbol.getValue();
+        depth.timestamp = std::chrono::high_resolution_clock::now();
+
+        FIX::NoMDEntries noEntries;
+        message.getField(noEntries);
+
+        for (int i = 1; i <= noEntries; ++i) {
+            FIX44::MarketDataSnapshotFullRefresh::NoMDEntries group;
+            message.getGroup(i, group);
+
+            FIX::MDEntryType entryType;
+            FIX::MDEntryPx price;
+            FIX::MDEntrySize size;
+
+            group.getField(entryType);
+            group.getField(price);
+            group.getField(size);
+
+            if (entryType == FIX::MDEntryType_BID) {
+                depth.bids.push_back({price, size});
+            } else if (entryType == FIX::MDEntryType_OFFER) {
+                depth.asks.push_back({price, size});
+            }
+        }
+
+        callback_->onMarketDepth(depth);
+    }
+
+    void onMessage(const FIX44::MarketDataIncrementalRefresh& message,
+                   const FIX::SessionID&) {
+        FIX::NoMDEntries noEntries;
+        message.getField(noEntries);
+
+        for (int i = 1; i <= noEntries; ++i) {
+            FIX44::MarketDataIncrementalRefresh::NoMDEntries group;
+            message.getGroup(i, group);
+
+            FIX::Symbol symbol;
+            FIX::MDUpdateAction action;
+            FIX::MDEntryType entryType;
+            FIX::MDEntryPx price;
+            FIX::MDEntrySize size;
+
+            group.getField(symbol);
+            group.getField(action);
+            group.getField(entryType);
+            group.getField(price);
+            group.getField(size);
+
+            MarketDataUpdate update;
+            update.symbol = symbol.getValue();
+            update.action = action;
+            update.entryType = entryType;
+            update.price = price;
+            update.size = size;
+            update.timestamp = std::chrono::high_resolution_clock::now();
+
+            callback_->onMarketDataUpdate(update);
+        }
+    }
+
+private:
+    void subscribeMarketData(const FIX::SessionID& sessionID) {
+        FIX44::MarketDataRequest request;
+        request.setField(FIX::MDReqID(generateRequestID()));
+        request.setField(FIX::SubscriptionRequestType(
+            FIX::SubscriptionRequestType_SNAPSHOT_PLUS_UPDATES));
+        request.setField(FIX::MarketDepth(10)); // Full depth
+        request.setField(FIX::MDUpdateType(FIX::MDUpdateType_INCREMENTAL_REFRESH));
+
+        // Request bid/ask and trades
+        FIX44::MarketDataRequest::NoMDEntryTypes entryTypes;
+        entryTypes.setField(FIX::MDEntryType(FIX::MDEntryType_BID));
+        request.addGroup(entryTypes);
+        entryTypes.setField(FIX::MDEntryType(FIX::MDEntryType_OFFER));
+        request.addGroup(entryTypes);
+        entryTypes.setField(FIX::MDEntryType(FIX::MDEntryType_TRADE));
+        request.addGroup(entryTypes);
+
+        // Add symbols to subscribe
+        FIX44::MarketDataRequest::NoRelatedSym symbols;
+        for (const auto& sub : subscriptions_) {
+            symbols.setField(FIX::Symbol(sub.first));
+            request.addGroup(symbols);
+        }
+
+        try {
+            FIX::Session::sendToTarget(request, sessionID);
+        } catch (FIX::SessionNotFound& e) {
+            std::cerr << "Session not found: " << e.what() << std::endl;
+        }
+    }
+};
+
+2.2 WEBSOCKET FEED INTEGRATION
+-------------------------------
+
+// C++ WebSocket Market Data Client
+#include <websocketpp/config/asio_client.hpp>
+#include <websocketpp/client.hpp>
+#include <json/json.h>
+
+typedef websocketpp::client<websocketpp::config::asio_tls_client> ws_client;
+
+class WebSocketMarketDataClient {
+private:
+    ws_client client_;
+    websocketpp::connection_hdl connection_;
+    MarketDataCallback* callback_;
+    std::thread ws_thread_;
+    std::atomic<bool> running_{false};
+
+public:
+    WebSocketMarketDataClient(MarketDataCallback* callback)
+        : callback_(callback) {
+        client_.init_asio();
+        client_.set_message_handler(
+            bind(&WebSocketMarketDataClient::onMessage, this,
+                 std::placeholders::_1, std::placeholders::_2));
+        client_.set_open_handler(
+            bind(&WebSocketMarketDataClient::onOpen, this,
+                 std::placeholders::_1));
+        client_.set_close_handler(
+            bind(&WebSocketMarketDataClient::onClose, this,
+                 std::placeholders::_1));
+        client_.set_fail_handler(
+            bind(&WebSocketMarketDataClient::onFail, this,
+                 std::placeholders::_1));
+    }
+
+    void connect(const std::string& uri) {
+        websocketpp::lib::error_code ec;
+        ws_client::connection_ptr con = client_.get_connection(uri, ec);
+
+        if (ec) {
+            throw std::runtime_error("Connection failed: " + ec.message());
+        }
+
+        connection_ = con->get_handle();
+        client_.connect(con);
+
+        running_ = true;
+        ws_thread_ = std::thread([this]() { client_.run(); });
+    }
+
+    void subscribe(const std::vector<std::string>& symbols) {
+        Json::Value request;
+        request["type"] = "subscribe";
+        request["channels"] = Json::arrayValue;
+
+        Json::Value trades_channel;
+        trades_channel["name"] = "trades";
+        trades_channel["symbols"] = Json::arrayValue;
+        for (const auto& symbol : symbols) {
+            trades_channel["symbols"].append(symbol);
+        }
+        request["channels"].append(trades_channel);
+
+        Json::Value quotes_channel;
+        quotes_channel["name"] = "quotes";
+        quotes_channel["symbols"] = Json::arrayValue;
+        for (const auto& symbol : symbols) {
+            quotes_channel["symbols"].append(symbol);
+        }
+        request["channels"].append(quotes_channel);
+
+        Json::StreamWriterBuilder writer;
+        std::string request_str = Json::writeString(writer, request);
+
+        websocketpp::lib::error_code ec;
+        client_.send(connection_, request_str,
+                     websocketpp::frame::opcode::text, ec);
+
+        if (ec) {
+            std::cerr << "Send failed: " << ec.message() << std::endl;
+        }
+    }
+
+    void disconnect() {
+        running_ = false;
+        websocketpp::lib::error_code ec;
+        client_.close(connection_, websocketpp::close::status::normal,
+                      "Closing", ec);
+        if (ws_thread_.joinable()) {
+            ws_thread_.join();
+        }
+    }
+
+private:
+    void onMessage(websocketpp::connection_hdl,
+                   ws_client::message_ptr msg) {
+        Json::Value root;
+        Json::Reader reader;
+
+        if (!reader.parse(msg->get_payload(), root)) {
+            std::cerr << "Failed to parse JSON" << std::endl;
+            return;
+        }
+
+        std::string type = root["type"].asString();
+
+        if (type == "trade") {
+            Trade trade;
+            trade.symbol = root["symbol"].asString();
+            trade.price = root["price"].asDouble();
+            trade.quantity = root["quantity"].asDouble();
+            trade.side = root["side"].asString();
+            trade.trade_id = root["trade_id"].asString();
+            trade.timestamp = parseTimestamp(root["timestamp"].asString());
+
+            callback_->onTrade(trade);
+
+        } else if (type == "quote") {
+            Quote quote;
+            quote.symbol = root["symbol"].asString();
+            quote.bid_price = root["bid"].asDouble();
+            quote.bid_size = root["bid_size"].asDouble();
+            quote.ask_price = root["ask"].asDouble();
+            quote.ask_size = root["ask_size"].asDouble();
+            quote.timestamp = parseTimestamp(root["timestamp"].asString());
+
+            callback_->onQuote(quote);
+        }
+    }
+
+    void onOpen(websocketpp::connection_hdl) {
+        std::cout << "WebSocket connection opened" << std::endl;
+    }
+
+    void onClose(websocketpp::connection_hdl) {
+        std::cout << "WebSocket connection closed" << std::endl;
+    }
+
+    void onFail(websocketpp::connection_hdl) {
+        std::cerr << "WebSocket connection failed" << std::endl;
+    }
+
+    std::chrono::system_clock::time_point parseTimestamp(
+        const std::string& ts_str) {
+        // Parse ISO 8601 timestamp
+        // Implementation depends on format
+        return std::chrono::system_clock::now();
+    }
+};
+
+2.3 BINARY PROTOCOL INTEGRATION (ITCH)
+---------------------------------------
+
+// C++ NASDAQ ITCH Protocol Parser
+#include <cstdint>
+#include <cstring>
+
+#pragma pack(push, 1)
+
+struct ITCHSystemEventMessage {
+    char message_type;           // 'S'
+    uint16_t stock_locate;
+    uint16_t tracking_number;
+    uint64_t timestamp;          // Nanoseconds since midnight
+    char event_code;
+};
+
+struct ITCHAddOrderMessage {
+    char message_type;           // 'A'
+    uint16_t stock_locate;
+    uint16_t tracking_number;
+    uint64_t timestamp;
+    uint64_t order_reference_number;
+    char buy_sell_indicator;     // 'B' or 'S'
+    uint32_t shares;
+    char stock[8];
+    uint32_t price;              // Fixed point 4 decimal places
+};
+
+struct ITCHTradeMessage {
+    char message_type;           // 'P'
+    uint16_t stock_locate;
+    uint16_t tracking_number;
+    uint64_t timestamp;
+    uint64_t order_reference_number;
+    char buy_sell_indicator;
+    uint32_t shares;
+    char stock[8];
+    uint32_t price;
+    uint64_t match_number;
+};
+
+#pragma pack(pop)
+
+class ITCHParser {
+private:
+    MarketDataCallback* callback_;
+    std::unordered_map<uint16_t, std::string> stock_directory_;
+
+public:
+    ITCHParser(MarketDataCallback* callback) : callback_(callback) {}
+
+    void parseMessage(const uint8_t* buffer, size_t length) {
+        if (length < 1) return;
+
+        char message_type = static_cast<char>(buffer[0]);
+
+        switch (message_type) {
+            case 'S':
+                parseSystemEvent(buffer, length);
+                break;
+            case 'R':
+                parseStockDirectory(buffer, length);
+                break;
+            case 'A':
+                parseAddOrder(buffer, length);
+                break;
+            case 'P':
+                parseTrade(buffer, length);
+                break;
+            case 'Q':
+                parseCrossTradeMessage(buffer, length);
+                break;
+            // Add more message types as needed
+            default:
+                // Unknown message type
+                break;
+        }
+    }
+
+private:
+    void parseSystemEvent(const uint8_t* buffer, size_t length) {
+        if (length < sizeof(ITCHSystemEventMessage)) return;
+
+        const ITCHSystemEventMessage* msg =
+            reinterpret_cast<const ITCHSystemEventMessage*>(buffer);
+
+        // Convert from network byte order
+        uint64_t timestamp = be64toh(msg->timestamp);
+
+        // Handle system event
+        // (start of day, end of day, etc.)
+    }
+
+    void parseStockDirectory(const uint8_t* buffer, size_t length) {
+        // Parse and store stock information
+        // Format: message_type (1) + stock_locate (2) + tracking_number (2) +
+        //         timestamp (8) + stock (8) + market_category (1) + ...
+        if (length < 39) return;
+
+        uint16_t stock_locate = ntohs(*reinterpret_cast<const uint16_t*>(buffer + 1));
+        char stock_raw[9] = {0};
+        memcpy(stock_raw, buffer + 11, 8);
+        std::string stock(stock_raw);
+        stock.erase(stock.find_last_not_of(' ') + 1); // Trim spaces
+
+        stock_directory_[stock_locate] = stock;
+    }
+
+    void parseAddOrder(const uint8_t* buffer, size_t length) {
+        if (length < sizeof(ITCHAddOrderMessage)) return;
+
+        const ITCHAddOrderMessage* msg =
+            reinterpret_cast<const ITCHAddOrderMessage*>(buffer);
+
+        uint16_t stock_locate = ntohs(msg->stock_locate);
+        uint64_t timestamp = be64toh(msg->timestamp);
+        uint64_t order_ref = be64toh(msg->order_reference_number);
+        uint32_t shares = ntohl(msg->shares);
+        uint32_t price_raw = ntohl(msg->price);
+        double price = price_raw / 10000.0;
+
+        char stock_raw[9] = {0};
+        memcpy(stock_raw, msg->stock, 8);
+        std::string symbol(stock_raw);
+        symbol.erase(symbol.find_last_not_of(' ') + 1);
+
+        // Create order book update
+        OrderBookUpdate update;
+        update.symbol = symbol;
+        update.order_id = order_ref;
+        update.side = (msg->buy_sell_indicator == 'B') ? Side::BUY : Side::SELL;
+        update.price = price;
+        update.quantity = shares;
+        update.timestamp = convertITCHTimestamp(timestamp);
+
+        callback_->onOrderBookUpdate(update);
+    }
+
+    void parseTrade(const uint8_t* buffer, size_t length) {
+        if (length < sizeof(ITCHTradeMessage)) return;
+
+        const ITCHTradeMessage* msg =
+            reinterpret_cast<const ITCHTradeMessage*>(buffer);
+
+        uint64_t timestamp = be64toh(msg->timestamp);
+        uint32_t shares = ntohl(msg->shares);
+        uint32_t price_raw = ntohl(msg->price);
+        double price = price_raw / 10000.0;
+
+        char stock_raw[9] = {0};
+        memcpy(stock_raw, msg->stock, 8);
+        std::string symbol(stock_raw);
+        symbol.erase(symbol.find_last_not_of(' ') + 1);
+
+        Trade trade;
+        trade.symbol = symbol;
+        trade.price = price;
+        trade.quantity = shares;
+        trade.side = (msg->buy_sell_indicator == 'B') ? "buy" : "sell";
+        trade.timestamp = convertITCHTimestamp(timestamp);
+
+        callback_->onTrade(trade);
+    }
+
+    std::chrono::system_clock::time_point convertITCHTimestamp(uint64_t nanos) {
+        // ITCH timestamps are nanoseconds since midnight
+        auto now = std::chrono::system_clock::now();
+        auto today = std::chrono::floor<std::chrono::days>(now);
+        return today + std::chrono::nanoseconds(nanos);
+    }
+};
+
+================================================================================
+3. DATA NORMALIZATION ENGINE
+================================================================================
+
+3.1 UNIFIED DATA MODEL
+----------------------
+
+// Normalized market data structures
+struct NormalizedTrade {
+    std::string symbol;
+    std::string exchange;
+    double price;
+    double quantity;
+    std::string side;              // "buy" or "sell"
+    std::string trade_id;
+    std::chrono::system_clock::time_point timestamp;
+    std::chrono::system_clock::time_point exchange_timestamp;
+    std::chrono::system_clock::time_point received_timestamp;
+    std::string conditions;        // Trade conditions/qualifiers
+    int64_t sequence_number;
+};
+
+struct NormalizedQuote {
+    std::string symbol;
+    std::string exchange;
+    double bid_price;
+    double bid_size;
+    double ask_price;
+    double ask_size;
+    double spread;
+    double mid_price;
+    std::chrono::system_clock::time_point timestamp;
+    std::chrono::system_clock::time_point exchange_timestamp;
+    std::chrono::system_clock::time_point received_timestamp;
+    int64_t sequence_number;
+};
+
+struct NormalizedOrderBookLevel {
+    double price;
+    double size;
+    int order_count;
+};
+
+struct NormalizedOrderBook {
+    std::string symbol;
+    std::string exchange;
+    std::vector<NormalizedOrderBookLevel> bids;  // Sorted descending
+    std::vector<NormalizedOrderBookLevel> asks;  // Sorted ascending
+    std::chrono::system_clock::time_point timestamp;
+    int64_t sequence_number;
+};
+
+3.2 NORMALIZATION ENGINE
+-------------------------
+
+class MarketDataNormalizer {
+private:
+    struct SymbolMapping {
+        std::string unified_symbol;
+        std::string exchange_symbol;
+        std::string exchange;
+        int instrument_id;
+        double tick_size;
+        double lot_size;
+        int price_precision;
+        int quantity_precision;
+    };
+
+    std::unordered_map<std::string, SymbolMapping> symbol_mappings_;
+    std::unordered_map<std::string, InstrumentMetadata> instrument_metadata_;
+
+public:
+    void loadSymbolMappings(const std::string& config_file) {
+        // Load symbol mappings from configuration
+        Json::Value root;
+        std::ifstream config(config_file);
+        config >> root;
+
+        for (const auto& mapping : root["mappings"]) {
+            SymbolMapping sm;
+            sm.unified_symbol = mapping["unified"].asString();
+            sm.exchange_symbol = mapping["exchange_symbol"].asString();
+            sm.exchange = mapping["exchange"].asString();
+            sm.instrument_id = mapping["instrument_id"].asInt();
+            sm.tick_size = mapping["tick_size"].asDouble();
+            sm.lot_size = mapping["lot_size"].asDouble();
+            sm.price_precision = mapping["price_precision"].asInt();
+            sm.quantity_precision = mapping["quantity_precision"].asInt();
+
+            std::string key = sm.exchange + ":" + sm.exchange_symbol;
+            symbol_mappings_[key] = sm;
+        }
+    }
+
+    NormalizedTrade normalizeTrade(const RawTrade& raw_trade) {
+        auto now = std::chrono::system_clock::now();
+
+        std::string key = raw_trade.exchange + ":" + raw_trade.symbol;
+        auto it = symbol_mappings_.find(key);
+
+        if (it == symbol_mappings_.end()) {
+            throw std::runtime_error("Unknown symbol mapping: " + key);
+        }
+
+        const SymbolMapping& mapping = it->second;
+
+        NormalizedTrade normalized;
+        normalized.symbol = mapping.unified_symbol;
+        normalized.exchange = raw_trade.exchange;
+        normalized.price = roundPrice(raw_trade.price, mapping.tick_size,
+                                      mapping.price_precision);
+        normalized.quantity = roundQuantity(raw_trade.quantity, mapping.lot_size,
+                                           mapping.quantity_precision);
+        normalized.side = normalizeSide(raw_trade.side);
+        normalized.trade_id = raw_trade.trade_id;
+        normalized.timestamp = raw_trade.timestamp;
+        normalized.exchange_timestamp = raw_trade.exchange_timestamp;
+        normalized.received_timestamp = now;
+        normalized.conditions = raw_trade.conditions;
+        normalized.sequence_number = raw_trade.sequence_number;
+
+        return normalized;
+    }
+
+    NormalizedQuote normalizeQuote(const RawQuote& raw_quote) {
+        auto now = std::chrono::system_clock::now();
+
+        std::string key = raw_quote.exchange + ":" + raw_quote.symbol;
+        auto it = symbol_mappings_.find(key);
+
+        if (it == symbol_mappings_.end()) {
+            throw std::runtime_error("Unknown symbol mapping: " + key);
+        }
+
+        const SymbolMapping& mapping = it->second;
+
+        NormalizedQuote normalized;
+        normalized.symbol = mapping.unified_symbol;
+        normalized.exchange = raw_quote.exchange;
+        normalized.bid_price = roundPrice(raw_quote.bid_price, mapping.tick_size,
+                                          mapping.price_precision);
+        normalized.bid_size = roundQuantity(raw_quote.bid_size, mapping.lot_size,
+                                           mapping.quantity_precision);
+        normalized.ask_price = roundPrice(raw_quote.ask_price, mapping.tick_size,
+                                          mapping.price_precision);
+        normalized.ask_size = roundQuantity(raw_quote.ask_size, mapping.lot_size,
+                                           mapping.quantity_precision);
+        normalized.spread = normalized.ask_price - normalized.bid_price;
+        normalized.mid_price = (normalized.bid_price + normalized.ask_price) / 2.0;
+        normalized.timestamp = raw_quote.timestamp;
+        normalized.exchange_timestamp = raw_quote.exchange_timestamp;
+        normalized.received_timestamp = now;
+        normalized.sequence_number = raw_quote.sequence_number;
+
+        return normalized;
+    }
+
+private:
+    double roundPrice(double price, double tick_size, int precision) {
+        // Round to nearest tick
+        double ticks = std::round(price / tick_size);
+        double rounded = ticks * tick_size;
+
+        // Round to precision
+        double multiplier = std::pow(10.0, precision);
+        return std::round(rounded * multiplier) / multiplier;
+    }
+
+    double roundQuantity(double quantity, double lot_size, int precision) {
+        // Round to nearest lot
+        double lots = std::round(quantity / lot_size);
+        double rounded = lots * lot_size;
+
+        // Round to precision
+        double multiplier = std::pow(10.0, precision);
+        return std::round(rounded * multiplier) / multiplier;
+    }
+
+    std::string normalizeSide(const std::string& raw_side) {
+        std::string lower = raw_side;
+        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+
+        if (lower == "b" || lower == "buy" || lower == "bid") {
+            return "buy";
+        } else if (lower == "s" || lower == "sell" || lower == "ask" ||
+                   lower == "offer") {
+            return "sell";
+        }
+        return raw_side; // Return as-is if unknown
+    }
+};
+
+================================================================================
+4. DATA VALIDATION AND QUALITY CONTROL
+================================================================================
+
+4.1 VALIDATION ENGINE
+---------------------
+
+class MarketDataValidator {
+private:
+    struct ValidationConfig {
+        double max_price_change_pct;     // Maximum price change %
+        double max_spread_pct;           // Maximum spread %
+        double min_quantity;             // Minimum valid quantity
+        double max_quantity;             // Maximum valid quantity
+        int64_t max_sequence_gap;        // Maximum sequence number gap
+        std::chrono::milliseconds max_latency;  // Maximum acceptable latency
+    };
+
+    std::unordered_map<std::string, ValidationConfig> configs_;
+    std::unordered_map<std::string, double> last_prices_;
+    std::unordered_map<std::string, int64_t> last_sequences_;
+
+public:
+    enum class ValidationResult {
+        VALID,
+        INVALID_PRICE,
+        INVALID_SPREAD,
+        INVALID_QUANTITY,
+        SEQUENCE_GAP,
+        STALE_DATA,
+        DUPLICATE
+    };
+
+    ValidationResult validateTrade(const NormalizedTrade& trade) {
+        auto config_it = configs_.find(trade.symbol);
+        if (config_it == configs_.end()) {
+            return ValidationResult::VALID; // No config, pass through
+        }
+
+        const ValidationConfig& config = config_it->second;
+
+        // Validate price
+        if (trade.price <= 0) {
+            return ValidationResult::INVALID_PRICE;
+        }
+
+        // Check price change
+        auto last_price_it = last_prices_.find(trade.symbol);
+        if (last_price_it != last_prices_.end()) {
+            double price_change_pct =
+                std::abs(trade.price - last_price_it->second) /
+                last_price_it->second * 100.0;
+
+            if (price_change_pct > config.max_price_change_pct) {
+                return ValidationResult::INVALID_PRICE;
+            }
+        }
+
+        // Validate quantity
+        if (trade.quantity < config.min_quantity ||
+            trade.quantity > config.max_quantity) {
+            return ValidationResult::INVALID_QUANTITY;
+        }
+
+        // Check latency
+        auto now = std::chrono::system_clock::now();
+        auto latency = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - trade.timestamp);
+
+        if (latency > config.max_latency) {
+            return ValidationResult::STALE_DATA;
+        }
+
+        // Check sequence number
+        auto last_seq_it = last_sequences_.find(trade.symbol);
+        if (last_seq_it != last_sequences_.end()) {
+            int64_t seq_gap = trade.sequence_number - last_seq_it->second;
+
+            if (seq_gap == 0) {
+                return ValidationResult::DUPLICATE;
+            }
+
+            if (seq_gap > config.max_sequence_gap) {
+                return ValidationResult::SEQUENCE_GAP;
+            }
+        }
+
+        // Update state
+        last_prices_[trade.symbol] = trade.price;
+        last_sequences_[trade.symbol] = trade.sequence_number;
+
+        return ValidationResult::VALID;
+    }
+
+    ValidationResult validateQuote(const NormalizedQuote& quote) {
+        auto config_it = configs_.find(quote.symbol);
+        if (config_it == configs_.end()) {
+            return ValidationResult::VALID;
+        }
+
+        const ValidationConfig& config = config_it->second;
+
+        // Validate prices
+        if (quote.bid_price <= 0 || quote.ask_price <= 0) {
+            return ValidationResult::INVALID_PRICE;
+        }
+
+        // Check bid/ask relationship
+        if (quote.bid_price >= quote.ask_price) {
+            return ValidationResult::INVALID_PRICE;
+        }
+
+        // Validate spread
+        double spread_pct = quote.spread / quote.mid_price * 100.0;
+        if (spread_pct > config.max_spread_pct) {
+            return ValidationResult::INVALID_SPREAD;
+        }
+
+        // Validate sizes
+        if (quote.bid_size < config.min_quantity ||
+            quote.ask_size < config.min_quantity) {
+            return ValidationResult::INVALID_QUANTITY;
+        }
+
+        // Check latency
+        auto now = std::chrono::system_clock::now();
+        auto latency = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - quote.timestamp);
+
+        if (latency > config.max_latency) {
+            return ValidationResult::STALE_DATA;
+        }
+
+        return ValidationResult::VALID;
+    }
+};
+
+================================================================================
+5. DATA DISTRIBUTION LAYER
+================================================================================
+
+5.1 ZERO-COPY SHARED MEMORY IPC
+--------------------------------
+
+// High-performance shared memory market data distribution
+#include <boost/interprocess/shared_memory_object.hpp>
+#include <boost/interprocess/mapped_region.hpp>
+#include <atomic>
+
+namespace bip = boost::interprocess;
+
+template<typename T, size_t QueueSize = 4096>
+class LockFreeRingBuffer {
+private:
+    struct alignas(64) Slot {
+        std::atomic<uint64_t> sequence;
+        T data;
+    };
+
+    Slot* slots_;
+    std::atomic<uint64_t> write_index_{0};
+    std::atomic<uint64_t> read_index_{0};
+    static constexpr size_t size_ = QueueSize;
+
+public:
+    bool tryWrite(const T& data) {
+        uint64_t write_idx = write_index_.load(std::memory_order_relaxed);
+        uint64_t read_idx = read_index_.load(std::memory_order_acquire);
+
+        if (write_idx - read_idx >= size_) {
+            return false; // Queue full
+        }
+
+        size_t slot_idx = write_idx & (size_ - 1);
+        slots_[slot_idx].data = data;
+        slots_[slot_idx].sequence.store(write_idx + 1,
+                                        std::memory_order_release);
+        write_index_.store(write_idx + 1, std::memory_order_release);
+
+        return true;
+    }
+
+    bool tryRead(T& data) {
+        uint64_t read_idx = read_index_.load(std::memory_order_relaxed);
+        uint64_t write_idx = write_index_.load(std::memory_order_acquire);
+
+        if (read_idx >= write_idx) {
+            return false; // Queue empty
+        }
+
+        size_t slot_idx = read_idx & (size_ - 1);
+        data = slots_[slot_idx].data;
+        read_index_.store(read_idx + 1, std::memory_order_release);
+
+        return true;
+    }
+};
+
+class SharedMemoryMarketDataPublisher {
+private:
+    bip::shared_memory_object shm_;
+    bip::mapped_region region_;
+    LockFreeRingBuffer<NormalizedTrade>* trade_buffer_;
+    LockFreeRingBuffer<NormalizedQuote>* quote_buffer_;
+
+public:
+    SharedMemoryMarketDataPublisher(const std::string& name, size_t size) {
+        bip::shared_memory_object::remove(name.c_str());
+
+        shm_ = bip::shared_memory_object(bip::create_only, name.c_str(),
+                                         bip::read_write);
+        shm_.truncate(size);
+
+        region_ = bip::mapped_region(shm_, bip::read_write);
+
+        void* addr = region_.get_address();
+        trade_buffer_ = new (addr) LockFreeRingBuffer<NormalizedTrade>();
+        quote_buffer_ = new (static_cast<char*>(addr) +
+                             sizeof(LockFreeRingBuffer<NormalizedTrade>()))
+            LockFreeRingBuffer<NormalizedQuote>();
+    }
+
+    bool publishTrade(const NormalizedTrade& trade) {
+        return trade_buffer_->tryWrite(trade);
+    }
+
+    bool publishQuote(const NormalizedQuote& quote) {
+        return quote_buffer_->tryWrite(quote);
+    }
+};
+
+================================================================================
+6. PERFORMANCE MONITORING
+================================================================================
+
+6.1 PIPELINE METRICS
+--------------------
+
+class PipelineMetrics {
+private:
+    struct MetricCounters {
+        std::atomic<uint64_t> messages_received{0};
+        std::atomic<uint64_t> messages_normalized{0};
+        std::atomic<uint64_t> messages_validated{0};
+        std::atomic<uint64_t> messages_distributed{0};
+        std::atomic<uint64_t> messages_dropped{0};
+        std::atomic<uint64_t> validation_failures{0};
+
+        LatencyHistogram ingestion_latency;
+        LatencyHistogram normalization_latency;
+        LatencyHistogram end_to_end_latency;
+    };
+
+    std::unordered_map<std::string, MetricCounters> symbol_metrics_;
+
+public:
+    void recordMessage(const std::string& symbol, const std::string& stage,
+                       uint64_t latency_ns) {
+        auto& metrics = symbol_metrics_[symbol];
+
+        if (stage == "received") {
+            metrics.messages_received++;
+        } else if (stage == "normalized") {
+            metrics.messages_normalized++;
+            metrics.normalization_latency.record(latency_ns);
+        } else if (stage == "validated") {
+            metrics.messages_validated++;
+        } else if (stage == "distributed") {
+            metrics.messages_distributed++;
+            metrics.end_to_end_latency.record(latency_ns);
+        }
+    }
+
+    void reportMetrics() {
+        for (const auto& [symbol, metrics] : symbol_metrics_) {
+            std::cout << "Symbol: " << symbol << std::endl;
+            std::cout << "  Received: " << metrics.messages_received << std::endl;
+            std::cout << "  Normalized: " << metrics.messages_normalized << std::endl;
+            std::cout << "  Distributed: " << metrics.messages_distributed << std::endl;
+            std::cout << "  Dropped: " << metrics.messages_dropped << std::endl;
+            std::cout << "  E2E Latency P99: "
+                      << metrics.end_to_end_latency.getPercentile(0.99)
+                      << " ns" << std::endl;
+        }
+    }
+};
+
+================================================================================
+END OF MARKET DATA PIPELINES DOCUMENT
+================================================================================

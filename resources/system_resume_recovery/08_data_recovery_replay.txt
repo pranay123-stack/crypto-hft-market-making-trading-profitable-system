@@ -1,0 +1,2078 @@
+================================================================================
+DATA RECOVERY AND REPLAY FOR HFT SYSTEMS
+================================================================================
+
+Author: HFT System Architecture Team
+Last Updated: 2025-11-25
+Version: 1.0
+Category: System Resume & Recovery
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+
+1. Market Data Replay for Debugging
+2. Order Replay to Reconstruct State
+3. Trade History Recovery
+4. Time-Travel Debugging
+5. Replay Architecture
+6. Replay Performance Optimization
+7. Use Cases for Replay
+8. Best Practices & Checklists
+
+================================================================================
+1. MARKET DATA REPLAY FOR DEBUGGING
+================================================================================
+
+1.1 WHY REPLAY MARKET DATA
+---------------------------
+
+Critical for HFT:
+- Reproduce bugs that only happen in specific market conditions
+- Backtest strategy changes
+- Validate system behavior
+- Train new team members
+- Regulatory compliance (prove what you saw)
+
+Example scenario:
+-----------------
+Strategy made unexpected trade at 10:15:23.456
+Question: Why?
+Answer: Replay market data from 10:14:00 - 10:16:00 to see exactly what happened
+
+Without replay:
+- Guess based on logs
+- Can't reproduce
+- Can't verify fix
+
+With replay:
+- See exact market conditions
+- Reproduce bug reliably
+- Verify fix works
+- Prevent recurrence
+
+1.2 MARKET DATA CAPTURE
+------------------------
+
+Capture everything:
+- Order book snapshots
+- Order book deltas (adds/removes/updates)
+- Trades (prints)
+- Quotes (BBO updates)
+- Exchange messages (all)
+- Timestamps (both exchange and local)
+
+Storage format:
+---------------
+struct MarketDataMessage {
+    uint64_t sequence_number;      // Monotonic sequence
+    timestamp_t exchange_timestamp; // From exchange
+    timestamp_t capture_timestamp;  // When we received it
+    string symbol;
+    MessageType type;              // SNAPSHOT, ADD, UPDATE, REMOVE, TRADE
+    char side;                     // B/A
+    double price;
+    uint64_t quantity;
+    uint64_t order_id;             // For order book messages
+
+    // Metadata
+    string exchange_id;
+    uint16_t message_flags;
+};
+
+Binary format (efficient storage):
+-----------------------------------
+[8 bytes: sequence]
+[8 bytes: exchange_timestamp]
+[8 bytes: capture_timestamp]
+[4 bytes: symbol_id]  // Use symbol table
+[1 byte: message_type]
+[1 byte: side]
+[8 bytes: price]      // Fixed-point
+[8 bytes: quantity]
+[8 bytes: order_id]
+[2 bytes: exchange_id]
+[2 bytes: flags]
+= 64 bytes per message
+
+1.3 MARKET DATA CAPTURE IMPLEMENTATION
+---------------------------------------
+
+class MarketDataRecorder {
+private:
+    std::ofstream capture_file_;
+    std::mutex write_mutex_;
+    uint64_t sequence_number_{0};
+    std::atomic<bool> recording_{false};
+
+    // Symbol table for efficient encoding
+    std::map<string, uint32_t> symbol_to_id_;
+    std::map<uint32_t, string> id_to_symbol_;
+    uint32_t next_symbol_id_{0};
+
+public:
+    void start_recording(const string& filename) {
+        capture_file_.open(filename, std::ios::binary);
+
+        if (!capture_file_.is_open()) {
+            throw std::runtime_error("Failed to open capture file");
+        }
+
+        recording_ = true;
+
+        // Write header
+        write_header();
+
+        LOG_INFO("Market data recording started: {}", filename);
+    }
+
+    void stop_recording() {
+        recording_ = false;
+
+        std::lock_guard<std::mutex> lock(write_mutex_);
+        capture_file_.close();
+
+        LOG_INFO("Market data recording stopped. Captured {} messages",
+                sequence_number_);
+    }
+
+    void record_message(const MarketDataMessage& msg) {
+        if (!recording_) return;
+
+        std::lock_guard<std::mutex> lock(write_mutex_);
+
+        // Encode message to binary
+        auto encoded = encode_message(msg);
+
+        // Write to file
+        capture_file_.write(reinterpret_cast<const char*>(encoded.data()),
+                           encoded.size());
+
+        sequence_number_++;
+
+        // Flush periodically
+        if (sequence_number_ % 10000 == 0) {
+            capture_file_.flush();
+        }
+    }
+
+private:
+    void write_header() {
+        // File format version
+        uint32_t version = 1;
+        capture_file_.write(reinterpret_cast<const char*>(&version),
+                           sizeof(version));
+
+        // Capture start time
+        auto start_time = now_utc();
+        capture_file_.write(reinterpret_cast<const char*>(&start_time),
+                           sizeof(start_time));
+
+        // Write symbol table
+        write_symbol_table();
+    }
+
+    void write_symbol_table() {
+        // Number of symbols
+        uint32_t num_symbols = symbol_to_id_.size();
+        capture_file_.write(reinterpret_cast<const char*>(&num_symbols),
+                           sizeof(num_symbols));
+
+        // Each symbol
+        for (const auto& [symbol, id] : symbol_to_id_) {
+            capture_file_.write(reinterpret_cast<const char*>(&id),
+                               sizeof(id));
+
+            uint16_t symbol_len = symbol.length();
+            capture_file_.write(reinterpret_cast<const char*>(&symbol_len),
+                               sizeof(symbol_len));
+
+            capture_file_.write(symbol.data(), symbol_len);
+        }
+    }
+
+    vector<uint8_t> encode_message(const MarketDataMessage& msg) {
+        vector<uint8_t> encoded(64);  // Fixed 64 bytes
+        size_t offset = 0;
+
+        // Sequence number
+        memcpy(&encoded[offset], &sequence_number_, 8);
+        offset += 8;
+
+        // Timestamps
+        memcpy(&encoded[offset], &msg.exchange_timestamp, 8);
+        offset += 8;
+        memcpy(&encoded[offset], &msg.capture_timestamp, 8);
+        offset += 8;
+
+        // Symbol (convert to ID)
+        uint32_t symbol_id = get_or_create_symbol_id(msg.symbol);
+        memcpy(&encoded[offset], &symbol_id, 4);
+        offset += 4;
+
+        // Message type
+        encoded[offset++] = static_cast<uint8_t>(msg.type);
+
+        // Side
+        encoded[offset++] = msg.side;
+
+        // Price (convert to fixed-point)
+        int64_t price_fp = static_cast<int64_t>(msg.price * 100000000);
+        memcpy(&encoded[offset], &price_fp, 8);
+        offset += 8;
+
+        // Quantity
+        memcpy(&encoded[offset], &msg.quantity, 8);
+        offset += 8;
+
+        // Order ID
+        memcpy(&encoded[offset], &msg.order_id, 8);
+        offset += 8;
+
+        // Exchange ID
+        uint16_t exchange_id = get_exchange_id(msg.exchange_id);
+        memcpy(&encoded[offset], &exchange_id, 2);
+        offset += 2;
+
+        // Flags
+        memcpy(&encoded[offset], &msg.message_flags, 2);
+        offset += 2;
+
+        return encoded;
+    }
+
+    uint32_t get_or_create_symbol_id(const string& symbol) {
+        auto it = symbol_to_id_.find(symbol);
+        if (it != symbol_to_id_.end()) {
+            return it->second;
+        }
+
+        uint32_t new_id = next_symbol_id_++;
+        symbol_to_id_[symbol] = new_id;
+        id_to_symbol_[new_id] = symbol;
+        return new_id;
+    }
+};
+
+1.4 MARKET DATA REPLAY
+-----------------------
+
+class MarketDataReplayer {
+private:
+    std::ifstream replay_file_;
+    std::map<uint32_t, string> symbol_table_;
+    timestamp_t replay_start_time_;
+    timestamp_t real_start_time_;
+    double playback_speed_{1.0};  // 1.0 = real-time, 2.0 = 2x speed
+
+public:
+    void load_capture(const string& filename) {
+        replay_file_.open(filename, std::ios::binary);
+
+        if (!replay_file_.is_open()) {
+            throw std::runtime_error("Failed to open replay file");
+        }
+
+        // Read header
+        read_header();
+
+        LOG_INFO("Loaded replay file: {}", filename);
+        LOG_INFO("Capture started at: {}",
+                format_timestamp(replay_start_time_));
+    }
+
+    void replay(std::function<void(const MarketDataMessage&)> callback) {
+        real_start_time_ = now_utc();
+        timestamp_t first_message_time = 0;
+
+        while (!replay_file_.eof()) {
+            // Read message
+            auto msg = read_next_message();
+            if (!msg.has_value()) break;
+
+            if (first_message_time == 0) {
+                first_message_time = msg->exchange_timestamp;
+            }
+
+            // Calculate how long to wait before delivering this message
+            auto msg_offset = msg->exchange_timestamp - first_message_time;
+            auto adjusted_offset = duration_cast<nanoseconds>(
+                msg_offset / playback_speed_
+            );
+
+            auto target_time = real_start_time_ + adjusted_offset;
+
+            // Sleep until target time
+            auto now = now_utc();
+            if (target_time > now) {
+                std::this_thread::sleep_for(target_time - now);
+            }
+
+            // Deliver message
+            callback(msg.value());
+        }
+
+        LOG_INFO("Replay complete");
+    }
+
+    void set_playback_speed(double speed) {
+        playback_speed_ = speed;
+    }
+
+private:
+    void read_header() {
+        // Version
+        uint32_t version;
+        replay_file_.read(reinterpret_cast<char*>(&version), sizeof(version));
+
+        if (version != 1) {
+            throw std::runtime_error("Unsupported file format version");
+        }
+
+        // Start time
+        replay_file_.read(reinterpret_cast<char*>(&replay_start_time_),
+                         sizeof(replay_start_time_));
+
+        // Symbol table
+        read_symbol_table();
+    }
+
+    void read_symbol_table() {
+        uint32_t num_symbols;
+        replay_file_.read(reinterpret_cast<char*>(&num_symbols),
+                         sizeof(num_symbols));
+
+        for (uint32_t i = 0; i < num_symbols; i++) {
+            uint32_t symbol_id;
+            replay_file_.read(reinterpret_cast<char*>(&symbol_id),
+                             sizeof(symbol_id));
+
+            uint16_t symbol_len;
+            replay_file_.read(reinterpret_cast<char*>(&symbol_len),
+                             sizeof(symbol_len));
+
+            vector<char> symbol_buf(symbol_len);
+            replay_file_.read(symbol_buf.data(), symbol_len);
+
+            string symbol(symbol_buf.begin(), symbol_buf.end());
+            symbol_table_[symbol_id] = symbol;
+        }
+    }
+
+    optional<MarketDataMessage> read_next_message() {
+        vector<uint8_t> encoded(64);
+
+        replay_file_.read(reinterpret_cast<char*>(encoded.data()), 64);
+
+        if (replay_file_.gcount() != 64) {
+            return std::nullopt;  // End of file
+        }
+
+        return decode_message(encoded);
+    }
+
+    MarketDataMessage decode_message(const vector<uint8_t>& encoded) {
+        MarketDataMessage msg;
+        size_t offset = 0;
+
+        // Sequence number
+        memcpy(&msg.sequence_number, &encoded[offset], 8);
+        offset += 8;
+
+        // Timestamps
+        memcpy(&msg.exchange_timestamp, &encoded[offset], 8);
+        offset += 8;
+        memcpy(&msg.capture_timestamp, &encoded[offset], 8);
+        offset += 8;
+
+        // Symbol
+        uint32_t symbol_id;
+        memcpy(&symbol_id, &encoded[offset], 4);
+        offset += 4;
+        msg.symbol = symbol_table_[symbol_id];
+
+        // Message type
+        msg.type = static_cast<MessageType>(encoded[offset++]);
+
+        // Side
+        msg.side = encoded[offset++];
+
+        // Price
+        int64_t price_fp;
+        memcpy(&price_fp, &encoded[offset], 8);
+        offset += 8;
+        msg.price = static_cast<double>(price_fp) / 100000000.0;
+
+        // Quantity
+        memcpy(&msg.quantity, &encoded[offset], 8);
+        offset += 8;
+
+        // Order ID
+        memcpy(&msg.order_id, &encoded[offset], 8);
+        offset += 8;
+
+        // Exchange ID
+        uint16_t exchange_id;
+        memcpy(&exchange_id, &encoded[offset], 2);
+        offset += 2;
+        msg.exchange_id = get_exchange_name(exchange_id);
+
+        // Flags
+        memcpy(&msg.message_flags, &encoded[offset], 2);
+
+        return msg;
+    }
+};
+
+1.5 REPLAY USAGE EXAMPLE
+-------------------------
+
+Example: Debug why strategy didn't trade at 10:15:23
+
+int main() {
+    // Create replayer
+    MarketDataReplayer replayer;
+    replayer.load_capture("/var/lib/trading/captures/2025-11-25.bin");
+
+    // Create strategy in debug mode
+    auto strategy = std::make_unique<MyStrategy>();
+    strategy->set_debug_mode(true);
+
+    // Replay market data
+    replayer.replay([&strategy](const MarketDataMessage& msg) {
+        // Feed message to strategy
+        strategy->on_market_data(msg);
+
+        // Log strategy state at critical time
+        if (msg.exchange_timestamp == timestamp_t(1732550123456789000)) {
+            LOG_INFO("=== Critical Time ===");
+            LOG_INFO("Strategy state: {}", strategy->dump_state());
+        }
+    });
+
+    return 0;
+}
+
+1.6 SELECTIVE REPLAY
+--------------------
+
+Replay only specific symbols or time ranges:
+
+class SelectiveReplayer {
+public:
+    void set_symbol_filter(const vector<string>& symbols) {
+        symbol_filter_ = std::set<string>(symbols.begin(), symbols.end());
+    }
+
+    void set_time_range(timestamp_t start, timestamp_t end) {
+        time_range_start_ = start;
+        time_range_end_ = end;
+    }
+
+    void replay(std::function<void(const MarketDataMessage&)> callback) {
+        while (auto msg = read_next_message()) {
+            // Filter by symbol
+            if (!symbol_filter_.empty() &&
+                symbol_filter_.count(msg->symbol) == 0) {
+                continue;
+            }
+
+            // Filter by time
+            if (msg->exchange_timestamp < time_range_start_ ||
+                msg->exchange_timestamp > time_range_end_) {
+                continue;
+            }
+
+            callback(*msg);
+        }
+    }
+
+private:
+    std::set<string> symbol_filter_;
+    timestamp_t time_range_start_;
+    timestamp_t time_range_end_;
+};
+
+Usage:
+------
+SelectiveReplayer replayer;
+replayer.load_capture("2025-11-25.bin");
+
+// Only replay AAPL and MSFT
+replayer.set_symbol_filter({"AAPL", "MSFT"});
+
+// Only replay 10:15:00 - 10:16:00
+replayer.set_time_range(
+    parse_timestamp("2025-11-25 10:15:00"),
+    parse_timestamp("2025-11-25 10:16:00")
+);
+
+replayer.replay([](const auto& msg) {
+    process_message(msg);
+});
+
+================================================================================
+2. ORDER REPLAY TO RECONSTRUCT STATE
+================================================================================
+
+2.1 WHY REPLAY ORDERS
+----------------------
+
+Reconstruct system state by replaying all orders and fills:
+- Rebuild position from scratch
+- Verify position calculations
+- Investigate P&L discrepancies
+- Audit trail for compliance
+
+Example:
+--------
+End of day: Position shows 1000 shares
+Question: How did we get here?
+Answer: Replay all orders/fills for the day
+
+2.2 ORDER EVENT LOG
+-------------------
+
+Log all order events:
+
+struct OrderEvent {
+    uint64_t event_id;
+    timestamp_t timestamp;
+    OrderEventType type;  // SUBMITTED, ACKED, FILLED, CANCELLED, REJECTED
+    uint64_t order_id;
+    string symbol;
+    OrderSide side;
+    uint64_t quantity;
+    double price;
+    uint64_t filled_quantity;
+    double fill_price;
+    string reason;  // For rejections/cancels
+};
+
+Storage:
+--------
+// Append-only log
+/var/lib/trading/order_events/2025-11-25.log
+
+Format (JSON lines for human readability):
+-------------------------------------------
+{"event_id":1,"timestamp":1732550000000000000,"type":"SUBMITTED","order_id":10001,"symbol":"AAPL","side":"BUY","quantity":100,"price":150.50}
+{"event_id":2,"timestamp":1732550000100000000,"type":"ACKED","order_id":10001,"symbol":"AAPL"}
+{"event_id":3,"timestamp":1732550000500000000,"type":"FILLED","order_id":10001,"symbol":"AAPL","filled_quantity":100,"fill_price":150.50}
+{"event_id":4,"timestamp":1732550100000000000,"type":"SUBMITTED","order_id":10002,"symbol":"AAPL","side":"SELL","quantity":50,"price":150.75}
+{"event_id":5,"timestamp":1732550100200000000,"type":"ACKED","order_id":10002,"symbol":"AAPL"}
+{"event_id":6,"timestamp":1732550100800000000,"type":"FILLED","order_id":10002,"symbol":"AAPL","filled_quantity":50,"fill_price":150.75}
+
+2.3 ORDER EVENT LOGGER
+-----------------------
+
+class OrderEventLogger {
+private:
+    std::ofstream log_file_;
+    std::mutex log_mutex_;
+    uint64_t event_id_{0};
+
+public:
+    void open_log(const string& filename) {
+        log_file_.open(filename, std::ios::app);  // Append mode
+
+        if (!log_file_.is_open()) {
+            throw std::runtime_error("Failed to open order event log");
+        }
+
+        LOG_INFO("Order event log opened: {}", filename);
+    }
+
+    void log_event(const OrderEvent& event) {
+        std::lock_guard<std::mutex> lock(log_mutex_);
+
+        json j = {
+            {"event_id", event_id_++},
+            {"timestamp", event.timestamp.count()},
+            {"type", event_type_to_string(event.type)},
+            {"order_id", event.order_id},
+            {"symbol", event.symbol}
+        };
+
+        if (event.type == OrderEventType::SUBMITTED) {
+            j["side"] = side_to_string(event.side);
+            j["quantity"] = event.quantity;
+            j["price"] = event.price;
+        }
+
+        if (event.type == OrderEventType::FILLED) {
+            j["filled_quantity"] = event.filled_quantity;
+            j["fill_price"] = event.fill_price;
+        }
+
+        if (event.type == OrderEventType::REJECTED ||
+            event.type == OrderEventType::CANCELLED) {
+            j["reason"] = event.reason;
+        }
+
+        log_file_ << j.dump() << "\n";
+        log_file_.flush();
+    }
+
+    void log_order_submitted(uint64_t order_id, const string& symbol,
+                             OrderSide side, uint64_t qty, double price) {
+        OrderEvent event{
+            .timestamp = now_utc(),
+            .type = OrderEventType::SUBMITTED,
+            .order_id = order_id,
+            .symbol = symbol,
+            .side = side,
+            .quantity = qty,
+            .price = price
+        };
+        log_event(event);
+    }
+
+    void log_order_acked(uint64_t order_id, const string& symbol) {
+        OrderEvent event{
+            .timestamp = now_utc(),
+            .type = OrderEventType::ACKED,
+            .order_id = order_id,
+            .symbol = symbol
+        };
+        log_event(event);
+    }
+
+    void log_order_filled(uint64_t order_id, const string& symbol,
+                         uint64_t filled_qty, double fill_price) {
+        OrderEvent event{
+            .timestamp = now_utc(),
+            .type = OrderEventType::FILLED,
+            .order_id = order_id,
+            .symbol = symbol,
+            .filled_quantity = filled_qty,
+            .fill_price = fill_price
+        };
+        log_event(event);
+    }
+
+    void log_order_cancelled(uint64_t order_id, const string& symbol,
+                            const string& reason) {
+        OrderEvent event{
+            .timestamp = now_utc(),
+            .type = OrderEventType::CANCELLED,
+            .order_id = order_id,
+            .symbol = symbol,
+            .reason = reason
+        };
+        log_event(event);
+    }
+
+    void log_order_rejected(uint64_t order_id, const string& symbol,
+                           const string& reason) {
+        OrderEvent event{
+            .timestamp = now_utc(),
+            .type = OrderEventType::REJECTED,
+            .order_id = order_id,
+            .symbol = symbol,
+            .reason = reason
+        };
+        log_event(event);
+    }
+};
+
+2.4 ORDER REPLAY ENGINE
+------------------------
+
+class OrderReplayEngine {
+public:
+    struct ReplayResult {
+        map<string, int64_t> final_positions;
+        map<string, double> avg_prices;
+        double total_pnl;
+        int total_orders;
+        int total_fills;
+        vector<string> warnings;
+    };
+
+    ReplayResult replay_from_log(const string& filename) {
+        LOG_INFO("Replaying orders from: {}", filename);
+
+        ReplayResult result;
+        result.total_orders = 0;
+        result.total_fills = 0;
+        result.total_pnl = 0.0;
+
+        std::ifstream log_file(filename);
+        string line;
+
+        while (std::getline(log_file, line)) {
+            try {
+                auto event = parse_event(line);
+                process_event(event, result);
+            }
+            catch (const std::exception& ex) {
+                LOG_ERROR("Failed to parse event: {}", ex.what());
+                result.warnings.push_back(
+                    format("Failed to parse line: {}", line)
+                );
+            }
+        }
+
+        LOG_INFO("Replay complete:");
+        LOG_INFO("  Total orders: {}", result.total_orders);
+        LOG_INFO("  Total fills: {}", result.total_fills);
+        LOG_INFO("  Total P&L: ${:.2f}", result.total_pnl);
+
+        return result;
+    }
+
+private:
+    OrderEvent parse_event(const string& line) {
+        auto j = json::parse(line);
+
+        OrderEvent event;
+        event.event_id = j["event_id"];
+        event.timestamp = timestamp_t(j["timestamp"]);
+        event.type = string_to_event_type(j["type"]);
+        event.order_id = j["order_id"];
+        event.symbol = j["symbol"];
+
+        if (j.contains("side")) {
+            event.side = string_to_side(j["side"]);
+        }
+        if (j.contains("quantity")) {
+            event.quantity = j["quantity"];
+        }
+        if (j.contains("price")) {
+            event.price = j["price"];
+        }
+        if (j.contains("filled_quantity")) {
+            event.filled_quantity = j["filled_quantity"];
+        }
+        if (j.contains("fill_price")) {
+            event.fill_price = j["fill_price"];
+        }
+        if (j.contains("reason")) {
+            event.reason = j["reason"];
+        }
+
+        return event;
+    }
+
+    void process_event(const OrderEvent& event, ReplayResult& result) {
+        switch (event.type) {
+        case OrderEventType::SUBMITTED:
+            result.total_orders++;
+            break;
+
+        case OrderEventType::FILLED:
+            process_fill(event, result);
+            result.total_fills++;
+            break;
+
+        case OrderEventType::CANCELLED:
+        case OrderEventType::REJECTED:
+        case OrderEventType::ACKED:
+            // No impact on positions
+            break;
+        }
+    }
+
+    void process_fill(const OrderEvent& event, ReplayResult& result) {
+        const auto& symbol = event.symbol;
+        int64_t signed_qty = event.filled_quantity;
+
+        // Determine if this increases or decreases position
+        // (This is simplified - in reality we'd need to track the original order)
+        // For demonstration, assume we can infer from current position
+
+        auto& position = result.final_positions[symbol];
+        auto& avg_price = result.avg_prices[symbol];
+
+        int64_t old_position = position;
+        double old_avg_price = avg_price;
+
+        // Update position
+        position += signed_qty;
+
+        // Update average price
+        if (position != 0) {
+            avg_price = ((old_avg_price * old_position) +
+                        (event.fill_price * signed_qty)) / position;
+        } else {
+            // Position closed, calculate P&L
+            double pnl = (event.fill_price - old_avg_price) * (-signed_qty);
+            result.total_pnl += pnl;
+            avg_price = 0.0;
+        }
+    }
+};
+
+2.5 POSITION RECONSTRUCTION
+----------------------------
+
+Reconstruct positions from order log and compare with stored positions:
+
+void validate_positions_from_replay() {
+    // Get current positions from system
+    auto current_positions = position_manager_->get_all_positions();
+
+    // Replay orders to calculate positions
+    OrderReplayEngine replay;
+    auto replay_result = replay.replay_from_log(
+        "/var/lib/trading/order_events/2025-11-25.log"
+    );
+
+    // Compare
+    bool all_match = true;
+
+    for (const auto& [symbol, current_pos] : current_positions) {
+        auto replay_pos = replay_result.final_positions[symbol];
+
+        if (current_pos.quantity != replay_pos) {
+            LOG_ERROR("Position mismatch for {}: current={}, replay={}",
+                     symbol, current_pos.quantity, replay_pos);
+            all_match = false;
+        } else {
+            LOG_INFO("Position match for {}: {}", symbol, current_pos.quantity);
+        }
+    }
+
+    if (all_match) {
+        LOG_INFO("All positions validated successfully!");
+    } else {
+        LOG_ERROR("Position mismatches detected!");
+    }
+}
+
+================================================================================
+3. TRADE HISTORY RECOVERY
+================================================================================
+
+3.1 TRADE HISTORY IMPORTANCE
+-----------------------------
+
+Complete trade history required for:
+- P&L calculation
+- Tax reporting
+- Regulatory reporting
+- Performance analysis
+- Strategy evaluation
+- Risk management
+
+Must never lose trade history!
+
+3.2 TRADE HISTORY STORAGE
+--------------------------
+
+Multi-tier storage:
+
+Tier 1: In-memory cache (last 1 hour)
+- Fast access
+- Real-time queries
+- Limited retention
+
+Tier 2: Database (last 30 days)
+- PostgreSQL or similar
+- Indexed for fast queries
+- Moderate retention
+
+Tier 3: Archive (forever)
+- Compressed files
+- S3 or similar
+- Permanent retention
+
+3.3 TRADE HISTORY SCHEMA
+-------------------------
+
+CREATE TABLE trades (
+    trade_id BIGSERIAL PRIMARY KEY,
+    exchange_trade_id VARCHAR(64) UNIQUE NOT NULL,
+    order_id BIGINT NOT NULL,
+    exchange_id VARCHAR(32) NOT NULL,
+    symbol VARCHAR(32) NOT NULL,
+    side VARCHAR(4) NOT NULL,  -- BUY/SELL
+    quantity BIGINT NOT NULL,
+    price NUMERIC(20, 8) NOT NULL,
+    commission NUMERIC(20, 8) NOT NULL,
+    trade_timestamp TIMESTAMP(6) NOT NULL,
+    capture_timestamp TIMESTAMP(6) NOT NULL,
+
+    -- Metadata
+    strategy_id VARCHAR(64),
+    account_id VARCHAR(64),
+
+    -- Indexes
+    INDEX idx_symbol_timestamp (symbol, trade_timestamp),
+    INDEX idx_trade_timestamp (trade_timestamp),
+    INDEX idx_order_id (order_id)
+);
+
+3.4 TRADE HISTORY RECOVERY PROCESS
+-----------------------------------
+
+class TradeHistoryRecovery {
+public:
+    void recover_missing_trades(timestamp_t since) {
+        LOG_INFO("Recovering trade history since {}",
+                format_timestamp(since));
+
+        // Get trades from database
+        auto db_trades = get_trades_from_db(since);
+        LOG_INFO("Found {} trades in database", db_trades.size());
+
+        // Get trades from exchange
+        auto exchange_trades = get_trades_from_exchange(since);
+        LOG_INFO("Found {} trades from exchange", exchange_trades.size());
+
+        // Find missing trades
+        auto missing = find_missing_trades(db_trades, exchange_trades);
+        LOG_INFO("Found {} missing trades", missing.size());
+
+        // Insert missing trades
+        for (const auto& trade : missing) {
+            insert_trade(trade);
+            LOG_INFO("Recovered trade: {} {} {}@{} at {}",
+                    trade.symbol,
+                    side_to_string(trade.side),
+                    trade.quantity,
+                    trade.price,
+                    format_timestamp(trade.trade_timestamp));
+        }
+
+        LOG_INFO("Trade history recovery complete");
+    }
+
+private:
+    vector<Trade> get_trades_from_db(timestamp_t since) {
+        auto result = db_->query(
+            "SELECT * FROM trades WHERE trade_timestamp >= $1 ORDER BY trade_timestamp",
+            since
+        );
+
+        vector<Trade> trades;
+        for (const auto& row : result) {
+            trades.push_back(parse_trade_from_row(row));
+        }
+
+        return trades;
+    }
+
+    vector<Trade> get_trades_from_exchange(timestamp_t since) {
+        vector<Trade> all_trades;
+
+        for (auto& exchange : exchanges_) {
+            try {
+                auto trades = exchange->get_fills_since(since);
+                all_trades.insert(all_trades.end(), trades.begin(), trades.end());
+            }
+            catch (const std::exception& ex) {
+                LOG_ERROR("Failed to get trades from {}: {}",
+                         exchange->get_name(), ex.what());
+            }
+        }
+
+        return all_trades;
+    }
+
+    vector<Trade> find_missing_trades(const vector<Trade>& db_trades,
+                                     const vector<Trade>& exchange_trades) {
+        // Build set of trade IDs from database
+        std::set<string> db_trade_ids;
+        for (const auto& trade : db_trades) {
+            db_trade_ids.insert(trade.exchange_trade_id);
+        }
+
+        // Find exchange trades not in database
+        vector<Trade> missing;
+        for (const auto& trade : exchange_trades) {
+            if (db_trade_ids.count(trade.exchange_trade_id) == 0) {
+                missing.push_back(trade);
+            }
+        }
+
+        return missing;
+    }
+
+    void insert_trade(const Trade& trade) {
+        db_->execute(
+            "INSERT INTO trades "
+            "(exchange_trade_id, order_id, exchange_id, symbol, side, "
+            " quantity, price, commission, trade_timestamp, capture_timestamp) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) "
+            "ON CONFLICT (exchange_trade_id) DO NOTHING",
+            trade.exchange_trade_id,
+            trade.order_id,
+            trade.exchange_id,
+            trade.symbol,
+            side_to_string(trade.side),
+            trade.quantity,
+            trade.price,
+            trade.commission,
+            trade.trade_timestamp,
+            now_utc()
+        );
+    }
+};
+
+3.5 TRADE HISTORY ARCHIVAL
+---------------------------
+
+Archive old trades to reduce database size:
+
+#!/bin/bash
+# archive_trades.sh
+
+# Archive trades older than 30 days
+
+ARCHIVE_DATE=$(date -d '30 days ago' +%Y-%m-%d)
+ARCHIVE_FILE="/var/lib/trading/archives/trades_${ARCHIVE_DATE}.csv.gz"
+
+echo "Archiving trades older than $ARCHIVE_DATE to $ARCHIVE_FILE"
+
+# Export to CSV
+psql -d trading_db -c "
+    COPY (
+        SELECT * FROM trades
+        WHERE trade_timestamp < '$ARCHIVE_DATE'
+        ORDER BY trade_timestamp
+    ) TO STDOUT WITH CSV HEADER
+" | gzip > $ARCHIVE_FILE
+
+# Verify archive created
+if [ -f "$ARCHIVE_FILE" ]; then
+    echo "Archive created: $ARCHIVE_FILE"
+
+    # Count records archived
+    ARCHIVED_COUNT=$(zcat $ARCHIVE_FILE | wc -l)
+    echo "Archived $ARCHIVED_COUNT records"
+
+    # Delete from database
+    psql -d trading_db -c "
+        DELETE FROM trades
+        WHERE trade_timestamp < '$ARCHIVE_DATE'
+    "
+
+    echo "Deleted archived records from database"
+else
+    echo "ERROR: Archive file not created!"
+    exit 1
+fi
+
+# Upload to S3 (optional)
+aws s3 cp $ARCHIVE_FILE s3://trading-archives/trades/
+
+echo "Archive complete"
+
+3.6 TRADE HISTORY QUERY API
+----------------------------
+
+Provide API to query trade history:
+
+class TradeHistoryAPI {
+public:
+    struct TradeQuery {
+        optional<string> symbol;
+        optional<timestamp_t> start_time;
+        optional<timestamp_t> end_time;
+        optional<uint64_t> order_id;
+        optional<string> strategy_id;
+        int limit = 1000;
+        int offset = 0;
+    };
+
+    vector<Trade> query_trades(const TradeQuery& query) {
+        // Build SQL query
+        std::stringstream sql;
+        sql << "SELECT * FROM trades WHERE 1=1";
+
+        vector<string> params;
+
+        if (query.symbol.has_value()) {
+            sql << " AND symbol = $" << (params.size() + 1);
+            params.push_back(query.symbol.value());
+        }
+
+        if (query.start_time.has_value()) {
+            sql << " AND trade_timestamp >= $" << (params.size() + 1);
+            params.push_back(format_timestamp(query.start_time.value()));
+        }
+
+        if (query.end_time.has_value()) {
+            sql << " AND trade_timestamp <= $" << (params.size() + 1);
+            params.push_back(format_timestamp(query.end_time.value()));
+        }
+
+        if (query.order_id.has_value()) {
+            sql << " AND order_id = $" << (params.size() + 1);
+            params.push_back(std::to_string(query.order_id.value()));
+        }
+
+        if (query.strategy_id.has_value()) {
+            sql << " AND strategy_id = $" << (params.size() + 1);
+            params.push_back(query.strategy_id.value());
+        }
+
+        sql << " ORDER BY trade_timestamp DESC";
+        sql << " LIMIT " << query.limit;
+        sql << " OFFSET " << query.offset;
+
+        // Execute query
+        auto result = db_->query(sql.str(), params);
+
+        // Parse results
+        vector<Trade> trades;
+        for (const auto& row : result) {
+            trades.push_back(parse_trade_from_row(row));
+        }
+
+        return trades;
+    }
+};
+
+HTTP endpoint:
+--------------
+GET /api/v1/trades?symbol=AAPL&start_time=2025-11-25T09:30:00Z&limit=100
+
+================================================================================
+4. TIME-TRAVEL DEBUGGING
+================================================================================
+
+4.1 CONCEPT
+-----------
+
+Time-travel debugging: Step backward and forward through system state
+
+Benefits:
+- See exact state at any point in time
+- Understand how state evolved
+- Find root cause of bugs
+- Validate fixes
+
+4.2 STATE SNAPSHOTS
+-------------------
+
+Periodically snapshot complete system state:
+
+class StateSnapshotter {
+private:
+    std::chrono::minutes snapshot_interval_{1};
+
+public:
+    struct Snapshot {
+        timestamp_t timestamp;
+        map<string, Position> positions;
+        vector<Order> open_orders;
+        RiskState risk_state;
+        StrategyState strategy_state;
+        map<string, double> indicators;
+    };
+
+    void start_snapshots() {
+        std::thread([this]() {
+            while (running_) {
+                std::this_thread::sleep_for(snapshot_interval_);
+                take_snapshot();
+            }
+        }).detach();
+    }
+
+    Snapshot take_snapshot() {
+        Snapshot snap;
+        snap.timestamp = now_utc();
+
+        // Snapshot positions
+        snap.positions = position_manager_->get_all_positions();
+
+        // Snapshot open orders
+        snap.open_orders = order_manager_->get_open_orders();
+
+        // Snapshot risk state
+        snap.risk_state = risk_manager_->get_state();
+
+        // Snapshot strategy state
+        snap.strategy_state = strategy_->get_state();
+
+        // Snapshot indicators
+        snap.indicators = strategy_->get_indicators();
+
+        // Save to disk
+        save_snapshot(snap);
+
+        LOG_DEBUG("Snapshot taken at {}", format_timestamp(snap.timestamp));
+
+        return snap;
+    }
+
+private:
+    void save_snapshot(const Snapshot& snap) {
+        string filename = format(
+            "/var/lib/trading/snapshots/snapshot_{}.json",
+            snap.timestamp.count()
+        );
+
+        json j = {
+            {"timestamp", snap.timestamp.count()},
+            {"positions", snap.positions},
+            {"open_orders", snap.open_orders},
+            {"risk_state", snap.risk_state},
+            {"strategy_state", snap.strategy_state},
+            {"indicators", snap.indicators}
+        };
+
+        std::ofstream file(filename);
+        file << j.dump(2);  // Pretty print
+    }
+};
+
+4.3 TIME-TRAVEL DEBUGGER
+-------------------------
+
+class TimeTravelDebugger {
+public:
+    void load_session(const string& snapshot_dir,
+                     const string& event_log) {
+        // Load all snapshots
+        load_snapshots(snapshot_dir);
+
+        // Load event log
+        load_events(event_log);
+
+        LOG_INFO("Loaded {} snapshots and {} events",
+                snapshots_.size(), events_.size());
+    }
+
+    void goto_time(timestamp_t target_time) {
+        LOG_INFO("Time traveling to {}", format_timestamp(target_time));
+
+        // Find snapshot before target time
+        auto snap = find_snapshot_before(target_time);
+
+        if (!snap.has_value()) {
+            LOG_ERROR("No snapshot before target time");
+            return;
+        }
+
+        // Restore from snapshot
+        current_state_ = snap.value();
+        LOG_INFO("Restored from snapshot at {}",
+                format_timestamp(current_state_.timestamp));
+
+        // Replay events from snapshot to target time
+        replay_events_to(current_state_.timestamp, target_time);
+
+        LOG_INFO("Time travel complete. Current time: {}",
+                format_timestamp(current_state_.timestamp));
+    }
+
+    void step_forward() {
+        // Apply next event
+        auto next_event = get_next_event(current_state_.timestamp);
+
+        if (!next_event.has_value()) {
+            LOG_INFO("No more events");
+            return;
+        }
+
+        apply_event(next_event.value());
+        LOG_INFO("Stepped forward to {}",
+                format_timestamp(current_state_.timestamp));
+    }
+
+    void step_backward() {
+        // Find previous event
+        auto prev_event = get_previous_event(current_state_.timestamp);
+
+        if (!prev_event.has_value()) {
+            LOG_INFO("No previous events");
+            return;
+        }
+
+        // Find snapshot before previous event
+        auto snap = find_snapshot_before(prev_event->timestamp);
+
+        if (!snap.has_value()) {
+            LOG_ERROR("No snapshot before previous event");
+            return;
+        }
+
+        // Restore from snapshot
+        current_state_ = snap.value();
+
+        // Replay events up to previous event
+        replay_events_to(current_state_.timestamp, prev_event->timestamp);
+
+        LOG_INFO("Stepped backward to {}",
+                format_timestamp(current_state_.timestamp));
+    }
+
+    void dump_state() {
+        LOG_INFO("=== System State at {} ===",
+                format_timestamp(current_state_.timestamp));
+
+        LOG_INFO("Positions:");
+        for (const auto& [symbol, pos] : current_state_.positions) {
+            LOG_INFO("  {}: {} @ ${:.2f}",
+                    symbol, pos.quantity, pos.avg_price);
+        }
+
+        LOG_INFO("Open Orders: {}", current_state_.open_orders.size());
+        for (const auto& order : current_state_.open_orders) {
+            LOG_INFO("  Order {}: {} {} {}@{}",
+                    order.order_id,
+                    order.symbol,
+                    side_to_string(order.side),
+                    order.quantity,
+                    order.price);
+        }
+
+        LOG_INFO("Risk State:");
+        LOG_INFO("  Capital used: ${:.2f}", current_state_.risk_state.capital_used);
+        LOG_INFO("  Daily P&L: ${:.2f}", current_state_.risk_state.daily_pnl);
+
+        LOG_INFO("Strategy State:");
+        for (const auto& [key, value] : current_state_.indicators) {
+            LOG_INFO("  {}: {:.4f}", key, value);
+        }
+    }
+
+private:
+    vector<Snapshot> snapshots_;
+    vector<Event> events_;
+    Snapshot current_state_;
+
+    void replay_events_to(timestamp_t from, timestamp_t to) {
+        for (const auto& event : events_) {
+            if (event.timestamp > from && event.timestamp <= to) {
+                apply_event(event);
+            }
+        }
+    }
+
+    void apply_event(const Event& event) {
+        // Update state based on event type
+        switch (event.type) {
+        case EventType::FILL:
+            apply_fill(event);
+            break;
+        case EventType::ORDER_SUBMITTED:
+            apply_order_submitted(event);
+            break;
+        case EventType::ORDER_CANCELLED:
+            apply_order_cancelled(event);
+            break;
+        // ... handle other event types
+        }
+
+        current_state_.timestamp = event.timestamp;
+    }
+};
+
+4.4 TIME-TRAVEL DEBUGGING SESSION
+----------------------------------
+
+Interactive debugging session:
+
+int main() {
+    TimeTravelDebugger debugger;
+
+    // Load session
+    debugger.load_session(
+        "/var/lib/trading/snapshots/2025-11-25",
+        "/var/lib/trading/events/2025-11-25.log"
+    );
+
+    // Interactive commands
+    string command;
+    while (std::cin >> command) {
+        if (command == "goto") {
+            string time_str;
+            std::cin >> time_str;
+            auto target_time = parse_timestamp(time_str);
+            debugger.goto_time(target_time);
+        }
+        else if (command == "forward" || command == "f") {
+            debugger.step_forward();
+        }
+        else if (command == "backward" || command == "b") {
+            debugger.step_backward();
+        }
+        else if (command == "state" || command == "s") {
+            debugger.dump_state();
+        }
+        else if (command == "quit" || command == "q") {
+            break;
+        }
+        else {
+            std::cout << "Commands: goto <time>, forward, backward, state, quit\n";
+        }
+    }
+
+    return 0;
+}
+
+Usage:
+------
+$ ./time_travel_debugger
+Loaded 1440 snapshots and 125834 events
+> goto 2025-11-25T10:15:23
+Time traveling to 2025-11-25 10:15:23
+Restored from snapshot at 2025-11-25 10:15:00
+Time travel complete. Current time: 2025-11-25 10:15:23
+> state
+=== System State at 2025-11-25 10:15:23 ===
+Positions:
+  AAPL: 1000 @ $150.50
+  MSFT: -500 @ $380.25
+Open Orders: 2
+  Order 10025: AAPL BUY 100@150.45
+  Order 10026: MSFT SELL 50@380.50
+...
+> forward
+Stepped forward to 2025-11-25 10:15:24
+> state
+...
+
+================================================================================
+5. REPLAY ARCHITECTURE
+================================================================================
+
+5.1 REPLAY SYSTEM COMPONENTS
+-----------------------------
+
+                     ┌─────────────────┐
+                     │  Capture Layer  │
+                     │  (Live System)  │
+                     └────────┬────────┘
+                              │
+                              v
+                     ┌─────────────────┐
+                     │   Data Store    │
+                     │ (Market Data,   │
+                     │  Orders, Fills) │
+                     └────────┬────────┘
+                              │
+                              v
+                     ┌─────────────────┐
+                     │  Replay Engine  │
+                     └────────┬────────┘
+                              │
+              ┌───────────────┼───────────────┐
+              │               │               │
+              v               v               v
+       ┌────────────┐  ┌────────────┐  ┌────────────┐
+       │  Strategy  │  │  Debugger  │  │  Validator │
+       │  Backtest  │  │            │  │            │
+       └────────────┘  └────────────┘  └────────────┘
+
+5.2 REPLAY DATA PIPELINE
+-------------------------
+
+1. Capture:
+   - Market data → Binary format → Disk
+   - Orders → JSON log → Disk
+   - Fills → Database → Disk
+
+2. Index:
+   - Build time-based index
+   - Build symbol-based index
+   - Build event-type index
+
+3. Replay:
+   - Read from disk
+   - Decode messages
+   - Deliver in time order
+   - Control playback speed
+
+4. Consume:
+   - Strategy backtesting
+   - Debugging
+   - Validation
+
+5.3 REPLAY PERFORMANCE OPTIMIZATION
+------------------------------------
+
+Problem: Replaying 1 day of data takes 1 day at 1x speed!
+
+Solutions:
+----------
+
+1. Fast-forward through quiet periods
+   - Skip periods with no events
+   - Jump to next event instantly
+
+2. Parallel replay
+   - Replay multiple symbols in parallel
+   - Careful with cross-symbol dependencies
+
+3. Indexed access
+   - Build indexes for fast seeking
+   - Jump to specific times quickly
+
+4. Compression
+   - Compress historical data
+   - Decompress on-the-fly
+
+5. Sampling
+   - For some use cases, sample data (every 10th message)
+   - Much faster replay
+
+Implementation:
+---------------
+class FastReplayEngine {
+public:
+    void set_fast_forward_mode(bool enabled) {
+        fast_forward_ = enabled;
+    }
+
+    void replay(std::function<void(const Event&)> callback) {
+        timestamp_t last_event_time = 0;
+
+        while (auto event = read_next_event()) {
+            if (fast_forward_) {
+                // Don't sleep, deliver immediately
+                callback(*event);
+            } else {
+                // Respect timing
+                auto delay = event->timestamp - last_event_time;
+                std::this_thread::sleep_for(delay);
+                callback(*event);
+            }
+
+            last_event_time = event->timestamp;
+        }
+    }
+
+private:
+    bool fast_forward_ = false;
+};
+
+================================================================================
+6. REPLAY PERFORMANCE OPTIMIZATION
+================================================================================
+
+6.1 DISK I/O OPTIMIZATION
+--------------------------
+
+Use memory-mapped files for fast access:
+
+class MemoryMappedReplayFile {
+private:
+    int fd_;
+    void* mapped_;
+    size_t file_size_;
+    size_t current_offset_;
+
+public:
+    void open(const string& filename) {
+        fd_ = ::open(filename.c_str(), O_RDONLY);
+        if (fd_ < 0) {
+            throw std::runtime_error("Failed to open file");
+        }
+
+        // Get file size
+        struct stat st;
+        fstat(fd_, &st);
+        file_size_ = st.st_size;
+
+        // Memory map file
+        mapped_ = mmap(nullptr, file_size_, PROT_READ, MAP_SHARED, fd_, 0);
+
+        if (mapped_ == MAP_FAILED) {
+            throw std::runtime_error("Failed to mmap file");
+        }
+
+        // Advise kernel we'll read sequentially
+        madvise(mapped_, file_size_, MADV_SEQUENTIAL);
+
+        current_offset_ = 0;
+
+        LOG_INFO("Memory mapped {} bytes", file_size_);
+    }
+
+    optional<Event> read_next() {
+        if (current_offset_ >= file_size_) {
+            return std::nullopt;
+        }
+
+        // Read directly from mapped memory (zero-copy!)
+        auto* event_ptr = reinterpret_cast<Event*>(
+            static_cast<uint8_t*>(mapped_) + current_offset_
+        );
+
+        current_offset_ += sizeof(Event);
+
+        return *event_ptr;
+    }
+
+    void seek(size_t offset) {
+        current_offset_ = offset;
+    }
+
+    ~MemoryMappedReplayFile() {
+        if (mapped_ != MAP_FAILED) {
+            munmap(mapped_, file_size_);
+        }
+        if (fd_ >= 0) {
+            close(fd_);
+        }
+    }
+};
+
+6.2 INDEXING FOR RANDOM ACCESS
+-------------------------------
+
+Build index for fast seeking:
+
+class ReplayIndex {
+private:
+    struct IndexEntry {
+        timestamp_t timestamp;
+        size_t file_offset;
+        string symbol;
+    };
+
+    vector<IndexEntry> index_;
+
+public:
+    void build_index(const string& data_file) {
+        LOG_INFO("Building index for {}", data_file);
+
+        std::ifstream file(data_file, std::ios::binary);
+        size_t offset = 0;
+
+        while (!file.eof()) {
+            auto event = read_event(file);
+            if (!event.has_value()) break;
+
+            IndexEntry entry{
+                .timestamp = event->timestamp,
+                .file_offset = offset,
+                .symbol = event->symbol
+            };
+
+            index_.push_back(entry);
+
+            offset = file.tellg();
+        }
+
+        // Sort by timestamp
+        std::sort(index_.begin(), index_.end(),
+                 [](const auto& a, const auto& b) {
+                     return a.timestamp < b.timestamp;
+                 });
+
+        LOG_INFO("Index built: {} entries", index_.size());
+    }
+
+    size_t find_offset_for_time(timestamp_t target) {
+        // Binary search
+        auto it = std::lower_bound(index_.begin(), index_.end(), target,
+                                  [](const auto& entry, timestamp_t time) {
+                                      return entry.timestamp < time;
+                                  });
+
+        if (it == index_.end()) {
+            return 0;  // Before all events
+        }
+
+        return it->file_offset;
+    }
+
+    vector<size_t> find_offsets_for_symbol(const string& symbol) {
+        vector<size_t> offsets;
+
+        for (const auto& entry : index_) {
+            if (entry.symbol == symbol) {
+                offsets.push_back(entry.file_offset);
+            }
+        }
+
+        return offsets;
+    }
+
+    void save_index(const string& index_file) {
+        std::ofstream file(index_file, std::ios::binary);
+
+        size_t count = index_.size();
+        file.write(reinterpret_cast<const char*>(&count), sizeof(count));
+
+        for (const auto& entry : index_) {
+            file.write(reinterpret_cast<const char*>(&entry), sizeof(entry));
+        }
+    }
+
+    void load_index(const string& index_file) {
+        std::ifstream file(index_file, std::ios::binary);
+
+        size_t count;
+        file.read(reinterpret_cast<char*>(&count), sizeof(count));
+
+        index_.resize(count);
+        file.read(reinterpret_cast<char*>(index_.data()),
+                 count * sizeof(IndexEntry));
+
+        LOG_INFO("Loaded index: {} entries", count);
+    }
+};
+
+6.3 COMPRESSION
+---------------
+
+Compress old replay files to save space:
+
+#!/bin/bash
+# compress_replays.sh
+
+# Compress replay files older than 7 days
+
+find /var/lib/trading/replays -name "*.bin" -mtime +7 | while read file; do
+    echo "Compressing $file..."
+
+    # Compress with zstd (fast, good compression)
+    zstd -19 "$file" -o "$file.zst"
+
+    # Verify compressed file
+    zstd -t "$file.zst"
+
+    if [ $? -eq 0 ]; then
+        # Delete original
+        rm "$file"
+        echo "Compressed: $file -> $file.zst"
+    else
+        echo "ERROR: Compression verification failed for $file"
+    fi
+done
+
+Decompress on-the-fly during replay:
+
+class CompressedReplayer {
+public:
+    void open(const string& filename) {
+        // Check if compressed
+        if (ends_with(filename, ".zst")) {
+            // Decompress to pipe
+            decompressor_ = popen(
+                format("zstd -d -c {}", filename).c_str(),
+                "r"
+            );
+
+            if (!decompressor_) {
+                throw std::runtime_error("Failed to start decompressor");
+            }
+
+            LOG_INFO("Replaying compressed file: {}", filename);
+        } else {
+            // Normal file
+            file_.open(filename, std::ios::binary);
+        }
+    }
+
+    optional<Event> read_next() {
+        if (decompressor_) {
+            // Read from decompressor pipe
+            Event event;
+            size_t n = fread(&event, sizeof(Event), 1, decompressor_);
+
+            if (n == 1) {
+                return event;
+            }
+        } else {
+            // Read from file
+            Event event;
+            file_.read(reinterpret_cast<char*>(&event), sizeof(Event));
+
+            if (file_.gcount() == sizeof(Event)) {
+                return event;
+            }
+        }
+
+        return std::nullopt;
+    }
+
+private:
+    std::ifstream file_;
+    FILE* decompressor_ = nullptr;
+};
+
+================================================================================
+7. USE CASES FOR REPLAY
+================================================================================
+
+7.1 STRATEGY BACKTESTING
+-------------------------
+
+Test strategy on historical data:
+
+void backtest_strategy(const string& strategy_name,
+                      const string& replay_file,
+                      timestamp_t start_time,
+                      timestamp_t end_time) {
+    // Create strategy
+    auto strategy = create_strategy(strategy_name);
+
+    // Create replayer
+    MarketDataReplayer replayer;
+    replayer.load_capture(replay_file);
+    replayer.set_time_range(start_time, end_time);
+
+    // Track results
+    double pnl = 0.0;
+    int trades = 0;
+
+    // Replay market data
+    replayer.replay([&](const MarketDataMessage& msg) {
+        // Feed to strategy
+        auto signals = strategy->on_market_data(msg);
+
+        // Execute signals
+        for (const auto& signal : signals) {
+            LOG_INFO("Signal: {} {} {}@{}",
+                    signal.symbol,
+                    side_to_string(signal.side),
+                    signal.quantity,
+                    signal.price);
+
+            // Simulate fill
+            double fill_price = signal.price;  // Simplified
+            double pnl_change = calculate_pnl(signal, fill_price);
+            pnl += pnl_change;
+            trades++;
+        }
+    });
+
+    // Report results
+    LOG_INFO("Backtest complete:");
+    LOG_INFO("  Total P&L: ${:.2f}", pnl);
+    LOG_INFO("  Total trades: {}", trades);
+    LOG_INFO("  P&L per trade: ${:.2f}", trades > 0 ? pnl / trades : 0.0);
+}
+
+7.2 REGRESSION TESTING
+-----------------------
+
+Test that system produces same results:
+
+void regression_test() {
+    // Replay same data with old and new system
+    auto old_results = run_system("old_version", "test_data.bin");
+    auto new_results = run_system("new_version", "test_data.bin");
+
+    // Compare results
+    if (old_results == new_results) {
+        LOG_INFO("Regression test PASSED - results match");
+    } else {
+        LOG_ERROR("Regression test FAILED - results differ");
+
+        // Show differences
+        auto diff = compare_results(old_results, new_results);
+        LOG_ERROR("Differences: {}", diff);
+    }
+}
+
+7.3 PERFORMANCE PROFILING
+--------------------------
+
+Profile system under realistic load:
+
+void profile_with_replay() {
+    // Start profiler
+    start_profiler();
+
+    // Replay heavy load
+    MarketDataReplayer replayer;
+    replayer.load_capture("high_volume_day.bin");
+    replayer.set_playback_speed(10.0);  // 10x speed
+
+    replayer.replay([](const auto& msg) {
+        // Process message (being profiled)
+        process_market_data(msg);
+    });
+
+    // Stop profiler and analyze
+    auto profile = stop_profiler();
+    analyze_profile(profile);
+}
+
+7.4 COMPLIANCE VALIDATION
+--------------------------
+
+Prove system behavior for regulators:
+
+void generate_compliance_report(const string& date) {
+    LOG_INFO("Generating compliance report for {}", date);
+
+    // Replay all market data and orders
+    MarketDataReplayer md_replayer;
+    md_replayer.load_capture(format("market_data_{}.bin", date));
+
+    OrderReplayEngine order_replayer;
+    auto orders = order_replayer.replay_from_log(
+        format("orders_{}.log", date)
+    );
+
+    // Generate report
+    ComplianceReport report;
+    report.date = date;
+
+    // Check all orders were within risk limits
+    for (const auto& order : orders) {
+        if (order.quantity > get_risk_limit(order.symbol)) {
+            report.violations.push_back(
+                format("Order {} exceeded risk limit", order.order_id)
+            );
+        }
+    }
+
+    // Check all trades were at best execution
+    for (const auto& trade : orders.trades) {
+        auto market_price = get_market_price_at_time(
+            trade.symbol, trade.timestamp
+        );
+
+        if (is_worse_price(trade.price, market_price)) {
+            report.warnings.push_back(
+                format("Trade {} may not have been best execution",
+                       trade.trade_id)
+            );
+        }
+    }
+
+    // Save report
+    save_compliance_report(report);
+
+    LOG_INFO("Compliance report generated: {} violations, {} warnings",
+            report.violations.size(), report.warnings.size());
+}
+
+================================================================================
+8. BEST PRACTICES & CHECKLISTS
+================================================================================
+
+8.1 REPLAY BEST PRACTICES
+--------------------------
+
+1. Capture everything
+   - All market data
+   - All orders
+   - All fills
+   - All state changes
+
+2. Use efficient formats
+   - Binary for market data (space efficient)
+   - JSON for orders (human readable)
+   - Compress old data
+
+3. Index for fast access
+   - Time-based index
+   - Symbol-based index
+   - Event-type index
+
+4. Validate captures regularly
+   - Test replay works
+   - Check for corruption
+   - Verify completeness
+
+5. Archive long-term
+   - Keep forever (or at least 7 years for compliance)
+   - Store on S3 or similar
+   - Test restore periodically
+
+6. Use replay for testing
+   - Backtest strategies
+   - Regression tests
+   - Performance profiling
+
+7. Optimize performance
+   - Memory-mapped files
+   - Parallel replay
+   - Fast-forward mode
+
+8.2 DATA CAPTURE CHECKLIST
+---------------------------
+
+[ ] Capturing all market data messages
+[ ] Capturing all order events
+[ ] Capturing all fills
+[ ] Capturing system state snapshots
+[ ] Timestamps from both exchange and local clock
+[ ] Sequence numbers for gap detection
+[ ] Symbol table for efficient encoding
+[ ] File rotation (daily)
+[ ] Compression of old files
+[ ] Archival to S3/backup
+[ ] Index generation
+[ ] Test replay works
+
+8.3 REPLAY TESTING CHECKLIST
+-----------------------------
+
+[ ] Can replay yesterday's data
+[ ] Can replay specific time range
+[ ] Can replay specific symbols
+[ ] Can replay at different speeds (1x, 10x, 100x)
+[ ] Can seek to specific time
+[ ] Can step forward/backward
+[ ] Index lookup works
+[ ] Compressed replay works
+[ ] Results match expected
+[ ] Performance acceptable
+
+8.4 TROUBLESHOOTING REPLAY ISSUES
+----------------------------------
+
+Problem: Replay files corrupt
+Solution:
+- Implement checksums
+- Validate files after writing
+- Keep multiple backups
+
+Problem: Replay too slow
+Solution:
+- Use memory-mapped files
+- Build indexes
+- Enable fast-forward mode
+- Use compressed formats
+
+Problem: Missing data in replay
+Solution:
+- Check capture was running
+- Review logs for errors
+- Check disk space
+- Verify rotation working
+
+Problem: Replay results don't match production
+Solution:
+- Check all data sources captured
+- Verify timestamps correct
+- Check for race conditions
+- Review state snapshot frequency
+
+Problem: Can't find specific event in replay
+Solution:
+- Build better indexes
+- Add more metadata
+- Improve search tools
+- Use time-travel debugger
+
+8.5 COMPLIANCE REQUIREMENTS
+----------------------------
+
+Regulatory requirements for data retention:
+
+SEC Rule 17a-4:
+- Keep records for at least 6 years
+- First 2 years in accessible location
+- Non-erasable, non-rewriteable format (WORM)
+
+MiFID II:
+- Keep records for at least 5 years
+- Must be able to reproduce all decisions
+- Must include timestamps
+
+Best practices:
+- Keep all data forever (storage is cheap)
+- Use immutable storage (S3 with versioning)
+- Test restore regularly (quarterly)
+- Document retention policy
+- Automate compliance reports
+
+================================================================================
+END OF DOCUMENT
+================================================================================

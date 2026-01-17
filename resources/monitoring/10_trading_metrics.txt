@@ -1,0 +1,817 @@
+REAL-TIME TRADING METRICS FOR HFT SYSTEMS
+==========================================
+
+TABLE OF CONTENTS
+-----------------
+1. Overview & Trading Metrics Framework
+2. Order Flow Metrics
+3. Execution Quality Metrics
+4. Market Making Metrics
+5. PnL & Risk Metrics
+6. Market Microstructure Metrics
+7. Strategy Performance Metrics
+8. Trade Cost Analysis (TCA)
+9. Real-Time Metric Calculation
+10. Metric Visualization
+11. Production Implementation
+
+============================================
+1. OVERVIEW & TRADING METRICS FRAMEWORK
+============================================
+
+Trading Metrics Architecture:
+------------------------------
+┌────────────────────────────────────────────────────────────┐
+│                     Trading Events                          │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  │
+│  │  Orders  │  │  Fills   │  │  Cancels │  │  Market  │  │
+│  │          │  │          │  │          │  │   Data   │  │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘  │
+└───────┼─────────────┼─────────────┼─────────────┼────────┘
+        │             │             │             │
+        └─────────────┴─────────────┴─────────────┘
+                            │
+                    ┌───────▼────────┐
+                    │ Metrics Engine │
+                    └───────┬────────┘
+                            │
+        ┌───────────────────┼───────────────────┐
+        │                   │                   │
+   ┌────▼─────┐      ┌─────▼──────┐     ┌─────▼──────┐
+   │ Order    │      │ Execution  │     │    PnL     │
+   │  Flow    │      │  Quality   │     │   & Risk   │
+   │ Metrics  │      │  Metrics   │     │  Metrics   │
+   └────┬─────┘      └─────┬──────┘     └─────┬──────┘
+        │                  │                   │
+        └──────────────────┼───────────────────┘
+                           │
+                    ┌──────▼──────┐
+                    │  Real-Time  │
+                    │  Dashboard  │
+                    └─────────────┘
+
+Critical Trading Metrics:
+--------------------------
+1. ORDER FLOW
+   - Orders/second
+   - Fill rate
+   - Cancellation rate
+   - Order-to-fill time
+
+2. EXECUTION QUALITY
+   - Slippage (bps)
+   - Implementation shortfall
+   - Effective spread
+   - Price improvement
+
+3. MARKET MAKING
+   - Spread captured
+   - Inventory turnover
+   - Quote time percentage
+   - Adverse selection cost
+
+4. PNL & RISK
+   - Real-time PnL
+   - Sharpe ratio
+   - Maximum drawdown
+   - VaR (Value at Risk)
+
+5. MICROSTRUCTURE
+   - Bid-ask spread
+   - Order book depth
+   - Trade imbalance
+   - Volume-weighted price
+
+============================================
+2. ORDER FLOW METRICS
+============================================
+
+Order Flow Tracker:
+-------------------
+#include <atomic>
+#include <map>
+#include <mutex>
+#include <chrono>
+
+class OrderFlowMetrics {
+private:
+    // Counters
+    std::atomic<uint64_t> orders_sent_{0};
+    std::atomic<uint64_t> orders_filled_{0};
+    std::atomic<uint64_t> orders_partial_{0};
+    std::atomic<uint64_t> orders_canceled_{0};
+    std::atomic<uint64_t> orders_rejected_{0};
+
+    // By exchange
+    struct ExchangeMetrics {
+        std::atomic<uint64_t> orders_sent{0};
+        std::atomic<uint64_t> orders_filled{0};
+        std::atomic<uint64_t> orders_rejected{0};
+        std::atomic<double> total_filled_quantity{0.0};
+        std::atomic<double> total_filled_notional{0.0};
+    };
+
+    std::map<std::string, ExchangeMetrics> exchange_metrics_;
+    std::mutex exchange_mutex_;
+
+    // Time-to-fill tracking
+    struct OrderTimestamp {
+        std::chrono::high_resolution_clock::time_point sent_time;
+        double quantity;
+    };
+
+    std::map<std::string, OrderTimestamp> pending_orders_;
+    std::mutex orders_mutex_;
+
+    // Rolling window for rates
+    std::deque<std::pair<uint64_t, uint64_t>> order_timeline_;  // timestamp, count
+    std::mutex timeline_mutex_;
+
+public:
+    void recordOrderSent(const std::string& order_id,
+                        const std::string& exchange,
+                        double quantity) {
+        orders_sent_.fetch_add(1, std::memory_order_relaxed);
+
+        {
+            std::lock_guard<std::mutex> lock(exchange_mutex_);
+            exchange_metrics_[exchange].orders_sent.fetch_add(1,
+                std::memory_order_relaxed);
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(orders_mutex_);
+            pending_orders_[order_id] = {
+                std::chrono::high_resolution_clock::now(),
+                quantity
+            };
+        }
+
+        updateTimeline();
+    }
+
+    void recordOrderFilled(const std::string& order_id,
+                          const std::string& exchange,
+                          double filled_quantity,
+                          double price) {
+        orders_filled_.fetch_add(1, std::memory_order_relaxed);
+
+        {
+            std::lock_guard<std::mutex> lock(exchange_mutex_);
+            auto& metrics = exchange_metrics_[exchange];
+            metrics.orders_filled.fetch_add(1, std::memory_order_relaxed);
+
+            double notional = filled_quantity * price;
+            metrics.total_filled_quantity.fetch_add(filled_quantity,
+                std::memory_order_relaxed);
+            metrics.total_filled_notional.fetch_add(notional,
+                std::memory_order_relaxed);
+        }
+
+        // Calculate time-to-fill
+        {
+            std::lock_guard<std::mutex> lock(orders_mutex_);
+            auto it = pending_orders_.find(order_id);
+            if (it != pending_orders_.end()) {
+                auto now = std::chrono::high_resolution_clock::now();
+                auto time_to_fill = std::chrono::duration_cast<
+                    std::chrono::microseconds>(now - it->second.sent_time).count();
+
+                recordTimeToFill(time_to_fill);
+                pending_orders_.erase(it);
+            }
+        }
+    }
+
+    void recordOrderRejected(const std::string& order_id,
+                            const std::string& exchange,
+                            const std::string& reason) {
+        orders_rejected_.fetch_add(1, std::memory_order_relaxed);
+
+        {
+            std::lock_guard<std::mutex> lock(exchange_mutex_);
+            exchange_metrics_[exchange].orders_rejected.fetch_add(1,
+                std::memory_order_relaxed);
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(orders_mutex_);
+            pending_orders_.erase(order_id);
+        }
+    }
+
+    void recordOrderCanceled(const std::string& order_id) {
+        orders_canceled_.fetch_add(1, std::memory_order_relaxed);
+
+        {
+            std::lock_guard<std::mutex> lock(orders_mutex_);
+            pending_orders_.erase(order_id);
+        }
+    }
+
+    struct Metrics {
+        uint64_t total_orders;
+        uint64_t filled_orders;
+        uint64_t canceled_orders;
+        uint64_t rejected_orders;
+
+        double fill_rate;
+        double cancellation_rate;
+        double rejection_rate;
+
+        double orders_per_second;
+        double fills_per_second;
+
+        std::map<std::string, ExchangeStats> by_exchange;
+    };
+
+    struct ExchangeStats {
+        uint64_t orders_sent;
+        uint64_t orders_filled;
+        uint64_t orders_rejected;
+        double total_filled_quantity;
+        double total_filled_notional;
+        double fill_rate;
+        double rejection_rate;
+        double average_fill_price;
+    };
+
+    Metrics getMetrics() const {
+        Metrics m;
+
+        m.total_orders = orders_sent_.load(std::memory_order_acquire);
+        m.filled_orders = orders_filled_.load(std::memory_order_acquire);
+        m.canceled_orders = orders_canceled_.load(std::memory_order_acquire);
+        m.rejected_orders = orders_rejected_.load(std::memory_order_acquire);
+
+        m.fill_rate = m.total_orders > 0 ?
+            static_cast<double>(m.filled_orders) / m.total_orders * 100.0 : 0.0;
+
+        m.cancellation_rate = m.total_orders > 0 ?
+            static_cast<double>(m.canceled_orders) / m.total_orders * 100.0 : 0.0;
+
+        m.rejection_rate = m.total_orders > 0 ?
+            static_cast<double>(m.rejected_orders) / m.total_orders * 100.0 : 0.0;
+
+        // Calculate rates
+        auto rates = calculateRates();
+        m.orders_per_second = rates.first;
+        m.fills_per_second = rates.second;
+
+        // Exchange-specific metrics
+        {
+            std::lock_guard<std::mutex> lock(exchange_mutex_);
+
+            for (const auto& [exchange, metrics] : exchange_metrics_) {
+                ExchangeStats stats;
+                stats.orders_sent = metrics.orders_sent.load(std::memory_order_acquire);
+                stats.orders_filled = metrics.orders_filled.load(std::memory_order_acquire);
+                stats.orders_rejected = metrics.orders_rejected.load(std::memory_order_acquire);
+                stats.total_filled_quantity = metrics.total_filled_quantity.load(
+                    std::memory_order_acquire);
+                stats.total_filled_notional = metrics.total_filled_notional.load(
+                    std::memory_order_acquire);
+
+                stats.fill_rate = stats.orders_sent > 0 ?
+                    static_cast<double>(stats.orders_filled) / stats.orders_sent * 100.0 : 0.0;
+
+                stats.rejection_rate = stats.orders_sent > 0 ?
+                    static_cast<double>(stats.orders_rejected) / stats.orders_sent * 100.0 : 0.0;
+
+                stats.average_fill_price = stats.total_filled_quantity > 0 ?
+                    stats.total_filled_notional / stats.total_filled_quantity : 0.0;
+
+                m.by_exchange[exchange] = stats;
+            }
+        }
+
+        return m;
+    }
+
+private:
+    void updateTimeline() {
+        auto now = std::chrono::system_clock::now();
+        auto timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+            now.time_since_epoch()).count();
+
+        std::lock_guard<std::mutex> lock(timeline_mutex_);
+
+        order_timeline_.push_back({timestamp, 1});
+
+        // Keep last 60 seconds
+        while (!order_timeline_.empty() &&
+               order_timeline_.front().first < timestamp - 60) {
+            order_timeline_.pop_front();
+        }
+    }
+
+    std::pair<double, double> calculateRates() const {
+        std::lock_guard<std::mutex> lock(timeline_mutex_);
+
+        if (order_timeline_.empty()) {
+            return {0.0, 0.0};
+        }
+
+        auto now = std::chrono::system_clock::now();
+        auto current_timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+            now.time_since_epoch()).count();
+
+        uint64_t orders_last_minute = 0;
+        for (const auto& [ts, count] : order_timeline_) {
+            if (ts >= current_timestamp - 60) {
+                orders_last_minute += count;
+            }
+        }
+
+        double orders_per_second = orders_last_minute / 60.0;
+
+        // Estimate fills per second based on fill rate
+        uint64_t filled = orders_filled_.load(std::memory_order_acquire);
+        uint64_t total = orders_sent_.load(std::memory_order_acquire);
+
+        double fill_rate = total > 0 ?
+            static_cast<double>(filled) / total : 0.0;
+
+        double fills_per_second = orders_per_second * fill_rate;
+
+        return {orders_per_second, fills_per_second};
+    }
+
+    void recordTimeToFill(uint64_t time_us) {
+        // Store in histogram for later analysis
+    }
+};
+
+============================================
+3. EXECUTION QUALITY METRICS
+============================================
+
+Execution Quality Tracker:
+---------------------------
+class ExecutionQualityMetrics {
+private:
+    struct Execution {
+        std::string symbol;
+        std::string side;
+        double quantity;
+        double execution_price;
+        double decision_price;  // Price when decision was made
+        double arrival_price;   // Price when order arrived at exchange
+        uint64_t decision_timestamp_us;
+        uint64_t execution_timestamp_us;
+    };
+
+    std::vector<Execution> executions_;
+    std::mutex mutex_;
+
+public:
+    void recordExecution(const std::string& symbol,
+                        const std::string& side,
+                        double quantity,
+                        double execution_price,
+                        double decision_price,
+                        double arrival_price,
+                        uint64_t decision_timestamp_us,
+                        uint64_t execution_timestamp_us) {
+
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        executions_.push_back({
+            symbol, side, quantity, execution_price,
+            decision_price, arrival_price,
+            decision_timestamp_us, execution_timestamp_us
+        });
+
+        // Keep last 10000 executions
+        if (executions_.size() > 10000) {
+            executions_.erase(executions_.begin(),
+                            executions_.begin() + executions_.size() - 10000);
+        }
+    }
+
+    struct QualityMetrics {
+        // Slippage (difference from decision price)
+        double average_slippage_bps;
+        double median_slippage_bps;
+        double p95_slippage_bps;
+
+        // Implementation shortfall
+        double average_implementation_shortfall_bps;
+
+        // Effective spread
+        double average_effective_spread_bps;
+
+        // Price improvement
+        double price_improvement_percentage;
+        double average_price_improvement_bps;
+
+        // Execution delay
+        double average_execution_delay_us;
+        double p95_execution_delay_us;
+
+        // By side
+        double buy_slippage_bps;
+        double sell_slippage_bps;
+    };
+
+    QualityMetrics calculateMetrics() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        QualityMetrics metrics{};
+
+        if (executions_.empty()) {
+            return metrics;
+        }
+
+        std::vector<double> slippages;
+        std::vector<double> implementation_shortfalls;
+        std::vector<double> effective_spreads;
+        std::vector<double> price_improvements;
+        std::vector<double> execution_delays;
+
+        std::vector<double> buy_slippages;
+        std::vector<double> sell_slippages;
+
+        int improved_count = 0;
+
+        for (const auto& exec : executions_) {
+            // Calculate slippage (bps)
+            double slippage_bps = 0.0;
+            if (exec.side == "buy") {
+                slippage_bps = ((exec.execution_price - exec.decision_price) /
+                               exec.decision_price) * 10000.0;
+                buy_slippages.push_back(slippage_bps);
+            } else {
+                slippage_bps = ((exec.decision_price - exec.execution_price) /
+                               exec.decision_price) * 10000.0;
+                sell_slippages.push_back(slippage_bps);
+            }
+
+            slippages.push_back(slippage_bps);
+
+            // Implementation shortfall
+            double shortfall = std::abs(exec.execution_price - exec.decision_price) /
+                              exec.decision_price * 10000.0;
+            implementation_shortfalls.push_back(shortfall);
+
+            // Effective spread (difference from arrival price)
+            double eff_spread = std::abs(exec.execution_price - exec.arrival_price) /
+                               exec.arrival_price * 10000.0;
+            effective_spreads.push_back(eff_spread);
+
+            // Price improvement (negative slippage is good)
+            if (slippage_bps < 0) {
+                improved_count++;
+                price_improvements.push_back(std::abs(slippage_bps));
+            }
+
+            // Execution delay
+            double delay = exec.execution_timestamp_us - exec.decision_timestamp_us;
+            execution_delays.push_back(delay);
+        }
+
+        // Calculate averages
+        metrics.average_slippage_bps = calculateMean(slippages);
+        metrics.median_slippage_bps = calculateMedian(slippages);
+        metrics.p95_slippage_bps = calculatePercentile(slippages, 95);
+
+        metrics.average_implementation_shortfall_bps =
+            calculateMean(implementation_shortfalls);
+
+        metrics.average_effective_spread_bps = calculateMean(effective_spreads);
+
+        metrics.price_improvement_percentage =
+            static_cast<double>(improved_count) / executions_.size() * 100.0;
+
+        metrics.average_price_improvement_bps =
+            !price_improvements.empty() ? calculateMean(price_improvements) : 0.0;
+
+        metrics.average_execution_delay_us = calculateMean(execution_delays);
+        metrics.p95_execution_delay_us = calculatePercentile(execution_delays, 95);
+
+        metrics.buy_slippage_bps = !buy_slippages.empty() ?
+            calculateMean(buy_slippages) : 0.0;
+
+        metrics.sell_slippage_bps = !sell_slippages.empty() ?
+            calculateMean(sell_slippages) : 0.0;
+
+        return metrics;
+    }
+
+private:
+    double calculateMean(const std::vector<double>& values) const {
+        if (values.empty()) return 0.0;
+
+        double sum = 0.0;
+        for (double v : values) {
+            sum += v;
+        }
+        return sum / values.size();
+    }
+
+    double calculateMedian(std::vector<double> values) const {
+        if (values.empty()) return 0.0;
+
+        std::sort(values.begin(), values.end());
+        size_t mid = values.size() / 2;
+
+        if (values.size() % 2 == 0) {
+            return (values[mid - 1] + values[mid]) / 2.0;
+        } else {
+            return values[mid];
+        }
+    }
+
+    double calculatePercentile(std::vector<double> values, double percentile) const {
+        if (values.empty()) return 0.0;
+
+        std::sort(values.begin(), values.end());
+
+        size_t index = static_cast<size_t>(
+            std::ceil(values.size() * percentile / 100.0) - 1);
+
+        return values[std::min(index, values.size() - 1)];
+    }
+};
+
+============================================
+4. PNL & RISK METRICS
+============================================
+
+PnL Tracker:
+------------
+class PnLTracker {
+private:
+    struct Position {
+        double quantity;
+        double average_price;
+        double realized_pnl;
+        double unrealized_pnl;
+    };
+
+    std::map<std::string, Position> positions_;  // symbol -> position
+    std::mutex mutex_;
+
+    double total_realized_pnl_{0.0};
+    double daily_pnl_{0.0};
+
+    // For Sharpe ratio calculation
+    std::deque<double> daily_returns_;
+    std::mutex returns_mutex_;
+
+    // For drawdown tracking
+    double peak_pnl_{0.0};
+    double max_drawdown_{0.0};
+
+public:
+    void updatePosition(const std::string& symbol,
+                       const std::string& side,
+                       double fill_quantity,
+                       double fill_price,
+                       double current_market_price) {
+
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        auto& pos = positions_[symbol];
+
+        double quantity_change = (side == "buy") ? fill_quantity : -fill_quantity;
+
+        // Calculate realized PnL
+        if ((pos.quantity > 0 && quantity_change < 0) ||
+            (pos.quantity < 0 && quantity_change > 0)) {
+
+            // Closing or reducing position
+            double closed_quantity = std::min(std::abs(quantity_change),
+                                             std::abs(pos.quantity));
+
+            double pnl_per_unit = (side == "sell") ?
+                (fill_price - pos.average_price) :
+                (pos.average_price - fill_price);
+
+            double realized = pnl_per_unit * closed_quantity;
+            pos.realized_pnl += realized;
+            total_realized_pnl_ += realized;
+            daily_pnl_ += realized;
+        }
+
+        // Update position
+        if (pos.quantity + quantity_change == 0) {
+            // Position closed
+            pos.quantity = 0;
+            pos.average_price = 0;
+        } else if ((pos.quantity >= 0 && quantity_change > 0) ||
+                  (pos.quantity <= 0 && quantity_change < 0)) {
+            // Adding to position
+            double new_quantity = pos.quantity + quantity_change;
+            pos.average_price = ((pos.quantity * pos.average_price) +
+                                (quantity_change * fill_price)) / new_quantity;
+            pos.quantity = new_quantity;
+        } else {
+            // Reducing position
+            pos.quantity += quantity_change;
+        }
+
+        // Calculate unrealized PnL
+        if (pos.quantity != 0) {
+            pos.unrealized_pnl = (current_market_price - pos.average_price) *
+                                pos.quantity;
+        } else {
+            pos.unrealized_pnl = 0;
+        }
+
+        // Update drawdown
+        double total_pnl = total_realized_pnl_ + getTotalUnrealizedPnL();
+        if (total_pnl > peak_pnl_) {
+            peak_pnl_ = total_pnl;
+        }
+
+        double current_drawdown = peak_pnl_ - total_pnl;
+        if (current_drawdown > max_drawdown_) {
+            max_drawdown_ = current_drawdown;
+        }
+    }
+
+    void updateMarketPrices(const std::map<std::string, double>& prices) {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        for (auto& [symbol, pos] : positions_) {
+            auto it = prices.find(symbol);
+            if (it != prices.end() && pos.quantity != 0) {
+                pos.unrealized_pnl = (it->second - pos.average_price) *
+                                    pos.quantity;
+            }
+        }
+    }
+
+    struct PnLMetrics {
+        double total_realized;
+        double total_unrealized;
+        double total_pnl;
+        double daily_pnl;
+
+        double max_drawdown;
+        double current_drawdown;
+
+        double sharpe_ratio;
+        double win_rate;
+
+        std::map<std::string, Position> positions;
+    };
+
+    PnLMetrics getMetrics() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        PnLMetrics metrics;
+        metrics.total_realized = total_realized_pnl_;
+        metrics.total_unrealized = getTotalUnrealizedPnL();
+        metrics.total_pnl = metrics.total_realized + metrics.total_unrealized;
+        metrics.daily_pnl = daily_pnl_;
+
+        metrics.max_drawdown = max_drawdown_;
+        metrics.current_drawdown = peak_pnl_ - metrics.total_pnl;
+
+        metrics.sharpe_ratio = calculateSharpeRatio();
+
+        metrics.positions = positions_;
+
+        return metrics;
+    }
+
+    void recordDailyReturn(double return_pct) {
+        std::lock_guard<std::mutex> lock(returns_mutex_);
+
+        daily_returns_.push_back(return_pct);
+
+        // Keep last 252 trading days (1 year)
+        if (daily_returns_.size() > 252) {
+            daily_returns_.pop_front();
+        }
+    }
+
+private:
+    double getTotalUnrealizedPnL() const {
+        double total = 0.0;
+        for (const auto& [symbol, pos] : positions_) {
+            total += pos.unrealized_pnl;
+        }
+        return total;
+    }
+
+    double calculateSharpeRatio() const {
+        std::lock_guard<std::mutex> lock(returns_mutex_);
+
+        if (daily_returns_.size() < 30) {
+            return 0.0;
+        }
+
+        // Calculate mean return
+        double mean_return = 0.0;
+        for (double r : daily_returns_) {
+            mean_return += r;
+        }
+        mean_return /= daily_returns_.size();
+
+        // Calculate standard deviation
+        double variance = 0.0;
+        for (double r : daily_returns_) {
+            variance += (r - mean_return) * (r - mean_return);
+        }
+        variance /= daily_returns_.size();
+        double std_dev = std::sqrt(variance);
+
+        // Assume risk-free rate of 2% annually = 0.0079% daily
+        double risk_free_rate = 0.000079;
+
+        // Sharpe ratio (annualized)
+        double sharpe = std_dev > 0 ?
+            ((mean_return - risk_free_rate) / std_dev) * std::sqrt(252) : 0.0;
+
+        return sharpe;
+    }
+};
+
+Production Metrics Export:
+---------------------------
+class TradingMetricsExporter {
+private:
+    OrderFlowMetrics order_flow_;
+    ExecutionQualityMetrics execution_quality_;
+    PnLTracker pnl_tracker_;
+
+public:
+    nlohmann::json exportMetrics() {
+        nlohmann::json metrics;
+
+        // Order flow metrics
+        auto flow = order_flow_.getMetrics();
+        metrics["order_flow"] = {
+            {"total_orders", flow.total_orders},
+            {"filled_orders", flow.filled_orders},
+            {"fill_rate", flow.fill_rate},
+            {"cancellation_rate", flow.cancellation_rate},
+            {"rejection_rate", flow.rejection_rate},
+            {"orders_per_second", flow.orders_per_second},
+            {"fills_per_second", flow.fills_per_second}
+        };
+
+        // Execution quality
+        auto quality = execution_quality_.calculateMetrics();
+        metrics["execution_quality"] = {
+            {"average_slippage_bps", quality.average_slippage_bps},
+            {"median_slippage_bps", quality.median_slippage_bps},
+            {"p95_slippage_bps", quality.p95_slippage_bps},
+            {"implementation_shortfall_bps", quality.average_implementation_shortfall_bps},
+            {"effective_spread_bps", quality.average_effective_spread_bps},
+            {"price_improvement_pct", quality.price_improvement_percentage},
+            {"avg_execution_delay_us", quality.average_execution_delay_us}
+        };
+
+        // PnL metrics
+        auto pnl = pnl_tracker_.getMetrics();
+        metrics["pnl"] = {
+            {"total_realized", pnl.total_realized},
+            {"total_unrealized", pnl.total_unrealized},
+            {"total_pnl", pnl.total_pnl},
+            {"daily_pnl", pnl.daily_pnl},
+            {"max_drawdown", pnl.max_drawdown},
+            {"current_drawdown", pnl.current_drawdown},
+            {"sharpe_ratio", pnl.sharpe_ratio}
+        };
+
+        return metrics;
+    }
+
+    void exportToPrometheus(const std::string& filename) {
+        auto metrics = exportMetrics();
+
+        std::ofstream file(filename);
+        if (!file.is_open()) return;
+
+        // Order flow
+        file << "# HELP hft_orders_total Total orders sent\n";
+        file << "# TYPE hft_orders_total counter\n";
+        file << "hft_orders_total " << metrics["order_flow"]["total_orders"] << "\n\n";
+
+        file << "# HELP hft_fill_rate Fill rate percentage\n";
+        file << "# TYPE hft_fill_rate gauge\n";
+        file << "hft_fill_rate " << metrics["order_flow"]["fill_rate"] << "\n\n";
+
+        // Execution quality
+        file << "# HELP hft_slippage_bps Average slippage in basis points\n";
+        file << "# TYPE hft_slippage_bps gauge\n";
+        file << "hft_slippage_bps " << metrics["execution_quality"]["average_slippage_bps"] << "\n\n";
+
+        // PnL
+        file << "# HELP hft_pnl_usd Total PnL in USD\n";
+        file << "# TYPE hft_pnl_usd gauge\n";
+        file << "hft_pnl_usd " << metrics["pnl"]["total_pnl"] << "\n\n";
+
+        file << "# HELP hft_sharpe_ratio Sharpe ratio\n";
+        file << "# TYPE hft_sharpe_ratio gauge\n";
+        file << "hft_sharpe_ratio " << metrics["pnl"]["sharpe_ratio"] << "\n\n";
+
+        file.close();
+    }
+};
+
+echo "Trading metrics implementation complete"

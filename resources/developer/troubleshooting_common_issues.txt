@@ -1,0 +1,1400 @@
+================================================================================
+                    TROUBLESHOOTING COMMON ISSUES
+================================================================================
+Version: 3.2.1
+Last Updated: 2025-11-25
+Maintainers: Bob Johnson, Charlie Brown, Diana Chen
+
+================================================================================
+SECTION 1: OVERVIEW
+================================================================================
+
+This document provides solutions to common issues encountered in the HFT
+trading system. Issues are organized by category with symptoms, root causes,
+and step-by-step resolution procedures.
+
+TROUBLESHOOTING APPROACH:
+1. Identify symptoms
+2. Gather diagnostic information
+3. Form hypothesis
+4. Test hypothesis
+5. Implement solution
+6. Verify resolution
+7. Document for future reference
+
+SEVERITY CLASSIFICATION:
+    P0 (Critical): Production down, immediate action required
+    P1 (High): Major functionality impaired, < 1 hour response
+    P2 (Medium): Significant impact, < 4 hour response
+    P3 (Low): Minor impact, < 24 hour response
+
+================================================================================
+SECTION 2: ORDER MANAGEMENT ISSUES
+================================================================================
+
+ISSUE 2.1: ORDERS NOT BEING SUBMITTED
+------------------------------------------------------------
+Severity: P0
+
+Symptoms:
+    - Strategy generating signals but no orders sent
+    - Order count in OMS is zero
+    - No order messages in logs
+    - Trading desk reports no activity
+
+Diagnostic Steps:
+    [ ] Check OMS service status
+        $ systemctl status hft-oms
+        Expected: active (running)
+
+    [ ] Check FIX session status
+        $ /opt/hft/scripts/check_fix_sessions.sh
+        Expected: All sessions "Logged In"
+
+    [ ] Check risk server status
+        $ systemctl status hft-risk-engine
+        Expected: active (running)
+
+    [ ] Check for risk limit breaches
+        $ /opt/hft/bin/risk_client limit_status
+        Look for: Any limits at 100%
+
+    [ ] Review OMS logs
+        $ tail -100 /var/log/hft/oms.log | grep -i error
+
+Common Root Causes:
+
+Root Cause 1: FIX Session Disconnected
+    Verification:
+        $ /opt/hft/scripts/check_fix_sessions.sh
+        Shows: Session status = "Disconnected"
+
+    Solution:
+        [ ] Restart FIX session
+            $ /opt/hft/bin/oms_client restart_session --venue NYSE
+
+        [ ] Monitor reconnection
+            $ tail -f /var/log/hft/oms.log | grep FIX
+
+        [ ] Verify session established
+            $ /opt/hft/scripts/check_fix_sessions.sh
+
+        Expected time to resolution: 2-3 minutes
+
+Root Cause 2: Risk Limit Breached
+    Verification:
+        $ /opt/hft/bin/risk_client limit_status
+        Shows: Position limit or loss limit at 100%
+
+    Solution:
+        [ ] Review current limits
+            $ /opt/hft/bin/risk_client show_limits
+
+        [ ] Check if limit breach is legitimate
+            $ /opt/hft/bin/risk_client position_summary
+
+        [ ] If breach is valid:
+            - Flatten positions to reduce exposure
+            - Contact risk manager for limit increase
+
+        [ ] If breach is error:
+            - Investigate position tracking bug
+            - Manually reset if approved by risk manager
+            $ /opt/hft/bin/risk_client reset_limits --with-approval
+
+Root Cause 3: OMS Service Failure
+    Verification:
+        $ systemctl status hft-oms
+        Shows: failed or inactive
+
+    Solution:
+        [ ] Check recent logs for crash reason
+            $ journalctl -u hft-oms --since "10 minutes ago"
+
+        [ ] Restart OMS service
+            $ systemctl restart hft-oms
+
+        [ ] Verify startup successful
+            $ systemctl status hft-oms
+            $ tail -50 /var/log/hft/oms.log
+
+        [ ] Re-establish FIX sessions
+            $ /opt/hft/scripts/check_fix_sessions.sh
+
+        Expected time to resolution: 5 minutes
+
+Root Cause 4: Network Connectivity Issues
+    Verification:
+        $ ping exchange-fix-gateway.nyse.com
+        Shows: Timeouts or packet loss
+
+    Solution:
+        [ ] Test network path
+            $ traceroute exchange-fix-gateway.nyse.com
+            $ mtr -r exchange-fix-gateway.nyse.com
+
+        [ ] Check firewall rules
+            $ sudo iptables -L -n | grep FIX_PORT
+
+        [ ] Contact network team if infrastructure issue
+
+        [ ] Failover to backup connection if available
+            $ /opt/hft/bin/oms_client failover --venue NYSE --connection backup
+
+
+ISSUE 2.2: HIGH ORDER REJECTION RATE
+------------------------------------------------------------
+Severity: P1
+
+Symptoms:
+    - Many orders rejected by exchange
+    - Fill rate significantly lower than normal
+    - Error messages in OMS log
+    - Trading desk complaints
+
+Diagnostic Steps:
+    [ ] Check rejection rate
+        $ /opt/hft/bin/oms_client rejection_stats --last 1h
+
+    [ ] Review rejection reasons
+        $ /opt/hft/bin/oms_client rejected_orders --last 1h --group-by reason
+
+    [ ] Check order parameters
+        $ /opt/hft/bin/oms_client recent_orders --count 100
+
+Common Root Causes:
+
+Root Cause 1: Incorrect Order Parameters
+    Symptoms: Rejection reason = "Invalid price" or "Invalid quantity"
+
+    Solution:
+        [ ] Review order validation logic
+            $ grep -A 20 "validateOrder" src/oms/order_validator.cpp
+
+        [ ] Check price tick size rules
+            $ /opt/hft/bin/reference_data price_rules --symbol AAPL
+
+        [ ] Check lot size rules
+            $ /opt/hft/bin/reference_data lot_sizes --symbol AAPL
+
+        [ ] Update validation rules if needed
+            Edit: /opt/hft/config/order_validation.yaml
+
+        [ ] Restart OMS to apply changes
+            $ systemctl restart hft-oms
+
+Root Cause 2: Insufficient Buying Power
+    Symptoms: Rejection reason = "Insufficient funds" or "Buying power exceeded"
+
+    Solution:
+        [ ] Check account buying power
+            $ /opt/hft/bin/risk_client buying_power
+
+        [ ] Check margin utilization
+            $ /opt/hft/bin/risk_client margin_status
+
+        [ ] Reduce position sizes
+            $ /opt/hft/bin/strategy_manager set_size --all --size 50%
+
+        [ ] Contact broker for buying power increase
+
+Root Cause 3: Symbol Halted or Suspended
+    Symptoms: Rejection reason = "Symbol halted" or "Trading suspended"
+
+    Solution:
+        [ ] Check halt status
+            $ /opt/hft/bin/reference_data halt_status --symbol AAPL
+
+        [ ] Verify with exchange website
+
+        [ ] Disable trading for halted symbols
+            $ /opt/hft/bin/strategy_manager exclude_symbol AAPL
+
+        [ ] Re-enable when halt lifted
+            $ /opt/hft/bin/strategy_manager include_symbol AAPL
+
+Root Cause 4: Market Closed or Pre-Opening
+    Symptoms: Rejection reason = "Market closed" or "Not in trading session"
+
+    Solution:
+        [ ] Check current trading session
+            $ /opt/hft/bin/reference_data market_status
+
+        [ ] Verify strategy schedule
+            $ /opt/hft/bin/strategy_manager show_schedule
+
+        [ ] Adjust strategy trading hours if needed
+            Edit: /opt/hft/strategies/[strategy_name].cfg
+            Update: TRADING_HOURS parameter
+
+
+ISSUE 2.3: ORDERS STUCK IN "PENDING" STATE
+------------------------------------------------------------
+Severity: P1
+
+Symptoms:
+    - Orders remain in "Pending" state for extended time
+    - No fill or rejection messages
+    - Position not updating
+    - Orders visible in OMS but not at exchange
+
+Diagnostic Steps:
+    [ ] List stuck orders
+        $ /opt/hft/bin/oms_client find_stuck_orders --threshold 60s
+
+    [ ] Check FIX message log
+        $ grep -A 5 "OrderID=[STUCK_ORDER_ID]" /var/log/hft/fix_messages.log
+
+    [ ] Check exchange acknowledgments
+        $ /opt/hft/bin/oms_client order_history --order-id [ORDER_ID]
+
+Solution:
+    [ ] Cancel stuck orders
+        $ /opt/hft/bin/oms_client cancel_order --order-id [ORDER_ID]
+
+    [ ] If cancel fails, force cancel
+        $ /opt/hft/bin/oms_client force_cancel --order-id [ORDER_ID]
+
+    [ ] Reconcile with exchange
+        $ /opt/hft/bin/oms_client reconcile --venue NYSE
+
+    [ ] Check for FIX sequence number issues
+        $ /opt/hft/scripts/check_fix_sequence.sh
+
+    [ ] Reset FIX sequence if needed (with exchange approval)
+        $ /opt/hft/bin/oms_client reset_fix_sequence --venue NYSE
+
+Prevention:
+    [ ] Implement order timeout monitoring
+    [ ] Add automatic cancellation for old pending orders
+    [ ] Increase FIX message logging
+
+
+================================================================================
+SECTION 3: MARKET DATA ISSUES
+================================================================================
+
+ISSUE 3.1: MARKET DATA FEED DISCONNECTED
+------------------------------------------------------------
+Severity: P0
+
+Symptoms:
+    - No market data updates
+    - Strategies not generating signals
+    - Last update timestamp old (> 10 seconds)
+    - Market data feed status shows "Disconnected"
+
+Diagnostic Steps:
+    [ ] Check feed status
+        $ /opt/hft/scripts/check_feed_status.sh
+        Expected: All feeds "Connected"
+
+    [ ] Check feed process status
+        $ systemctl status hft-marketdata@nyse
+        Expected: active (running)
+
+    [ ] Check network connectivity
+        $ ping marketdata.nyse.com
+
+    [ ] Review feed logs
+        $ tail -100 /var/log/hft/marketdata/nyse.log
+
+Solutions:
+
+Solution 1: Restart Feed Handler
+    [ ] Restart specific feed
+        $ systemctl restart hft-marketdata@nyse
+
+    [ ] Monitor reconnection
+        $ tail -f /var/log/hft/marketdata/nyse.log
+
+    [ ] Verify connection established
+        $ /opt/hft/scripts/check_feed_status.sh
+
+    Expected time to resolution: 1-2 minutes
+
+Solution 2: Failover to Backup Feed
+    [ ] Switch to backup feed
+        $ /opt/hft/bin/marketdata_client failover --feed NYSE --to backup
+
+    [ ] Verify data flowing from backup
+        $ /opt/hft/bin/marketdata_client message_rates
+
+    [ ] Contact primary feed provider
+
+Solution 3: Network Issue Resolution
+    [ ] Check network path
+        $ traceroute marketdata.nyse.com
+
+    [ ] Check firewall rules
+        $ sudo iptables -L -n | grep MARKETDATA_PORT
+
+    [ ] Check bandwidth utilization
+        $ nethogs
+
+    [ ] Contact network team if needed
+
+
+ISSUE 3.2: STALE MARKET DATA
+------------------------------------------------------------
+Severity: P1
+
+Symptoms:
+    - Feed shows "Connected" but data not updating
+    - Last update timestamp old
+    - Prices don't match external sources
+    - Strategies not trading
+
+Diagnostic Steps:
+    [ ] Check message rates
+        $ /opt/hft/bin/marketdata_client message_rates
+        Compare to normal rates (should be ~100k msgs/sec)
+
+    [ ] Check for specific symbols
+        $ /opt/hft/bin/marketdata_client last_update --symbol AAPL
+        Should be < 1 second old
+
+    [ ] Check for heartbeats
+        $ grep "Heartbeat" /var/log/hft/marketdata/nyse.log
+
+    [ ] Compare with external source
+        Check: Bloomberg, Yahoo Finance, etc.
+
+Solutions:
+
+Solution 1: Reconnect Feed
+    [ ] Disconnect and reconnect
+        $ /opt/hft/bin/marketdata_client reconnect --feed NYSE
+
+    [ ] Verify data freshness
+        $ /opt/hft/bin/marketdata_client verify_freshness
+
+Solution 2: Clear Cache
+    [ ] Clear market data cache
+        $ /opt/hft/bin/marketdata_client clear_cache
+
+    [ ] Restart market data service
+        $ systemctl restart hft-marketdata@nyse
+
+Solution 3: Check Clock Synchronization
+    [ ] Check system time
+        $ timedatectl status
+        Should show: "System clock synchronized: yes"
+
+    [ ] Check NTP status
+        $ ntpq -p
+
+    [ ] Sync time if needed
+        $ sudo ntpdate -u ntp.ubuntu.com
+
+
+ISSUE 3.3: HIGH MARKET DATA LATENCY
+------------------------------------------------------------
+Severity: P1
+
+Symptoms:
+    - Market data processing latency > 1ms
+    - Strategies underperforming
+    - Quotes arriving late
+    - Latency dashboard showing red
+
+Diagnostic Steps:
+    [ ] Measure current latency
+        $ /opt/hft/scripts/measure_md_latency.sh
+
+    [ ] Check CPU usage
+        $ top -n 1 -b | grep hft-marketdata
+
+    [ ] Check network latency
+        $ ping -c 100 marketdata.nyse.com
+
+    [ ] Check for packet loss
+        $ mtr -r marketdata.nyse.com
+
+Common Root Causes:
+
+Root Cause 1: CPU Overload
+    Verification:
+        $ top -n 1 -b | grep hft-marketdata
+        Shows: CPU usage > 90%
+
+    Solution:
+        [ ] Check for resource-intensive processes
+            $ ps aux --sort=-%cpu | head -10
+
+        [ ] Stop non-critical processes
+
+        [ ] Add CPU affinity to market data process
+            $ taskset -cp 0,1 $(pgrep hft-marketdata)
+
+        [ ] Consider horizontal scaling (add more servers)
+
+Root Cause 2: Network Congestion
+    Verification:
+        $ nethogs
+        Shows: High bandwidth usage
+
+    Solution:
+        [ ] Identify bandwidth-hungry process
+            $ nethogs
+
+        [ ] Check network interface stats
+            $ ifconfig | grep -A 5 eth0
+
+        [ ] Enable QoS for market data traffic
+            $ /opt/hft/scripts/enable_qos.sh
+
+        [ ] Contact network team for dedicated circuit
+
+Root Cause 3: Inefficient Processing Code
+    Verification:
+        $ perf record -p $(pgrep hft-marketdata)
+        $ perf report
+
+    Solution:
+        [ ] Profile the code
+            $ perf record -g -p $(pgrep hft-marketdata)
+
+        [ ] Identify hot spots
+            $ perf report --stdio
+
+        [ ] Optimize hot code paths
+            - Review code for inefficiencies
+            - Reduce allocations
+            - Optimize data structures
+            - Consider parallel processing
+
+        [ ] Deploy optimized version
+
+Root Cause 4: Database Bottleneck
+    Verification:
+        $ /opt/hft/scripts/db_performance_check.sh
+        Shows: Slow queries or high load
+
+    Solution:
+        [ ] Identify slow queries
+            postgres=# SELECT * FROM pg_stat_statements
+                       ORDER BY total_time DESC LIMIT 10;
+
+        [ ] Optimize queries
+            - Add indexes
+            - Rewrite inefficient queries
+            - Use materialized views
+
+        [ ] Consider caching
+            - Cache reference data
+            - Reduce database calls
+
+
+================================================================================
+SECTION 4: RISK MANAGEMENT ISSUES
+================================================================================
+
+ISSUE 4.1: POSITION LIMIT BREACH
+------------------------------------------------------------
+Severity: P0
+
+Symptoms:
+    - Position exceeds configured limit
+    - Risk alert triggered
+    - Trading automatically stopped
+    - Risk dashboard shows red
+
+Diagnostic Steps:
+    [ ] Check current positions
+        $ /opt/hft/bin/risk_client position_summary
+
+    [ ] Check position limits
+        $ /opt/hft/bin/risk_client show_limits --type position
+
+    [ ] Review recent trades
+        $ /opt/hft/bin/oms_client recent_trades --last 1h
+
+    [ ] Check for duplicate fills
+        $ /opt/hft/bin/oms_client check_duplicates
+
+Solutions:
+
+Solution 1: Legitimate Limit Breach
+    [ ] Immediately stop affected strategy
+        $ /opt/hft/bin/strategy_manager stop [STRATEGY_NAME]
+
+    [ ] Flatten excess position
+        $ /opt/hft/bin/strategy_manager flatten [STRATEGY_NAME] --urgent
+
+    [ ] Monitor position reduction
+        $ watch -n 5 '/opt/hft/bin/risk_client position_summary'
+
+    [ ] Contact risk manager
+        Report incident and request approval to resume
+
+    [ ] Prevent recurrence
+        - Review strategy parameters
+        - Adjust position sizes
+        - Enhance pre-trade risk checks
+
+Solution 2: Position Tracking Error
+    [ ] Verify actual position with broker
+        Call broker operations desk
+
+    [ ] Compare system position vs broker position
+        $ /opt/hft/bin/risk_client reconcile --verbose
+
+    [ ] If discrepancy found:
+        - Identify cause (missed fill, duplicate fill, etc.)
+        - Correct position in system
+        $ /opt/hft/bin/risk_client adjust_position --symbol AAPL --quantity [CORRECT_QTY] --reason "Reconciliation" --approval [TICKET#]
+
+    [ ] Review and fix root cause
+
+Solution 3: Configuration Error
+    [ ] Review limit configuration
+        $ cat /opt/hft/config/risk_limits.yaml
+
+    [ ] Verify limits are reasonable
+        Compare with trading desk expectations
+
+    [ ] Update limits if needed (with approval)
+        Edit: /opt/hft/config/risk_limits.yaml
+        $ /opt/hft/bin/risk_client reload_limits
+
+
+ISSUE 4.2: LOSS LIMIT BREACH
+------------------------------------------------------------
+Severity: P0
+
+Symptoms:
+    - Daily loss exceeds limit
+    - All trading stopped
+    - P&L dashboard shows large loss
+    - Risk alerts triggered
+
+Diagnostic Steps:
+    [ ] Check current P&L
+        $ /opt/hft/bin/risk_client pnl_summary
+
+    [ ] Check loss limits
+        $ /opt/hft/bin/risk_client show_limits --type loss
+
+    [ ] Review P&L by strategy
+        $ /opt/hft/bin/risk_client pnl_by_strategy
+
+    [ ] Review P&L by symbol
+        $ /opt/hft/bin/risk_client pnl_by_symbol --sort-by pnl
+
+Immediate Actions:
+    [ ] Stop all trading immediately
+        $ /opt/hft/bin/emergency_stop.sh
+
+    [ ] Flatten all positions (if approved)
+        $ /opt/hft/bin/strategy_manager flatten --all --urgent
+
+    [ ] Notify management
+        - CTO
+        - Risk Manager
+        - Trading Desk Manager
+
+    [ ] Preserve evidence
+        - Archive all logs
+        - Export trade data
+        - Capture system state
+
+Investigation:
+    [ ] Identify losing trades
+        $ /opt/hft/bin/risk_client losing_trades --threshold 10000
+
+    [ ] Analyze root cause
+        - Strategy malfunction?
+        - Market event?
+        - Execution issues?
+        - Risk check failure?
+
+    [ ] Generate incident report
+        $ /opt/hft/scripts/generate_incident_report.sh --type loss_breach
+
+Recovery:
+    [ ] Review with risk committee
+    [ ] Implement corrective measures
+    [ ] Update risk limits if needed
+    [ ] Enhance monitoring
+    [ ] Resume trading (if approved)
+
+
+ISSUE 4.3: POSITION RECONCILIATION FAILURES
+------------------------------------------------------------
+Severity: P1
+
+Symptoms:
+    - System position doesn't match broker position
+    - Reconciliation report shows discrepancies
+    - End-of-day reconciliation fails
+
+Diagnostic Steps:
+    [ ] Run reconciliation
+        $ /opt/hft/scripts/reconcile_positions.sh --verbose
+
+    [ ] Get broker position report
+        Download from broker portal or API
+
+    [ ] Compare position by position
+        $ /opt/hft/bin/risk_client compare_positions --broker-file broker_positions.csv
+
+    [ ] Review trade logs
+        $ /opt/hft/bin/oms_client trade_log --date $(date +%Y-%m-%d)
+
+Common Root Causes:
+
+Root Cause 1: Missed Fill Message
+    Solution:
+        [ ] Request fill report from broker
+        [ ] Identify missing fills
+        [ ] Manually add fills to system
+            $ /opt/hft/bin/oms_client add_fill --order-id [ID] --quantity [QTY] --price [PRICE] --approval [TICKET#]
+        [ ] Verify reconciliation passes
+
+Root Cause 2: Duplicate Fill Processing
+    Solution:
+        [ ] Identify duplicate fills
+            $ /opt/hft/bin/oms_client find_duplicates
+        [ ] Remove duplicates
+            $ /opt/hft/bin/oms_client remove_fill --fill-id [ID] --approval [TICKET#]
+        [ ] Fix duplicate detection logic
+
+Root Cause 3: Corporate Action Not Processed
+    Solution:
+        [ ] Check for recent corporate actions
+            $ /opt/hft/bin/reference_data corporate_actions --recent
+        [ ] Process missing corporate actions
+            - Stock splits
+            - Dividends
+            - Mergers
+        [ ] Adjust positions accordingly
+
+
+================================================================================
+SECTION 5: PERFORMANCE ISSUES
+================================================================================
+
+ISSUE 5.1: HIGH LATENCY SPIKES
+------------------------------------------------------------
+Severity: P1
+
+Symptoms:
+    - Occasional latency spikes (> 1ms)
+    - p99 latency exceeds target
+    - Inconsistent performance
+    - Grafana dashboard shows spikes
+
+Diagnostic Steps:
+    [ ] Measure latency distribution
+        $ /opt/hft/scripts/measure_latency.sh --duration 300s
+
+    [ ] Check for garbage collection pauses (if using Java)
+        $ jstat -gcutil $(pgrep -f trading_engine) 1000
+
+    [ ] Check system interrupts
+        $ cat /proc/interrupts
+
+    [ ] Check for CPU throttling
+        $ turbostat --interval 1
+
+Common Root Causes:
+
+Root Cause 1: Garbage Collection Pauses (Java)
+    Solution:
+        [ ] Tune GC parameters
+            Add to JVM args:
+            -XX:+UseG1GC
+            -XX:MaxGCPauseMillis=10
+            -XX:+UseStringDeduplication
+
+        [ ] Monitor GC activity
+            $ jstat -gcutil $(pgrep -f trading_engine) 1000
+
+        [ ] Consider ZGC for ultra-low latency
+            -XX:+UseZGC
+
+Root Cause 2: Memory Allocations
+    Solution:
+        [ ] Profile memory allocations
+            $ valgrind --tool=massif ./trading_engine
+
+        [ ] Identify allocation hot spots
+            $ ms_print massif.out.*
+
+        [ ] Optimize code
+            - Use object pools
+            - Pre-allocate memory
+            - Reduce allocations in hot path
+
+Root Cause 3: Lock Contention
+    Solution:
+        [ ] Profile locks
+            $ perf record -e lock:contention_begin -g
+            $ perf report
+
+        [ ] Identify contended locks
+        [ ] Optimize locking strategy
+            - Reduce critical section size
+            - Use lock-free data structures
+            - Partition data to reduce sharing
+
+Root Cause 4: NUMA Effects
+    Solution:
+        [ ] Check NUMA configuration
+            $ numactl --hardware
+
+        [ ] Pin process to single NUMA node
+            $ numactl --cpunodebind=0 --membind=0 ./trading_engine
+
+        [ ] Verify improvement
+            $ /opt/hft/scripts/measure_latency.sh
+
+
+ISSUE 5.2: LOW THROUGHPUT
+------------------------------------------------------------
+Severity: P1
+
+Symptoms:
+    - System processing fewer orders than expected
+    - Order rate below target
+    - Fill rate lower than normal
+    - Underperforming competitors
+
+Diagnostic Steps:
+    [ ] Measure current throughput
+        $ /opt/hft/scripts/measure_throughput.sh
+
+    [ ] Check CPU usage
+        $ mpstat -P ALL 1
+
+    [ ] Check for bottlenecks
+        $ perf record -g ./trading_engine
+        $ perf report
+
+    [ ] Profile system calls
+        $ strace -c -p $(pgrep trading_engine)
+
+Solutions:
+
+Solution 1: Single-threaded Bottleneck
+    [ ] Identify single-threaded section
+        $ perf top -p $(pgrep trading_engine)
+
+    [ ] Parallelize if possible
+        - Use thread pool
+        - Pipeline processing
+        - Multiple instances
+
+Solution 2: Database Bottleneck
+    [ ] Check database performance
+        $ /opt/hft/scripts/db_performance_check.sh
+
+    [ ] Optimize queries
+        - Add indexes
+        - Use prepared statements
+        - Batch operations
+
+    [ ] Consider caching
+        - Cache reference data
+        - Use in-memory cache (Redis)
+
+Solution 3: Network Bottleneck
+    [ ] Check network utilization
+        $ nethogs
+        $ iftop
+
+    [ ] Optimize network usage
+        - Batch messages
+        - Compress data
+        - Use more efficient protocol
+
+    [ ] Upgrade network infrastructure
+
+
+ISSUE 5.3: MEMORY LEAK
+------------------------------------------------------------
+Severity: P1
+
+Symptoms:
+    - Memory usage continuously increasing
+    - System eventually crashes or swaps
+    - OOM (Out of Memory) killer triggers
+    - Performance degrades over time
+
+Diagnostic Steps:
+    [ ] Monitor memory usage over time
+        $ /opt/hft/scripts/monitor_memory.sh --duration 3600
+
+    [ ] Check for memory leak
+        $ valgrind --leak-check=full ./trading_engine
+
+    [ ] Profile heap usage
+        $ valgrind --tool=massif ./trading_engine
+        $ ms_print massif.out.*
+
+Solutions:
+
+Solution 1: Identify and Fix Leak
+    [ ] Run with leak detection
+        $ valgrind --leak-check=full --show-leak-kinds=all ./trading_engine
+
+    [ ] Analyze leak report
+        - Direct leaks (memory not freed)
+        - Indirect leaks (contained in leaked blocks)
+        - Possible leaks (pointers that may be valid)
+
+    [ ] Fix code
+        - Add missing delete/free calls
+        - Use smart pointers (std::unique_ptr, std::shared_ptr)
+        - Fix circular references
+
+    [ ] Verify fix
+        $ valgrind --leak-check=full ./trading_engine
+
+Solution 2: Temporary Mitigation (Restart Service)
+    [ ] Schedule regular restarts
+        Add to crontab:
+        0 2 * * * systemctl restart hft-trading-engine
+
+    [ ] Implement graceful restart
+        - Wait for idle period
+        - Drain connections
+        - Restart process
+
+Solution 3: Increase Available Memory
+    [ ] Add more RAM (if feasible)
+    [ ] Increase swap space (not recommended for low-latency)
+    [ ] Optimize memory usage
+        - Reduce cache sizes
+        - Limit buffer sizes
+        - Clean up old data
+
+
+================================================================================
+SECTION 6: DATABASE ISSUES
+================================================================================
+
+ISSUE 6.1: SLOW QUERIES
+------------------------------------------------------------
+Severity: P2
+
+Symptoms:
+    - Database queries taking > 10ms
+    - Application response time slow
+    - High database CPU usage
+    - Query timeouts
+
+Diagnostic Steps:
+    [ ] Identify slow queries
+        postgres=# SELECT query, calls, total_time, mean_time
+                   FROM pg_stat_statements
+                   ORDER BY mean_time DESC
+                   LIMIT 10;
+
+    [ ] Analyze query plan
+        postgres=# EXPLAIN ANALYZE [SLOW_QUERY];
+
+    [ ] Check for missing indexes
+        postgres=# SELECT schemaname, tablename, attname, n_distinct
+                   FROM pg_stats
+                   WHERE schemaname = 'public'
+                   AND attname NOT IN (
+                       SELECT a.attname
+                       FROM pg_index i
+                       JOIN pg_attribute a ON a.attrelid = i.indrelid
+                       WHERE i.indrelid = 'your_table'::regclass
+                   );
+
+Solutions:
+
+Solution 1: Add Indexes
+    [ ] Identify columns to index
+        - WHERE clause columns
+        - JOIN columns
+        - ORDER BY columns
+
+    [ ] Create index
+        postgres=# CREATE INDEX idx_trades_symbol_timestamp
+                   ON trades(symbol, timestamp);
+
+    [ ] Verify improvement
+        postgres=# EXPLAIN ANALYZE [QUERY];
+
+Solution 2: Rewrite Query
+    [ ] Optimize query logic
+        - Avoid SELECT *
+        - Use appropriate JOINs
+        - Filter early
+        - Use LIMIT when possible
+
+    [ ] Use query hints if needed
+
+Solution 3: Partition Large Tables
+    [ ] Partition by range (e.g., date)
+        postgres=# CREATE TABLE trades_partitioned (
+                       LIKE trades
+                   ) PARTITION BY RANGE (timestamp);
+
+    [ ] Create partitions
+        postgres=# CREATE TABLE trades_2025_11
+                   PARTITION OF trades_partitioned
+                   FOR VALUES FROM ('2025-11-01') TO ('2025-12-01');
+
+    [ ] Migrate data
+
+
+ISSUE 6.2: REPLICATION LAG
+------------------------------------------------------------
+Severity: P1
+
+Symptoms:
+    - Secondary database behind primary
+    - Lag seconds increasing
+    - Stale data on secondary
+    - Read replicas not up-to-date
+
+Diagnostic Steps:
+    [ ] Check replication status
+        postgres=# SELECT * FROM pg_stat_replication;
+
+    [ ] Check replication lag
+        postgres=# SELECT now() - pg_last_xact_replay_timestamp() AS lag;
+
+    [ ] Check for replication errors
+        $ tail -100 /var/log/postgresql/postgresql.log | grep -i replication
+
+Solutions:
+
+Solution 1: Increase Replication Resources
+    [ ] Check network bandwidth
+        $ nethogs
+
+    [ ] Increase wal_sender_timeout
+        postgres=# ALTER SYSTEM SET wal_sender_timeout = '120s';
+        postgres=# SELECT pg_reload_conf();
+
+    [ ] Increase max_wal_senders
+        postgres=# ALTER SYSTEM SET max_wal_senders = 10;
+        Requires restart
+
+Solution 2: Reduce Primary Load
+    [ ] Offload reads to other replicas
+    [ ] Optimize write-heavy queries
+    [ ] Batch write operations
+
+Solution 3: Check Disk I/O
+    [ ] Monitor disk I/O
+        $ iostat -x 1
+
+    [ ] Upgrade to faster storage (SSD/NVMe)
+    [ ] Tune filesystem (XFS for PostgreSQL)
+
+
+ISSUE 6.3: DATABASE DEADLOCKS
+------------------------------------------------------------
+Severity: P2
+
+Symptoms:
+    - Transactions failing with deadlock error
+    - Error: "deadlock detected"
+    - Application retrying transactions
+    - Database log shows deadlock reports
+
+Diagnostic Steps:
+    [ ] Check for recent deadlocks
+        postgres=# SELECT * FROM pg_stat_database_conflicts;
+
+    [ ] Review deadlock details in log
+        $ grep -A 10 "deadlock detected" /var/log/postgresql/postgresql.log
+
+    [ ] Identify tables involved
+        From log output
+
+Solutions:
+
+Solution 1: Consistent Lock Ordering
+    [ ] Review code for lock acquisition order
+    [ ] Enforce consistent ordering
+        Example: Always lock tables in alphabetical order
+
+Solution 2: Reduce Transaction Scope
+    [ ] Keep transactions short
+    [ ] Release locks quickly
+    [ ] Avoid long-running transactions
+
+Solution 3: Increase Lock Timeout
+    [ ] Set statement timeout
+        postgres=# SET statement_timeout = '5s';
+
+    [ ] Set lock timeout
+        postgres=# SET lock_timeout = '2s';
+
+Solution 4: Use Advisory Locks
+    [ ] For application-level locking
+        postgres=# SELECT pg_advisory_lock(123);
+        postgres=# SELECT pg_advisory_unlock(123);
+
+
+================================================================================
+SECTION 7: NETWORK ISSUES
+================================================================================
+
+ISSUE 7.1: PACKET LOSS
+------------------------------------------------------------
+Severity: P1
+
+Symptoms:
+    - Intermittent connectivity issues
+    - Retransmissions in TCP stats
+    - Increased latency
+    - Dropped market data messages
+
+Diagnostic Steps:
+    [ ] Measure packet loss
+        $ ping -c 1000 exchange-gateway.com
+
+    [ ] Check network statistics
+        $ netstat -s | grep -i loss
+
+    [ ] Use mtr for detailed path analysis
+        $ mtr -r -c 100 exchange-gateway.com
+
+    [ ] Check network interface errors
+        $ ifconfig | grep -E 'errors|dropped'
+
+Solutions:
+
+Solution 1: Network Interface Issues
+    [ ] Check interface errors
+        $ ethtool -S eth0 | grep -i error
+
+    [ ] Check for duplex mismatch
+        $ ethtool eth0
+
+    [ ] Verify MTU settings
+        $ ip link show eth0
+
+    [ ] Test with different MTU
+        $ sudo ip link set eth0 mtu 9000
+
+Solution 2: Switch/Router Issues
+    [ ] Contact network team
+    [ ] Check switch port statistics
+    [ ] Verify QoS settings
+    [ ] Check for congestion
+
+Solution 3: Cable Issues
+    [ ] Check cable quality
+    [ ] Replace cables if old
+    [ ] Use Cat6 or better
+    [ ] Check for physical damage
+
+
+ISSUE 7.2: HIGH NETWORK LATENCY
+------------------------------------------------------------
+Severity: P1
+
+Symptoms:
+    - Ping times > 1ms
+    - Increased round-trip time
+    - Slow data transmission
+    - Poor trading performance
+
+Diagnostic Steps:
+    [ ] Measure current latency
+        $ ping -c 100 exchange-gateway.com
+
+    [ ] Trace route to identify hop with latency
+        $ traceroute -n exchange-gateway.com
+
+    [ ] Check for congestion
+        $ iftop
+
+    [ ] Measure application-level latency
+        $ /opt/hft/scripts/measure_network_latency.sh
+
+Solutions:
+
+Solution 1: Optimize Network Path
+    [ ] Identify problematic hop
+        $ mtr -r exchange-gateway.com
+
+    [ ] Contact ISP if issue in their network
+    [ ] Consider alternative routing
+    [ ] Use direct connection if possible
+
+Solution 2: Reduce Network Load
+    [ ] Identify bandwidth-heavy applications
+        $ nethogs
+
+    [ ] Implement traffic shaping
+        $ tc qdisc add dev eth0 root tbf rate 1gbit burst 32kbit latency 400ms
+
+    [ ] Prioritize trading traffic
+        $ /opt/hft/scripts/setup_qos.sh
+
+Solution 3: Kernel Network Tuning
+    [ ] Increase network buffers
+        $ sudo sysctl -w net.core.rmem_max=134217728
+        $ sudo sysctl -w net.core.wmem_max=134217728
+
+    [ ] Tune TCP parameters
+        $ sudo sysctl -w net.ipv4.tcp_rmem='4096 87380 134217728'
+        $ sudo sysctl -w net.ipv4.tcp_wmem='4096 65536 134217728'
+
+    [ ] Enable TCP fast open
+        $ sudo sysctl -w net.ipv4.tcp_fastopen=3
+
+
+================================================================================
+SECTION 8: STRATEGY-SPECIFIC ISSUES
+================================================================================
+
+ISSUE 8.1: MARKET MAKING STRATEGY - LOW FILL RATE
+------------------------------------------------------------
+Severity: P2
+
+Symptoms:
+    - Fill rate < 40% (normal is > 45%)
+    - Quotes being generated but not filled
+    - Missing trade opportunities
+    - Underperforming revenue targets
+
+Diagnostic Steps:
+    [ ] Check current fill rate
+        $ /opt/hft/bin/strategy_manager metrics MM_EQ_001 --metric fill_rate
+
+    [ ] Check quote refresh rate
+        $ /opt/hft/bin/strategy_manager metrics MM_EQ_001 --metric quote_refresh_ms
+
+    [ ] Check spread width
+        $ /opt/hft/bin/strategy_manager get_param MM_EQ_001 MIN_SPREAD_BPS
+
+    [ ] Compare with competitors
+        Check market depth on external platform
+
+Solutions:
+
+Solution 1: Quotes Too Wide
+    [ ] Reduce spread width
+        $ /opt/hft/bin/strategy_manager set_param MM_EQ_001 MIN_SPREAD_BPS 1.0
+
+    [ ] Monitor impact on adverse selection
+        $ /opt/hft/bin/strategy_manager metrics MM_EQ_001 --metric adverse_selection
+
+Solution 2: Quotes Too Slow
+    [ ] Reduce quote refresh interval
+        $ /opt/hft/bin/strategy_manager set_param MM_EQ_001 QUOTE_REFRESH_MS 100
+
+    [ ] Monitor system latency
+        $ /opt/hft/scripts/measure_latency.sh
+
+Solution 3: Quoting Away from Touch
+    [ ] Review pricing model
+        $ /opt/hft/bin/strategy_manager debug MM_EQ_001 --show-pricing
+
+    [ ] Adjust pricing parameters
+    [ ] Reduce inventory skew impact
+
+
+ISSUE 8.2: STATISTICAL ARBITRAGE - PAIRS DECORRELATING
+------------------------------------------------------------
+Severity: P2
+
+Symptoms:
+    - Correlation dropping below threshold
+    - Pairs trading underperforming
+    - Losses on open pairs positions
+    - Win rate declining
+
+Diagnostic Steps:
+    [ ] Check current correlations
+        $ /opt/hft/bin/strategy_manager metrics STAT_ARB_PAIRS_001 --show-correlations
+
+    [ ] Check pair performance
+        $ /opt/hft/bin/strategy_manager metrics STAT_ARB_PAIRS_001 --by-pair
+
+    [ ] Review z-scores of open positions
+        $ /opt/hft/bin/strategy_manager debug STAT_ARB_PAIRS_001 --show-positions
+
+Solutions:
+
+Solution 1: Close Decorrelated Pairs
+    [ ] Identify pairs with correlation < 0.80
+        $ /opt/hft/bin/strategy_manager metrics STAT_ARB_PAIRS_001 --low-correlation
+
+    [ ] Close positions in decorrelated pairs
+        $ /opt/hft/bin/strategy_manager close_pair STAT_ARB_PAIRS_001 --pair AAPL-MSFT
+
+    [ ] Remove from trading universe
+        $ /opt/hft/bin/strategy_manager exclude_pair STAT_ARB_PAIRS_001 --pair AAPL-MSFT
+
+Solution 2: Update Correlation Matrix
+    [ ] Recalculate correlations with recent data
+        $ /opt/hft/scripts/update_correlations.sh --lookback 30
+
+    [ ] Reload strategy with new correlations
+        $ /opt/hft/bin/strategy_manager reload STAT_ARB_PAIRS_001
+
+Solution 3: Widen Z-Score Thresholds
+    [ ] Increase entry threshold
+        $ /opt/hft/bin/strategy_manager set_param STAT_ARB_PAIRS_001 Z_SCORE_ENTRY_THRESHOLD 2.5
+
+    [ ] Reduce position sizes
+        $ /opt/hft/bin/strategy_manager set_param STAT_ARB_PAIRS_001 POSITION_SIZE_DOLLARS 50000
+
+
+ISSUE 8.3: MOMENTUM STRATEGY - WHIPSAW LOSSES
+------------------------------------------------------------
+Severity: P2
+
+Symptoms:
+    - Frequent small losses
+    - Win rate declining
+    - Momentum signals reversing quickly
+    - Choppy market conditions
+
+Diagnostic Steps:
+    [ ] Check win rate
+        $ /opt/hft/bin/strategy_manager metrics MOMENTUM_ST_001 --metric win_rate
+
+    [ ] Review recent trades
+        $ /opt/hft/bin/strategy_manager trades MOMENTUM_ST_001 --last 100
+
+    [ ] Check market conditions
+        $ /opt/hft/bin/market_analysis volatility
+        $ /opt/hft/bin/market_analysis trend_strength
+
+Solutions:
+
+Solution 1: Increase Signal Threshold
+    [ ] Raise momentum threshold
+        $ /opt/hft/bin/strategy_manager set_param MOMENTUM_ST_001 MOMENTUM_THRESHOLD 0.80
+
+    [ ] Require stronger signals to trade
+
+Solution 2: Add Volatility Filter
+    [ ] Enable volatility filtering
+        $ /opt/hft/bin/strategy_manager set_param MOMENTUM_ST_001 VOLATILITY_FILTER_ENABLED true
+
+    [ ] Set appropriate threshold
+        $ /opt/hft/bin/strategy_manager set_param MOMENTUM_ST_001 MAX_VOLATILITY_PERCENTILE 0.90
+
+Solution 3: Reduce Position Sizes
+    [ ] Lower position sizes in choppy markets
+        $ /opt/hft/bin/strategy_manager set_size MOMENTUM_ST_001 --size 50%
+
+    [ ] Monitor market conditions
+        $ /opt/hft/bin/market_analysis trend_strength
+
+    [ ] Restore size when trends emerge
+
+
+================================================================================
+SECTION 9: LOGGING AND DIAGNOSTICS
+================================================================================
+
+USEFUL LOG LOCATIONS:
+------------------------------------------------------------
+Application Logs:
+    Trading Engine: /var/log/hft/trading.log
+    OMS: /var/log/hft/oms.log
+    Risk Engine: /var/log/hft/risk.log
+    Market Data: /var/log/hft/marketdata/
+    Strategies: /var/log/hft/strategies/
+    Web Interface: /var/log/hft/web.log
+
+System Logs:
+    System: /var/log/syslog
+    Kernel: /var/log/kern.log
+    Authentication: /var/log/auth.log
+    Services: journalctl -u [service_name]
+
+USEFUL DIAGNOSTIC COMMANDS:
+------------------------------------------------------------
+System Health:
+    $ /opt/hft/scripts/health_check.sh
+    $ ansible-playbook /opt/hft/playbooks/health_check.yml
+
+Performance Metrics:
+    $ /opt/hft/scripts/generate_metrics_report.sh
+    $ /opt/hft/bin/strategy_manager metrics --all
+
+Position & Risk:
+    $ /opt/hft/bin/risk_client position_summary
+    $ /opt/hft/bin/risk_client pnl_summary
+    $ /opt/hft/bin/risk_client limit_status
+
+Order Management:
+    $ /opt/hft/bin/oms_client order_stats
+    $ /opt/hft/bin/oms_client recent_trades
+    $ /opt/hft/bin/oms_client rejection_stats
+
+Market Data:
+    $ /opt/hft/scripts/check_feed_status.sh
+    $ /opt/hft/bin/marketdata_client message_rates
+    $ /opt/hft/bin/marketdata_client verify_freshness
+
+
+================================================================================
+SECTION 10: ESCALATION PROCEDURES
+================================================================================
+
+WHEN TO ESCALATE:
+------------------------------------------------------------
+Escalate to Senior Developer:
+    - Cannot resolve issue in 15 minutes (P0/P1)
+    - Issue requires architectural knowledge
+    - Issue affects multiple components
+    - Need additional access/permissions
+
+Escalate to Management:
+    - P0 incident lasting > 30 minutes
+    - Major financial impact
+    - Regulatory implications
+    - External vendor coordination needed
+
+Escalate to Risk Manager:
+    - Risk limit breaches
+    - Unusual P&L movements
+    - Position reconciliation issues
+    - Suspected trading errors
+
+Escalate to Vendor:
+    - Exchange connectivity issues
+    - Market data feed problems
+    - Third-party service failures
+    - Infrastructure issues
+
+ESCALATION CONTACTS:
+------------------------------------------------------------
+Development Team:
+    Bob Johnson (Senior Dev): +1-555-0100
+    Charlie Brown (Lead Dev): +1-555-0102
+    Diana Chen (Senior Dev): +1-555-0104
+
+Management:
+    VP Engineering: +1-555-0110
+    CTO: +1-555-0111
+
+Risk Management:
+    Risk Manager: +1-555-0115
+
+Operations:
+    Operations Manager: +1-555-0120
+
+External:
+    NYSE Support: +1-555-0130
+    NASDAQ Support: +1-555-0131
+    Network Provider: +1-555-0132
+
+
+================================================================================
+END OF TROUBLESHOOTING GUIDE
+================================================================================
+
+For additions or corrections to this guide, contact:
+    Bob Johnson: bob.johnson@hftsystem.local
+    Charlie Brown: charlie.brown@hftsystem.local
+    Diana Chen: diana.chen@hftsystem.local

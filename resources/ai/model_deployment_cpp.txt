@@ -1,0 +1,966 @@
+MODEL DEPLOYMENT IN C++ FOR HFT
+================================
+
+TABLE OF CONTENTS
+-----------------
+1. Deployment Architecture
+2. ONNX Runtime Integration
+3. TensorRT Optimization
+4. Model Serving Infrastructure
+5. Batch vs Streaming Inference
+6. Memory Management
+7. Multi-threading Strategy
+8. Performance Monitoring
+9. Model Versioning
+10. Production Best Practices
+
+================================================================================
+1. DEPLOYMENT ARCHITECTURE
+================================================================================
+
+1.1 SYSTEM OVERVIEW
+-------------------
+
+Production ML Pipeline:
+Market Data → Feature Extraction → Model Inference → Trading Decision
+    ↓              ↓                     ↓                  ↓
+ <10μs         50-100μs            100-500μs          <10μs
+
+Total latency budget: <1ms end-to-end
+
+Architecture Layers:
+1. Data Layer: Market data ingestion and preprocessing
+2. Feature Layer: Real-time feature computation
+3. Model Layer: ML model inference
+4. Decision Layer: Trading logic and risk management
+5. Execution Layer: Order routing and management
+
+Key Requirements:
+- Ultra-low latency (<1ms)
+- High throughput (>10K predictions/sec)
+- Fault tolerance and graceful degradation
+- Hot model swapping without downtime
+- Comprehensive monitoring and logging
+
+1.2 DEPLOYMENT OPTIONS
+----------------------
+
+Option 1: CPU Inference (ONNX Runtime)
+Pros:
+- Low latency (100-500μs)
+- Deterministic performance
+- No GPU dependency
+- Lower infrastructure cost
+
+Cons:
+- Limited throughput
+- Less efficient for large models
+
+Option 2: GPU Inference (TensorRT)
+Pros:
+- Very low latency (50-200μs)
+- High throughput
+- Efficient for complex models
+
+Cons:
+- GPU resource requirements
+- Batching needed for efficiency
+- Non-deterministic latency
+
+Option 3: Hybrid (CPU for latency-critical, GPU for batch)
+Pros:
+- Best of both worlds
+- Flexible resource allocation
+
+Cons:
+- More complex infrastructure
+- Higher operational overhead
+
+================================================================================
+2. ONNX RUNTIME INTEGRATION
+================================================================================
+
+2.1 PRODUCTION-GRADE ONNX WRAPPER
+----------------------------------
+
+#include <onnxruntime/core/session/onnxruntime_cxx_api.h>
+#include <memory>
+#include <vector>
+#include <string>
+#include <chrono>
+#include <mutex>
+
+class ONNXModel {
+private:
+    // ONNX Runtime objects
+    std::unique_ptr<Ort::Env> env_;
+    std::unique_ptr<Ort::Session> session_;
+    Ort::SessionOptions session_options_;
+    Ort::MemoryInfo memory_info_;
+
+    // Model metadata
+    std::vector<std::string> input_names_;
+    std::vector<std::string> output_names_;
+    std::vector<std::vector<int64_t>> input_shapes_;
+    std::vector<std::vector<int64_t>> output_shapes_;
+
+    // Performance tracking
+    struct Stats {
+        uint64_t total_inferences = 0;
+        uint64_t total_latency_ns = 0;
+        uint64_t max_latency_ns = 0;
+        uint64_t min_latency_ns = UINT64_MAX;
+        std::mutex mutex;
+
+        void update(uint64_t latency_ns) {
+            std::lock_guard<std::mutex> lock(mutex);
+            total_inferences++;
+            total_latency_ns += latency_ns;
+            max_latency_ns = std::max(max_latency_ns, latency_ns);
+            min_latency_ns = std::min(min_latency_ns, latency_ns);
+        }
+
+        double avg_latency_us() const {
+            return total_inferences > 0 ?
+                (total_latency_ns / total_inferences) / 1000.0 : 0.0;
+        }
+    };
+
+    Stats stats_;
+
+public:
+    ONNXModel() : memory_info_(Ort::MemoryInfo::CreateCpu(
+        OrtArenaAllocator, OrtMemTypeDefault)) {
+
+        env_ = std::make_unique<Ort::Env>(
+            ORT_LOGGING_LEVEL_WARNING, "HFT_Model");
+
+        // Optimize session for production
+        configure_session_options();
+    }
+
+    void load_model(const std::string& model_path) {
+        // Create session
+        session_ = std::make_unique<Ort::Session>(
+            *env_, model_path.c_str(), session_options_);
+
+        // Extract model metadata
+        extract_model_metadata();
+
+        std::cout << "Model loaded successfully from: " << model_path << "\n";
+        print_model_info();
+    }
+
+    // Single prediction
+    std::vector<float> predict(const std::vector<float>& input_data) {
+        auto start = std::chrono::high_resolution_clock::now();
+
+        // Validate input size
+        size_t expected_size = 1;
+        for (auto dim : input_shapes_[0]) {
+            if (dim > 0) expected_size *= dim;
+        }
+
+        if (input_data.size() != expected_size) {
+            throw std::runtime_error(
+                "Input size mismatch: expected " + std::to_string(expected_size) +
+                ", got " + std::to_string(input_data.size()));
+        }
+
+        // Create input tensor
+        std::vector<Ort::Value> input_tensors;
+        input_tensors.push_back(Ort::Value::CreateTensor<float>(
+            memory_info_,
+            const_cast<float*>(input_data.data()),
+            input_data.size(),
+            input_shapes_[0].data(),
+            input_shapes_[0].size()));
+
+        // Prepare input/output names
+        std::vector<const char*> input_names_char;
+        for (const auto& name : input_names_) {
+            input_names_char.push_back(name.c_str());
+        }
+
+        std::vector<const char*> output_names_char;
+        for (const auto& name : output_names_) {
+            output_names_char.push_back(name.c_str());
+        }
+
+        // Run inference
+        auto output_tensors = session_->Run(
+            Ort::RunOptions{nullptr},
+            input_names_char.data(),
+            input_tensors.data(),
+            input_tensors.size(),
+            output_names_char.data(),
+            output_names_char.size());
+
+        // Extract output
+        float* output_data = output_tensors[0].GetTensorMutableData<float>();
+        size_t output_size = 1;
+        for (auto dim : output_shapes_[0]) {
+            if (dim > 0) output_size *= dim;
+        }
+
+        std::vector<float> output(output_data, output_data + output_size);
+
+        auto end = std::chrono::high_resolution_clock::now();
+        uint64_t latency_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            end - start).count();
+
+        stats_.update(latency_ns);
+
+        return output;
+    }
+
+    // Batch prediction (more efficient)
+    std::vector<std::vector<float>> predict_batch(
+        const std::vector<std::vector<float>>& batch_input) {
+
+        if (batch_input.empty()) {
+            return {};
+        }
+
+        size_t batch_size = batch_input.size();
+        size_t feature_size = batch_input[0].size();
+
+        // Flatten batch
+        std::vector<float> flat_input;
+        flat_input.reserve(batch_size * feature_size);
+        for (const auto& input : batch_input) {
+            flat_input.insert(flat_input.end(), input.begin(), input.end());
+        }
+
+        // Create dynamic batch shape
+        std::vector<int64_t> batch_shape = input_shapes_[0];
+        batch_shape[0] = static_cast<int64_t>(batch_size);
+
+        std::vector<Ort::Value> input_tensors;
+        input_tensors.push_back(Ort::Value::CreateTensor<float>(
+            memory_info_,
+            flat_input.data(),
+            flat_input.size(),
+            batch_shape.data(),
+            batch_shape.size()));
+
+        std::vector<const char*> input_names_char;
+        for (const auto& name : input_names_) {
+            input_names_char.push_back(name.c_str());
+        }
+
+        std::vector<const char*> output_names_char;
+        for (const auto& name : output_names_) {
+            output_names_char.push_back(name.c_str());
+        }
+
+        auto output_tensors = session_->Run(
+            Ort::RunOptions{nullptr},
+            input_names_char.data(),
+            input_tensors.data(),
+            input_tensors.size(),
+            output_names_char.data(),
+            output_names_char.size());
+
+        // Extract batch output
+        float* output_data = output_tensors[0].GetTensorMutableData<float>();
+
+        size_t output_feature_size = 1;
+        for (size_t i = 1; i < output_shapes_[0].size(); i++) {
+            output_feature_size *= output_shapes_[0][i];
+        }
+
+        std::vector<std::vector<float>> batch_output(batch_size);
+        for (size_t i = 0; i < batch_size; i++) {
+            batch_output[i].assign(
+                output_data + i * output_feature_size,
+                output_data + (i + 1) * output_feature_size);
+        }
+
+        return batch_output;
+    }
+
+    const Stats& get_stats() const { return stats_; }
+
+    void reset_stats() {
+        std::lock_guard<std::mutex> lock(stats_.mutex);
+        stats_ = Stats();
+    }
+
+    void print_stats() const {
+        std::lock_guard<std::mutex> lock(stats_.mutex);
+        std::cout << "Model Performance Statistics:\n";
+        std::cout << "  Total Inferences: " << stats_.total_inferences << "\n";
+        std::cout << "  Avg Latency: " << stats_.avg_latency_us() << " μs\n";
+        std::cout << "  Min Latency: " << (stats_.min_latency_ns / 1000.0) << " μs\n";
+        std::cout << "  Max Latency: " << (stats_.max_latency_ns / 1000.0) << " μs\n";
+    }
+
+private:
+    void configure_session_options() {
+        // Execution mode
+        session_options_.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
+
+        // Thread optimization
+        session_options_.SetIntraOpNumThreads(1);  // Single-threaded for latency
+        session_options_.SetInterOpNumThreads(1);
+
+        // Graph optimization
+        session_options_.SetGraphOptimizationLevel(
+            GraphOptimizationLevel::ORT_ENABLE_ALL);
+
+        // Memory optimization
+        session_options_.AddConfigEntry(
+            "session.intra_op.allow_spinning", "1");
+        session_options_.AddConfigEntry(
+            "session.inter_op.allow_spinning", "1");
+
+        // Disable profiling in production
+        session_options_.EnableProfiling("onnx_profile");
+        session_options_.DisableProfiling();
+    }
+
+    void extract_model_metadata() {
+        Ort::AllocatorWithDefaultOptions allocator;
+
+        // Input metadata
+        size_t num_inputs = session_->GetInputCount();
+        for (size_t i = 0; i < num_inputs; i++) {
+            auto input_name = session_->GetInputNameAllocated(i, allocator);
+            input_names_.push_back(input_name.get());
+
+            auto type_info = session_->GetInputTypeInfo(i);
+            auto tensor_info = type_info.GetTensorTypeAndShapeInfo();
+            input_shapes_.push_back(tensor_info.GetShape());
+        }
+
+        // Output metadata
+        size_t num_outputs = session_->GetOutputCount();
+        for (size_t i = 0; i < num_outputs; i++) {
+            auto output_name = session_->GetOutputNameAllocated(i, allocator);
+            output_names_.push_back(output_name.get());
+
+            auto type_info = session_->GetOutputTypeInfo(i);
+            auto tensor_info = type_info.GetTensorTypeAndShapeInfo();
+            output_shapes_.push_back(tensor_info.GetShape());
+        }
+    }
+
+    void print_model_info() const {
+        std::cout << "Model Information:\n";
+        std::cout << "  Inputs: " << input_names_.size() << "\n";
+        for (size_t i = 0; i < input_names_.size(); i++) {
+            std::cout << "    " << input_names_[i] << " shape: [";
+            for (size_t j = 0; j < input_shapes_[i].size(); j++) {
+                std::cout << input_shapes_[i][j];
+                if (j < input_shapes_[i].size() - 1) std::cout << ", ";
+            }
+            std::cout << "]\n";
+        }
+
+        std::cout << "  Outputs: " << output_names_.size() << "\n";
+        for (size_t i = 0; i < output_names_.size(); i++) {
+            std::cout << "    " << output_names_[i] << " shape: [";
+            for (size_t j = 0; j < output_shapes_[i].size(); j++) {
+                std::cout << output_shapes_[i][j];
+                if (j < output_shapes_[i].size() - 1) std::cout << ", ";
+            }
+            std::cout << "]\n";
+        }
+    }
+};
+
+================================================================================
+3. TENSORRT OPTIMIZATION
+================================================================================
+
+3.1 TENSORRT ENGINE BUILDER
+----------------------------
+
+#include <NvInfer.h>
+#include <NvOnnxParser.h>
+#include <cuda_runtime_api.h>
+#include <fstream>
+#include <iostream>
+
+class Logger : public nvinfer1::ILogger {
+public:
+    void log(Severity severity, const char* msg) noexcept override {
+        if (severity <= Severity::kWARNING) {
+            std::cout << msg << std::endl;
+        }
+    }
+};
+
+class TensorRTEngine {
+private:
+    Logger logger_;
+    nvinfer1::IRuntime* runtime_;
+    nvinfer1::ICudaEngine* engine_;
+    nvinfer1::IExecutionContext* context_;
+
+    std::vector<void*> buffers_;
+    cudaStream_t stream_;
+
+    std::vector<int> input_indices_;
+    std::vector<int> output_indices_;
+    std::vector<size_t> buffer_sizes_;
+
+    struct Stats {
+        uint64_t total_inferences = 0;
+        uint64_t total_latency_ns = 0;
+    };
+    Stats stats_;
+
+public:
+    TensorRTEngine() : runtime_(nullptr), engine_(nullptr), context_(nullptr) {
+        cudaStreamCreate(&stream_);
+    }
+
+    ~TensorRTEngine() {
+        cleanup();
+    }
+
+    // Build engine from ONNX model
+    bool build_from_onnx(const std::string& onnx_file,
+                        const std::string& engine_file,
+                        bool use_fp16 = true,
+                        int max_batch_size = 32) {
+
+        auto builder = nvinfer1::createInferBuilder(logger_);
+        if (!builder) {
+            std::cerr << "Failed to create builder\n";
+            return false;
+        }
+
+        const auto explicit_batch = 1U << static_cast<uint32_t>(
+            nvinfer1::NetworkDefinitionCreationFlag::kEXPLICIT_BATCH);
+        auto network = builder->createNetworkV2(explicit_batch);
+        if (!network) {
+            std::cerr << "Failed to create network\n";
+            return false;
+        }
+
+        auto parser = nvonnxparser::createParser(*network, logger_);
+        if (!parser) {
+            std::cerr << "Failed to create parser\n";
+            return false;
+        }
+
+        // Parse ONNX file
+        if (!parser->parseFromFile(onnx_file.c_str(),
+                                   static_cast<int>(nvinfer1::ILogger::Severity::kWARNING))) {
+            std::cerr << "Failed to parse ONNX file\n";
+            return false;
+        }
+
+        // Build engine config
+        auto config = builder->createBuilderConfig();
+        config->setMaxWorkspaceSize(1ULL << 30);  // 1GB
+
+        if (use_fp16 && builder->platformHasFastFp16()) {
+            config->setFlag(nvinfer1::BuilderFlag::kFP16);
+            std::cout << "Using FP16 precision\n";
+        }
+
+        // Enable DLA if available
+        if (builder->getNbDLACores() > 0) {
+            config->setDefaultDeviceType(nvinfer1::DeviceType::kDLA);
+            config->setDLACore(0);
+            std::cout << "Using DLA core\n";
+        }
+
+        // Build engine
+        std::cout << "Building TensorRT engine (this may take a while)...\n";
+        auto serialized_engine = builder->buildSerializedNetwork(*network, *config);
+        if (!serialized_engine) {
+            std::cerr << "Failed to build engine\n";
+            return false;
+        }
+
+        // Save engine to file
+        std::ofstream file(engine_file, std::ios::binary);
+        file.write(reinterpret_cast<const char*>(serialized_engine->data()),
+                  serialized_engine->size());
+
+        std::cout << "Engine saved to: " << engine_file << "\n";
+
+        // Clean up
+        delete serialized_engine;
+        delete config;
+        delete parser;
+        delete network;
+        delete builder;
+
+        return true;
+    }
+
+    // Load pre-built engine
+    bool load_engine(const std::string& engine_file) {
+        // Read engine file
+        std::ifstream file(engine_file, std::ios::binary);
+        if (!file.good()) {
+            std::cerr << "Failed to open engine file: " << engine_file << "\n";
+            return false;
+        }
+
+        file.seekg(0, std::ios::end);
+        size_t size = file.tellg();
+        file.seekg(0, std::ios::beg);
+
+        std::vector<char> engine_data(size);
+        file.read(engine_data.data(), size);
+
+        // Deserialize engine
+        runtime_ = nvinfer1::createInferRuntime(logger_);
+        engine_ = runtime_->deserializeCudaEngine(engine_data.data(), size);
+        if (!engine_) {
+            std::cerr << "Failed to deserialize engine\n";
+            return false;
+        }
+
+        context_ = engine_->createExecutionContext();
+        if (!context_) {
+            std::cerr << "Failed to create execution context\n";
+            return false;
+        }
+
+        // Allocate buffers
+        allocate_buffers();
+
+        std::cout << "TensorRT engine loaded successfully\n";
+        print_engine_info();
+
+        return true;
+    }
+
+    // Synchronous inference
+    std::vector<float> infer(const std::vector<float>& input) {
+        auto start = std::chrono::high_resolution_clock::now();
+
+        // Copy input to GPU
+        size_t input_idx = input_indices_[0];
+        cudaMemcpyAsync(buffers_[input_idx], input.data(),
+                       buffer_sizes_[input_idx],
+                       cudaMemcpyHostToDevice, stream_);
+
+        // Execute inference
+        context_->enqueueV2(buffers_.data(), stream_, nullptr);
+
+        // Copy output from GPU
+        size_t output_idx = output_indices_[0];
+        size_t output_size = buffer_sizes_[output_idx] / sizeof(float);
+        std::vector<float> output(output_size);
+
+        cudaMemcpyAsync(output.data(), buffers_[output_idx],
+                       buffer_sizes_[output_idx],
+                       cudaMemcpyDeviceToHost, stream_);
+
+        cudaStreamSynchronize(stream_);
+
+        auto end = std::chrono::high_resolution_clock::now();
+        uint64_t latency_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            end - start).count();
+
+        stats_.total_inferences++;
+        stats_.total_latency_ns += latency_ns;
+
+        return output;
+    }
+
+    // Batch inference
+    std::vector<std::vector<float>> infer_batch(
+        const std::vector<std::vector<float>>& batch_input) {
+
+        size_t batch_size = batch_input.size();
+        if (batch_size == 0) return {};
+
+        // Flatten batch
+        std::vector<float> flat_input;
+        flat_input.reserve(batch_size * batch_input[0].size());
+        for (const auto& input : batch_input) {
+            flat_input.insert(flat_input.end(), input.begin(), input.end());
+        }
+
+        // Copy to GPU
+        size_t input_idx = input_indices_[0];
+        cudaMemcpyAsync(buffers_[input_idx], flat_input.data(),
+                       flat_input.size() * sizeof(float),
+                       cudaMemcpyHostToDevice, stream_);
+
+        // Execute
+        context_->enqueueV2(buffers_.data(), stream_, nullptr);
+
+        // Copy output
+        size_t output_idx = output_indices_[0];
+        size_t output_feature_size = buffer_sizes_[output_idx] / (batch_size * sizeof(float));
+
+        std::vector<float> flat_output(batch_size * output_feature_size);
+        cudaMemcpyAsync(flat_output.data(), buffers_[output_idx],
+                       batch_size * output_feature_size * sizeof(float),
+                       cudaMemcpyDeviceToHost, stream_);
+
+        cudaStreamSynchronize(stream_);
+
+        // Unflatten output
+        std::vector<std::vector<float>> batch_output(batch_size);
+        for (size_t i = 0; i < batch_size; i++) {
+            batch_output[i].assign(
+                flat_output.begin() + i * output_feature_size,
+                flat_output.begin() + (i + 1) * output_feature_size);
+        }
+
+        return batch_output;
+    }
+
+    void print_stats() const {
+        if (stats_.total_inferences > 0) {
+            double avg_latency_us = (stats_.total_latency_ns / stats_.total_inferences) / 1000.0;
+            std::cout << "TensorRT Performance:\n";
+            std::cout << "  Total Inferences: " << stats_.total_inferences << "\n";
+            std::cout << "  Avg Latency: " << avg_latency_us << " μs\n";
+        }
+    }
+
+private:
+    void allocate_buffers() {
+        int num_bindings = engine_->getNbBindings();
+        buffers_.resize(num_bindings);
+        buffer_sizes_.resize(num_bindings);
+
+        for (int i = 0; i < num_bindings; i++) {
+            auto dims = engine_->getBindingDimensions(i);
+            size_t size = 1;
+            for (int j = 0; j < dims.nbDims; j++) {
+                size *= dims.d[j];
+            }
+
+            size_t byte_size = size * sizeof(float);
+            buffer_sizes_[i] = byte_size;
+
+            cudaMalloc(&buffers_[i], byte_size);
+
+            if (engine_->bindingIsInput(i)) {
+                input_indices_.push_back(i);
+            } else {
+                output_indices_.push_back(i);
+            }
+        }
+    }
+
+    void print_engine_info() const {
+        std::cout << "Engine Information:\n";
+        std::cout << "  Bindings: " << engine_->getNbBindings() << "\n";
+
+        for (int i = 0; i < engine_->getNbBindings(); i++) {
+            auto dims = engine_->getBindingDimensions(i);
+            std::cout << "  " << engine_->getBindingName(i)
+                     << (engine_->bindingIsInput(i) ? " (Input)" : " (Output)")
+                     << " shape: [";
+            for (int j = 0; j < dims.nbDims; j++) {
+                std::cout << dims.d[j];
+                if (j < dims.nbDims - 1) std::cout << ", ";
+            }
+            std::cout << "]\n";
+        }
+    }
+
+    void cleanup() {
+        for (void* buffer : buffers_) {
+            if (buffer) cudaFree(buffer);
+        }
+
+        if (stream_) cudaStreamDestroy(stream_);
+        if (context_) context_->destroy();
+        if (engine_) engine_->destroy();
+        if (runtime_) runtime_->destroy();
+    }
+};
+
+================================================================================
+4. MODEL SERVING INFRASTRUCTURE
+================================================================================
+
+4.1 MODEL SERVER WITH HOT SWAPPING
+-----------------------------------
+
+#include <atomic>
+#include <thread>
+#include <filesystem>
+
+class ModelServer {
+private:
+    // Current active model
+    std::shared_ptr<ONNXModel> active_model_;
+    std::mutex model_mutex_;
+
+    // Model versioning
+    std::string current_model_path_;
+    std::atomic<int> model_version_{0};
+
+    // Model hot-swapping
+    std::atomic<bool> running_{true};
+    std::thread watcher_thread_;
+
+    // Feature normalizer
+    std::unique_ptr<FeatureNormalizer> normalizer_;
+
+public:
+    ModelServer() {
+        normalizer_ = std::make_unique<FeatureNormalizer>(200);
+    }
+
+    ~ModelServer() {
+        running_ = false;
+        if (watcher_thread_.joinable()) {
+            watcher_thread_.join();
+        }
+    }
+
+    bool load_model(const std::string& model_path,
+                   const std::string& normalizer_path = "") {
+        try {
+            auto new_model = std::make_shared<ONNXModel>();
+            new_model->load_model(model_path);
+
+            // Load normalizer if provided
+            if (!normalizer_path.empty()) {
+                normalizer_->load(normalizer_path);
+            }
+
+            // Atomic swap
+            {
+                std::lock_guard<std::mutex> lock(model_mutex_);
+                active_model_ = new_model;
+                current_model_path_ = model_path;
+                model_version_++;
+            }
+
+            std::cout << "Model loaded successfully, version: "
+                     << model_version_ << "\n";
+            return true;
+
+        } catch (const std::exception& e) {
+            std::cerr << "Failed to load model: " << e.what() << "\n";
+            return false;
+        }
+    }
+
+    std::vector<float> predict(const std::vector<float>& features) {
+        // Normalize features
+        auto normalized = normalizer_->transform(features);
+
+        // Get model under shared lock
+        std::shared_ptr<ONNXModel> model;
+        {
+            std::lock_guard<std::mutex> lock(model_mutex_);
+            model = active_model_;
+        }
+
+        if (!model) {
+            throw std::runtime_error("No model loaded");
+        }
+
+        return model->predict(normalized);
+    }
+
+    std::vector<std::vector<float>> predict_batch(
+        const std::vector<std::vector<float>>& batch_features) {
+
+        // Normalize batch
+        std::vector<std::vector<float>> normalized_batch;
+        normalized_batch.reserve(batch_features.size());
+        for (const auto& features : batch_features) {
+            normalized_batch.push_back(normalizer_->transform(features));
+        }
+
+        // Get model
+        std::shared_ptr<ONNXModel> model;
+        {
+            std::lock_guard<std::mutex> lock(model_mutex_);
+            model = active_model_;
+        }
+
+        if (!model) {
+            throw std::runtime_error("No model loaded");
+        }
+
+        return model->predict_batch(normalized_batch);
+    }
+
+    // Start watching for model updates
+    void start_watching(const std::string& model_dir, int check_interval_sec = 60) {
+        watcher_thread_ = std::thread([this, model_dir, check_interval_sec]() {
+            auto last_write_time = std::filesystem::last_write_time(current_model_path_);
+
+            while (running_) {
+                std::this_thread::sleep_for(std::chrono::seconds(check_interval_sec));
+
+                try {
+                    auto current_write_time = std::filesystem::last_write_time(
+                        current_model_path_);
+
+                    if (current_write_time > last_write_time) {
+                        std::cout << "Detected model update, reloading...\n";
+                        load_model(current_model_path_);
+                        last_write_time = current_write_time;
+                    }
+                } catch (const std::exception& e) {
+                    std::cerr << "Error checking model updates: " << e.what() << "\n";
+                }
+            }
+        });
+    }
+
+    int get_version() const { return model_version_; }
+
+    void print_stats() const {
+        std::lock_guard<std::mutex> lock(model_mutex_);
+        if (active_model_) {
+            active_model_->print_stats();
+        }
+    }
+};
+
+================================================================================
+5. PRODUCTION DEPLOYMENT EXAMPLE
+================================================================================
+
+5.1 COMPLETE TRADING SYSTEM
+----------------------------
+
+class MLTradingSystem {
+private:
+    ModelServer model_server_;
+    FeatureVectorBuilder feature_builder_;
+
+    struct PredictionCache {
+        float value;
+        int64_t timestamp;
+        bool valid;
+        std::mutex mutex;
+    };
+
+    PredictionCache prediction_cache_;
+
+public:
+    MLTradingSystem(const std::string& model_path,
+                   const std::string& normalizer_path) {
+        // Load model
+        if (!model_server_.load_model(model_path, normalizer_path)) {
+            throw std::runtime_error("Failed to load model");
+        }
+
+        // Start model watching for hot updates
+        model_server_.start_watching("./models", 60);
+
+        prediction_cache_.valid = false;
+    }
+
+    void on_market_data(const OrderBookSnapshot& ob,
+                       const std::vector<Trade>& trades) {
+        // Update features
+        feature_builder_.update(ob, trades);
+
+        // Extract feature vector
+        auto features = feature_builder_.build_features();
+
+        // Get prediction
+        auto prediction = model_server_.predict(features);
+
+        // Update cache
+        {
+            std::lock_guard<std::mutex> lock(prediction_cache_.mutex);
+            prediction_cache_.value = prediction[0];
+            prediction_cache_.timestamp = ob.timestamp;
+            prediction_cache_.valid = true;
+        }
+    }
+
+    float get_current_prediction() const {
+        std::lock_guard<std::mutex> lock(prediction_cache_.mutex);
+        return prediction_cache_.valid ? prediction_cache_.value : 0.5f;
+    }
+
+    bool should_buy(double threshold = 0.55) const {
+        return get_current_prediction() > threshold;
+    }
+
+    bool should_sell(double threshold = 0.45) const {
+        return get_current_prediction() < threshold;
+    }
+
+    void print_system_stats() const {
+        std::cout << "\n=== ML Trading System Stats ===\n";
+        std::cout << "Model Version: " << model_server_.get_version() << "\n";
+        model_server_.print_stats();
+    }
+};
+
+// Usage Example
+int main() {
+    try {
+        // Initialize system
+        MLTradingSystem trading_system(
+            "models/price_predictor.onnx",
+            "models/normalizer.txt");
+
+        // Simulate market data processing
+        for (int i = 0; i < 10000; i++) {
+            OrderBookSnapshot ob = get_market_data();  // Your data source
+            std::vector<Trade> trades = get_recent_trades();
+
+            trading_system.on_market_data(ob, trades);
+
+            // Trading decision
+            if (trading_system.should_buy()) {
+                // Execute buy order
+            } else if (trading_system.should_sell()) {
+                // Execute sell order
+            }
+        }
+
+        // Print statistics
+        trading_system.print_system_stats();
+
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << "\n";
+        return 1;
+    }
+
+    return 0;
+}
+
+================================================================================
+6. PERFORMANCE BENCHMARKS
+================================================================================
+
+Deployment Performance:
+----------------------
+
+CPU Inference (ONNX Runtime):
+- Single prediction: 200-500 μs
+- Batch (32): 3-6 ms (50-190 μs/sample)
+- Throughput: 2,000-5,000 predictions/sec
+
+GPU Inference (TensorRT FP16):
+- Single prediction: 80-200 μs
+- Batch (32): 1-2 ms (30-60 μs/sample)
+- Throughput: 15,000-30,000 predictions/sec
+
+Memory Usage:
+- ONNX Model: 500KB - 2MB
+- TensorRT Engine: 200KB - 1MB (optimized)
+- Feature Buffer: 100KB per stream
+- Total Runtime: 10-50 MB
+
+End-to-End Latency:
+- Market Data Arrival: 0 μs
+- Feature Extraction: 50-100 μs
+- Model Inference: 200-500 μs
+- Trading Decision: 10-20 μs
+- Total: 260-620 μs (well under 1ms target)
+
+================================================================================
+END OF DOCUMENT
+================================================================================

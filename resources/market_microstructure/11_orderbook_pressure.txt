@@ -1,0 +1,226 @@
+================================================================================
+ORDER BOOK PRESSURE INDICATORS
+High-Frequency Trading System Documentation
+================================================================================
+
+Order book pressure measures buying vs. selling interest through limit order flow.
+
+KEY METRICS:
+
+1. ORDER BOOK IMBALANCE (OBI):
+OBI = (Bid Volume - Ask Volume) / (Bid Volume + Ask Volume)
+
+Range: [-1, +1]
+- OBI > 0.3: Strong buy pressure
+- OBI < -0.3: Strong sell pressure
+
+class OrderBookPressure {
+private:
+    int64_t bid_volume_;
+    int64_t ask_volume_;
+    
+public:
+    void update(int64_t bid_vol, int64_t ask_vol) {
+        bid_volume_ = bid_vol;
+        ask_volume_ = ask_vol;
+    }
+    
+    double imbalance() const {
+        if (bid_volume_ + ask_volume_ == 0) return 0.0;
+        return (double)(bid_volume_ - ask_volume_) / 
+               (bid_volume_ + ask_volume_);
+    }
+    
+    enum class Signal { STRONG_BUY, BUY, NEUTRAL, SELL, STRONG_SELL };
+    
+    Signal get_signal() const {
+        double imb = imbalance();
+        if (imb > 0.5) return Signal::STRONG_BUY;
+        if (imb > 0.2) return Signal::BUY;
+        if (imb < -0.5) return Signal::STRONG_SELL;
+        if (imb < -0.2) return Signal::SELL;
+        return Signal::NEUTRAL;
+    }
+};
+
+2. WEIGHTED IMBALANCE:
+Weights levels by distance from mid-price.
+
+WI = Σ(Bid_i / Distance_i) - Σ(Ask_i / Distance_i)
+
+Gives more importance to near-touch liquidity.
+
+class WeightedImbalance {
+public:
+    static double calculate(
+        const std::vector<std::pair<double, int64_t>>& bids,  // price, volume
+        const std::vector<std::pair<double, int64_t>>& asks,
+        double mid_price
+    ) {
+        double bid_weighted = 0.0;
+        for (const auto& [price, volume] : bids) {
+            double distance = mid_price - price;
+            if (distance > 0) {
+                bid_weighted += volume / distance;
+            }
+        }
+        
+        double ask_weighted = 0.0;
+        for (const auto& [price, volume] : asks) {
+            double distance = price - mid_price;
+            if (distance > 0) {
+                ask_weighted += volume / distance;
+            }
+        }
+        
+        if (bid_weighted + ask_weighted == 0) return 0.0;
+        return (bid_weighted - ask_weighted) / (bid_weighted + ask_weighted);
+    }
+};
+
+3. DEPTH PRESSURE:
+Measures rate of change in order book depth.
+
+ΔDepth/Δt = (Depth_now - Depth_prev) / Time_elapsed
+
+class DepthPressure {
+private:
+    struct DepthSnapshot {
+        int64_t bid_depth;
+        int64_t ask_depth;
+        uint64_t timestamp_us;
+    };
+    
+    DepthSnapshot current_;
+    DepthSnapshot previous_;
+    
+public:
+    void update(int64_t bid_depth, int64_t ask_depth, uint64_t timestamp) {
+        previous_ = current_;
+        current_ = {bid_depth, ask_depth, timestamp};
+    }
+    
+    double bid_pressure_rate() const {
+        uint64_t time_diff = current_.timestamp_us - previous_.timestamp_us;
+        if (time_diff == 0) return 0.0;
+        
+        double time_sec = time_diff / 1e6;
+        return (current_.bid_depth - previous_.bid_depth) / time_sec;
+    }
+    
+    double ask_pressure_rate() const {
+        uint64_t time_diff = current_.timestamp_us - previous_.timestamp_us;
+        if (time_diff == 0) return 0.0;
+        
+        double time_sec = time_diff / 1e6;
+        return (current_.ask_depth - previous_.ask_depth) / time_sec;
+    }
+    
+    bool is_rapid_bid_buildup(double threshold = 10000.0) const {
+        return bid_pressure_rate() > threshold;  // 10K shares/sec
+    }
+    
+    bool is_rapid_ask_buildup(double threshold = 10000.0) const {
+        return ask_pressure_rate() > threshold;
+    }
+};
+
+4. QUEUE POSITION PRESSURE:
+Tracks your position in the order queue.
+
+QP = Your_Position / Total_Queue_Size
+
+Lower QP = Higher fill probability
+
+class QueuePositionTracker {
+private:
+    size_t position_;
+    int64_t volume_ahead_;
+    int64_t total_volume_;
+    
+public:
+    void update(size_t pos, int64_t vol_ahead, int64_t total_vol) {
+        position_ = pos;
+        volume_ahead_ = vol_ahead;
+        total_volume_ = total_vol;
+    }
+    
+    double queue_percentage() const {
+        if (total_volume_ == 0) return 1.0;
+        return (double)volume_ahead_ / total_volume_;
+    }
+    
+    double fill_probability(int64_t expected_incoming_volume) const {
+        if (expected_incoming_volume >= volume_ahead_) {
+            return 1.0;
+        }
+        return (double)expected_incoming_volume / volume_ahead_;
+    }
+};
+
+5. SPOOFING DETECTION:
+Identify manipulative order placement patterns.
+
+class SpoofingDetector {
+private:
+    struct OrderEvent {
+        int64_t volume;
+        uint64_t timestamp_us;
+        bool is_cancel;
+    };
+    
+    std::vector<OrderEvent> recent_events_;
+    
+public:
+    void add_large_order(int64_t volume, uint64_t timestamp) {
+        recent_events_.push_back({volume, timestamp, false});
+    }
+    
+    void add_cancel(int64_t volume, uint64_t timestamp) {
+        recent_events_.push_back({volume, timestamp, true});
+    }
+    
+    bool detect_spoof_pattern() const {
+        // Pattern: Large order → Quick cancel without fill
+        // Simplified detection logic
+        
+        if (recent_events_.size() < 2) return false;
+        
+        const auto& last = recent_events_.back();
+        const auto& prev = recent_events_[recent_events_.size() - 2];
+        
+        // Large order followed by immediate cancel
+        if (!prev.is_cancel && last.is_cancel &&
+            prev.volume > 10000 &&
+            (last.timestamp_us - prev.timestamp_us) < 100000) {  // < 100ms
+            return true;
+        }
+        
+        return false;
+    }
+};
+
+TRADING STRATEGIES:
+
+1. Pressure Momentum:
+   - High buy pressure → Go long
+   - High sell pressure → Go short
+   - Exit when pressure reverses
+
+2. Pressure Divergence:
+   - Price rising, pressure falling → Fade
+   - Price falling, pressure rising → Buy
+
+3. Queue Position Optimization:
+   - Join queue early when pressure low
+   - Cancel when position deteriorates
+
+COMBINED PRESSURE INDEX:
+
+CPI = 0.4 × OBI + 0.3 × WeightedImbalance + 0.3 × DepthPressureRate
+
+Normalize to [-1, +1] and generate signals.
+
+================================================================================
+Version: 1.0 | Size: ~20 KB
+================================================================================

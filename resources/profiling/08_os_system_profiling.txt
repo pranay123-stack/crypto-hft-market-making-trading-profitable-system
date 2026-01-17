@@ -1,0 +1,706 @@
+================================================================================
+OS & SYSTEM-LEVEL PROFILING FOR HFT C++
+================================================================================
+
+THEORY:
+-------
+Operating system profiling focuses on:
+1. System resource utilization (CPU, memory, disk, network)
+2. Kernel behavior (syscalls, interrupts, scheduling)
+3. Hardware interactions (I/O, DMA, interrupts)
+4. System-wide performance bottlenecks
+5. OS configuration and tuning
+
+In HFT, the OS can be both enabler and bottleneck:
+- Context switches destroy cache (100+ microseconds penalty)
+- Interrupts cause jitter (unpredictable latency spikes)
+- Scheduler latency affects wake-up times
+- Memory allocator can cause stalls
+- Kernel network stack adds latency
+
+Goal: Minimize OS interference, maximize determinism.
+
+TOOLS OVERVIEW:
+---------------
+1. top/htop - Real-time process monitoring
+2. vmstat - Virtual memory statistics
+3. iostat - I/O statistics
+4. mpstat - Multi-processor statistics
+5. pidstat - Per-process statistics
+6. sar - System Activity Reporter
+7. strace - System call tracer
+8. /proc filesystem - Kernel runtime information
+9. systemtap/eBPF - Dynamic kernel instrumentation
+10. perf - Performance monitoring (kernel + user)
+
+================================================================================
+1. TOP/HTOP - PROCESS MONITORING
+================================================================================
+
+THEORY:
+Real-time view of system resource usage.
+Key metrics:
+- CPU utilization per process/core
+- Memory usage (RSS, VSZ)
+- Load average
+- Process states
+
+INSTALLATION:
+sudo apt-get install htop
+
+PROCESS:
+--------
+# Basic top
+top
+
+# Sort by CPU usage: Press 'P'
+# Sort by memory: Press 'M'
+# Show threads: Press 'H'
+# Show per-core CPU: Press '1'
+
+# htop (better interface)
+htop
+
+# Batch mode for logging
+top -b -n 10 > top_output.txt
+
+HFT-SPECIFIC MONITORING:
+------------------------
+# Monitor specific HFT process
+top -p $(pof your_hft_app)
+
+# Or with htop, filter by process name (F4 key)
+
+KEY METRICS FOR HFT:
+- %CPU should be high for trading threads (close to 100% on pinned cores)
+- %MEM should be stable (no growth = no leaks)
+- Load average should be <= number of active cores
+- No processes in 'D' state (uninterruptible sleep = I/O wait)
+
+INTERPRETING OUTPUT:
+--------------------
+PID  USER  PR  NI  VIRT   RES   SHR S  %CPU  %MEM     TIME+  COMMAND
+1234 user  99 -20  512M   256M  8192 R  99.9   1.2  123:45  trading_engine
+
+PR 99: Real-time priority (good for HFT)
+NI -20: Highest nice value (negative = higher priority)
+S R: Running state (good, not waiting)
+%CPU 99.9: Fully utilizing CPU (expected for busy trading loop)
+RES 256M: Resident memory (should be stable)
+
+RED FLAGS:
+- %CPU fluctuating wildly (context switching issues)
+- RES growing over time (memory leak)
+- Process in 'D' or 'S' state during trading (blocked on I/O or sleeping)
+
+================================================================================
+2. VMSTAT - VIRTUAL MEMORY STATISTICS
+================================================================================
+
+THEORY:
+Monitor system-wide virtual memory, process, CPU, and I/O statistics.
+
+PROCESS:
+--------
+# Update every second
+vmstat 1
+
+# 10 samples, 1 second apart
+vmstat 1 10
+
+# Show in megabytes
+vmstat -S M 1
+
+# Active/inactive memory
+vmstat -a 1
+
+OUTPUT EXPLANATION:
+-------------------
+procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+ 2  0      0 524288  65536 131072    0    0     0     0 5000 1000 50 10 40  0  0
+
+COLUMNS:
+Procs:
+  r: Processes running or waiting (should match active cores)
+  b: Processes in uninterruptible sleep (should be 0 for HFT)
+
+Memory:
+  swpd: Swapped memory (MUST be 0 for HFT!)
+  free: Free memory
+  buff: Buffer cache
+  cache: Page cache
+
+Swap:
+  si: Memory swapped in from disk (MUST be 0!)
+  so: Memory swapped out to disk (MUST be 0!)
+
+IO:
+  bi: Blocks received from block device
+  bo: Blocks sent to block device
+
+System:
+  in: Interrupts per second (lower is better for HFT)
+  cs: Context switches per second (lower is better)
+
+CPU:
+  us: User time (should be high for HFT app)
+  sy: System/kernel time (should be low, <5% ideally)
+  id: Idle time
+  wa: I/O wait (should be 0 for HFT)
+  st: Stolen time (virtualization, should be 0)
+
+HFT IDEAL VALUES:
+-----------------
+procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+ 4  0      0 524288  65536 131072    0    0     0     0  100   50 95  5  0  0  0
+
+- r = number of active trading threads
+- b = 0 (no blocking)
+- swpd = 0 (no swap)
+- si/so = 0 (no swapping)
+- in < 1000 (low interrupts)
+- cs < 100 (minimal context switching)
+- us = 95% (mostly user code)
+- sy = 5% (minimal kernel)
+- wa = 0 (no I/O wait)
+
+================================================================================
+3. IOSTAT - I/O STATISTICS
+================================================================================
+
+THEORY:
+Monitor disk I/O performance.
+In HFT, disk I/O should be minimal during trading hours.
+
+INSTALLATION:
+sudo apt-get install sysstat
+
+PROCESS:
+--------
+# Basic usage
+iostat
+
+# Extended statistics, 1 second intervals
+iostat -x 1
+
+# Per-device statistics
+iostat -d 1
+
+# CPU and device stats
+iostat -xc 1
+
+OUTPUT:
+-------
+Device   r/s   w/s  rkB/s  wkB/s  await  svctm  %util
+sda     10.0  20.0   100.0  200.0   5.0    2.0   50.0
+
+r/s: Reads per second
+w/s: Writes per second
+rkB/s: KB read per second
+wkB/s: KB written per second
+await: Average wait time (ms) - queue + service
+svctm: Average service time (ms)
+%util: Device utilization percentage
+
+HFT EXPECTATIONS:
+During active trading, disk I/O should be minimal:
+- r/s, w/s: Near 0 (all data in memory)
+- await: N/A (no I/O)
+- %util: <5%
+
+Logging/persistence should be:
+- Asynchronous
+- Batched
+- On separate thread/core
+- Using separate disk/SSD
+
+================================================================================
+4. MPSTAT - MULTI-PROCESSOR STATISTICS
+================================================================================
+
+THEORY:
+Monitor per-CPU statistics.
+Critical for HFT to verify:
+- Thread pinning effectiveness
+- CPU utilization distribution
+- Interrupt distribution
+
+PROCESS:
+--------
+# All CPUs, 1 second intervals
+mpstat -P ALL 1
+
+# Specific CPU
+mpstat -P 0 1
+
+# Show interrupts per CPU
+mpstat -I ALL 1
+
+OUTPUT:
+-------
+CPU    %usr   %nice    %sys %iowait    %irq   %soft  %steal  %guest   %idle
+all   25.00    0.00    5.00    0.00    0.50    0.50    0.00    0.00   69.00
+  0   95.00    0.00    5.00    0.00    0.00    0.00    0.00    0.00    0.00
+  1    1.00    0.00    1.00    0.00    1.00    1.00    0.00    0.00   96.00
+  2    5.00    0.00    5.00    0.00    0.00    0.00    0.00    0.00   90.00
+  3    1.00    0.00    1.00    0.00    1.00    1.00    0.00    0.00   96.00
+
+HFT INTERPRETATION:
+CPU 0: 95% user, 5% system - Trading thread (GOOD)
+CPU 1-3: Low utilization - Interrupt handling / background tasks
+
+Ideal HFT setup:
+- Dedicated CPUs at 95-100% user time (trading threads)
+- Separate CPUs for interrupts and OS tasks
+- %iowait = 0 (no I/O blocking)
+- %irq + %soft < 5% on trading CPUs
+
+================================================================================
+5. PIDSTAT - PER-PROCESS STATISTICS
+================================================================================
+
+THEORY:
+Detailed per-process and per-thread statistics.
+
+PROCESS:
+--------
+# Monitor specific process
+pidstat -p $(pidof trading_engine) 1
+
+# Show threads
+pidstat -t -p $(pidof trading_engine) 1
+
+# Show context switches
+pidstat -w -p $(pidof trading_engine) 1
+
+# Show page faults
+pidstat -r -p $(pidof trading_engine) 1
+
+# Show I/O
+pidstat -d -p $(pidof trading_engine) 1
+
+CONTEXT SWITCH OUTPUT:
+----------------------
+Time      PID   cswch/s nvcswch/s  Command
+10:30:01  1234      10.0    1000.0  trading_engine
+
+cswch/s: Voluntary context switches (process gave up CPU)
+nvcswch/s: Involuntary context switches (preempted)
+
+HFT TARGETS:
+- cswch/s: <100 (minimal voluntary switching)
+- nvcswch/s: <10 (minimal preemption with real-time priority)
+
+High values indicate:
+- Lock contention (voluntary)
+- CPU oversubscription (involuntary)
+- Interrupt interference (involuntary)
+
+PAGE FAULT OUTPUT:
+------------------
+Time      PID  minflt/s  majflt/s  Command
+10:30:01  1234     50.0       0.0  trading_engine
+
+minflt/s: Minor page faults (page in memory, not in process table)
+majflt/s: Major page faults (page not in memory, must load from disk)
+
+HFT TARGETS:
+- minflt/s: <100 after warmup
+- majflt/s: 0 (CRITICAL - major faults are milliseconds!)
+
+Solutions for high page faults:
+- Use mlockall() to lock all memory
+- Pre-fault all memory during initialization
+- Disable swap
+
+================================================================================
+6. SAR - SYSTEM ACTIVITY REPORTER
+================================================================================
+
+THEORY:
+Historical system performance data.
+Useful for analyzing performance over time.
+
+INSTALLATION:
+sudo apt-get install sysstat
+sudo systemctl enable sysstat
+
+PROCESS:
+--------
+# CPU usage (historical)
+sar -u
+
+# Memory usage
+sar -r
+
+# Network statistics
+sar -n DEV
+
+# Context switches
+sar -w
+
+# Specific time range (from archived data)
+sar -u -f /var/log/sysstat/sa15  # Day 15 of month
+
+# Real-time monitoring
+sar -u 1 10  # 10 samples, 1 second apart
+
+HFT USE CASES:
+--------------
+# Did we have CPU spikes during trading hours?
+sar -u -s 09:30:00 -e 16:00:00
+
+# Memory pressure during trading?
+sar -r -s 09:30:00 -e 16:00:00
+
+# Network issues?
+sar -n DEV -s 09:30:00 -e 16:00:00
+
+# Unusual context switching?
+sar -w -s 09:30:00 -e 16:00:00
+
+================================================================================
+7. STRACE - SYSTEM CALL TRACER
+================================================================================
+
+THEORY:
+Trace all system calls made by a process.
+High overhead (10-100x slowdown) - use only for debugging!
+
+PROCESS:
+--------
+# Trace program from start
+strace ./your_program
+
+# Attach to running process
+strace -p $(pidof your_program)
+
+# Show timestamps
+strace -t ./your_program
+
+# Show time spent in each syscall
+strace -c ./your_program
+
+# Trace specific syscalls only
+strace -e trace=network ./your_program  # Network calls only
+strace -e trace=file ./your_program     # File operations
+strace -e trace=memory ./your_program   # Memory operations
+
+# Save to file
+strace -o trace.log ./your_program
+
+HFT C++ EXAMPLE (Finding Unwanted Syscalls):
+---------------------------------------------
+
+// syscall_audit.cpp
+#include <iostream>
+#include <vector>
+#include <unistd.h>
+
+void processOrders() {
+    std::vector<double> prices;
+
+    for (int i = 0; i < 1000; ++i) {
+        // BAD: Dynamic allocation in hot loop
+        prices.push_back(100.0 + i * 0.01);
+
+        // BAD: Syscall in hot loop (for demonstration)
+        if (i % 100 == 0) {
+            getpid();  // Unnecessary syscall!
+        }
+    }
+}
+
+int main() {
+    processOrders();
+    std::cout << "Done\n";
+    return 0;
+}
+
+WORKFLOW:
+---------
+# Compile
+g++ -O2 -std=c++17 syscall_audit.cpp -o syscall_audit
+
+# Count syscalls
+strace -c ./syscall_audit
+
+EXPECTED OUTPUT:
+% time     seconds  usecs/call     calls    errors syscall
+------ ----------- ----------- --------- --------- ----------------
+ 40.00    0.000100          10        10           getpid
+ 30.00    0.000075           2        37           brk
+ ...
+
+ACTION: Remove getpid() calls from hot path!
+
+STRACE FOR LATENCY DEBUGGING:
+------------------------------
+# Show time for each syscall (microseconds)
+strace -tt -T ./your_program
+
+# Example output:
+10:30:45.123456 sendto(...) = 100 <0.000015>
+                                    ^^^^^^^^ 15 microseconds
+
+Identify slow syscalls:
+- Look for syscalls taking >100 microseconds
+- Identify unexpected syscalls in critical path
+- Find opportunities to eliminate syscalls
+
+================================================================================
+8. /PROC FILESYSTEM - RUNTIME INFORMATION
+================================================================================
+
+THEORY:
+/proc provides runtime information about processes and kernel.
+
+KEY FILES FOR HFT:
+------------------
+
+# CPU information
+cat /proc/cpuinfo
+
+# Check for constant_tsc (required for RDTSC)
+grep constant_tsc /proc/cpuinfo
+
+# Memory information
+cat /proc/meminfo
+
+# Check huge pages
+grep Huge /proc/meminfo
+
+# Process-specific info (replace PID)
+PID=$(pidof trading_engine)
+
+# Memory maps
+cat /proc/$PID/maps
+
+# Memory statistics
+cat /proc/$PID/status
+
+# Open file descriptors
+ls -l /proc/$PID/fd
+
+# Thread information
+ls /proc/$PID/task
+
+# Scheduling info
+cat /proc/$PID/sched
+
+# Check if process is using huge pages
+grep AnonHugePages /proc/$PID/smaps
+
+# Network statistics
+cat /proc/net/dev       # Network interface stats
+cat /proc/net/snmp      # Protocol statistics
+cat /proc/net/sockstat  # Socket statistics
+
+# Interrupts
+cat /proc/interrupts    # Per-CPU interrupt counts
+
+# System limits
+cat /proc/sys/kernel/pid_max
+cat /proc/sys/vm/max_map_count
+cat /proc/sys/net/core/rmem_max
+
+HFT MONITORING SCRIPT:
+----------------------
+
+#!/bin/bash
+# monitor_hft.sh - Monitor HFT application
+
+PID=$(pidof trading_engine)
+
+if [ -z "$PID" ]; then
+    echo "Trading engine not running"
+    exit 1
+fi
+
+echo "=== CPU Affinity ==="
+taskset -cp $PID
+
+echo -e "\n=== Scheduling Policy ==="
+chrt -p $PID
+
+echo -e "\n=== Memory Locked ==="
+grep VmLck /proc/$PID/status
+
+echo -e "\n=== Huge Pages ==="
+grep AnonHugePages /proc/$PID/smaps | awk '{sum+=$2} END {print sum " kB"}'
+
+echo -e "\n=== Context Switches ==="
+grep voluntary_ctxt_switches /proc/$PID/status
+grep nonvoluntary_ctxt_switches /proc/$PID/status
+
+echo -e "\n=== Open File Descriptors ==="
+ls /proc/$PID/fd | wc -l
+
+echo -e "\n=== Thread Count ==="
+ls /proc/$PID/task | wc -l
+
+echo -e "\n=== Network Connections ==="
+ss -tan | grep $(echo $PID | awk '{print ":"$1}') | wc -l
+
+================================================================================
+9. SYSTEM TUNING FOR HFT
+================================================================================
+
+CPU ISOLATION:
+--------------
+# Kernel boot parameter (edit /etc/default/grub)
+GRUB_CMDLINE_LINUX="isolcpus=2,3,4,5 nohz_full=2,3,4,5 rcu_nocbs=2,3,4,5"
+
+# Update grub
+sudo update-grub
+sudo reboot
+
+DISABLE SERVICES:
+-----------------
+# Disable unnecessary services
+sudo systemctl disable bluetooth
+sudo systemctl disable cups
+sudo systemctl disable avahi-daemon
+
+TRANSPARENT HUGE PAGES:
+-----------------------
+# Enable THP
+echo always | sudo tee /sys/kernel/mm/transparent_hugepage/enabled
+
+# Or disable if causing jitter
+echo never | sudo tee /sys/kernel/mm/transparent_hugepage/enabled
+
+SWAPPINESS:
+-----------
+# Minimize swapping (0 = only swap to avoid OOM)
+sudo sysctl -w vm.swappiness=0
+
+# Make permanent
+echo "vm.swappiness=0" | sudo tee -a /etc/sysctl.conf
+
+DISABLE SWAP ENTIRELY:
+----------------------
+sudo swapoff -a
+# Comment out swap in /etc/fstab
+
+POWER MANAGEMENT:
+-----------------
+# Disable CPU frequency scaling
+sudo cpupower frequency-set -g performance
+
+# Disable turbo boost (for consistency)
+echo 1 | sudo tee /sys/devices/system/cpu/intel_pstate/no_turbo
+
+# Disable C-states
+sudo cpupower idle-set -d 2
+
+NETWORK TUNING:
+---------------
+# See network profiling guide for detailed network tuning
+
+IRQ AFFINITY:
+-------------
+# Pin network card IRQs to specific CPUs
+for irq in $(grep eth0 /proc/interrupts | awk '{print $1}' | tr -d ':'); do
+    echo 2 | sudo tee /proc/irq/$irq/smp_affinity
+done
+
+================================================================================
+10. COMPLETE SYSTEM HEALTH CHECK SCRIPT
+================================================================================
+
+#!/bin/bash
+# hft_system_check.sh - Comprehensive HFT system validation
+
+echo "=== HFT SYSTEM HEALTH CHECK ==="
+echo
+
+# CPU Configuration
+echo "=== CPU Configuration ==="
+echo "CPUs: $(nproc)"
+echo "CPU Model: $(lscpu | grep 'Model name' | sed 's/Model name: *//')"
+echo "CPU Frequency: $(lscpu | grep 'CPU MHz' | sed 's/CPU MHz: *//')"
+echo "Constant TSC: $(grep -q constant_tsc /proc/cpuinfo && echo YES || echo NO)"
+echo "Governor: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo N/A)"
+echo "Turbo: $(cat /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null || echo N/A)"
+echo
+
+# Memory Configuration
+echo "=== Memory Configuration ==="
+echo "Total Memory: $(free -h | awk '/^Mem:/{print $2}')"
+echo "Free Memory: $(free -h | awk '/^Mem:/{print $4}')"
+echo "Swap Configured: $(free -h | awk '/^Swap:/{print $2}')"
+echo "Swap Used: $(free -h | awk '/^Swap:/{print $3}')"
+echo "Swappiness: $(cat /proc/sys/vm/swappiness)"
+echo "Huge Pages: $(grep HugePages_Total /proc/meminfo | awk '{print $2}')"
+echo "THP: $(cat /sys/kernel/mm/transparent_hugepage/enabled)"
+echo
+
+# Network Configuration
+echo "=== Network Configuration ==="
+echo "rmem_max: $(cat /proc/sys/net/core/rmem_max)"
+echo "wmem_max: $(cat /proc/sys/net/core/wmem_max)"
+echo "netdev_max_backlog: $(cat /proc/sys/net/core/netdev_max_backlog)"
+echo
+
+# Kernel Configuration
+echo "=== Kernel Configuration ==="
+echo "Kernel: $(uname -r)"
+echo "Boot Parameters: $(cat /proc/cmdline)"
+echo
+
+# Check for common issues
+echo "=== Potential Issues ==="
+[ "$(cat /proc/sys/vm/swappiness)" -gt 10 ] && echo "WARNING: Swappiness > 10"
+[ "$(free | awk '/^Swap:/{print $3}')" -gt 0 ] && echo "WARNING: Swap is being used!"
+grep -q performance /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor || echo "WARNING: Not all CPUs in performance mode"
+[ "$(cat /proc/sys/net/core/rmem_max)" -lt 134217728 ] && echo "WARNING: rmem_max too small"
+
+echo
+echo "=== System Load ==="
+uptime
+echo
+
+================================================================================
+BEST PRACTICES FOR HFT OS CONFIGURATION
+================================================================================
+
+1. CPU CONFIGURATION:
+   - Use performance governor
+   - Disable turbo boost for consistency
+   - Isolate CPUs for trading threads
+   - Disable C-states beyond C1
+
+2. MEMORY CONFIGURATION:
+   - Disable swap entirely
+   - Use huge pages
+   - Lock all memory (mlockall)
+   - Pre-fault all allocations
+
+3. SCHEDULING:
+   - Use SCHED_FIFO with high priority
+   - Pin threads to cores
+   - Minimize thread count
+   - Avoid thread creation during trading
+
+4. INTERRUPTS:
+   - Pin network IRQs to dedicated CPUs
+   - Disable interrupt coalescing
+   - Minimize interrupt rate
+
+5. NETWORK:
+   - See network profiling guide
+   - Consider kernel bypass (DPDK, OpenOnload)
+
+6. MONITORING:
+   - Continuous monitoring of key metrics
+   - Alert on anomalies (context switches, page faults)
+   - Historical analysis with sar
+
+7. TESTING:
+   - Test under realistic load
+   - Stress test for extended periods
+   - Verify tail latencies
+   - Check for gradual degradation

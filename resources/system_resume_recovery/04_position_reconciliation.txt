@@ -1,0 +1,1498 @@
+================================================================================
+POSITION RECONCILIATION IN HFT SYSTEMS
+================================================================================
+
+Author: HFT System Architecture Team
+Last Updated: 2025-11-25
+Version: 1.0
+Category: System Resume & Recovery
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+
+1. Why Position Reconciliation is Critical
+2. Reconciliation Algorithms
+3. Multi-Exchange Position Reconciliation
+4. Fill Recovery (Missed Fill Notifications)
+5. Order Status Recovery
+6. Handling Discrepancies
+7. Code Examples for Reconciliation
+8. Testing Reconciliation Logic
+9. Best Practices & Checklists
+
+================================================================================
+1. WHY POSITION RECONCILIATION IS CRITICAL
+================================================================================
+
+1.1 FINANCIAL RISK
+------------------
+- Incorrect positions can lead to massive losses
+- Regulatory violations (position limits, margin requirements)
+- Market risk exposure mismanagement
+- Unintended overnight positions incurring funding costs
+
+1.2 OPERATIONAL RISK
+--------------------
+- Trading decisions based on wrong positions
+- Incorrect hedging calculations
+- Risk limit breaches going undetected
+- Unable to close positions due to stale data
+
+1.3 REGULATORY REQUIREMENTS
+---------------------------
+- MiFID II requires position tracking and reporting
+- SEC Rule 15c3-5 (Market Access Rule)
+- FINRA 4210 margin requirements
+- Real-time position monitoring mandatory
+
+1.4 COMMON SCENARIOS REQUIRING RECONCILIATION
+----------------------------------------------
+1. System crash during trading hours
+2. Network partition between components
+3. Exchange connection loss
+4. Partial fill notifications received out of order
+5. System restart after maintenance
+6. Clock synchronization issues
+7. Exchange API bugs (rare but catastrophic)
+
+1.5 COST OF INCORRECT POSITIONS
+--------------------------------
+Real-world example:
+- System shows: Long 1000 contracts
+- Actual position: Long 2000 contracts
+- Market moves -$10 per contract
+- Expected loss: $10,000
+- Actual loss: $20,000
+- Unaccounted loss: $10,000
+
+Time to detect error matters exponentially in HFT!
+
+================================================================================
+2. RECONCILIATION ALGORITHMS
+================================================================================
+
+2.1 THREE-WAY RECONCILIATION
+----------------------------
+Compare three sources of truth:
+
+Source A: Internal Position Manager
+Source B: Exchange Position API
+Source C: Order Management System (calculated from fills)
+
+Algorithm:
+----------
+1. Query all three sources
+2. Compare positions symbol-by-symbol
+3. If all three match -> PASS
+4. If two match -> Use majority, investigate minority
+5. If all differ -> CRITICAL - Manual intervention
+6. Log all discrepancies with timestamps
+
+Pseudocode:
+-----------
+struct PositionSource {
+    string symbol;
+    int64_t quantity;
+    double avg_price;
+    timestamp_t as_of_time;
+};
+
+enum ReconciliationResult {
+    MATCH,
+    MINOR_DISCREPANCY,
+    MAJOR_DISCREPANCY,
+    CRITICAL_MISMATCH
+};
+
+ReconciliationResult reconcile_position(
+    const PositionSource& internal,
+    const PositionSource& exchange,
+    const PositionSource& oms_calc
+) {
+    // Check timestamp freshness
+    auto now = now_utc();
+    if (now - exchange.as_of_time > seconds(30)) {
+        LOG_ERROR("Stale exchange data!");
+        return CRITICAL_MISMATCH;
+    }
+
+    // Exact match
+    if (internal.quantity == exchange.quantity &&
+        exchange.quantity == oms_calc.quantity) {
+        return MATCH;
+    }
+
+    // Two sources agree
+    if (internal.quantity == exchange.quantity) {
+        // OMS calculated wrong, trust exchange
+        return MINOR_DISCREPANCY;
+    }
+    if (exchange.quantity == oms_calc.quantity) {
+        // Internal wrong, trust exchange
+        return MAJOR_DISCREPANCY;
+    }
+
+    // All three differ
+    return CRITICAL_MISMATCH;
+}
+
+2.2 TEMPORAL RECONCILIATION
+----------------------------
+Account for in-flight orders and pending settlements:
+
+Position_T0 = Last known good position
+Orders_pending = Orders sent but not yet filled
+Fills_unacked = Fills received but not yet processed
+Position_current = Position_T0 + Fills_unacked - calculate_exposure(Orders_pending)
+
+C++ Implementation:
+-------------------
+class TemporalReconciliation {
+private:
+    struct InFlightOrder {
+        uint64_t order_id;
+        string symbol;
+        int64_t quantity;
+        OrderSide side;
+        timestamp_t sent_time;
+    };
+
+    std::map<std::string, int64_t> last_good_positions_;
+    std::vector<InFlightOrder> in_flight_;
+    std::mutex mtx_;
+
+public:
+    int64_t calculate_expected_position(const string& symbol) {
+        std::lock_guard<std::mutex> lock(mtx_);
+
+        int64_t base_position = last_good_positions_[symbol];
+        int64_t adjustment = 0;
+
+        // Subtract max potential exposure from pending orders
+        for (const auto& order : in_flight_) {
+            if (order.symbol == symbol) {
+                int64_t qty = order.quantity;
+                if (order.side == OrderSide::SELL) {
+                    qty = -qty;
+                }
+                adjustment += qty;
+            }
+        }
+
+        return base_position + adjustment;
+    }
+
+    void mark_order_in_flight(uint64_t order_id, const string& symbol,
+                               int64_t qty, OrderSide side) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        in_flight_.push_back({order_id, symbol, qty, side, now_utc()});
+    }
+
+    void remove_in_flight(uint64_t order_id) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        in_flight_.erase(
+            std::remove_if(in_flight_.begin(), in_flight_.end(),
+                [order_id](const auto& o) { return o.order_id == order_id; }),
+            in_flight_.end()
+        );
+    }
+};
+
+2.3 CHECKSUM-BASED RECONCILIATION
+----------------------------------
+Use cryptographic checksums to detect corruption:
+
+SHA256(symbol + quantity + avg_price + timestamp) = checksum
+
+Store checksums with positions:
+- Helps detect bit flips in memory
+- Catches serialization errors
+- Validates network transmission
+
+Example:
+--------
+#include <openssl/sha.h>
+
+struct Position {
+    string symbol;
+    int64_t quantity;
+    double avg_price;
+    timestamp_t last_update;
+    std::array<uint8_t, SHA256_DIGEST_LENGTH> checksum;
+
+    void compute_checksum() {
+        SHA256_CTX ctx;
+        SHA256_Init(&ctx);
+        SHA256_Update(&ctx, symbol.data(), symbol.size());
+        SHA256_Update(&ctx, &quantity, sizeof(quantity));
+        SHA256_Update(&ctx, &avg_price, sizeof(avg_price));
+        SHA256_Update(&ctx, &last_update, sizeof(last_update));
+        SHA256_Final(checksum.data(), &ctx);
+    }
+
+    bool validate_checksum() const {
+        Position temp = *this;
+        temp.compute_checksum();
+        return temp.checksum == this->checksum;
+    }
+};
+
+================================================================================
+3. MULTI-EXCHANGE POSITION RECONCILIATION
+================================================================================
+
+3.1 CHALLENGES
+--------------
+- Different timestamp formats across exchanges
+- Different position calculation methods
+- Settlement timing differences
+- Corporate actions (splits, dividends)
+- Cross-margining complexities
+
+3.2 AGGREGATED POSITION VIEW
+-----------------------------
+Aggregate positions across multiple exchanges:
+
+Total_Position[AAPL] = CME_Position[AAPL] + NYSE_Position[AAPL] + NASDAQ_Position[AAPL]
+
+But need to account for:
+- T+0, T+1, T+2 settlement
+- Different product IDs for same underlying
+- Currency conversions for multi-currency positions
+
+3.3 MULTI-EXCHANGE RECONCILIATION ENGINE
+-----------------------------------------
+
+class MultiExchangeReconciliation {
+private:
+    struct ExchangePosition {
+        string exchange_id;
+        string symbol;
+        string internal_symbol;  // normalized
+        int64_t quantity;
+        Settlement settlement_type;  // T+0, T+1, T+2
+        timestamp_t as_of_time;
+    };
+
+    std::map<string, vector<ExchangePosition>> positions_by_symbol_;
+
+public:
+    struct AggregatedPosition {
+        string symbol;
+        int64_t total_quantity;
+        map<string, int64_t> per_exchange;
+        vector<string> discrepancies;
+    };
+
+    AggregatedPosition reconcile_multi_exchange(const string& symbol) {
+        AggregatedPosition result;
+        result.symbol = symbol;
+        result.total_quantity = 0;
+
+        // Get positions from all exchanges
+        auto positions = get_all_exchange_positions(symbol);
+
+        for (const auto& pos : positions) {
+            // Normalize for settlement timing
+            int64_t adjusted_qty = adjust_for_settlement(pos);
+
+            result.total_quantity += adjusted_qty;
+            result.per_exchange[pos.exchange_id] = adjusted_qty;
+
+            // Cross-check with internal records
+            auto internal = get_internal_position(pos.exchange_id, symbol);
+            if (internal.quantity != pos.quantity) {
+                result.discrepancies.push_back(
+                    format("Exchange {}: Internal={}, Exchange={}",
+                           pos.exchange_id, internal.quantity, pos.quantity)
+                );
+            }
+        }
+
+        return result;
+    }
+
+private:
+    int64_t adjust_for_settlement(const ExchangePosition& pos) {
+        auto now = now_utc();
+
+        switch (pos.settlement_type) {
+        case Settlement::T0:
+            return pos.quantity;
+
+        case Settlement::T1:
+            // Don't count if trade was today and hasn't settled
+            if (is_same_day(pos.as_of_time, now)) {
+                return 0;
+            }
+            return pos.quantity;
+
+        case Settlement::T2:
+            // Complex logic for T+2 settlement
+            if (business_days_between(pos.as_of_time, now) < 2) {
+                return 0;
+            }
+            return pos.quantity;
+        }
+
+        return pos.quantity;
+    }
+};
+
+3.4 POSITION NETTING ACROSS VENUES
+-----------------------------------
+For fungible instruments:
+
+Net_Position = Sum_i(Exchange_i_Position[symbol])
+
+But watch out for:
+- Locked-in positions (pending settlement)
+- Regulatory restrictions (can't net across certain venues)
+- Margin requirements (each exchange has independent margin)
+
+================================================================================
+4. FILL RECOVERY (MISSED FILL NOTIFICATIONS)
+================================================================================
+
+4.1 WHY FILLS GET MISSED
+-------------------------
+1. Network packet loss
+2. System crash before processing fill message
+3. Exchange resend logic gaps
+4. Multicast UDP drops (common in co-location)
+5. Sequence number gaps not detected
+
+4.2 FILL RECOVERY STRATEGIES
+-----------------------------
+
+Strategy 1: Exchange API Query
+-------------------------------
+Query exchange for all fills since last known fill:
+
+GET /api/v1/fills?since=<last_fill_id>&symbol=AAPL
+
+Pros: Authoritative source
+Cons: API rate limits, slower than real-time feed
+
+Strategy 2: Order Status Reconciliation
+----------------------------------------
+For each open order, query current status:
+- If order shows "FILLED" but we never received fill -> MISSED FILL
+- Query fill details and replay
+
+Strategy 3: Trade Reconstruction from TCP Stream
+-------------------------------------------------
+If using TCP (FIX protocol), recover from sequence numbers:
+
+Last processed seq: 12345
+Current seq from exchange: 12350
+Gap detected: 5 messages
+
+Request resend:
+FIX: <ResendRequest> BeginSeqNo=12346 EndSeqNo=12350 </ResendRequest>
+
+4.3 FILL RECOVERY IMPLEMENTATION
+---------------------------------
+
+class FillRecovery {
+private:
+    struct Fill {
+        uint64_t fill_id;
+        uint64_t order_id;
+        string symbol;
+        int64_t quantity;
+        double price;
+        timestamp_t fill_time;
+        bool processed;
+    };
+
+    uint64_t last_fill_id_ = 0;
+    std::set<uint64_t> processed_fills_;
+
+public:
+    vector<Fill> recover_missed_fills(const string& exchange_id) {
+        vector<Fill> missed_fills;
+
+        // Step 1: Query exchange for recent fills
+        auto recent_fills = query_exchange_fills(exchange_id, last_fill_id_);
+
+        // Step 2: Identify missing fills
+        for (const auto& fill : recent_fills) {
+            if (processed_fills_.count(fill.fill_id) == 0) {
+                LOG_WARN("Missed fill detected: fill_id={}, order_id={}, qty={}, price={}",
+                         fill.fill_id, fill.order_id, fill.quantity, fill.price);
+                missed_fills.push_back(fill);
+            }
+        }
+
+        // Step 3: Sort by fill_time to process in order
+        std::sort(missed_fills.begin(), missed_fills.end(),
+                  [](const auto& a, const auto& b) {
+                      return a.fill_time < b.fill_time;
+                  });
+
+        // Step 4: Replay fills
+        for (auto& fill : missed_fills) {
+            replay_fill(fill);
+            processed_fills_.insert(fill.fill_id);
+            last_fill_id_ = std::max(last_fill_id_, fill.fill_id);
+        }
+
+        return missed_fills;
+    }
+
+private:
+    void replay_fill(const Fill& fill) {
+        // Update positions
+        position_manager_->apply_fill(fill.symbol, fill.quantity, fill.price);
+
+        // Update order status
+        order_manager_->mark_fill(fill.order_id, fill.quantity, fill.price);
+
+        // Trigger risk checks with replayed fill
+        risk_manager_->check_post_trade(fill.symbol, fill.quantity);
+
+        // Log for audit
+        audit_log_->log_fill_replay(fill);
+    }
+};
+
+4.4 DETECTING FILL GAPS
+-----------------------
+Use fill_id sequence numbers:
+
+Expected next fill_id: 10001
+Received fill_id: 10005
+Gap: 10002, 10003, 10004 (3 fills missed!)
+
+Immediate action:
+1. Halt trading on affected symbols
+2. Query exchange for missing fills
+3. Reconcile positions
+4. Resume trading only after reconciliation
+
+Code:
+-----
+class FillGapDetector {
+private:
+    uint64_t expected_next_fill_id_ = 0;
+
+public:
+    bool detect_gap(uint64_t received_fill_id) {
+        if (expected_next_fill_id_ == 0) {
+            expected_next_fill_id_ = received_fill_id + 1;
+            return false;
+        }
+
+        if (received_fill_id != expected_next_fill_id_) {
+            uint64_t gap_size = received_fill_id - expected_next_fill_id_;
+            LOG_CRITICAL("Fill gap detected! Expected {}, got {}. Gap size: {}",
+                        expected_next_fill_id_, received_fill_id, gap_size);
+
+            // Alert ops team
+            send_alert("FILL_GAP", gap_size);
+
+            // Halt trading
+            trading_engine_->halt("Fill gap detected");
+
+            expected_next_fill_id_ = received_fill_id + 1;
+            return true;
+        }
+
+        expected_next_fill_id_ = received_fill_id + 1;
+        return false;
+    }
+};
+
+================================================================================
+5. ORDER STATUS RECOVERY
+================================================================================
+
+5.1 ORDER STATES
+----------------
+NEW -> PENDING -> ACKNOWLEDGED -> PARTIAL_FILL -> FILLED
+                              \-> CANCELLED
+                              \-> REJECTED
+
+During crash, orders can be in inconsistent states:
+- Sent to exchange but no ack received
+- Partially filled but fill not processed
+- Cancel request sent but not confirmed
+
+5.2 ORDER RECOVERY PROCEDURE
+-----------------------------
+
+Step 1: Load orders from persistent storage
+Step 2: Query exchange for actual order status
+Step 3: Reconcile differences
+Step 4: Update internal state
+Step 5: Resume trading
+
+5.3 ORDER RECOVERY IMPLEMENTATION
+----------------------------------
+
+class OrderRecovery {
+private:
+    struct Order {
+        uint64_t order_id;
+        string symbol;
+        OrderSide side;
+        int64_t quantity;
+        double price;
+        OrderState internal_state;
+        OrderState exchange_state;
+        int64_t filled_quantity;
+        timestamp_t last_update;
+    };
+
+public:
+    void recover_orders() {
+        LOG_INFO("Starting order recovery...");
+
+        // Step 1: Load from database
+        auto db_orders = load_orders_from_db();
+        LOG_INFO("Loaded {} orders from database", db_orders.size());
+
+        // Step 2: Query exchange
+        auto exchange_orders = query_all_exchange_orders();
+        LOG_INFO("Retrieved {} orders from exchange", exchange_orders.size());
+
+        // Step 3: Reconcile
+        reconcile_orders(db_orders, exchange_orders);
+
+        // Step 4: Handle discrepancies
+        handle_order_discrepancies();
+
+        LOG_INFO("Order recovery completed");
+    }
+
+private:
+    void reconcile_orders(const vector<Order>& db_orders,
+                         const vector<Order>& exchange_orders) {
+        // Build lookup map
+        std::map<uint64_t, Order> exchange_map;
+        for (const auto& order : exchange_orders) {
+            exchange_map[order.order_id] = order;
+        }
+
+        for (const auto& db_order : db_orders) {
+            auto it = exchange_map.find(db_order.order_id);
+
+            if (it == exchange_map.end()) {
+                // Order in DB but not on exchange
+                handle_orphan_order(db_order);
+                continue;
+            }
+
+            const auto& exch_order = it->second;
+
+            if (db_order.internal_state != exch_order.exchange_state) {
+                LOG_WARN("Order {} state mismatch: internal={}, exchange={}",
+                         db_order.order_id,
+                         state_to_string(db_order.internal_state),
+                         state_to_string(exch_order.exchange_state));
+
+                // Trust exchange state
+                update_order_state(db_order.order_id, exch_order.exchange_state);
+            }
+
+            if (db_order.filled_quantity != exch_order.filled_quantity) {
+                LOG_WARN("Order {} fill quantity mismatch: internal={}, exchange={}",
+                         db_order.order_id,
+                         db_order.filled_quantity,
+                         exch_order.filled_quantity);
+
+                // Recover missed fills
+                recover_fills_for_order(db_order.order_id,
+                                       db_order.filled_quantity,
+                                       exch_order.filled_quantity);
+            }
+        }
+    }
+
+    void handle_orphan_order(const Order& order) {
+        // Order exists in our DB but not on exchange
+        // Possibilities:
+        // 1. Never sent (system crashed before send)
+        // 2. Rejected (we never got rejection)
+        // 3. Filled and removed from exchange (we missed fill)
+
+        LOG_ERROR("Orphan order detected: {}", order.order_id);
+
+        // Query order history API if available
+        auto history = query_order_history(order.order_id);
+
+        if (history.exists) {
+            // Order was processed, update our state
+            LOG_INFO("Found orphan order in history: state={}",
+                    state_to_string(history.final_state));
+            update_order_state(order.order_id, history.final_state);
+        } else {
+            // Order never made it to exchange, mark as failed
+            LOG_ERROR("Order {} never reached exchange, marking as FAILED",
+                     order.order_id);
+            update_order_state(order.order_id, OrderState::FAILED);
+        }
+    }
+};
+
+5.4 HANDLING PENDING CANCEL REQUESTS
+-------------------------------------
+Critical scenario: Cancel sent but system crashed before confirmation
+
+Solution:
+---------
+void recover_pending_cancels() {
+    auto pending_cancels = db_->get_pending_cancel_requests();
+
+    for (const auto& cancel_req : pending_cancels) {
+        // Check if order still exists on exchange
+        auto order_status = exchange_->get_order_status(cancel_req.order_id);
+
+        if (order_status.state == OrderState::CANCELLED) {
+            // Cancel succeeded
+            LOG_INFO("Pending cancel {} succeeded", cancel_req.order_id);
+            db_->mark_cancel_completed(cancel_req.cancel_id);
+        }
+        else if (order_status.state == OrderState::FILLED) {
+            // Order filled before cancel executed
+            LOG_WARN("Order {} filled before cancel", cancel_req.order_id);
+            db_->mark_cancel_failed(cancel_req.cancel_id, "Already filled");
+            // Recover the fill!
+            recover_fills_for_order(cancel_req.order_id);
+        }
+        else {
+            // Order still active, resend cancel
+            LOG_INFO("Resending cancel for order {}", cancel_req.order_id);
+            exchange_->send_cancel(cancel_req.order_id);
+        }
+    }
+}
+
+================================================================================
+6. HANDLING DISCREPANCIES
+================================================================================
+
+6.1 CLASSIFICATION OF DISCREPANCIES
+------------------------------------
+
+Severity Levels:
+----------------
+1. INFO: <0.01% of position, likely rounding
+2. WARNING: <1% of position, investigate but continue trading
+3. ERROR: 1-5% of position, halt affected symbol
+4. CRITICAL: >5% of position, halt all trading
+
+6.2 DISCREPANCY RESOLUTION FLOWCHART
+-------------------------------------
+
+Discrepancy Detected
+  |
+  v
+Calculate Severity
+  |
+  +-- INFO/WARNING --> Log + Continue
+  |
+  +-- ERROR --> Halt Symbol
+  |              |
+  |              v
+  |           Investigate Source
+  |              |
+  |              +-- Exchange Correct --> Update Internal
+  |              +-- Internal Correct --> Report to Exchange
+  |              +-- Unknown --> Manual Review
+  |
+  +-- CRITICAL --> Halt All Trading
+                    |
+                    v
+                  Emergency Protocol
+                    |
+                    v
+                  Manual Reconciliation
+
+6.3 AUTOMATED RESOLUTION
+-------------------------
+
+class DiscrepancyResolver {
+public:
+    enum Resolution {
+        TRUST_EXCHANGE,
+        TRUST_INTERNAL,
+        MANUAL_REVIEW,
+        AUTO_CORRECTED
+    };
+
+    Resolution resolve_discrepancy(const string& symbol,
+                                   int64_t internal_pos,
+                                   int64_t exchange_pos) {
+        int64_t diff = std::abs(internal_pos - exchange_pos);
+        double pct_diff = static_cast<double>(diff) /
+                         std::max(std::abs(internal_pos), std::abs(exchange_pos));
+
+        // Small rounding difference
+        if (diff <= 1 && pct_diff < 0.001) {
+            LOG_INFO("Minor rounding discrepancy for {}: {} vs {}",
+                    symbol, internal_pos, exchange_pos);
+            update_internal_position(symbol, exchange_pos);
+            return AUTO_CORRECTED;
+        }
+
+        // Check for in-flight orders
+        auto in_flight = get_in_flight_orders(symbol);
+        int64_t in_flight_exposure = calculate_exposure(in_flight);
+
+        if (internal_pos + in_flight_exposure == exchange_pos) {
+            LOG_INFO("Discrepancy explained by in-flight orders");
+            return AUTO_CORRECTED;
+        }
+
+        // Check for recently settled trades
+        auto recent_trades = get_trades_last_n_seconds(symbol, 60);
+        int64_t recent_qty = sum_trade_quantities(recent_trades);
+
+        if (internal_pos + recent_qty == exchange_pos) {
+            LOG_INFO("Discrepancy explained by recent unsettled trades");
+            return AUTO_CORRECTED;
+        }
+
+        // Moderate discrepancy - trust exchange
+        if (pct_diff < 0.05) {
+            LOG_WARN("Moderate discrepancy ({}%), trusting exchange",
+                    pct_diff * 100);
+            update_internal_position(symbol, exchange_pos);
+            return TRUST_EXCHANGE;
+        }
+
+        // Large discrepancy - manual review required
+        LOG_ERROR("Large discrepancy ({}%), manual review required",
+                 pct_diff * 100);
+        halt_trading(symbol);
+        alert_ops_team(symbol, internal_pos, exchange_pos);
+        return MANUAL_REVIEW;
+    }
+};
+
+6.4 DISCREPANCY INVESTIGATION TOOLS
+------------------------------------
+
+Bash script for discrepancy investigation:
+-------------------------------------------
+
+#!/bin/bash
+# investigate_discrepancy.sh
+
+SYMBOL=$1
+INTERNAL_POS=$2
+EXCHANGE_POS=$3
+
+echo "=== Discrepancy Investigation for $SYMBOL ==="
+echo "Internal: $INTERNAL_POS"
+echo "Exchange: $EXCHANGE_POS"
+echo "Difference: $((EXCHANGE_POS - INTERNAL_POS))"
+echo ""
+
+# Check recent fills
+echo "=== Recent Fills (last 1 hour) ==="
+psql -d trading_db -c "
+    SELECT fill_id, order_id, quantity, price, fill_time
+    FROM fills
+    WHERE symbol = '$SYMBOL'
+      AND fill_time > NOW() - INTERVAL '1 hour'
+    ORDER BY fill_time DESC;
+"
+
+# Check open orders
+echo ""
+echo "=== Open Orders ==="
+psql -d trading_db -c "
+    SELECT order_id, side, quantity, filled_quantity, state
+    FROM orders
+    WHERE symbol = '$SYMBOL'
+      AND state NOT IN ('FILLED', 'CANCELLED', 'REJECTED')
+    ORDER BY created_time DESC;
+"
+
+# Check position history
+echo ""
+echo "=== Position History (last 24 hours) ==="
+psql -d trading_db -c "
+    SELECT timestamp, position, change, reason
+    FROM position_history
+    WHERE symbol = '$SYMBOL'
+      AND timestamp > NOW() - INTERVAL '24 hours'
+    ORDER BY timestamp DESC
+    LIMIT 20;
+"
+
+# Check error logs
+echo ""
+echo "=== Recent Errors ==="
+grep -i "error\|fail\|reject" /var/log/trading/*.log | \
+    grep "$SYMBOL" | \
+    tail -20
+
+echo ""
+echo "=== Investigation Complete ==="
+
+6.5 DISCREPANCY LOGGING
+------------------------
+
+struct DiscrepancyRecord {
+    timestamp_t detected_time;
+    string symbol;
+    int64_t internal_position;
+    int64_t exchange_position;
+    int64_t difference;
+    double percentage_diff;
+    string resolution;
+    string investigation_notes;
+    timestamp_t resolved_time;
+};
+
+void log_discrepancy(const DiscrepancyRecord& record) {
+    // Log to database
+    db_->execute(
+        "INSERT INTO position_discrepancies "
+        "(detected_time, symbol, internal_pos, exchange_pos, "
+        " difference, pct_diff, resolution, notes, resolved_time) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        record.detected_time, record.symbol,
+        record.internal_position, record.exchange_position,
+        record.difference, record.percentage_diff,
+        record.resolution, record.investigation_notes,
+        record.resolved_time
+    );
+
+    // Log to file for offline analysis
+    auto log_file = open_log_file("discrepancies.log");
+    log_file << format(
+        "{} | {} | Internal={} Exchange={} Diff={} ({}%) | {} | {}\n",
+        format_timestamp(record.detected_time),
+        record.symbol,
+        record.internal_position,
+        record.exchange_position,
+        record.difference,
+        record.percentage_diff * 100,
+        record.resolution,
+        record.investigation_notes
+    );
+}
+
+================================================================================
+7. CODE EXAMPLES FOR RECONCILIATION
+================================================================================
+
+7.1 COMPLETE RECONCILIATION ENGINE
+-----------------------------------
+
+class ReconciliationEngine {
+private:
+    PositionManager* position_mgr_;
+    ExchangeAPI* exchange_api_;
+    OrderManager* order_mgr_;
+    Database* db_;
+    RiskManager* risk_mgr_;
+
+    struct ReconciliationReport {
+        timestamp_t start_time;
+        timestamp_t end_time;
+        int total_symbols;
+        int matched;
+        int minor_discrepancies;
+        int major_discrepancies;
+        int critical_mismatches;
+        vector<string> failed_symbols;
+        map<string, string> discrepancy_details;
+    };
+
+public:
+    ReconciliationReport full_reconciliation() {
+        ReconciliationReport report;
+        report.start_time = now_utc();
+
+        LOG_INFO("=== Starting Full Position Reconciliation ===");
+
+        // Get all active symbols
+        auto symbols = get_all_active_symbols();
+        report.total_symbols = symbols.size();
+
+        for (const auto& symbol : symbols) {
+            try {
+                auto result = reconcile_symbol(symbol);
+
+                switch (result) {
+                case ReconciliationResult::MATCH:
+                    report.matched++;
+                    break;
+                case ReconciliationResult::MINOR_DISCREPANCY:
+                    report.minor_discrepancies++;
+                    break;
+                case ReconciliationResult::MAJOR_DISCREPANCY:
+                    report.major_discrepancies++;
+                    break;
+                case ReconciliationResult::CRITICAL_MISMATCH:
+                    report.critical_mismatches++;
+                    report.failed_symbols.push_back(symbol);
+                    break;
+                }
+            }
+            catch (const std::exception& ex) {
+                LOG_ERROR("Reconciliation failed for {}: {}",
+                         symbol, ex.what());
+                report.failed_symbols.push_back(symbol);
+            }
+        }
+
+        report.end_time = now_utc();
+
+        // Log summary
+        LOG_INFO("=== Reconciliation Complete ===");
+        LOG_INFO("Duration: {} ms",
+                (report.end_time - report.start_time).count());
+        LOG_INFO("Total Symbols: {}", report.total_symbols);
+        LOG_INFO("Matched: {}", report.matched);
+        LOG_INFO("Minor Discrepancies: {}", report.minor_discrepancies);
+        LOG_INFO("Major Discrepancies: {}", report.major_discrepancies);
+        LOG_INFO("Critical Mismatches: {}", report.critical_mismatches);
+
+        if (!report.failed_symbols.empty()) {
+            LOG_ERROR("Failed symbols: {}",
+                     join(report.failed_symbols, ", "));
+        }
+
+        // Persist report
+        save_report(report);
+
+        return report;
+    }
+
+private:
+    ReconciliationResult reconcile_symbol(const string& symbol) {
+        // Get positions from all sources
+        auto internal = position_mgr_->get_position(symbol);
+        auto exchange = exchange_api_->get_position(symbol);
+        auto oms_calc = order_mgr_->calculate_position(symbol);
+
+        LOG_DEBUG("Reconciling {}: Internal={}, Exchange={}, OMS={}",
+                 symbol, internal.quantity, exchange.quantity,
+                 oms_calc.quantity);
+
+        // Three-way comparison
+        if (internal.quantity == exchange.quantity &&
+            exchange.quantity == oms_calc.quantity) {
+            return ReconciliationResult::MATCH;
+        }
+
+        // Calculate discrepancy
+        int64_t max_pos = std::max({std::abs(internal.quantity),
+                                    std::abs(exchange.quantity),
+                                    std::abs(oms_calc.quantity)});
+        if (max_pos == 0) max_pos = 1;  // Avoid division by zero
+
+        int64_t max_diff = std::max({
+            std::abs(internal.quantity - exchange.quantity),
+            std::abs(exchange.quantity - oms_calc.quantity),
+            std::abs(oms_calc.quantity - internal.quantity)
+        });
+
+        double pct_diff = static_cast<double>(max_diff) / max_pos;
+
+        // Classify severity
+        if (pct_diff < 0.01) {
+            // Minor - likely rounding, auto-correct
+            position_mgr_->update_position(symbol, exchange.quantity);
+            return ReconciliationResult::MINOR_DISCREPANCY;
+        }
+        else if (pct_diff < 0.05) {
+            // Major - investigate but trust exchange
+            LOG_WARN("Major discrepancy for {}: {}%", symbol, pct_diff*100);
+            position_mgr_->update_position(symbol, exchange.quantity);
+            alert_ops_team(symbol, "Major discrepancy");
+            return ReconciliationResult::MAJOR_DISCREPANCY;
+        }
+        else {
+            // Critical - halt and manual review
+            LOG_ERROR("Critical mismatch for {}: {}%", symbol, pct_diff*100);
+            halt_trading(symbol);
+            alert_ops_team(symbol, "Critical mismatch - trading halted");
+            return ReconciliationResult::CRITICAL_MISMATCH;
+        }
+    }
+};
+
+7.2 INCREMENTAL RECONCILIATION
+-------------------------------
+Run continuously in background, reconciling a few symbols at a time:
+
+class IncrementalReconciliation {
+private:
+    std::atomic<bool> running_{false};
+    std::thread reconciliation_thread_;
+    std::chrono::seconds interval_{60};  // Reconcile every 60 seconds
+
+public:
+    void start() {
+        running_ = true;
+        reconciliation_thread_ = std::thread([this]() {
+            run_loop();
+        });
+    }
+
+    void stop() {
+        running_ = false;
+        if (reconciliation_thread_.joinable()) {
+            reconciliation_thread_.join();
+        }
+    }
+
+private:
+    void run_loop() {
+        while (running_) {
+            try {
+                // Reconcile a batch of symbols
+                auto symbols = get_next_batch_symbols(10);  // 10 at a time
+
+                for (const auto& symbol : symbols) {
+                    if (!running_) break;
+                    reconcile_symbol(symbol);
+                }
+
+                // Sleep before next batch
+                std::this_thread::sleep_for(interval_);
+            }
+            catch (const std::exception& ex) {
+                LOG_ERROR("Incremental reconciliation error: {}", ex.what());
+            }
+        }
+    }
+};
+
+7.3 POSITION SNAPSHOT & RESTORE
+--------------------------------
+
+class PositionSnapshot {
+public:
+    struct Snapshot {
+        timestamp_t timestamp;
+        map<string, int64_t> positions;
+        map<string, double> avg_prices;
+        string checksum;
+    };
+
+    Snapshot take_snapshot() {
+        Snapshot snap;
+        snap.timestamp = now_utc();
+
+        auto symbols = get_all_symbols();
+        for (const auto& symbol : symbols) {
+            auto pos = position_mgr_->get_position(symbol);
+            snap.positions[symbol] = pos.quantity;
+            snap.avg_prices[symbol] = pos.avg_price;
+        }
+
+        snap.checksum = compute_checksum(snap);
+
+        // Persist to disk
+        save_snapshot(snap);
+
+        return snap;
+    }
+
+    void restore_from_snapshot(const Snapshot& snap) {
+        // Validate checksum
+        if (compute_checksum(snap) != snap.checksum) {
+            throw std::runtime_error("Snapshot checksum validation failed!");
+        }
+
+        LOG_INFO("Restoring positions from snapshot at {}",
+                format_timestamp(snap.timestamp));
+
+        for (const auto& [symbol, quantity] : snap.positions) {
+            double avg_price = snap.avg_prices.at(symbol);
+            position_mgr_->set_position(symbol, quantity, avg_price);
+            LOG_DEBUG("Restored {}: qty={}, avg_price={}",
+                     symbol, quantity, avg_price);
+        }
+
+        LOG_INFO("Position restore complete");
+    }
+
+private:
+    string compute_checksum(const Snapshot& snap) {
+        SHA256_CTX ctx;
+        SHA256_Init(&ctx);
+
+        // Hash timestamp
+        SHA256_Update(&ctx, &snap.timestamp, sizeof(snap.timestamp));
+
+        // Hash positions (in sorted order for determinism)
+        for (const auto& [symbol, qty] : snap.positions) {
+            SHA256_Update(&ctx, symbol.data(), symbol.size());
+            SHA256_Update(&ctx, &qty, sizeof(qty));
+            double price = snap.avg_prices.at(symbol);
+            SHA256_Update(&ctx, &price, sizeof(price));
+        }
+
+        unsigned char hash[SHA256_DIGEST_LENGTH];
+        SHA256_Final(hash, &ctx);
+
+        // Convert to hex string
+        std::stringstream ss;
+        for (int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
+            ss << std::hex << std::setw(2) << std::setfill('0')
+               << static_cast<int>(hash[i]);
+        }
+        return ss.str();
+    }
+};
+
+================================================================================
+8. TESTING RECONCILIATION LOGIC
+================================================================================
+
+8.1 TEST SCENARIOS
+------------------
+
+1. Exact match (happy path)
+2. Minor rounding difference (<0.01%)
+3. Moderate discrepancy (1-5%)
+4. Large discrepancy (>5%)
+5. Exchange API failure
+6. Stale exchange data
+7. Missing fills
+8. Duplicate fills (idempotency)
+9. Concurrent reconciliation
+10. Multi-exchange reconciliation
+
+8.2 UNIT TESTS
+--------------
+
+#include <gtest/gtest.h>
+
+class ReconciliationTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        reconciler_ = std::make_unique<ReconciliationEngine>();
+        mock_exchange_ = std::make_unique<MockExchangeAPI>();
+        // Setup test fixtures
+    }
+
+    std::unique_ptr<ReconciliationEngine> reconciler_;
+    std::unique_ptr<MockExchangeAPI> mock_exchange_;
+};
+
+TEST_F(ReconciliationTest, ExactMatch) {
+    // Setup
+    string symbol = "AAPL";
+    int64_t quantity = 1000;
+
+    set_internal_position(symbol, quantity);
+    mock_exchange_->set_position(symbol, quantity);
+
+    // Execute
+    auto result = reconciler_->reconcile_symbol(symbol);
+
+    // Verify
+    EXPECT_EQ(result, ReconciliationResult::MATCH);
+}
+
+TEST_F(ReconciliationTest, MinorDiscrepancy) {
+    string symbol = "AAPL";
+
+    set_internal_position(symbol, 1000);
+    mock_exchange_->set_position(symbol, 1001);  // Off by 1
+
+    auto result = reconciler_->reconcile_symbol(symbol);
+
+    EXPECT_EQ(result, ReconciliationResult::MINOR_DISCREPANCY);
+
+    // Verify auto-correction
+    auto pos = get_internal_position(symbol);
+    EXPECT_EQ(pos, 1001);
+}
+
+TEST_F(ReconciliationTest, MajorDiscrepancy) {
+    string symbol = "AAPL";
+
+    set_internal_position(symbol, 1000);
+    mock_exchange_->set_position(symbol, 1030);  // 3% off
+
+    auto result = reconciler_->reconcile_symbol(symbol);
+
+    EXPECT_EQ(result, ReconciliationResult::MAJOR_DISCREPANCY);
+
+    // Verify alert was sent
+    EXPECT_TRUE(was_alert_sent(symbol));
+}
+
+TEST_F(ReconciliationTest, CriticalMismatch) {
+    string symbol = "AAPL";
+
+    set_internal_position(symbol, 1000);
+    mock_exchange_->set_position(symbol, 1200);  // 20% off!
+
+    auto result = reconciler_->reconcile_symbol(symbol);
+
+    EXPECT_EQ(result, ReconciliationResult::CRITICAL_MISMATCH);
+
+    // Verify trading halted
+    EXPECT_TRUE(is_trading_halted(symbol));
+}
+
+TEST_F(ReconciliationTest, ExchangeAPIFailure) {
+    string symbol = "AAPL";
+
+    set_internal_position(symbol, 1000);
+    mock_exchange_->set_failure(true);
+
+    EXPECT_THROW(
+        reconciler_->reconcile_symbol(symbol),
+        ExchangeAPIException
+    );
+}
+
+TEST_F(ReconciliationTest, MissedFillRecovery) {
+    string symbol = "AAPL";
+
+    set_internal_position(symbol, 1000);
+
+    // Simulate missed fill
+    Fill missed_fill{
+        .fill_id = 12345,
+        .order_id = 67890,
+        .symbol = symbol,
+        .quantity = 500,
+        .price = 150.0,
+        .fill_time = now_utc()
+    };
+
+    mock_exchange_->add_fill(missed_fill);
+    mock_exchange_->set_position(symbol, 1500);  // 1000 + 500
+
+    auto result = reconciler_->reconcile_symbol(symbol);
+
+    // Verify fill was recovered
+    EXPECT_TRUE(was_fill_processed(missed_fill.fill_id));
+
+    // Verify position updated
+    auto pos = get_internal_position(symbol);
+    EXPECT_EQ(pos, 1500);
+}
+
+8.3 INTEGRATION TESTS
+---------------------
+
+// Test with real exchange API (testnet)
+TEST(ReconciliationIntegration, RealExchangeReconciliation) {
+    // Setup real exchange connection (testnet)
+    auto exchange = create_testnet_exchange();
+    auto reconciler = ReconciliationEngine(exchange);
+
+    // Place a real order
+    uint64_t order_id = exchange->send_order("BTCUSD", OrderSide::BUY, 1, 50000);
+
+    // Wait for fill
+    wait_for_fill(order_id, std::chrono::seconds(10));
+
+    // Run reconciliation
+    auto result = reconciler.reconcile_symbol("BTCUSD");
+
+    EXPECT_EQ(result, ReconciliationResult::MATCH);
+}
+
+8.4 CHAOS TESTING
+-----------------
+
+Simulate crashes during reconciliation:
+
+void chaos_test_reconciliation() {
+    for (int i = 0; i < 100; i++) {
+        // Start reconciliation
+        auto future = std::async(std::launch::async, []() {
+            reconciler_->full_reconciliation();
+        });
+
+        // Random crash during reconciliation
+        std::this_thread::sleep_for(std::chrono::milliseconds(rand() % 1000));
+
+        if (rand() % 2 == 0) {
+            // Simulate crash
+            LOG_INFO("Simulating crash during reconciliation");
+            exit(1);  // Hard crash
+        }
+
+        future.wait();
+    }
+}
+
+8.5 PERFORMANCE TESTS
+---------------------
+
+TEST(ReconciliationPerformance, ThousandSymbols) {
+    // Setup 1000 symbols
+    for (int i = 0; i < 1000; i++) {
+        string symbol = "SYM" + std::to_string(i);
+        set_internal_position(symbol, 1000);
+        mock_exchange_->set_position(symbol, 1000);
+    }
+
+    auto start = now_utc();
+    auto report = reconciler_->full_reconciliation();
+    auto end = now_utc();
+
+    auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        end - start
+    ).count();
+
+    LOG_INFO("Reconciled 1000 symbols in {} ms", duration_ms);
+
+    // Should complete in < 10 seconds
+    EXPECT_LT(duration_ms, 10000);
+
+    // All should match
+    EXPECT_EQ(report.matched, 1000);
+}
+
+================================================================================
+9. BEST PRACTICES & CHECKLISTS
+================================================================================
+
+9.1 RECONCILIATION BEST PRACTICES
+----------------------------------
+
+1. Run reconciliation at multiple frequencies:
+   - Continuous: Every 1-5 minutes for critical symbols
+   - Regular: Every 15-30 minutes for all symbols
+   - Deep: Once per day (end of day)
+
+2. Always trust exchange as source of truth
+   (unless you have proof exchange is wrong)
+
+3. Never auto-correct large discrepancies (>5%)
+   - Halt trading
+   - Alert ops team
+   - Manual investigation required
+
+4. Log everything:
+   - Every discrepancy, no matter how small
+   - All reconciliation runs
+   - All resolutions
+
+5. Test reconciliation regularly:
+   - Monthly drills
+   - Chaos testing
+   - Integration tests with real exchanges
+
+6. Have a rollback plan:
+   - Position snapshots every N minutes
+   - Ability to restore from snapshot
+   - Audit trail of all changes
+
+7. Monitor reconciliation performance:
+   - How long does it take?
+   - How often does it find discrepancies?
+   - What types of discrepancies?
+
+8. Handle edge cases:
+   - Corporate actions (splits, dividends)
+   - Settlement timing differences
+   - Exchange API outages
+   - Stale data
+
+9.2 PRE-RECONCILIATION CHECKLIST
+---------------------------------
+
+[ ] Verify exchange API is responsive
+[ ] Check system clock synchronization (NTP)
+[ ] Ensure database is accessible
+[ ] Verify sufficient API rate limit quota
+[ ] Check network connectivity
+[ ] Review recent error logs
+[ ] Confirm no ongoing deployments
+[ ] Verify backup systems are ready
+[ ] Ensure sufficient disk space for logs
+[ ] Check monitoring dashboards are functional
+
+9.3 POST-RECONCILIATION CHECKLIST
+----------------------------------
+
+[ ] Review reconciliation report
+[ ] Investigate all discrepancies
+[ ] Verify all auto-corrections were valid
+[ ] Check alert logs
+[ ] Review trading halt decisions
+[ ] Update position snapshots
+[ ] Verify risk limits are accurate
+[ ] Document any manual interventions
+[ ] Update runbooks if new issues found
+[ ] Communicate results to stakeholders
+
+9.4 INCIDENT RESPONSE CHECKLIST
+--------------------------------
+
+When critical discrepancy detected:
+
+[ ] Immediate: Halt trading on affected symbols
+[ ] Immediate: Alert on-call team
+[ ] 1 min: Verify discrepancy is real (not data glitch)
+[ ] 2 min: Query exchange for position
+[ ] 3 min: Review recent fills and orders
+[ ] 5 min: Check for missed fills
+[ ] 10 min: Determine root cause
+[ ] 15 min: Implement fix or manual correction
+[ ] 20 min: Verify positions are now correct
+[ ] 25 min: Test with small order
+[ ] 30 min: Resume trading if verified
+[ ] Post-incident: Write post-mortem
+[ ] Post-incident: Update monitoring/alerts
+[ ] Post-incident: Add test case to prevent recurrence
+
+9.5 MONITORING METRICS
+----------------------
+
+Key metrics to track:
+
+1. Reconciliation frequency: How often running?
+2. Reconciliation duration: How long does it take?
+3. Discrepancy rate: What % of symbols have discrepancies?
+4. Discrepancy severity distribution: How many INFO/WARN/ERROR/CRITICAL?
+5. Auto-correction rate: How many auto-corrected vs manual?
+6. Time to detect discrepancy: How fast do we catch issues?
+7. Time to resolve discrepancy: How fast do we fix them?
+8. False positive rate: How many alerts were false alarms?
+
+9.6 TROUBLESHOOTING GUIDE
+--------------------------
+
+Problem: Reconciliation taking too long
+Solution:
+  - Increase parallelism
+  - Use batch APIs instead of individual queries
+  - Cache exchange positions
+  - Reconcile only active symbols
+
+Problem: Frequent minor discrepancies
+Solution:
+  - Check for timing issues (race conditions)
+  - Verify settlement timing handling
+  - Review rounding logic
+  - Check for duplicate fill processing
+
+Problem: Exchange API rate limit hit
+Solution:
+  - Reduce reconciliation frequency
+  - Use websocket for real-time updates instead
+  - Implement exponential backoff
+  - Request higher rate limit from exchange
+
+Problem: False alerts for discrepancies
+Solution:
+  - Adjust thresholds
+  - Account for in-flight orders
+  - Improve timing synchronization
+  - Add smarter filtering logic
+
+================================================================================
+END OF DOCUMENT
+================================================================================

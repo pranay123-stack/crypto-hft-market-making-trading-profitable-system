@@ -1,0 +1,608 @@
+================================================================================
+                    SERVICE DISCOVERY FOR HFT
+                    Consul and etcd Implementation
+================================================================================
+
+TABLE OF CONTENTS
+================================================================================
+1. Introduction to Service Discovery
+2. Consul Architecture
+3. etcd Architecture  
+4. Consul Implementation
+5. etcd Implementation
+6. Health Checks and Monitoring
+7. Comparison and Best Practices
+
+================================================================================
+1. INTRODUCTION TO SERVICE DISCOVERY
+================================================================================
+
+Service discovery enables dynamic service location in distributed HFT systems.
+
+ARCHITECTURE:
+
+Traditional (Static):
+Service A ──> hardcoded://service-b:8080
+
+Dynamic (Service Discovery):
+Service A ──> Discovery Service ──> Current location of Service B
+                     │
+              ┌──────┴──────┐
+         Service B1      Service B2
+        (healthy)       (unhealthy - excluded)
+
+BENEFITS:
+✓ Dynamic service registration
+✓ Automatic health checking
+✓ Load balancing support
+✓ Failover handling
+✓ Configuration management
+
+================================================================================
+2. CONSUL ARCHITECTURE
+================================================================================
+
+CONSUL COMPONENTS:
+
+┌─────────────────────────────────────────────────────────┐
+│                  Consul Cluster                         │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐             │
+│  │ Server 1 │◄─┤ Server 2 │─►│ Server 3 │  (Raft)     │
+│  │ (Leader) │  │(Follower)│  │(Follower)│             │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘             │
+└───────┼─────────────┼─────────────┼────────────────────┘
+        │             │             │
+   ┌────▼────┐   ┌────▼────┐   ┌───▼─────┐
+   │ Agent 1 │   │ Agent 2 │   │ Agent 3 │
+   │(Client) │   │(Client) │   │(Client) │
+   └────┬────┘   └────┬────┘   └────┬────┘
+        │             │             │
+   ┌────▼────┐   ┌────▼────┐   ┌───▼─────┐
+   │Strategy │   │ Risk    │   │  OMS    │
+   │Service  │   │ Service │   │ Service │
+   └─────────┘   └─────────┘   └─────────┘
+
+KEY FEATURES:
+- Service Registration & Discovery
+- Health Checking
+- Key/Value Store
+- Multi-Datacenter Support
+- DNS Interface
+- HTTP API
+
+================================================================================
+3. ETCD ARCHITECTURE
+================================================================================
+
+ETCD COMPONENTS:
+
+┌──────────────────────────────────────────────────────┐
+│                etcd Cluster                          │
+│  ┌────────┐     ┌────────┐     ┌────────┐          │
+│  │ Node 1 │◄───►│ Node 2 │◄───►│ Node 3 │  (Raft)  │
+│  │(Leader)│     │        │     │        │          │
+│  └────┬───┘     └────┬───┘     └────┬───┘          │
+└───────┼──────────────┼──────────────┼───────────────┘
+        │              │              │
+   ┌────▼────────┬─────▼────────┬────▼────────┐
+   │   Client 1  │   Client 2   │   Client 3  │
+   │  (Strategy) │    (Risk)    │    (OMS)    │
+   └─────────────┴──────────────┴─────────────┘
+
+KEY FEATURES:
+- Distributed KV store
+- Strong consistency
+- Watch for changes
+- Lease mechanism
+- Transactions
+- gRPC API
+
+================================================================================
+4. CONSUL IMPLEMENTATION
+================================================================================
+
+C++ CONSUL CLIENT:
+
+#include <curl/curl.h>
+#include <nlohmann/json.hpp>
+#include <string>
+#include <vector>
+
+using json = nlohmann::json;
+
+class ConsulClient {
+    std::string base_url_;
+
+public:
+    ConsulClient(const std::string& host = "localhost", int port = 8500)
+        : base_url_("http://" + host + ":" + std::to_string(port)) {}
+
+    // Register service
+    bool registerService(const std::string& service_name,
+                        const std::string& service_id,
+                        const std::string& address,
+                        int port,
+                        const std::vector<std::string>& tags = {}) {
+
+        json registration = {
+            {"ID", service_id},
+            {"Name", service_name},
+            {"Address", address},
+            {"Port", port},
+            {"Tags", tags},
+            {"Check", {
+                {"HTTP", "http://" + address + ":" + std::to_string(port) + "/health"},
+                {"Interval", "10s"},
+                {"Timeout", "5s"},
+                {"DeregisterCriticalServiceAfter", "1m"}
+            }}
+        };
+
+        std::string url = base_url_ + "/v1/agent/service/register";
+        return httpPut(url, registration.dump());
+    }
+
+    // Deregister service
+    bool deregisterService(const std::string& service_id) {
+        std::string url = base_url_ + "/v1/agent/service/deregister/" + service_id;
+        return httpPut(url, "");
+    }
+
+    // Discover healthy services
+    struct ServiceInstance {
+        std::string id;
+        std::string address;
+        int port;
+        std::vector<std::string> tags;
+    };
+
+    std::vector<ServiceInstance> discoverService(const std::string& service_name) {
+        std::string url = base_url_ + "/v1/health/service/" + service_name + "?passing";
+        std::string response = httpGet(url);
+
+        auto j = json::parse(response);
+        std::vector<ServiceInstance> instances;
+
+        for (const auto& item : j) {
+            ServiceInstance inst;
+            inst.id = item["Service"]["ID"];
+            inst.address = item["Service"]["Address"];
+            inst.port = item["Service"]["Port"];
+
+            if (item["Service"].contains("Tags")) {
+                inst.tags = item["Service"]["Tags"].get<std::vector<std::string>>();
+            }
+
+            instances.push_back(inst);
+        }
+
+        return instances;
+    }
+
+    // KV operations
+    bool kvPut(const std::string& key, const std::string& value) {
+        std::string url = base_url_ + "/v1/kv/" + key;
+        return httpPut(url, value);
+    }
+
+    std::optional<std::string> kvGet(const std::string& key) {
+        std::string url = base_url_ + "/v1/kv/" + key + "?raw";
+        return std::optional<std::string>(httpGet(url));
+    }
+
+    bool kvDelete(const std::string& key) {
+        std::string url = base_url_ + "/v1/kv/" + key;
+        return httpDelete(url);
+    }
+
+private:
+    bool httpPut(const std::string& url, const std::string& data) {
+        CURL* curl = curl_easy_init();
+        if (!curl) return false;
+
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data.c_str());
+
+        CURLcode res = curl_easy_perform(curl);
+        curl_easy_cleanup(curl);
+
+        return res == CURLE_OK;
+    }
+
+    std::string httpGet(const std::string& url) {
+        CURL* curl = curl_easy_init();
+        std::string response;
+
+        if (curl) {
+            curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCallback);
+            curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+            curl_easy_perform(curl);
+            curl_easy_cleanup(curl);
+        }
+        return response;
+    }
+
+    bool httpDelete(const std::string& url) {
+        CURL* curl = curl_easy_init();
+        if (!curl) return false;
+
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
+
+        CURLcode res = curl_easy_perform(curl);
+        curl_easy_cleanup(curl);
+
+        return res == CURLE_OK;
+    }
+
+    static size_t writeCallback(void* contents, size_t size, size_t nmemb, void* userp) {
+        ((std::string*)userp)->append((char*)contents, size * nmemb);
+        return size * nmemb;
+    }
+};
+
+// SERVICE REGISTRATION EXAMPLE:
+
+class TradingService {
+    ConsulClient consul_;
+    std::string service_id_;
+
+public:
+    TradingService(const std::string& service_name, int port)
+        : consul_("localhost", 8500)
+        , service_id_(service_name + "-" + std::to_string(getpid())) {
+
+        // Register service on startup
+        if (!consul_.registerService(service_name, service_id_,
+                                     getLocalIP(), port,
+                                     {"trading", "hft", "cpp"})) {
+            throw std::runtime_error("Failed to register service");
+        }
+
+        // Ensure deregistration on exit
+        std::atexit([this]() {
+            consul_.deregisterService(service_id_);
+        });
+    }
+
+    ~TradingService() {
+        consul_.deregisterService(service_id_);
+    }
+
+    // Discover risk service
+    std::string discoverRiskService() {
+        auto instances = consul_.discoverService("risk-service");
+
+        if (instances.empty()) {
+            throw std::runtime_error("No risk service available");
+        }
+
+        // Return first healthy instance
+        return instances[0].address + ":" + std::to_string(instances[0].port);
+    }
+};
+
+================================================================================
+5. ETCD IMPLEMENTATION
+================================================================================
+
+C++ ETCD CLIENT:
+
+#include <etcd/Client.hpp>
+#include <etcd/KeepAlive.hpp>
+#include <string>
+
+class EtcdServiceRegistry {
+    std::shared_ptr<etcd::Client> client_;
+    std::string service_prefix_;
+    int64_t lease_id_;
+
+public:
+    EtcdServiceRegistry(const std::string& endpoints = "http://127.0.0.1:2379",
+                       const std::string& service_prefix = "/services/")
+        : client_(std::make_shared<etcd::Client>(endpoints))
+        , service_prefix_(service_prefix)
+        , lease_id_(0) {
+
+        // Create lease (TTL: 10 seconds)
+        auto lease_response = client_->leasegrant(10);
+        if (!lease_response.is_ok()) {
+            throw std::runtime_error("Failed to create lease");
+        }
+        lease_id_ = lease_response.value().ID;
+
+        // Keep lease alive
+        startKeepAlive();
+    }
+
+    ~EtcdServiceRegistry() {
+        if (lease_id_ != 0) {
+            client_->leaserevoke(lease_id_);
+        }
+    }
+
+    // Register service
+    bool registerService(const std::string& service_name,
+                        const std::string& instance_id,
+                        const std::string& address,
+                        int port) {
+
+        std::string key = service_prefix_ + service_name + "/" + instance_id;
+
+        json value = {
+            {"address", address},
+            {"port", port},
+            {"timestamp", std::time(nullptr)}
+        };
+
+        // Put with lease
+        auto response = client_->put(key, value.dump(), lease_id_);
+
+        return response.is_ok();
+    }
+
+    // Discover services
+    struct ServiceInstance {
+        std::string id;
+        std::string address;
+        int port;
+    };
+
+    std::vector<ServiceInstance> discoverService(const std::string& service_name) {
+        std::string prefix = service_prefix_ + service_name + "/";
+
+        auto response = client_->ls(prefix);
+
+        std::vector<ServiceInstance> instances;
+
+        if (!response.is_ok()) {
+            return instances;
+        }
+
+        for (size_t i = 0; i < response.keys().size(); ++i) {
+            std::string key = response.key(i);
+            std::string value_str = response.value(i).as_string();
+
+            auto value = json::parse(value_str);
+
+            ServiceInstance inst;
+            inst.id = key.substr(prefix.length());
+            inst.address = value["address"];
+            inst.port = value["port"];
+
+            instances.push_back(inst);
+        }
+
+        return instances;
+    }
+
+    // Watch for service changes
+    void watchService(const std::string& service_name,
+                     std::function<void(const std::vector<ServiceInstance>&)> callback) {
+
+        std::string prefix = service_prefix_ + service_name + "/";
+
+        std::thread watch_thread([this, prefix, callback]() {
+            auto watcher = client_->watch(prefix, true);  // Recursive watch
+
+            while (true) {
+                auto response = watcher->waitNext();
+
+                if (!response.is_ok()) {
+                    std::cerr << "Watch error" << std::endl;
+                    continue;
+                }
+
+                // Service list changed, notify callback
+                auto instances = discoverService(prefix);
+                callback(instances);
+            }
+        });
+
+        watch_thread.detach();
+    }
+
+    // Configuration management
+    bool putConfig(const std::string& key, const std::string& value) {
+        auto response = client_->put("/config/" + key, value);
+        return response.is_ok();
+    }
+
+    std::optional<std::string> getConfig(const std::string& key) {
+        auto response = client_->get("/config/" + key);
+
+        if (!response.is_ok() || response.value().as_string().empty()) {
+            return std::nullopt;
+        }
+
+        return response.value().as_string();
+    }
+
+    // Watch configuration changes
+    void watchConfig(const std::string& key,
+                    std::function<void(const std::string&)> callback) {
+
+        std::thread watch_thread([this, key, callback]() {
+            auto watcher = client_->watch("/config/" + key);
+
+            while (true) {
+                auto response = watcher->waitNext();
+
+                if (response.is_ok()) {
+                    std::string new_value = response.value().as_string();
+                    callback(new_value);
+                }
+            }
+        });
+
+        watch_thread.detach();
+    }
+
+private:
+    void startKeepAlive() {
+        std::thread keepalive_thread([this]() {
+            while (lease_id_ != 0) {
+                auto response = client_->leasekeepalive(lease_id_);
+
+                if (!response.is_ok()) {
+                    std::cerr << "Lease keepalive failed" << std::endl;
+                }
+
+                std::this_thread::sleep_for(std::chrono::seconds(3));
+            }
+        });
+
+        keepalive_thread.detach();
+    }
+};
+
+// USAGE:
+
+class StrategyService {
+    EtcdServiceRegistry registry_;
+
+public:
+    StrategyService()
+        : registry_("http://127.0.0.1:2379") {
+
+        // Register this service
+        registry_.registerService("strategy", "instance-1",
+                                 getLocalIP(), 8080);
+
+        // Watch for OMS service changes
+        registry_.watchService("oms", [this](const auto& instances) {
+            std::cout << "OMS instances updated: " << instances.size() << std::endl;
+            updateOMSConnections(instances);
+        });
+
+        // Watch configuration changes
+        registry_.watchConfig("max_position", [this](const std::string& value) {
+            std::cout << "Max position updated: " << value << std::endl;
+            updateMaxPosition(std::stoi(value));
+        });
+    }
+};
+
+================================================================================
+6. HEALTH CHECKS AND MONITORING
+================================================================================
+
+HTTP HEALTH CHECK ENDPOINT:
+
+#include <httplib.h>
+
+class HealthCheckServer {
+    httplib::Server server_;
+    std::atomic<bool> healthy_{true};
+
+public:
+    HealthCheckServer(int port = 8080) {
+        // Health check endpoint
+        server_.Get("/health", [this](const auto& req, auto& res) {
+            if (healthy_) {
+                res.set_content("OK", "text/plain");
+                res.status = 200;
+            } else {
+                res.set_content("UNHEALTHY", "text/plain");
+                res.status = 503;
+            }
+        });
+
+        // Start server in background
+        std::thread([this, port]() {
+            server_.listen("0.0.0.0", port);
+        }).detach();
+    }
+
+    void setHealthy(bool healthy) {
+        healthy_ = healthy;
+    }
+};
+
+// Usage in service
+HealthCheckServer health_server(8080);
+
+// Mark unhealthy if critical component fails
+if (critical_component_failed) {
+    health_server.setHealthy(false);
+}
+
+================================================================================
+7. COMPARISON AND BEST PRACTICES
+================================================================================
+
+CONSUL VS ETCD:
+
+┌────────────────────┬─────────────────┬─────────────────┐
+│ Feature            │ Consul          │ etcd            │
+├────────────────────┼─────────────────┼─────────────────┤
+│ Service Discovery  │ Built-in        │ Manual          │
+│ Health Checks      │ Built-in        │ Manual (lease)  │
+│ DNS Interface      │ Yes             │ No              │
+│ HTTP API           │ Yes             │ gRPC            │
+│ Multi-DC           │ Native          │ Manual          │
+│ K/V Store          │ Yes             │ Yes (primary)   │
+│ Watches            │ Blocking        │ Streaming       │
+│ Consistency        │ Eventual/Strong │ Strong          │
+│ Complexity         │ Medium          │ Lower           │
+└────────────────────┴─────────────────┴─────────────────┘
+
+WHEN TO USE CONSUL:
+✓ Need built-in service discovery
+✓ Want DNS interface
+✓ Multi-datacenter setup
+✓ Prefer HTTP API
+✓ Need extensive health checking
+
+WHEN TO USE ETCD:
+✓ Already using Kubernetes
+✓ Need strong consistency
+✓ Want streaming watches
+✓ Prefer gRPC API
+✓ Simpler setup
+
+BEST PRACTICES:
+
+✓ Run 3 or 5 server nodes (odd number for quorum)
+✓ Deploy agents on each host
+✓ Implement health checks for all services
+✓ Use service tags for versioning/routing
+✓ Set appropriate TTLs for KV data
+✓ Monitor cluster health
+✓ Backup KV store regularly
+✓ Use watches for dynamic configuration
+✓ Implement retry logic with backoff
+✓ Test failure scenarios
+
+DON'T:
+
+✗ Run single node in production
+✗ Store large values in KV store
+✗ Poll for changes (use watches)
+✗ Ignore health check failures
+✗ Hardcode service addresses
+✗ Forget to deregister services
+✗ Use for critical path lookups (cache locally)
+
+DEPLOYMENT:
+
+# Consul server
+consul agent -server -bootstrap-expect=3 \
+  -data-dir=/var/consul \
+  -bind=192.168.1.10
+
+# Consul client
+consul agent -data-dir=/var/consul \
+  -bind=192.168.1.20 \
+  -join=192.168.1.10
+
+# etcd
+etcd --name node1 \
+  --initial-cluster node1=http://192.168.1.10:2380 \
+  --listen-client-urls http://0.0.0.0:2379
+
+================================================================================
+END OF SERVICE DISCOVERY
+================================================================================

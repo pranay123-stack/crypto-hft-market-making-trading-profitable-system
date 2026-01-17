@@ -1,0 +1,910 @@
+================================================================================
+HFT DATABASE CONFIGURATION - DATABASE CONNECTIONS AND STORAGE
+================================================================================
+Version: 1.0.0
+Last Updated: 2025-11-25
+Description: Database and persistent storage configuration
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Database Architecture
+2. TimeSeries Database (Market Data)
+3. Relational Database (Orders/Trades)
+4. In-Memory Database (Real-time State)
+5. Message Queue Systems
+6. Cache Configuration
+7. Data Persistence
+8. Backup and Recovery
+9. C++ Database Clients
+10. Data Retention
+
+================================================================================
+1. DATABASE ARCHITECTURE
+================================================================================
+
+DATABASE ARCHITECTURE:
+----------------------
+```yaml
+database_architecture:
+  # Multi-database strategy
+  databases:
+    # High-frequency tick data
+    timeseries:
+      type: "questdb"  # questdb, timescaledb, influxdb
+      purpose: "market_data_ticks"
+      priority: "high"
+
+    # Order and trade data
+    relational:
+      type: "postgresql"
+      purpose: "orders_trades_positions"
+      priority: "high"
+
+    # Real-time state
+    inmemory:
+      type: "redis"  # redis, memcached, aerospike
+      purpose: "session_state_cache"
+      priority: "critical"
+
+    # Analytics and reporting
+    analytical:
+      type: "clickhouse"
+      purpose: "historical_analysis"
+      priority: "low"
+
+  data_flow:
+    # Real-time data path
+    hot_path:
+      - source: "market_data_feed"
+      - destination: "inmemory_cache"
+      - async_persist: "timeseries_db"
+
+    # Order/trade path
+    trading_path:
+      - source: "order_execution"
+      - destination: "relational_db"
+      - async_backup: "audit_log"
+
+  partitioning:
+    strategy: "time_based"  # time_based, hash_based, range_based
+    partition_interval: "daily"
+```
+
+CONNECTION POOLING:
+-------------------
+```yaml
+connection_pooling:
+  global_settings:
+    min_connections: 5
+    max_connections: 50
+    connection_timeout_ms: 5000
+    idle_timeout_ms: 60000
+
+  per_database:
+    postgresql:
+      min_connections: 10
+      max_connections: 100
+      max_idle_time_s: 300
+      validation_query: "SELECT 1"
+
+    redis:
+      min_connections: 20
+      max_connections: 200
+      connection_retry_delay_ms: 100
+      max_retries: 3
+
+    questdb:
+      min_connections: 5
+      max_connections: 20
+```
+
+================================================================================
+2. TIMESERIES DATABASE - MARKET DATA
+================================================================================
+
+QUESTDB CONFIGURATION:
+----------------------
+```yaml
+questdb:
+  server:
+    host: "localhost"
+    http_port: 9000
+    pg_port: 8812
+    ilp_port: 9009  # InfluxDB Line Protocol
+
+  connection:
+    protocol: "ilp"  # ilp (fastest), http, postgresql
+    buffer_size: 65536
+    auto_flush_interval_ms: 1000
+
+  tables:
+    # Tick data
+    market_data_ticks:
+      schema:
+        - name: "timestamp"
+          type: "timestamp"
+          designated_timestamp: true
+
+        - name: "symbol"
+          type: "symbol"
+          indexed: true
+
+        - name: "bid_price"
+          type: "double"
+
+        - name: "bid_size"
+          type: "int"
+
+        - name: "ask_price"
+          type: "double"
+
+        - name: "ask_size"
+          type: "int"
+
+        - name: "last_price"
+          type: "double"
+
+        - name: "last_size"
+          type: "int"
+
+        - name: "exchange"
+          type: "symbol"
+
+      partitioning:
+        type: "DAY"
+        retention_days: 90
+
+      optimization:
+        deduplicate: false
+        wal_enabled: true
+        max_uncommitted_rows: 500000
+
+    # Trade data
+    trades:
+      schema:
+        - name: "timestamp"
+          type: "timestamp"
+          designated_timestamp: true
+
+        - name: "symbol"
+          type: "symbol"
+
+        - name: "price"
+          type: "double"
+
+        - name: "quantity"
+          type: "int"
+
+        - name: "side"
+          type: "symbol"  # BUY/SELL
+
+        - name: "exchange"
+          type: "symbol"
+
+      partitioning:
+        type: "DAY"
+        retention_days: 365
+
+  performance:
+    # Write optimization
+    write_buffer_size_mb: 256
+    max_uncommitted_rows: 1000000
+
+    # Read optimization
+    page_cache_size_mb: 2048
+    query_timeout_ms: 30000
+
+  ingestion:
+    # InfluxDB Line Protocol (ILP) - fastest
+    ilp:
+      enabled: true
+      port: 9009
+      buffer_size: 65536
+      worker_threads: 4
+```
+
+C++ QUESTDB CLIENT:
+-------------------
+```cpp
+#include <questdb/ingress/line_sender.hpp>
+
+class QuestDBWriter {
+private:
+    questdb::ingress::line_sender sender_;
+    questdb::ingress::line_sender_buffer buffer_;
+
+public:
+    QuestDBWriter(const std::string& host, uint16_t port) {
+        sender_ = questdb::ingress::line_sender::from_conf(
+            fmt::format("tcp::addr={}:{};", host, port));
+
+        buffer_.reserve(65536);
+    }
+
+    void WriteMarketData(const MarketDataTick& tick) {
+        try {
+            buffer_.table("market_data_ticks")
+                .symbol("symbol", tick.symbol)
+                .symbol("exchange", tick.exchange)
+                .column("bid_price", tick.bid_price)
+                .column("bid_size", tick.bid_size)
+                .column("ask_price", tick.ask_price)
+                .column("ask_size", tick.ask_size)
+                .column("last_price", tick.last_price)
+                .column("last_size", tick.last_size)
+                .at(std::chrono::microseconds(tick.timestamp_us));
+
+            // Auto-flush after N records or timeout
+            if (buffer_.size() > 1000) {
+                Flush();
+            }
+
+        } catch (const std::exception& e) {
+            LOG_ERROR("QuestDB write error: {}", e.what());
+        }
+    }
+
+    void WriteTrade(const Trade& trade) {
+        buffer_.table("trades")
+            .symbol("symbol", trade.symbol)
+            .symbol("exchange", trade.exchange)
+            .symbol("side", trade.side == Side::BUY ? "BUY" : "SELL")
+            .column("price", trade.price)
+            .column("quantity", trade.quantity)
+            .at(std::chrono::microseconds(trade.timestamp_us));
+
+        if (buffer_.size() > 1000) {
+            Flush();
+        }
+    }
+
+    void Flush() {
+        if (!buffer_.empty()) {
+            sender_.flush(buffer_);
+            buffer_.clear();
+        }
+    }
+
+    void StartAutoFlush(uint32_t interval_ms) {
+        auto flush_thread = std::thread([this, interval_ms]() {
+            while (true) {
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(interval_ms));
+                Flush();
+            }
+        });
+        flush_thread.detach();
+    }
+};
+```
+
+TIMESCALEDB (ALTERNATIVE):
+--------------------------
+```yaml
+timescaledb:
+  connection:
+    host: "localhost"
+    port: 5432
+    database: "hft_market_data"
+    user: "hft_user"
+    password_file: "/etc/hft/secrets/timescaledb.pwd"
+    sslmode: "require"
+
+  hypertables:
+    market_data_ticks:
+      time_column: "timestamp"
+      chunk_time_interval: "1 day"
+      compression:
+        enabled: true
+        compress_after: "7 days"
+        segment_by: "symbol"
+
+  retention:
+    policy: "drop_chunks"
+    older_than: "90 days"
+```
+
+================================================================================
+3. RELATIONAL DATABASE - ORDERS AND TRADES
+================================================================================
+
+POSTGRESQL CONFIGURATION:
+--------------------------
+```yaml
+postgresql:
+  connection:
+    host: "db.internal.local"
+    port: 5432
+    database: "hft_trading"
+    user: "hft_user"
+    password_file: "/etc/hft/secrets/postgres.pwd"
+
+    pool_settings:
+      min_connections: 10
+      max_connections: 100
+      connection_lifetime_s: 3600
+
+    ssl:
+      enabled: true
+      mode: "require"
+      cert_file: "/etc/hft/certs/client.crt"
+      key_file: "/etc/hft/keys/client.key"
+
+  performance:
+    # Connection
+    tcp_keepalives_idle: 60
+    tcp_keepalives_interval: 10
+    tcp_keepalives_count: 5
+
+    # Query
+    statement_timeout: 30000  # 30 seconds
+    lock_timeout: 5000        # 5 seconds
+
+  tables:
+    orders:
+      schema: |
+        CREATE TABLE orders (
+          order_id BIGSERIAL PRIMARY KEY,
+          client_order_id VARCHAR(50) UNIQUE NOT NULL,
+          symbol VARCHAR(20) NOT NULL,
+          side VARCHAR(4) NOT NULL,
+          order_type VARCHAR(10) NOT NULL,
+          quantity INTEGER NOT NULL,
+          price NUMERIC(12, 4),
+          time_in_force VARCHAR(10),
+          status VARCHAR(20) NOT NULL,
+          strategy_id VARCHAR(50),
+          created_at TIMESTAMP NOT NULL,
+          updated_at TIMESTAMP NOT NULL,
+          filled_quantity INTEGER DEFAULT 0,
+          avg_fill_price NUMERIC(12, 4),
+          exchange VARCHAR(20),
+          exchange_order_id VARCHAR(50)
+        );
+
+      indexes:
+        - "CREATE INDEX idx_orders_client_order_id ON orders(client_order_id);"
+        - "CREATE INDEX idx_orders_symbol ON orders(symbol);"
+        - "CREATE INDEX idx_orders_status ON orders(status);"
+        - "CREATE INDEX idx_orders_created_at ON orders(created_at DESC);"
+
+      partitioning:
+        type: "RANGE"
+        column: "created_at"
+        interval: "1 MONTH"
+
+    fills:
+      schema: |
+        CREATE TABLE fills (
+          fill_id BIGSERIAL PRIMARY KEY,
+          order_id BIGINT REFERENCES orders(order_id),
+          execution_id VARCHAR(50) UNIQUE NOT NULL,
+          symbol VARCHAR(20) NOT NULL,
+          side VARCHAR(4) NOT NULL,
+          quantity INTEGER NOT NULL,
+          price NUMERIC(12, 4) NOT NULL,
+          commission NUMERIC(10, 4),
+          exchange VARCHAR(20),
+          executed_at TIMESTAMP NOT NULL,
+          liquidity_flag VARCHAR(10)
+        );
+
+      indexes:
+        - "CREATE INDEX idx_fills_order_id ON fills(order_id);"
+        - "CREATE INDEX idx_fills_executed_at ON fills(executed_at DESC);"
+
+    positions:
+      schema: |
+        CREATE TABLE positions (
+          position_id SERIAL PRIMARY KEY,
+          symbol VARCHAR(20) NOT NULL,
+          strategy_id VARCHAR(50) NOT NULL,
+          quantity INTEGER NOT NULL,
+          avg_price NUMERIC(12, 4) NOT NULL,
+          realized_pnl NUMERIC(15, 2) DEFAULT 0,
+          unrealized_pnl NUMERIC(15, 2) DEFAULT 0,
+          updated_at TIMESTAMP NOT NULL,
+          UNIQUE(symbol, strategy_id)
+        );
+
+      indexes:
+        - "CREATE INDEX idx_positions_symbol ON positions(symbol);"
+        - "CREATE INDEX idx_positions_strategy_id ON positions(strategy_id);"
+```
+
+C++ POSTGRESQL CLIENT:
+----------------------
+```cpp
+#include <libpqxx/pqxx>
+
+class PostgreSQLClient {
+private:
+    std::unique_ptr<pqxx::connection> conn_;
+    std::string connection_string_;
+
+public:
+    PostgreSQLClient(const std::string& host, uint16_t port,
+                    const std::string& db, const std::string& user,
+                    const std::string& password) {
+
+        connection_string_ = fmt::format(
+            "host={} port={} dbname={} user={} password={} "
+            "connect_timeout=5 sslmode=require",
+            host, port, db, user, password);
+
+        Connect();
+    }
+
+    void Connect() {
+        try {
+            conn_ = std::make_unique<pqxx::connection>(
+                connection_string_);
+
+            if (!conn_->is_open()) {
+                throw std::runtime_error("Failed to connect to database");
+            }
+
+            LOG_INFO("Connected to PostgreSQL: {}",
+                    conn_->dbname());
+
+        } catch (const std::exception& e) {
+            LOG_ERROR("PostgreSQL connection error: {}", e.what());
+            throw;
+        }
+    }
+
+    uint64_t InsertOrder(const Order& order) {
+        try {
+            pqxx::work txn(*conn_);
+
+            auto result = txn.exec_params(
+                "INSERT INTO orders "
+                "(client_order_id, symbol, side, order_type, "
+                "quantity, price, time_in_force, status, "
+                "strategy_id, created_at, updated_at) "
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, "
+                "NOW(), NOW()) "
+                "RETURNING order_id",
+                order.client_order_id,
+                order.symbol,
+                order.side == Side::BUY ? "BUY" : "SELL",
+                OrderTypeToString(order.type),
+                order.quantity,
+                order.price,
+                TIFToString(order.tif),
+                "NEW",
+                order.strategy_id
+            );
+
+            txn.commit();
+
+            return result[0][0].as<uint64_t>();
+
+        } catch (const std::exception& e) {
+            LOG_ERROR("Failed to insert order: {}", e.what());
+            throw;
+        }
+    }
+
+    void UpdateOrderStatus(uint64_t order_id,
+                          const std::string& status,
+                          int filled_qty = 0,
+                          double avg_price = 0.0) {
+
+        try {
+            pqxx::work txn(*conn_);
+
+            txn.exec_params(
+                "UPDATE orders SET "
+                "status = $1, filled_quantity = $2, "
+                "avg_fill_price = $3, updated_at = NOW() "
+                "WHERE order_id = $4",
+                status, filled_qty, avg_price, order_id
+            );
+
+            txn.commit();
+
+        } catch (const std::exception& e) {
+            LOG_ERROR("Failed to update order: {}", e.what());
+            throw;
+        }
+    }
+
+    void InsertFill(const Fill& fill) {
+        try {
+            pqxx::work txn(*conn_);
+
+            txn.exec_params(
+                "INSERT INTO fills "
+                "(order_id, execution_id, symbol, side, quantity, "
+                "price, commission, exchange, executed_at) "
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())",
+                fill.order_id,
+                fill.execution_id,
+                fill.symbol,
+                fill.side == Side::BUY ? "BUY" : "SELL",
+                fill.quantity,
+                fill.price,
+                fill.commission,
+                fill.exchange
+            );
+
+            txn.commit();
+
+        } catch (const std::exception& e) {
+            LOG_ERROR("Failed to insert fill: {}", e.what());
+            throw;
+        }
+    }
+
+    void UpdatePosition(const std::string& symbol,
+                       const std::string& strategy_id,
+                       int quantity, double avg_price) {
+
+        try {
+            pqxx::work txn(*conn_);
+
+            txn.exec_params(
+                "INSERT INTO positions "
+                "(symbol, strategy_id, quantity, avg_price, updated_at) "
+                "VALUES ($1, $2, $3, $4, NOW()) "
+                "ON CONFLICT (symbol, strategy_id) "
+                "DO UPDATE SET "
+                "quantity = $3, avg_price = $4, updated_at = NOW()",
+                symbol, strategy_id, quantity, avg_price
+            );
+
+            txn.commit();
+
+        } catch (const std::exception& e) {
+            LOG_ERROR("Failed to update position: {}", e.what());
+            throw;
+        }
+    }
+
+    std::vector<Order> GetActiveOrders() {
+        std::vector<Order> orders;
+
+        try {
+            pqxx::work txn(*conn_);
+
+            auto result = txn.exec(
+                "SELECT order_id, client_order_id, symbol, side, "
+                "order_type, quantity, price, status "
+                "FROM orders "
+                "WHERE status IN ('NEW', 'PARTIALLY_FILLED') "
+                "ORDER BY created_at DESC"
+            );
+
+            for (const auto& row : result) {
+                Order order;
+                order.order_id = row["order_id"].as<uint64_t>();
+                order.client_order_id =
+                    row["client_order_id"].as<std::string>();
+                order.symbol = row["symbol"].as<std::string>();
+                // ... parse other fields
+
+                orders.push_back(order);
+            }
+
+            txn.commit();
+
+        } catch (const std::exception& e) {
+            LOG_ERROR("Failed to get active orders: {}", e.what());
+        }
+
+        return orders;
+    }
+};
+```
+
+================================================================================
+4. IN-MEMORY DATABASE - REAL-TIME STATE
+================================================================================
+
+REDIS CONFIGURATION:
+--------------------
+```yaml
+redis:
+  connection:
+    mode: "cluster"  # standalone, sentinel, cluster
+
+    standalone:
+      host: "localhost"
+      port: 6379
+      password_file: "/etc/hft/secrets/redis.pwd"
+      database: 0
+
+    cluster:
+      nodes:
+        - host: "redis1.internal.local"
+          port: 6379
+        - host: "redis2.internal.local"
+          port: 6379
+        - host: "redis3.internal.local"
+          port: 6379
+
+  pool_settings:
+    min_connections: 20
+    max_connections: 200
+    connection_timeout_ms: 1000
+    socket_timeout_ms: 500
+
+  performance:
+    pipeline_enabled: true
+    pipeline_size: 100
+
+    tcp_options:
+      tcp_nodelay: true
+      tcp_keepalive: true
+
+  persistence:
+    # Disable for maximum performance (if acceptable)
+    rdb_enabled: false
+    aof_enabled: false
+
+    # Or use minimal persistence
+    save:
+      - "900 1"    # Save after 900s if 1 key changed
+      - "300 10"   # Save after 300s if 10 keys changed
+
+  memory:
+    maxmemory: "8gb"
+    maxmemory_policy: "allkeys-lru"  # Eviction policy
+
+  data_structures:
+    # Order book cache
+    order_books:
+      type: "sorted_set"  # ZSET
+      key_pattern: "orderbook:{symbol}:{side}"
+      ttl_seconds: 3600
+
+    # Position cache
+    positions:
+      type: "hash"
+      key_pattern: "position:{strategy}:{symbol}"
+      ttl_seconds: 86400
+
+    # Session state
+    sessions:
+      type: "hash"
+      key_pattern: "session:{session_id}"
+      ttl_seconds: 28800  # 8 hours
+```
+
+C++ REDIS CLIENT:
+-----------------
+```cpp
+#include <sw/redis++/redis++.h>
+
+class RedisClient {
+private:
+    std::unique_ptr<sw::redis::Redis> redis_;
+
+public:
+    RedisClient(const std::string& host, uint16_t port,
+               const std::string& password) {
+
+        sw::redis::ConnectionOptions opts;
+        opts.host = host;
+        opts.port = port;
+        opts.password = password;
+        opts.socket_timeout = std::chrono::milliseconds(500);
+        opts.connect_timeout = std::chrono::milliseconds(1000);
+
+        sw::redis::ConnectionPoolOptions pool_opts;
+        pool_opts.size = 20;
+        pool_opts.wait_timeout = std::chrono::milliseconds(100);
+
+        redis_ = std::make_unique<sw::redis::Redis>(opts, pool_opts);
+
+        LOG_INFO("Connected to Redis: {}:{}", host, port);
+    }
+
+    // Cache order book level
+    void CacheOrderBookLevel(const std::string& symbol,
+                            Side side,
+                            double price,
+                            uint32_t quantity) {
+
+        std::string key = fmt::format("orderbook:{}:{}",
+                                     symbol,
+                                     side == Side::BUY ? "bid" : "ask");
+
+        // Use sorted set (ZSET) - score is price
+        redis_->zadd(key, price, quantity);
+
+        // Set expiration
+        redis_->expire(key, 3600);  // 1 hour
+    }
+
+    // Get top N levels from order book
+    std::vector<std::pair<double, uint32_t>>
+    GetOrderBookLevels(const std::string& symbol,
+                      Side side, size_t n) {
+
+        std::vector<std::pair<double, uint32_t>> levels;
+
+        std::string key = fmt::format("orderbook:{}:{}",
+                                     symbol,
+                                     side == Side::BUY ? "bid" : "ask");
+
+        // Get top N (bids descending, asks ascending)
+        if (side == Side::BUY) {
+            auto result = redis_->zrevrange(key, 0, n - 1,
+                                          sw::redis::WITHSCORES);
+            // Parse result
+        } else {
+            auto result = redis_->zrange(key, 0, n - 1,
+                                       sw::redis::WITHSCORES);
+            // Parse result
+        }
+
+        return levels;
+    }
+
+    // Cache position
+    void CachePosition(const std::string& strategy,
+                      const std::string& symbol,
+                      int32_t quantity,
+                      double avg_price) {
+
+        std::string key = fmt::format("position:{}:{}", strategy, symbol);
+
+        redis_->hset(key, "quantity", quantity);
+        redis_->hset(key, "avg_price", avg_price);
+        redis_->hset(key, "updated_at", GetCurrentTimestamp());
+
+        redis_->expire(key, 86400);  // 24 hours
+    }
+
+    // Get position
+    std::optional<Position> GetPosition(const std::string& strategy,
+                                       const std::string& symbol) {
+
+        std::string key = fmt::format("position:{}:{}", strategy, symbol);
+
+        if (!redis_->exists(key)) {
+            return std::nullopt;
+        }
+
+        std::unordered_map<std::string, std::string> fields;
+        redis_->hgetall(key, std::inserter(fields, fields.begin()));
+
+        Position pos;
+        pos.strategy_id = strategy;
+        pos.symbol = symbol;
+        pos.quantity = std::stoi(fields["quantity"]);
+        pos.avg_price = std::stod(fields["avg_price"]);
+
+        return pos;
+    }
+
+    // Session management
+    void CreateSession(const std::string& session_id,
+                      const std::string& user_id) {
+
+        std::string key = fmt::format("session:{}", session_id);
+
+        redis_->hset(key, "user_id", user_id);
+        redis_->hset(key, "created_at", GetCurrentTimestamp());
+        redis_->hset(key, "last_activity", GetCurrentTimestamp());
+
+        redis_->expire(key, 28800);  // 8 hours
+    }
+
+    // Pub/Sub for real-time updates
+    void PublishMarketData(const std::string& symbol,
+                          const MarketDataTick& tick) {
+
+        std::string channel = fmt::format("market_data:{}", symbol);
+
+        nlohmann::json j = {
+            {"symbol", tick.symbol},
+            {"bid", tick.bid_price},
+            {"ask", tick.ask_price},
+            {"last", tick.last_price},
+            {"timestamp", tick.timestamp_us}
+        };
+
+        redis_->publish(channel, j.dump());
+    }
+};
+```
+
+================================================================================
+5. MESSAGE QUEUE SYSTEMS
+================================================================================
+
+MESSAGE QUEUE CONFIGURATION:
+----------------------------
+```yaml
+message_queues:
+  # Internal event bus
+  zeromq:
+    enabled: true
+
+    sockets:
+      market_data_pub:
+        type: "PUB"
+        endpoint: "tcp://*:5555"
+        hwm: 1000000  # High water mark
+
+      order_events_pub:
+        type: "PUB"
+        endpoint: "tcp://*:5556"
+        hwm: 100000
+
+      command_sub:
+        type: "SUB"
+        endpoint: "tcp://localhost:5557"
+        topics: ["order", "cancel", "modify"]
+
+  # External message broker
+  kafka:
+    enabled: false  # Use for non-critical async tasks
+
+    brokers:
+      - "kafka1:9092"
+      - "kafka2:9092"
+      - "kafka3:9092"
+
+    topics:
+      market_data_archive:
+        partitions: 12
+        replication_factor: 3
+
+      trade_executions:
+        partitions: 6
+        replication_factor: 3
+```
+
+================================================================================
+6. DATA RETENTION AND ARCHIVAL
+================================================================================
+
+DATA RETENTION POLICY:
+----------------------
+```yaml
+data_retention:
+  # Hot data (fast access)
+  hot_storage:
+    location: "/var/lib/hft/hot"
+    retention_days: 7
+    storage_type: "nvme_ssd"
+
+  # Warm data (moderate access)
+  warm_storage:
+    location: "/var/lib/hft/warm"
+    retention_days: 90
+    storage_type: "ssd"
+
+  # Cold data (archival)
+  cold_storage:
+    location: "s3://hft-data-archive"
+    retention_years: 7
+    compression: "zstd"
+    encryption: true
+
+  # Per-data-type retention
+  retention_policies:
+    tick_data:
+      hot_days: 7
+      warm_days: 30
+      archive_years: 1
+
+    order_data:
+      hot_days: 30
+      warm_days: 365
+      archive_years: 7  # Regulatory
+
+    trade_data:
+      hot_days: 30
+      warm_days: 365
+      archive_years: 7  # Regulatory
+```
+
+================================================================================
+END OF DATABASE CONFIGURATION
+================================================================================

@@ -1,0 +1,823 @@
+================================================================================
+CPU SETTINGS FOR HFT OPTIMIZATION
+================================================================================
+
+OVERVIEW:
+CPU configuration is the most critical aspect of HFT system optimization.
+This document covers CPU governor settings, frequency scaling, turbo boost,
+C-states, hyperthreading, and CPU isolation strategies to minimize latency
+and maximize deterministic performance.
+
+TARGET METRICS:
+- CPU Frequency: Locked at maximum (3.5+ GHz)
+- Context Switch Time: < 1 microsecond
+- CPU Wake-up Latency: < 100 nanoseconds
+- Jitter: < 50 nanoseconds (99.99th percentile)
+- Cache Miss Penalty: Minimized through isolation
+
+================================================================================
+1. CPU GOVERNOR CONFIGURATION
+================================================================================
+
+CONCEPT:
+The CPU governor controls CPU frequency scaling. For HFT, we always want
+maximum frequency with no dynamic scaling to avoid latency variance.
+
+AVAILABLE GOVERNORS:
+- performance: Always run at maximum frequency (REQUIRED FOR HFT)
+- powersave: Always run at minimum frequency (NEVER USE)
+- ondemand: Scale frequency based on load (NEVER USE)
+- conservative: Gradual scaling (NEVER USE)
+- schedutil: Scheduler-based scaling (NEVER USE)
+- userspace: Manual control (ADVANCED USE ONLY)
+
+CHECK CURRENT GOVERNOR:
+----------------------------------------
+# Check all CPUs
+cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+
+# Check specific CPU
+cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
+
+# List available governors
+cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors
+----------------------------------------
+
+SET PERFORMANCE GOVERNOR:
+----------------------------------------
+# Set for all CPUs (temporary - until reboot)
+for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+    echo performance > $cpu
+done
+
+# Verify
+cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+
+# Alternative using cpupower
+cpupower frequency-set -g performance
+
+# Verify with cpupower
+cpupower frequency-info
+----------------------------------------
+
+PERSISTENT CONFIGURATION:
+----------------------------------------
+# Method 1: Using cpufrequtils
+# Install: apt-get install cpufrequtils (Ubuntu/Debian)
+#          yum install cpupowerutils (RHEL/CentOS)
+
+# Edit /etc/default/cpufrequtils
+GOVERNOR="performance"
+MIN_SPEED="0"
+MAX_SPEED="0"  # 0 means maximum available
+
+# Restart service
+systemctl restart cpufrequtils
+
+# Method 2: Using systemd service
+# Create /etc/systemd/system/cpu-performance.service
+
+[Unit]
+Description=Set CPU governor to performance
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/cpupower frequency-set -g performance
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+
+# Enable service
+systemctl enable cpu-performance.service
+systemctl start cpu-performance.service
+
+# Method 3: Using rc.local
+echo 'performance' | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+----------------------------------------
+
+VALIDATION:
+----------------------------------------
+# Check current frequency for all CPUs
+cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq
+
+# Monitor frequency in real-time
+watch -n 1 "cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq"
+
+# Detailed frequency info
+turbostat --quiet --show PkgWatt,CorWatt,GFX%rc6,Pkg%pc2,Pkg%pc6 --interval 1
+
+# Using i7z tool
+i7z
+----------------------------------------
+
+================================================================================
+2. TURBO BOOST CONFIGURATION
+================================================================================
+
+CONCEPT:
+Intel Turbo Boost (and AMD Turbo Core) dynamically increases CPU frequency
+above base frequency. For HFT, this can be beneficial if deterministic,
+but may cause thermal throttling under sustained load.
+
+DECISION MATRIX:
+- Enable Turbo: If cooling is excellent and load is bursty
+- Disable Turbo: If determinism is critical and load is sustained
+
+CHECK TURBO BOOST STATUS:
+----------------------------------------
+# Intel: Check turbo status
+cat /sys/devices/system/cpu/intel_pstate/no_turbo
+# 0 = turbo enabled, 1 = turbo disabled
+
+# AMD: Check boost status
+cat /sys/devices/system/cpu/cpufreq/boost
+# 1 = boost enabled, 0 = boost disabled
+
+# Alternative: Using cpupower
+cpupower frequency-info | grep -i boost
+----------------------------------------
+
+ENABLE TURBO BOOST:
+----------------------------------------
+# Intel
+echo 0 > /sys/devices/system/cpu/intel_pstate/no_turbo
+
+# AMD
+echo 1 > /sys/devices/system/cpu/cpufreq/boost
+
+# Verify maximum frequency
+cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq
+----------------------------------------
+
+DISABLE TURBO BOOST (RECOMMENDED FOR DETERMINISM):
+----------------------------------------
+# Intel
+echo 1 > /sys/devices/system/cpu/intel_pstate/no_turbo
+
+# AMD
+echo 0 > /sys/devices/system/cpu/cpufreq/boost
+
+# Make persistent: Add to /etc/rc.local or systemd service
+# Intel
+echo "echo 1 > /sys/devices/system/cpu/intel_pstate/no_turbo" >> /etc/rc.local
+
+# AMD
+echo "echo 0 > /sys/devices/system/cpu/cpufreq/boost" >> /etc/rc.local
+----------------------------------------
+
+MONITORING TURBO:
+----------------------------------------
+# Real-time frequency monitoring
+turbostat --interval 1
+
+# Sample output interpretation:
+# Core 0: 3.5 GHz (base) vs 4.2 GHz (turbo)
+# Look for frequency variations under load
+
+# Using perf
+perf stat -e cpu-cycles,instructions -a sleep 5
+----------------------------------------
+
+================================================================================
+3. C-STATES MANAGEMENT
+================================================================================
+
+CONCEPT:
+C-states are CPU idle/sleep states that save power but introduce wake-up
+latency. For HFT, all C-states beyond C0 (running) should be disabled.
+
+C-STATE LEVELS:
+- C0: Running state (normal operation)
+- C1: Halt state (1-10 us wake-up latency)
+- C1E: Enhanced halt (10-20 us wake-up latency)
+- C3: Sleep state (20-100 us wake-up latency)
+- C6: Deep sleep (100-1000 us wake-up latency)
+- C7/C8: Deeper sleep (1+ ms wake-up latency)
+
+CHECK CURRENT C-STATES:
+----------------------------------------
+# List available C-states
+ls /sys/devices/system/cpu/cpu0/cpuidle/
+
+# Check state names and latency
+for state in /sys/devices/system/cpu/cpu0/cpuidle/state*; do
+    echo "State: $(basename $state)"
+    cat $state/name
+    cat $state/latency
+    cat $state/disable
+    echo "---"
+done
+
+# Using cpupower
+cpupower idle-info
+
+# Using powertop
+powertop --auto-tune
+----------------------------------------
+
+DISABLE C-STATES (KERNEL PARAMETER - RECOMMENDED):
+----------------------------------------
+# Edit /etc/default/grub
+GRUB_CMDLINE_LINUX="intel_idle.max_cstate=0 processor.max_cstate=0 idle=poll"
+
+# For AMD processors
+GRUB_CMDLINE_LINUX="processor.max_cstate=0 idle=poll"
+
+# Update grub
+update-grub  # Ubuntu/Debian
+grub2-mkconfig -o /boot/grub2/grub.cfg  # RHEL/CentOS
+
+# Reboot
+reboot
+----------------------------------------
+
+DISABLE C-STATES (RUNTIME - TEMPORARY):
+----------------------------------------
+# Disable specific C-states for all CPUs
+for cpu in /sys/devices/system/cpu/cpu*/cpuidle/state*/disable; do
+    echo 1 > $cpu
+done
+
+# Disable only deep C-states (C3 and beyond)
+for state in /sys/devices/system/cpu/cpu*/cpuidle/state{2,3,4,5,6,7,8}/disable; do
+    [ -f "$state" ] && echo 1 > $state
+done
+
+# Verify
+cpupower idle-info
+----------------------------------------
+
+IDLE POLLING (AGGRESSIVE - MAXIMUM PERFORMANCE):
+----------------------------------------
+# Force CPU to poll instead of halt
+# Add to kernel parameters:
+idle=poll
+
+# WARNING: This consumes maximum power and generates heat
+# Only use on isolated CPUs dedicated to trading
+
+# Alternative: Use in combination with CPU isolation
+idle=poll isolcpus=1-4
+----------------------------------------
+
+VALIDATION:
+----------------------------------------
+# Monitor C-state residency
+turbostat --show Package,Core,CPU,Avg_MHz,Busy%,Bzy_MHz,C1%,C2%,C3%,C6%,C7%
+
+# Check that C-states beyond C0/C1 are at 0%
+# Expected output for isolated CPUs:
+# C1% = 0.00, C3% = 0.00, C6% = 0.00
+
+# Using perf
+perf stat -e 'power/cpu-cycles/' -a sleep 5
+
+# Check power consumption (should be maximum)
+cat /sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj
+----------------------------------------
+
+================================================================================
+4. CPU FREQUENCY SCALING CONFIGURATION
+================================================================================
+
+CONCEPT:
+Lock CPU frequency to maximum to eliminate frequency transition latency
+and ensure consistent performance.
+
+DISABLE FREQUENCY SCALING:
+----------------------------------------
+# Set minimum = maximum frequency
+for cpu in /sys/devices/system/cpu/cpu*/cpufreq/; do
+    max_freq=$(cat ${cpu}cpuinfo_max_freq)
+    echo $max_freq > ${cpu}scaling_min_freq
+    echo $max_freq > ${cpu}scaling_max_freq
+done
+
+# Using cpupower
+cpupower frequency-set -d $(cpupower frequency-info -w | awk '{print $1}')
+cpupower frequency-set -u $(cpupower frequency-info -w | awk '{print $1}')
+----------------------------------------
+
+INTEL P-STATE DRIVER:
+----------------------------------------
+# Check if using intel_pstate
+cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_driver
+
+# If intel_pstate is active, configure it
+echo 1 > /sys/devices/system/cpu/intel_pstate/no_turbo
+echo performance > /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+
+# Disable intel_pstate (use acpi-cpufreq instead)
+# Add to kernel parameters:
+intel_pstate=disable
+
+# This allows finer control but may reduce maximum frequency
+----------------------------------------
+
+AMD P-STATE DRIVER:
+----------------------------------------
+# Check driver
+cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_driver
+
+# Configure AMD P-states
+echo performance > /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+
+# Disable dynamic frequency scaling
+for cpu in /sys/devices/system/cpu/cpu*/cpufreq/; do
+    echo $(cat ${cpu}cpuinfo_max_freq) > ${cpu}scaling_min_freq
+done
+----------------------------------------
+
+VALIDATION:
+----------------------------------------
+# Verify frequencies are locked
+watch -n 0.1 "grep MHz /proc/cpuinfo"
+
+# All CPUs should show identical, maximum frequency
+# Example output:
+# cpu MHz : 3700.000
+# cpu MHz : 3700.000
+# cpu MHz : 3700.000
+
+# Check frequency transitions (should be zero)
+cpupower frequency-info | grep "transition latency"
+
+# Monitor with turbostat
+turbostat --show Package,Core,CPU,Avg_MHz,Busy%,Bzy_MHz --interval 1
+----------------------------------------
+
+================================================================================
+5. CPU ISOLATION (CRITICAL FOR HFT)
+================================================================================
+
+CONCEPT:
+Isolate specific CPU cores from Linux scheduler and OS tasks to dedicate
+them exclusively to trading threads, eliminating OS noise and jitter.
+
+ISOLATION STRATEGIES:
+1. isolcpus: Remove CPUs from scheduler
+2. nohz_full: Disable scheduler tick on isolated CPUs
+3. rcu_nocbs: Move RCU callbacks off isolated CPUs
+
+TOPOLOGY ANALYSIS:
+----------------------------------------
+# View CPU topology
+lscpu --extended
+
+# Example output:
+# CPU NODE SOCKET CORE L1d:L1i:L2:L3 ONLINE
+# 0   0    0      0    0:0:0:0       yes
+# 1   0    0      1    1:1:1:0       yes
+# 2   0    0      2    2:2:2:0       yes
+# ...
+
+# View NUMA nodes
+numactl --hardware
+
+# View cache hierarchy
+lstopo-no-graphics
+----------------------------------------
+
+ISOLATION CONFIGURATION:
+----------------------------------------
+# Edit /etc/default/grub
+# Isolate CPUs 1-4 for trading, leave 0 for OS
+
+GRUB_CMDLINE_LINUX="isolcpus=1-4 nohz_full=1-4 rcu_nocbs=1-4"
+
+# Full recommended configuration
+GRUB_CMDLINE_LINUX="isolcpus=1-4 nohz_full=1-4 rcu_nocbs=1-4 \
+    intel_idle.max_cstate=0 processor.max_cstate=0 \
+    intel_pstate=disable nosoftlockup \
+    tsc=reliable clocksource=tsc"
+
+# Update grub and reboot
+update-grub && reboot
+----------------------------------------
+
+ISOLCPUS VARIANTS:
+----------------------------------------
+# Domain isolation (isolate from SMP scheduling domains)
+isolcpus=domain,1-4
+
+# Managed IRQ isolation (prevent managed IRQs)
+isolcpus=managed_irq,1-4
+
+# Combined isolation (recommended)
+isolcpus=domain,managed_irq,1-4
+----------------------------------------
+
+VERIFICATION:
+----------------------------------------
+# Check isolated CPUs
+cat /sys/devices/system/cpu/isolated
+# Should show: 1-4
+
+# Check nohz_full CPUs
+cat /sys/devices/system/cpu/nohz_full
+# Should show: 1-4
+
+# Check RCU offloading
+cat /sys/module/rcutree/parameters/rcu_nocbs
+# Should show: 1-4
+
+# Verify kernel command line
+cat /proc/cmdline
+----------------------------------------
+
+CPU AFFINITY FOR TRADING PROCESSES:
+----------------------------------------
+# Set CPU affinity using taskset
+taskset -c 1 ./trading_engine_thread1 &
+taskset -c 2 ./trading_engine_thread2 &
+taskset -c 3 ./market_data_processor &
+taskset -c 4 ./order_manager &
+
+# Using numactl (with NUMA awareness)
+numactl --cpunodebind=0 --membind=0 --physcpubind=1 ./trading_engine
+
+# In C++ code
+#include <sched.h>
+#include <pthread.h>
+
+void set_cpu_affinity(int cpu_id) {
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(cpu_id, &cpuset);
+
+    pthread_t thread = pthread_self();
+    int result = pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset);
+
+    if (result != 0) {
+        std::cerr << "Failed to set CPU affinity: " << result << std::endl;
+    }
+}
+
+// Usage in trading thread
+int main() {
+    set_cpu_affinity(1);  // Pin to CPU 1
+    // ... trading logic
+}
+----------------------------------------
+
+VERIFICATION OF PROCESS AFFINITY:
+----------------------------------------
+# Check process CPU affinity
+taskset -cp <PID>
+
+# View all threads of a process
+ps -eLo pid,tid,psr,comm | grep trading_engine
+# PSR column shows which CPU thread is running on
+
+# Monitor CPU usage per core
+mpstat -P ALL 1
+
+# Should show isolated CPUs at 100% for trading threads
+# Non-isolated CPUs handling OS tasks
+----------------------------------------
+
+================================================================================
+6. HYPERTHREADING / SMT CONFIGURATION
+================================================================================
+
+CONCEPT:
+Simultaneous Multithreading (SMT/Hyperthreading) allows two threads per
+physical core. For HFT, SMT can reduce determinism due to shared resources.
+
+DECISION MATRIX:
+- Disable SMT: Maximum determinism, predictable latency (RECOMMENDED)
+- Enable SMT: More logical CPUs, but potential cache/TLB conflicts
+
+CHECK SMT STATUS:
+----------------------------------------
+# Check if SMT is enabled
+cat /sys/devices/system/cpu/smt/active
+# 1 = enabled, 0 = disabled
+
+# Count threads per core
+lscpu | grep "Thread(s) per core"
+# 2 = SMT enabled, 1 = SMT disabled
+
+# View sibling threads
+cat /sys/devices/system/cpu/cpu0/topology/thread_siblings_list
+----------------------------------------
+
+DISABLE SMT (RUNTIME):
+----------------------------------------
+# Disable SMT on all CPUs
+echo off > /sys/devices/system/cpu/smt/control
+
+# Alternative: Disable specific logical CPUs
+# If CPUs 0,2,4,6 are physical and 1,3,5,7 are siblings:
+echo 0 > /sys/devices/system/cpu/cpu1/online
+echo 0 > /sys/devices/system/cpu/cpu3/online
+echo 0 > /sys/devices/system/cpu/cpu5/online
+echo 0 > /sys/devices/system/cpu/cpu7/online
+----------------------------------------
+
+DISABLE SMT (KERNEL PARAMETER):
+----------------------------------------
+# Edit /etc/default/grub
+GRUB_CMDLINE_LINUX="nosmt"
+
+# Update grub
+update-grub && reboot
+
+# Or use max CPU number
+GRUB_CMDLINE_LINUX="maxcpus=4"
+# This limits to 4 physical cores (no hyperthreads)
+----------------------------------------
+
+DISABLE SMT (BIOS - RECOMMENDED):
+----------------------------------------
+# Best method: Disable in BIOS/UEFI
+# Steps vary by manufacturer:
+# - Intel: Look for "Hyper-Threading" or "HT Technology"
+# - AMD: Look for "SMT Mode" or "SMT Control"
+# - Set to "Disabled"
+
+# Advantages of BIOS disable:
+# - Most thorough method
+# - Reduces CPU enumeration overhead
+# - Cleaner topology
+----------------------------------------
+
+VALIDATION:
+----------------------------------------
+# Verify SMT is disabled
+lscpu | grep -E "Thread|Core|Socket"
+
+# Expected output with SMT disabled:
+# Thread(s) per core:  1
+# Core(s) per socket:  4
+# Socket(s):           1
+
+# Check CPU topology
+lstopo-no-graphics
+
+# Verify isolated CPUs don't share cores
+cat /sys/devices/system/cpu/cpu1/topology/thread_siblings_list
+# Should show only: 1 (no sibling)
+----------------------------------------
+
+================================================================================
+7. CPU CACHE OPTIMIZATION
+================================================================================
+
+CONCEPT:
+Optimize CPU cache usage to minimize cache misses and maximize data locality.
+
+CACHE HIERARCHY ANALYSIS:
+----------------------------------------
+# View cache information
+lscpu | grep cache
+
+# Detailed cache info
+cat /sys/devices/system/cpu/cpu0/cache/index*/size
+cat /sys/devices/system/cpu/cpu0/cache/index*/type
+cat /sys/devices/system/cpu/cpu0/cache/index*/level
+
+# Cache sharing topology
+cat /sys/devices/system/cpu/cpu0/cache/index*/shared_cpu_list
+----------------------------------------
+
+CACHE OPTIMIZATION STRATEGIES:
+----------------------------------------
+# 1. Data Structure Alignment
+// Align to cache line (typically 64 bytes)
+struct alignas(64) TradingData {
+    uint64_t price;
+    uint64_t quantity;
+    // ... other fields
+};
+
+# 2. False Sharing Prevention
+// Separate frequently modified variables
+struct alignas(64) Counter {
+    std::atomic<uint64_t> value;
+    char padding[56];  // Pad to cache line
+};
+
+# 3. Prefetching
+__builtin_prefetch(&data[i+1], 0, 3);
+
+# 4. Cache-aware Thread Pinning
+# Pin threads that share data to CPUs sharing L3 cache
+----------------------------------------
+
+CACHE MISS MONITORING:
+----------------------------------------
+# Monitor cache misses using perf
+perf stat -e L1-dcache-load-misses,L1-dcache-loads,LLC-load-misses,LLC-loads \
+    ./trading_engine
+
+# Cache miss ratio should be < 1%
+# Formula: (cache-misses / cache-references) * 100
+
+# Detailed cache profiling
+perf record -e cache-misses -c 1000 ./trading_engine
+perf report
+----------------------------------------
+
+================================================================================
+8. CONTEXT SWITCH MINIMIZATION
+================================================================================
+
+CONCEPT:
+Context switches introduce latency. Minimize them through proper CPU
+isolation and process priorities.
+
+MONITOR CONTEXT SWITCHES:
+----------------------------------------
+# System-wide context switches
+vmstat 1
+# Look at 'cs' column (context switches per second)
+
+# Per-process context switches
+pidstat -w 1
+# Look at cswch/s (voluntary) and nvcswch/s (involuntary)
+
+# Detailed analysis
+perf stat -e context-switches,cpu-migrations ./trading_engine
+----------------------------------------
+
+REDUCE CONTEXT SWITCHES:
+----------------------------------------
+# 1. CPU Isolation (already covered)
+isolcpus=1-4 nohz_full=1-4
+
+# 2. Real-time Scheduling
+chrt -f 99 ./trading_engine
+# SCHED_FIFO with priority 99
+
+# 3. Disable IRQ Balance on isolated CPUs
+systemctl stop irqbalance
+systemctl disable irqbalance
+
+# 4. Pin interrupts away from trading CPUs
+echo 1 > /proc/irq/<IRQ_NUMBER>/smp_affinity_list
+# Pin to CPU 0 (non-isolated)
+
+# 5. Minimize system calls
+# Use busy-wait polling instead of blocking calls
+----------------------------------------
+
+VALIDATION:
+----------------------------------------
+# Monitor context switches on isolated CPUs
+# Should be near zero
+perf stat -C 1 -e context-switches sleep 10
+
+# Expected: < 10 context switches in 10 seconds
+# Goal: < 1 context switch per second on isolated CPUs
+----------------------------------------
+
+================================================================================
+9. REAL-TIME SCHEDULING
+================================================================================
+
+CONCEPT:
+Use real-time scheduling policies to ensure trading threads get
+immediate CPU access.
+
+SCHEDULING POLICIES:
+- SCHED_OTHER: Default time-sharing (DON'T USE FOR TRADING)
+- SCHED_FIFO: Real-time FIFO (RECOMMENDED)
+- SCHED_RR: Real-time round-robin
+- SCHED_DEADLINE: Deadline-based (ADVANCED)
+
+SET REAL-TIME PRIORITY:
+----------------------------------------
+# Using chrt
+chrt -f 99 ./trading_engine  # SCHED_FIFO, priority 99
+chrt -r 99 ./trading_engine  # SCHED_RR, priority 99
+
+# Check current scheduling policy
+chrt -p <PID>
+
+# In C++ code
+#include <sched.h>
+
+void set_realtime_priority() {
+    struct sched_param param;
+    param.sched_priority = 99;  // Maximum priority
+
+    if (sched_setscheduler(0, SCHED_FIFO, &param) == -1) {
+        perror("sched_setscheduler failed");
+        exit(1);
+    }
+}
+----------------------------------------
+
+ULIMIT CONFIGURATION:
+----------------------------------------
+# Allow non-root real-time priority
+# Edit /etc/security/limits.conf
+
+@trading    soft    rtprio     99
+@trading    hard    rtprio     99
+@trading    soft    nice      -20
+@trading    hard    nice      -20
+@trading    soft    memlock   unlimited
+@trading    hard    memlock   unlimited
+
+# Reboot or re-login for changes to take effect
+----------------------------------------
+
+VALIDATION:
+----------------------------------------
+# Verify scheduling policy
+ps -eo pid,cls,rtprio,comm | grep trading
+# CLS: FF = SCHED_FIFO, RR = SCHED_RR, TS = SCHED_OTHER
+# RTPRIO: Should be 99
+
+# Monitor preemption
+perf stat -e sched:sched_switch ./trading_engine
+----------------------------------------
+
+================================================================================
+10. MONITORING AND BENCHMARKING
+================================================================================
+
+CPU LATENCY TESTING:
+----------------------------------------
+# Cyclictest: Measure real-time latency
+cyclictest -p 99 -t 1 -n -m -i 200 -l 100000 -c 1
+# -p 99: Priority 99
+# -t 1: 1 thread
+# -n: Use nanosleep
+# -m: Lock memory
+# -i 200: 200 us interval
+# -l 100000: 100k loops
+# -c 1: Run on CPU 1
+
+# Target results:
+# Min: < 1 us
+# Avg: < 5 us
+# Max: < 10 us
+----------------------------------------
+
+CPU BENCHMARK:
+----------------------------------------
+# Stress test
+stress-ng --cpu 4 --cpu-method ackermann --metrics-brief -t 60s
+
+# CPU frequency stability
+turbostat --interval 1 --num_iterations 600
+
+# Context switch benchmark
+lmbench: ./lat_ctx -s 0 2
+----------------------------------------
+
+CONTINUOUS MONITORING:
+----------------------------------------
+# Create monitoring script: /usr/local/bin/hft_cpu_monitor.sh
+
+#!/bin/bash
+while true; do
+    echo "=== $(date) ==="
+    echo "CPU Frequencies:"
+    cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq
+    echo "CPU Governors:"
+    cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+    echo "Isolated CPUs:"
+    cat /sys/devices/system/cpu/isolated
+    echo "Context Switches:"
+    vmstat 1 2 | tail -1 | awk '{print $12}'
+    sleep 60
+done >> /var/log/hft_cpu_monitor.log 2>&1
+
+# Run as systemd service
+chmod +x /usr/local/bin/hft_cpu_monitor.sh
+# Create systemd unit file
+----------------------------------------
+
+================================================================================
+SUMMARY CHECKLIST
+================================================================================
+
+[ ] CPU governor set to 'performance'
+[ ] Turbo boost configured (enabled or disabled per requirements)
+[ ] All C-states beyond C0 disabled
+[ ] CPU frequency scaling disabled (min = max)
+[ ] CPU isolation configured (isolcpus, nohz_full, rcu_nocbs)
+[ ] Hyperthreading disabled (if determinism required)
+[ ] Real-time scheduling priorities set
+[ ] IRQ balance disabled
+[ ] Context switches minimized (< 1/sec on isolated CPUs)
+[ ] Cache optimization reviewed
+[ ] Monitoring scripts deployed
+[ ] Latency benchmarks completed
+[ ] Configuration persisted across reboots
+
+TARGET VALIDATION METRICS:
+- cyclictest max latency: < 10 us
+- Context switches (isolated CPUs): < 1/sec
+- CPU frequency variance: 0 Hz
+- Cache miss ratio: < 1%
+
+================================================================================
+END OF DOCUMENT
+================================================================================

@@ -1,0 +1,888 @@
+================================================================================
+TIME-SERIES DATA STORAGE FOR HFT SYSTEMS
+InfluxDB & ClickHouse Implementation
+================================================================================
+
+OVERVIEW
+--------
+This document covers comprehensive time-series data storage solutions for
+high-frequency trading systems using InfluxDB for real-time metrics and
+ClickHouse for analytical queries on massive datasets. Both systems are
+optimized for write-heavy workloads and fast querying.
+
+================================================================================
+1. INFLUXDB SCHEMA DESIGN
+================================================================================
+
+1.1 INFLUXDB FUNDAMENTALS
+--------------------------
+
+InfluxDB uses a different data model:
+- Measurement: Similar to a table
+- Tags: Indexed metadata (string values)
+- Fields: Non-indexed data (various types)
+- Timestamp: Nanosecond precision
+
+Best Practices:
+- Use tags for frequently queried dimensions
+- Use fields for actual metric values
+- Keep tag cardinality low (< 100K unique combinations)
+- Optimize retention policies for storage efficiency
+
+1.2 MARKET DATA MEASUREMENTS
+-----------------------------
+
+// Tick data (trades)
+// Measurement: market_trades
+// Tags: symbol, exchange, trade_type
+// Fields: price, quantity, volume_usd
+// Timestamp: Trade execution time
+
+Example Line Protocol:
+market_trades,symbol=AAPL,exchange=NASDAQ,trade_type=regular price=150.25,quantity=100,volume_usd=15025 1640000000000000000
+
+// Level 1 quotes (BBO)
+// Measurement: market_quotes
+// Tags: symbol, exchange
+// Fields: bid_price, bid_size, ask_price, ask_size, spread, mid_price
+
+Example:
+market_quotes,symbol=AAPL,exchange=NASDAQ bid_price=150.20,bid_size=500,ask_price=150.25,ask_size=300,spread=0.05,mid_price=150.225 1640000000000000000
+
+// Order book depth
+// Measurement: order_book
+// Tags: symbol, exchange, level
+// Fields: bid_price, bid_size, ask_price, ask_size
+
+Example:
+order_book,symbol=AAPL,exchange=NASDAQ,level=1 bid_price=150.20,bid_size=500,ask_price=150.25,ask_size=300 1640000000000000000
+order_book,symbol=AAPL,exchange=NASDAQ,level=2 bid_price=150.19,bid_size=400,ask_price=150.26,ask_size=250 1640000000000000000
+
+// OHLCV bars
+// Measurement: market_ohlcv
+// Tags: symbol, exchange, interval
+// Fields: open, high, low, close, volume, vwap, trade_count
+
+Example:
+market_ohlcv,symbol=AAPL,exchange=NASDAQ,interval=1m open=150.00,high=150.50,low=149.90,close=150.25,volume=50000,vwap=150.20,trade_count=150 1640000000000000000
+
+1.3 TRADING ACTIVITY MEASUREMENTS
+----------------------------------
+
+// Order events
+// Measurement: order_events
+// Tags: account_id, strategy_id, symbol, exchange, order_type, side, status
+// Fields: quantity, price, filled_qty, commission, latency_us
+
+Example:
+order_events,account_id=12345,strategy_id=1,symbol=AAPL,exchange=NASDAQ,order_type=limit,side=buy,status=filled quantity=100,price=150.25,filled_qty=100,commission=1.50,latency_us=250 1640000000000000000
+
+// Execution events
+// Measurement: executions
+// Tags: account_id, strategy_id, symbol, exchange, side, liquidity_flag
+// Fields: quantity, price, commission, fees, notional_value
+
+Example:
+executions,account_id=12345,strategy_id=1,symbol=AAPL,exchange=NASDAQ,side=buy,liquidity_flag=taker quantity=100,price=150.25,commission=1.50,fees=0.10,notional_value=15025 1640000000000000000
+
+// Position snapshots
+// Measurement: positions
+// Tags: account_id, strategy_id, symbol, exchange, side
+// Fields: quantity, avg_price, market_value, unrealized_pnl, realized_pnl
+
+Example:
+positions,account_id=12345,strategy_id=1,symbol=AAPL,exchange=NASDAQ,side=long quantity=500,avg_price=149.80,market_value=75125,unrealized_pnl=225,realized_pnl=1500 1640000000000000000
+
+1.4 PERFORMANCE METRICS
+-----------------------
+
+// System latency
+// Measurement: system_latency
+// Tags: component, operation, server_id
+// Fields: latency_us, latency_p50, latency_p95, latency_p99
+
+Example:
+system_latency,component=order_gateway,operation=submit_order,server_id=prod-01 latency_us=150,latency_p50=145,latency_p95=280,latency_p99=450 1640000000000000000
+
+// Market data latency
+// Measurement: market_data_latency
+// Tags: feed_type, symbol, exchange
+// Fields: feed_latency_us, processing_latency_us, total_latency_us
+
+Example:
+market_data_latency,feed_type=trades,symbol=AAPL,exchange=NASDAQ feed_latency_us=50,processing_latency_us=30,total_latency_us=80 1640000000000000000
+
+// Strategy performance
+// Measurement: strategy_performance
+// Tags: strategy_id, account_id
+// Fields: pnl, sharpe_ratio, win_rate, trade_count, max_drawdown
+
+Example:
+strategy_performance,strategy_id=1,account_id=12345 pnl=2500.50,sharpe_ratio=1.85,win_rate=0.65,trade_count=50,max_drawdown=-500 1640000000000000000
+
+// Risk metrics
+// Measurement: risk_metrics
+// Tags: account_id, strategy_id
+// Fields: var_95, var_99, exposure, leverage, margin_usage
+
+Example:
+risk_metrics,account_id=12345,strategy_id=1 var_95=5000,var_99=8000,exposure=100000,leverage=2.5,margin_usage=0.45 1640000000000000000
+
+1.5 INFLUXDB RETENTION POLICIES
+--------------------------------
+
+// Flux script to create retention policies
+
+option task = {name: "Setup Retention Policies", every: 1d}
+
+// High-frequency tick data: 7 days
+CREATE RETENTION POLICY "rp_7d" ON "market_data" DURATION 7d REPLICATION 1
+
+// Minute bars: 90 days
+CREATE RETENTION POLICY "rp_90d" ON "market_data" DURATION 90d REPLICATION 1
+
+// Hourly aggregates: 2 years
+CREATE RETENTION POLICY "rp_2y" ON "market_data" DURATION 104w REPLICATION 1
+
+// Performance metrics: 30 days
+CREATE RETENTION POLICY "rp_30d" ON "trading_metrics" DURATION 30d REPLICATION 1
+
+// Continuous queries for downsampling
+
+CREATE CONTINUOUS QUERY "cq_1min_ohlcv" ON "market_data"
+BEGIN
+  SELECT
+    first(price) AS open,
+    max(price) AS high,
+    min(price) AS low,
+    last(price) AS close,
+    sum(quantity) AS volume,
+    count(price) AS trade_count
+  INTO "market_data"."rp_90d"."market_ohlcv_1m"
+  FROM "market_data"."rp_7d"."market_trades"
+  GROUP BY time(1m), symbol, exchange
+END
+
+CREATE CONTINUOUS QUERY "cq_5min_ohlcv" ON "market_data"
+BEGIN
+  SELECT
+    first(open) AS open,
+    max(high) AS high,
+    min(low) AS low,
+    last(close) AS close,
+    sum(volume) AS volume,
+    sum(trade_count) AS trade_count
+  INTO "market_data"."rp_2y"."market_ohlcv_5m"
+  FROM "market_data"."rp_90d"."market_ohlcv_1m"
+  GROUP BY time(5m), symbol, exchange
+END
+
+1.6 INFLUXDB QUERY EXAMPLES (FLUX)
+-----------------------------------
+
+// Get recent trades for a symbol
+from(bucket: "market_data/rp_7d")
+  |> range(start: -1h)
+  |> filter(fn: (r) => r._measurement == "market_trades")
+  |> filter(fn: (r) => r.symbol == "AAPL")
+  |> filter(fn: (r) => r.exchange == "NASDAQ")
+  |> filter(fn: (r) => r._field == "price" or r._field == "quantity")
+  |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
+  |> yield(name: "recent_trades")
+
+// Calculate VWAP over last hour
+from(bucket: "market_data/rp_7d")
+  |> range(start: -1h)
+  |> filter(fn: (r) => r._measurement == "market_trades")
+  |> filter(fn: (r) => r.symbol == "AAPL")
+  |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
+  |> map(fn: (r) => ({ r with notional: r.price * r.quantity }))
+  |> reduce(
+      fn: (r, accumulator) => ({
+        sum_notional: r.notional + accumulator.sum_notional,
+        sum_volume: r.quantity + accumulator.sum_volume,
+      }),
+      identity: {sum_notional: 0.0, sum_volume: 0.0}
+    )
+  |> map(fn: (r) => ({ r with vwap: r.sum_notional / r.sum_volume }))
+
+// Get current positions with unrealized PnL
+current_positions = from(bucket: "trading_metrics/rp_30d")
+  |> range(start: -1m)
+  |> filter(fn: (r) => r._measurement == "positions")
+  |> filter(fn: (r) => r.account_id == "12345")
+  |> last()
+  |> pivot(rowKey:["symbol"], columnKey: ["_field"], valueColumn: "_value")
+
+current_prices = from(bucket: "market_data/rp_7d")
+  |> range(start: -5m)
+  |> filter(fn: (r) => r._measurement == "market_quotes")
+  |> filter(fn: (r) => r._field == "mid_price")
+  |> last()
+  |> pivot(rowKey:["symbol"], columnKey: ["_field"], valueColumn: "_value")
+
+join(
+  tables: {positions: current_positions, prices: current_prices},
+  on: ["symbol"]
+)
+|> map(fn: (r) => ({
+    r with
+    unrealized_pnl: (r.mid_price - r.avg_price) * r.quantity
+  }))
+
+// Calculate average order latency by strategy
+from(bucket: "trading_metrics/rp_30d")
+  |> range(start: -24h)
+  |> filter(fn: (r) => r._measurement == "order_events")
+  |> filter(fn: (r) => r._field == "latency_us")
+  |> group(columns: ["strategy_id"])
+  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
+
+// Monitor system performance
+from(bucket: "trading_metrics/rp_30d")
+  |> range(start: -1h)
+  |> filter(fn: (r) => r._measurement == "system_latency")
+  |> filter(fn: (r) => r._field == "latency_p99")
+  |> filter(fn: (r) => r.component == "order_gateway")
+  |> aggregateWindow(every: 1m, fn: max, createEmpty: false)
+  |> yield(name: "p99_latency")
+
+================================================================================
+2. CLICKHOUSE SCHEMA DESIGN
+================================================================================
+
+2.1 CLICKHOUSE TABLE ENGINES
+-----------------------------
+
+ClickHouse offers several table engines optimized for different use cases:
+- MergeTree: General-purpose, sorted storage
+- ReplacingMergeTree: Deduplication support
+- AggregatingMergeTree: Pre-aggregated data
+- SummingMergeTree: Automatic summation
+- CollapsingMergeTree: Update/delete support
+
+2.2 MARKET DATA TABLES
+----------------------
+
+-- Trades table (100M+ rows per day)
+CREATE TABLE market_trades
+(
+    event_date Date DEFAULT toDate(event_time),
+    event_time DateTime64(9, 'UTC'),
+    instrument_id UInt32,
+    symbol String,
+    exchange LowCardinality(String),
+    trade_id String,
+    price Decimal64(8),
+    quantity Decimal64(8),
+    side Enum8('buy' = 1, 'sell' = 2),
+    trade_conditions String,
+    exchange_timestamp DateTime64(9, 'UTC'),
+    sequence_number UInt64,
+    ingestion_time DateTime64(9, 'UTC') DEFAULT now64()
+)
+ENGINE = MergeTree()
+PARTITION BY toYYYYMM(event_date)
+ORDER BY (instrument_id, event_time, sequence_number)
+TTL event_date + INTERVAL 90 DAY
+SETTINGS index_granularity = 8192;
+
+-- Quotes table (Level 1 BBO)
+CREATE TABLE market_quotes
+(
+    event_date Date DEFAULT toDate(event_time),
+    event_time DateTime64(9, 'UTC'),
+    instrument_id UInt32,
+    symbol String,
+    exchange LowCardinality(String),
+    bid_price Decimal64(8),
+    bid_size Decimal64(8),
+    ask_price Decimal64(8),
+    ask_size Decimal64(8),
+    spread Decimal64(8),
+    mid_price Decimal64(8),
+    exchange_timestamp DateTime64(9, 'UTC'),
+    ingestion_time DateTime64(9, 'UTC') DEFAULT now64()
+)
+ENGINE = MergeTree()
+PARTITION BY toYYYYMM(event_date)
+ORDER BY (instrument_id, event_time)
+TTL event_date + INTERVAL 90 DAY
+SETTINGS index_granularity = 8192;
+
+-- Order book snapshots
+CREATE TABLE market_order_book
+(
+    event_date Date DEFAULT toDate(event_time),
+    event_time DateTime64(9, 'UTC'),
+    instrument_id UInt32,
+    symbol String,
+    exchange LowCardinality(String),
+    level UInt8,
+    bid_price Decimal64(8),
+    bid_size Decimal64(8),
+    bid_orders UInt32,
+    ask_price Decimal64(8),
+    ask_size Decimal64(8),
+    ask_orders UInt32
+)
+ENGINE = MergeTree()
+PARTITION BY toYYYYMM(event_date)
+ORDER BY (instrument_id, event_time, level)
+TTL event_date + INTERVAL 30 DAY
+SETTINGS index_granularity = 8192;
+
+-- OHLCV bars with materialized views
+CREATE TABLE market_ohlcv_base
+(
+    event_date Date DEFAULT toDate(event_time),
+    event_time DateTime64(9, 'UTC'),
+    instrument_id UInt32,
+    symbol String,
+    exchange LowCardinality(String),
+    price Decimal64(8),
+    quantity Decimal64(8),
+    trade_count UInt32
+)
+ENGINE = MergeTree()
+PARTITION BY toYYYYMM(event_date)
+ORDER BY (instrument_id, event_time);
+
+-- 1-minute OHLCV materialized view
+CREATE TABLE market_ohlcv_1m
+(
+    event_date Date,
+    event_time DateTime,
+    instrument_id UInt32,
+    symbol String,
+    exchange LowCardinality(String),
+    open Decimal64(8),
+    high Decimal64(8),
+    low Decimal64(8),
+    close Decimal64(8),
+    volume Decimal64(8),
+    vwap Decimal64(8),
+    trade_count UInt32
+)
+ENGINE = SummingMergeTree()
+PARTITION BY toYYYYMM(event_date)
+ORDER BY (instrument_id, event_time);
+
+CREATE MATERIALIZED VIEW market_ohlcv_1m_mv TO market_ohlcv_1m AS
+SELECT
+    toDate(event_time) AS event_date,
+    toStartOfMinute(event_time) AS event_time,
+    instrument_id,
+    any(symbol) AS symbol,
+    any(exchange) AS exchange,
+    argMin(price, event_time) AS open,
+    max(price) AS high,
+    min(price) AS low,
+    argMax(price, event_time) AS close,
+    sum(quantity) AS volume,
+    sum(price * quantity) / sum(quantity) AS vwap,
+    sum(trade_count) AS trade_count
+FROM market_trades
+GROUP BY event_date, event_time, instrument_id;
+
+-- 5-minute OHLCV
+CREATE TABLE market_ohlcv_5m
+(
+    event_date Date,
+    event_time DateTime,
+    instrument_id UInt32,
+    symbol String,
+    exchange LowCardinality(String),
+    open Decimal64(8),
+    high Decimal64(8),
+    low Decimal64(8),
+    close Decimal64(8),
+    volume Decimal64(8),
+    vwap Decimal64(8),
+    trade_count UInt32
+)
+ENGINE = SummingMergeTree()
+PARTITION BY toYYYYMM(event_date)
+ORDER BY (instrument_id, event_time);
+
+CREATE MATERIALIZED VIEW market_ohlcv_5m_mv TO market_ohlcv_5m AS
+SELECT
+    event_date,
+    toStartOfFiveMinute(event_time) AS event_time,
+    instrument_id,
+    any(symbol) AS symbol,
+    any(exchange) AS exchange,
+    argMin(open, event_time) AS open,
+    max(high) AS high,
+    min(low) AS low,
+    argMax(close, event_time) AS close,
+    sum(volume) AS volume,
+    sum(volume * vwap) / sum(volume) AS vwap,
+    sum(trade_count) AS trade_count
+FROM market_ohlcv_1m
+GROUP BY event_date, event_time, instrument_id;
+
+2.3 TRADING ACTIVITY TABLES
+----------------------------
+
+-- Orders table
+CREATE TABLE orders
+(
+    event_date Date DEFAULT toDate(created_at),
+    order_id UInt64,
+    client_order_id String,
+    account_id UInt32,
+    strategy_id UInt32,
+    instrument_id UInt32,
+    symbol String,
+    exchange LowCardinality(String),
+    order_type LowCardinality(String),
+    side Enum8('buy' = 1, 'sell' = 2, 'short' = 3, 'cover' = 4),
+    quantity Decimal64(8),
+    price Nullable(Decimal64(8)),
+    stop_price Nullable(Decimal64(8)),
+    time_in_force LowCardinality(String),
+    filled_quantity Decimal64(8),
+    avg_fill_price Nullable(Decimal64(8)),
+    commission Decimal64(8),
+    fees Decimal64(8),
+    order_status LowCardinality(String),
+    exchange_order_id Nullable(String),
+    created_at DateTime64(6, 'UTC'),
+    submitted_at Nullable(DateTime64(6, 'UTC')),
+    acknowledged_at Nullable(DateTime64(6, 'UTC')),
+    filled_at Nullable(DateTime64(6, 'UTC')),
+    cancelled_at Nullable(DateTime64(6, 'UTC')),
+    latency_submit_us UInt32,
+    latency_ack_us UInt32,
+    latency_fill_us UInt32
+)
+ENGINE = ReplacingMergeTree(created_at)
+PARTITION BY toYYYYMM(event_date)
+ORDER BY (account_id, order_id)
+SETTINGS index_granularity = 8192;
+
+-- Executions table
+CREATE TABLE executions
+(
+    event_date Date DEFAULT toDate(executed_at),
+    execution_id UInt64,
+    order_id UInt64,
+    account_id UInt32,
+    strategy_id UInt32,
+    instrument_id UInt32,
+    symbol String,
+    exchange LowCardinality(String),
+    side Enum8('buy' = 1, 'sell' = 2, 'short' = 3, 'cover' = 4),
+    quantity Decimal64(8),
+    price Decimal64(8),
+    liquidity_flag Enum8('maker' = 1, 'taker' = 2, 'auction' = 3),
+    commission Decimal64(8),
+    fees Decimal64(8),
+    notional_value Decimal64(8),
+    executed_at DateTime64(6, 'UTC'),
+    reported_at DateTime64(6, 'UTC') DEFAULT now64()
+)
+ENGINE = MergeTree()
+PARTITION BY toYYYYMM(event_date)
+ORDER BY (account_id, executed_at, execution_id)
+SETTINGS index_granularity = 8192;
+
+-- Positions snapshots
+CREATE TABLE positions_snapshots
+(
+    snapshot_date Date,
+    snapshot_time DateTime,
+    account_id UInt32,
+    strategy_id UInt32,
+    instrument_id UInt32,
+    symbol String,
+    exchange LowCardinality(String),
+    quantity Decimal64(8),
+    side Enum8('long' = 1, 'short' = 2),
+    avg_entry_price Decimal64(8),
+    current_price Decimal64(8),
+    market_value Decimal64(2),
+    unrealized_pnl Decimal64(2),
+    realized_pnl Decimal64(2),
+    total_pnl Decimal64(2)
+)
+ENGINE = ReplacingMergeTree(snapshot_time)
+PARTITION BY toYYYYMM(snapshot_date)
+ORDER BY (account_id, instrument_id, snapshot_time)
+SETTINGS index_granularity = 8192;
+
+2.4 PERFORMANCE AND ANALYTICS TABLES
+-------------------------------------
+
+-- Strategy performance daily
+CREATE TABLE strategy_performance_daily
+(
+    performance_date Date,
+    strategy_id UInt32,
+    account_id UInt32,
+    total_trades UInt32,
+    winning_trades UInt32,
+    losing_trades UInt32,
+    gross_profit Decimal64(2),
+    gross_loss Decimal64(2),
+    net_pnl Decimal64(2),
+    commissions Decimal64(2),
+    fees Decimal64(2),
+    max_drawdown Decimal64(2),
+    sharpe_ratio Decimal64(4),
+    win_rate Decimal64(4),
+    profit_factor Decimal64(4),
+    avg_win Decimal64(2),
+    avg_loss Decimal64(2),
+    largest_win Decimal64(2),
+    largest_loss Decimal64(2)
+)
+ENGINE = ReplacingMergeTree(performance_date)
+PARTITION BY toYYYYMM(performance_date)
+ORDER BY (strategy_id, account_id, performance_date)
+SETTINGS index_granularity = 8192;
+
+-- Latency metrics
+CREATE TABLE latency_metrics
+(
+    event_date Date DEFAULT toDate(event_time),
+    event_time DateTime64(6, 'UTC'),
+    component LowCardinality(String),
+    operation LowCardinality(String),
+    server_id LowCardinality(String),
+    latency_us UInt32,
+    latency_p50 UInt32,
+    latency_p95 UInt32,
+    latency_p99 UInt32,
+    latency_max UInt32
+)
+ENGINE = MergeTree()
+PARTITION BY toYYYYMM(event_date)
+ORDER BY (component, operation, event_time)
+TTL event_date + INTERVAL 30 DAY
+SETTINGS index_granularity = 8192;
+
+2.5 CLICKHOUSE QUERY EXAMPLES
+------------------------------
+
+-- Get recent trades with aggregations
+SELECT
+    symbol,
+    count() AS trade_count,
+    sum(quantity) AS total_volume,
+    avg(price) AS avg_price,
+    min(price) AS low_price,
+    max(price) AS high_price,
+    sum(price * quantity) / sum(quantity) AS vwap
+FROM market_trades
+WHERE event_time >= now() - INTERVAL 1 HOUR
+  AND exchange = 'NASDAQ'
+GROUP BY symbol
+ORDER BY total_volume DESC
+LIMIT 20;
+
+-- Time-weighted average price (TWAP)
+SELECT
+    symbol,
+    avg(mid_price) AS twap,
+    count() AS sample_count
+FROM market_quotes
+WHERE event_time >= now() - INTERVAL 1 HOUR
+  AND symbol = 'AAPL'
+GROUP BY symbol;
+
+-- Order fill analysis
+SELECT
+    account_id,
+    strategy_id,
+    count() AS total_orders,
+    countIf(order_status = 'filled') AS filled_orders,
+    countIf(order_status = 'partial') AS partial_fills,
+    countIf(order_status = 'cancelled') AS cancelled_orders,
+    avg(latency_submit_us) AS avg_submit_latency,
+    avg(latency_ack_us) AS avg_ack_latency,
+    quantile(0.95)(latency_fill_us) AS p95_fill_latency
+FROM orders
+WHERE event_date = today()
+GROUP BY account_id, strategy_id
+ORDER BY total_orders DESC;
+
+-- Intraday PnL tracking
+SELECT
+    toStartOfHour(executed_at) AS hour,
+    strategy_id,
+    sum(CASE
+        WHEN side IN ('buy', 'cover') THEN -quantity * price - commission - fees
+        ELSE quantity * price - commission - fees
+    END) AS pnl
+FROM executions
+WHERE event_date = today()
+GROUP BY hour, strategy_id
+ORDER BY hour, strategy_id;
+
+-- Market microstructure analysis
+SELECT
+    toStartOfMinute(event_time) AS minute,
+    symbol,
+    avg(spread) AS avg_spread,
+    avg(bid_size + ask_size) AS avg_depth,
+    stddevPop(mid_price) AS volatility,
+    count() AS quote_count
+FROM market_quotes
+WHERE event_time >= now() - INTERVAL 1 HOUR
+  AND symbol IN ('AAPL', 'MSFT', 'GOOGL')
+GROUP BY minute, symbol
+ORDER BY minute, symbol;
+
+-- Top performers analysis
+SELECT
+    s.strategy_id,
+    s.strategy_name,
+    sp.net_pnl,
+    sp.win_rate,
+    sp.sharpe_ratio,
+    sp.profit_factor,
+    sp.total_trades
+FROM strategy_performance_daily sp
+JOIN strategies s ON sp.strategy_id = s.strategy_id
+WHERE sp.performance_date >= today() - INTERVAL 30 DAY
+GROUP BY s.strategy_id, s.strategy_name, sp.net_pnl, sp.win_rate,
+         sp.sharpe_ratio, sp.profit_factor, sp.total_trades
+ORDER BY sp.net_pnl DESC
+LIMIT 10;
+
+-- System latency monitoring
+SELECT
+    toStartOfMinute(event_time) AS minute,
+    component,
+    operation,
+    avg(latency_p50) AS avg_p50,
+    avg(latency_p95) AS avg_p95,
+    avg(latency_p99) AS avg_p99,
+    max(latency_max) AS max_latency
+FROM latency_metrics
+WHERE event_time >= now() - INTERVAL 1 HOUR
+GROUP BY minute, component, operation
+ORDER BY minute DESC, avg_p99 DESC;
+
+2.6 CLICKHOUSE OPTIMIZATION TECHNIQUES
+---------------------------------------
+
+-- Use dictionaries for instrument lookups
+CREATE DICTIONARY instruments_dict
+(
+    instrument_id UInt32,
+    symbol String,
+    exchange String,
+    instrument_type String
+)
+PRIMARY KEY instrument_id
+SOURCE(CLICKHOUSE(
+    HOST 'localhost'
+    PORT 9000
+    USER 'default'
+    TABLE 'instruments'
+    DB 'trading'
+))
+LAYOUT(FLAT())
+LIFETIME(3600);
+
+-- Distributed table for horizontal scaling
+CREATE TABLE market_trades_distributed AS market_trades
+ENGINE = Distributed(trading_cluster, default, market_trades, rand());
+
+-- Projection for common query patterns
+ALTER TABLE market_trades
+ADD PROJECTION trades_by_symbol
+(
+    SELECT
+        symbol,
+        event_time,
+        price,
+        quantity
+    ORDER BY (symbol, event_time)
+);
+
+-- Compression codec optimization
+ALTER TABLE market_trades
+MODIFY COLUMN price Decimal64(8) CODEC(Delta, ZSTD(3));
+
+ALTER TABLE market_trades
+MODIFY COLUMN quantity Decimal64(8) CODEC(Delta, ZSTD(3));
+
+================================================================================
+3. DATA INGESTION PIPELINES
+================================================================================
+
+3.1 INFLUXDB INGESTION (GO)
+----------------------------
+
+package main
+
+import (
+    "context"
+    "fmt"
+    "time"
+    influxdb2 "github.com/influxdata/influxdb-client-go/v2"
+    "github.com/influxdata/influxdb-client-go/v2/api/write"
+)
+
+type MarketDataIngester struct {
+    client influxdb2.Client
+    writeAPI influxdb2.WriteAPI
+}
+
+func NewMarketDataIngester(url, token, org, bucket string) *MarketDataIngester {
+    client := influxdb2.NewClient(url, token)
+    writeAPI := client.WriteAPI(org, bucket)
+
+    return &MarketDataIngester{
+        client: client,
+        writeAPI: writeAPI,
+    }
+}
+
+func (m *MarketDataIngester) IngestTrade(trade *Trade) error {
+    p := write.NewPointWithMeasurement("market_trades").
+        AddTag("symbol", trade.Symbol).
+        AddTag("exchange", trade.Exchange).
+        AddTag("trade_type", trade.TradeType).
+        AddField("price", trade.Price).
+        AddField("quantity", trade.Quantity).
+        AddField("volume_usd", trade.Price * trade.Quantity).
+        SetTime(trade.Timestamp)
+
+    m.writeAPI.WritePoint(p)
+    return nil
+}
+
+func (m *MarketDataIngester) IngestQuote(quote *Quote) error {
+    p := write.NewPointWithMeasurement("market_quotes").
+        AddTag("symbol", quote.Symbol).
+        AddTag("exchange", quote.Exchange).
+        AddField("bid_price", quote.BidPrice).
+        AddField("bid_size", quote.BidSize).
+        AddField("ask_price", quote.AskPrice).
+        AddField("ask_size", quote.AskSize).
+        AddField("spread", quote.AskPrice - quote.BidPrice).
+        AddField("mid_price", (quote.BidPrice + quote.AskPrice) / 2).
+        SetTime(quote.Timestamp)
+
+    m.writeAPI.WritePoint(p)
+    return nil
+}
+
+func (m *MarketDataIngester) Flush() {
+    m.writeAPI.Flush()
+}
+
+func (m *MarketDataIngester) Close() {
+    m.writeAPI.Flush()
+    m.client.Close()
+}
+
+3.2 CLICKHOUSE INGESTION (C++)
+-------------------------------
+
+#include <clickhouse/client.h>
+#include <vector>
+#include <string>
+
+using namespace clickhouse;
+
+class MarketDataIngester {
+private:
+    Client client_;
+    std::vector<std::string> batch_symbols_;
+    std::vector<time_t> batch_times_;
+    std::vector<double> batch_prices_;
+    std::vector<double> batch_quantities_;
+    size_t batch_size_ = 10000;
+
+public:
+    MarketDataIngester(const std::string& host, int port)
+        : client_(ClientOptions().SetHost(host).SetPort(port)) {
+        batch_symbols_.reserve(batch_size_);
+        batch_times_.reserve(batch_size_);
+        batch_prices_.reserve(batch_size_);
+        batch_quantities_.reserve(batch_size_);
+    }
+
+    void IngestTrade(const std::string& symbol, time_t timestamp,
+                     double price, double quantity) {
+        batch_symbols_.push_back(symbol);
+        batch_times_.push_back(timestamp);
+        batch_prices_.push_back(price);
+        batch_quantities_.push_back(quantity);
+
+        if (batch_symbols_.size() >= batch_size_) {
+            Flush();
+        }
+    }
+
+    void Flush() {
+        if (batch_symbols_.empty()) return;
+
+        Block block;
+
+        auto symbol_col = std::make_shared<ColumnString>();
+        auto time_col = std::make_shared<ColumnDateTime>();
+        auto price_col = std::make_shared<ColumnDecimal>(18, 8);
+        auto qty_col = std::make_shared<ColumnDecimal>(18, 8);
+
+        for (size_t i = 0; i < batch_symbols_.size(); ++i) {
+            symbol_col->Append(batch_symbols_[i]);
+            time_col->Append(batch_times_[i]);
+            price_col->Append(batch_prices_[i]);
+            qty_col->Append(batch_quantities_[i]);
+        }
+
+        block.AppendColumn("symbol", symbol_col);
+        block.AppendColumn("event_time", time_col);
+        block.AppendColumn("price", price_col);
+        block.AppendColumn("quantity", qty_col);
+
+        client_.Insert("market_trades", block);
+
+        // Clear batches
+        batch_symbols_.clear();
+        batch_times_.clear();
+        batch_prices_.clear();
+        batch_quantities_.clear();
+    }
+};
+
+================================================================================
+4. PERFORMANCE OPTIMIZATION
+================================================================================
+
+4.1 INFLUXDB BEST PRACTICES
+----------------------------
+
+1. Batch writes (1000-5000 points per batch)
+2. Use appropriate precision (nanosecond for HFT)
+3. Optimize tag cardinality (<100K unique combinations)
+4. Use continuous queries for downsampling
+5. Implement proper retention policies
+6. Use compression on disk
+7. Monitor memory usage
+8. Shard data across multiple buckets
+
+4.2 CLICKHOUSE BEST PRACTICES
+------------------------------
+
+1. Use appropriate table engines
+2. Optimize partition keys (monthly for HFT data)
+3. Choose correct ORDER BY columns
+4. Use compression codecs
+5. Implement TTL policies
+6. Use dictionaries for lookups
+7. Create materialized views for aggregations
+8. Optimize primary key for query patterns
+9. Use projections for common queries
+10. Implement distributed tables for scaling
+
+================================================================================
+END OF TIME-SERIES DATA STORAGE DOCUMENT
+================================================================================

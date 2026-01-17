@@ -1,0 +1,755 @@
+================================================================================
+CRASH RECOVERY PROCEDURES
+================================================================================
+
+Procedures for recovering HFT systems after unexpected crashes, system
+failures, or abnormal terminations. Focus on safety and correctness.
+
+================================================================================
+CRASH DETECTION
+================================================================================
+
+**Automatic Detection Methods:**
+
+1. **Process Monitor (Watchdog)**
+```bash
+#!/bin/bash
+# watchdog.sh - Monitor trading process and detect crashes
+
+PROCESS_NAME="trading_engine"
+CHECK_INTERVAL=5  # seconds
+ALERT_URL="http://monitoring/api/alert"
+
+while true; do
+    if ! pgrep -f "$PROCESS_NAME" > /dev/null; then
+        echo "[ALERT] $PROCESS_NAME not running! Crash detected."
+
+        # Send alert
+        curl -X POST "$ALERT_URL" \
+            -H "Content-Type: application/json" \
+            -d "{\"severity\":\"critical\", \
+                 \"message\":\"Trading engine crashed\", \
+                 \"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
+
+        # Log crash
+        echo "$(date): $PROCESS_NAME crashed" >> /var/log/trading/crashes.log
+
+        # Trigger recovery (optional: auto-restart or wait for manual)
+        # ./scripts/crash_recovery.sh
+    fi
+
+    sleep $CHECK_INTERVAL
+done
+```
+
+2. **Heartbeat Monitor**
+```cpp
+// heartbeat_monitor.cpp
+class HeartbeatMonitor {
+public:
+    void UpdateHeartbeat() {
+        last_heartbeat_ = GetCurrentTimeMillis();
+
+        // Write to shared memory for external monitor
+        mmap_heartbeat_->timestamp = last_heartbeat_;
+    }
+
+    bool IsHealthy() const {
+        auto now = GetCurrentTimeMillis();
+        return (now - last_heartbeat_) < 5000;  // 5 second threshold
+    }
+
+private:
+    uint64_t last_heartbeat_;
+    SharedMemory<HeartbeatData>* mmap_heartbeat_;
+};
+
+// External monitor checks heartbeat
+while (true) {
+    auto heartbeat = ReadHeartbeat();
+    auto age = CurrentTime() - heartbeat.timestamp;
+
+    if (age > 10000) {  // 10 seconds
+        AlertCrash("Heartbeat timeout - process hung or crashed");
+        TriggerRecovery();
+    }
+
+    sleep(2);
+}
+```
+
+3. **Core Dump Detection**
+```bash
+# Monitor for core dumps
+inotifywait -m /var/crash -e create -e moved_to |
+    while read path action file; do
+        if [[ "$file" =~ core\. ]]; then
+            echo "Core dump detected: $file"
+            ./scripts/alert_crash.sh --core-dump "$path/$file"
+            ./scripts/analyze_core.sh "$path/$file"
+        fi
+    done
+```
+
+4. **Health Check API**
+```bash
+# External monitor pings health check endpoint
+while true; do
+    if ! curl -f http://localhost:8080/health > /dev/null 2>&1; then
+        echo "Health check failed - system down"
+        ./scripts/crash_recovery.sh
+    fi
+    sleep 5
+done
+```
+
+================================================================================
+CRASH ANALYSIS
+================================================================================
+
+**Immediate Analysis (Automated):**
+
+```bash
+#!/bin/bash
+# analyze_crash.sh - Analyze crash immediately after detection
+
+CRASH_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+ANALYSIS_DIR="/var/log/trading/crash_analysis/$CRASH_TIME"
+mkdir -p "$ANALYSIS_DIR"
+
+echo "=== CRASH ANALYSIS: $CRASH_TIME ===" | tee "$ANALYSIS_DIR/summary.txt"
+
+# 1. Capture system state
+echo "Capturing system state..."
+top -bn1 > "$ANALYSIS_DIR/top.txt"
+free -h > "$ANALYSIS_DIR/memory.txt"
+df -h > "$ANALYSIS_DIR/disk.txt"
+netstat -an > "$ANALYSIS_DIR/network.txt"
+
+# 2. Check for core dump
+if [ -f "/var/crash/core.$(pgrep -f trading_engine)" ]; then
+    CORE_FILE="/var/crash/core.$(pgrep -f trading_engine)"
+    echo "Core dump found: $CORE_FILE"
+
+    # Quick backtrace
+    gdb -batch -ex "bt" ./trading_engine "$CORE_FILE" > "$ANALYSIS_DIR/backtrace.txt"
+
+    # Copy core dump
+    cp "$CORE_FILE" "$ANALYSIS_DIR/core.dump"
+fi
+
+# 3. Extract recent logs (last 5 minutes before crash)
+echo "Extracting recent logs..."
+journalctl -u trading_engine --since "5 minutes ago" > "$ANALYSIS_DIR/logs_recent.txt"
+
+# 4. Check for OOM (Out of Memory)
+echo "Checking for OOM killer..."
+dmesg | grep -i "out of memory" | tail -20 > "$ANALYSIS_DIR/oom.txt"
+dmesg | grep -i "killed process" | tail -20 >> "$ANALYSIS_DIR/oom.txt"
+
+# 5. Check for segfault
+echo "Checking for segfault..."
+dmesg | grep -i "segfault" | tail -20 > "$ANALYSIS_DIR/segfault.txt"
+
+# 6. Capture positions before recovery (from exchange)
+echo "Capturing positions from exchanges..."
+./scripts/get_exchange_positions.sh --all > "$ANALYSIS_DIR/positions_exchange.txt"
+
+# 7. Load last checkpoint info
+echo "Checking last checkpoint..."
+ls -lh /data/checkpoints/latest.ckpt > "$ANALYSIS_DIR/checkpoint_info.txt"
+
+echo "=== ANALYSIS COMPLETE ===" | tee -a "$ANALYSIS_DIR/summary.txt"
+echo "Results saved to: $ANALYSIS_DIR"
+```
+
+**Root Cause Analysis (Manual):**
+
+1. **Examine Core Dump**
+```bash
+gdb ./trading_engine /var/crash/core.12345
+
+# GDB commands:
+(gdb) bt full          # Full backtrace with local variables
+(gdb) info threads     # All thread backtraces
+(gdb) thread apply all bt  # Backtrace for each thread
+(gdb) print variable_name  # Examine variable values
+(gdb) frame N          # Switch to frame N in backtrace
+```
+
+2. **Analyze Logs**
+```bash
+# Last error before crash
+grep -i error /var/log/trading/trading.log | tail -20
+
+# Last warning before crash
+grep -i warn /var/log/trading/trading.log | tail -50
+
+# Timeline around crash (± 1 minute)
+./scripts/log_timeline.sh --time "$CRASH_TIME" --window 60
+```
+
+3. **Check System Resources**
+```bash
+# Memory usage trend (if sar available)
+sar -r 1 60
+
+# CPU usage trend
+sar -u 1 60
+
+# Network issues
+./scripts/check_network_issues.sh --time "$CRASH_TIME"
+```
+
+================================================================================
+RECOVERY DECISION TREE
+================================================================================
+
+```
+Crash Detected
+    │
+    ├─ Auto-Recovery Safe?
+    │   ├─ YES (transient issue, clean crash)
+    │   │   └─→ Automatic Recovery (proceed)
+    │   │
+    │   └─ NO (repeated crashes, data corruption, unknown cause)
+    │       └─→ Manual Investigation Required
+    │           ├─ Analyze crash (logs, core dump)
+    │           ├─ Fix underlying issue
+    │           ├─ Test fix
+    │           └─ Manual recovery when ready
+    │
+    ├─ Was Last Checkpoint Recent? (<5 seconds)
+    │   ├─ YES → Load checkpoint (minimal data loss)
+    │   └─ NO → Reconstruct from exchanges (slower)
+    │
+    └─ Market Conditions
+        ├─ Normal → Resume trading
+        └─ Extreme volatility → Human approval before resume
+```
+
+================================================================================
+CRASH RECOVERY PROCEDURE
+================================================================================
+
+**Automated Recovery Script:**
+
+```bash
+#!/bin/bash
+# crash_recovery.sh - Automatic recovery from crash
+
+set -e
+trap 'echo "Recovery failed at line $LINENO"' ERR
+
+LOG_FILE="/var/log/trading/recovery_$(date +%Y%m%d_%H%M%S).log"
+
+log() {
+    echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+}
+
+log "===================================================================="
+log "CRASH RECOVERY INITIATED"
+log "===================================================================="
+
+# Step 1: Crash Analysis
+log "Step 1: Analyzing crash..."
+./scripts/analyze_crash.sh
+CRASH_DIR=$(ls -td /var/log/trading/crash_analysis/* | head -1)
+log "Analysis saved to: $CRASH_DIR"
+
+# Step 2: Safety Checks
+log "Step 2: Performing safety checks..."
+
+# Check if repeated crashes (> 3 in last 5 minutes)
+CRASH_COUNT=$(grep -c "Crash detected" /var/log/trading/crashes.log | tail -5m || echo 0)
+if [ "$CRASH_COUNT" -gt 3 ]; then
+    log "ERROR: Repeated crashes detected ($CRASH_COUNT in 5 min)"
+    log "Aborting auto-recovery - manual intervention required"
+    ./scripts/alert_ops.sh --severity critical \
+        --message "Repeated crashes - auto-recovery disabled"
+    exit 1
+fi
+
+# Check for data corruption
+if [ -f /data/checkpoints/latest.ckpt ]; then
+    if ! ./scripts/validate_checkpoint.sh /data/checkpoints/latest.ckpt; then
+        log "ERROR: Checkpoint validation failed - possible corruption"
+        log "Attempting recovery from exchange state..."
+        RECOVERY_MODE="exchange"
+    else
+        log "Checkpoint validation passed"
+        RECOVERY_MODE="checkpoint"
+    fi
+else
+    log "WARNING: No checkpoint found"
+    RECOVERY_MODE="exchange"
+fi
+
+# Step 3: Load State
+log "Step 3: Loading state (mode: $RECOVERY_MODE)..."
+
+if [ "$RECOVERY_MODE" = "checkpoint" ]; then
+    # Load from checkpoint
+    log "Loading from checkpoint..."
+    ./scripts/load_checkpoint.sh /data/checkpoints/latest.ckpt
+    if [ $? -ne 0 ]; then
+        log "ERROR: Checkpoint load failed"
+        log "Falling back to exchange recovery..."
+        RECOVERY_MODE="exchange"
+    fi
+fi
+
+if [ "$RECOVERY_MODE" = "exchange" ]; then
+    # Reconstruct from exchanges
+    log "Reconstructing state from exchanges (slow)..."
+    ./scripts/reconstruct_state.sh --all-exchanges > /tmp/reconstructed_state.json
+    ./scripts/load_state.sh --file /tmp/reconstructed_state.json
+fi
+
+# Step 4: Position Reconciliation
+log "Step 4: Reconciling positions with exchanges..."
+./scripts/reconcile_positions.sh --exchanges all --strict
+if [ $? -ne 0 ]; then
+    log "ERROR: Position reconciliation failed"
+    log "Manual reconciliation required before trading"
+    exit 1
+fi
+
+# Step 5: Recover Open Orders
+log "Step 5: Recovering open orders..."
+./scripts/recover_open_orders.sh --all-exchanges
+OPEN_ORDERS=$(./scripts/count_open_orders.sh)
+log "Open orders recovered: $OPEN_ORDERS"
+
+# Step 6: Validate System Health
+log "Step 6: Validating system health..."
+
+# Start services (without trading yet)
+./scripts/start_services.sh --no-trading
+
+# Health checks
+sleep 5  # Let services initialize
+
+./scripts/health_check.sh --comprehensive
+if [ $? -ne 0 ]; then
+    log "ERROR: Health check failed after restart"
+    ./scripts/stop_services.sh --force
+    exit 1
+fi
+
+# Step 7: Risk Checks
+log "Step 7: Performing risk checks..."
+
+# Verify risk limits loaded
+./scripts/verify_risk_limits.sh
+if [ $? -ne 0 ]; then
+    log "ERROR: Risk limits not properly loaded"
+    exit 1
+fi
+
+# Check current exposure
+EXPOSURE=$(./scripts/get_current_exposure.sh)
+log "Current exposure: $EXPOSURE"
+
+if [ $(echo "$EXPOSURE > 1000000" | bc) -eq 1 ]; then
+    log "WARNING: High exposure detected ($EXPOSURE)"
+    log "Requiring manual approval to resume trading"
+    ./scripts/alert_ops.sh --severity warning \
+        --message "High exposure after crash recovery: $EXPOSURE"
+    exit 0  # Don't auto-resume
+fi
+
+# Step 8: Market Condition Check
+log "Step 8: Checking market conditions..."
+
+# Check for extreme volatility
+VOLATILITY=$(./scripts/get_current_volatility.sh)
+log "Current volatility: $VOLATILITY"
+
+if [ $(echo "$VOLATILITY > 0.05" | bc) -eq 1 ]; then
+    log "WARNING: High volatility detected ($VOLATILITY)"
+    log "Requiring manual approval to resume trading"
+    exit 0
+fi
+
+# Check if markets are open
+./scripts/check_market_hours.sh
+if [ $? -ne 0 ]; then
+    log "Markets closed - resuming in monitoring mode only"
+    exit 0
+fi
+
+# Step 9: Resume Trading (Gradual)
+log "Step 9: Resuming trading (gradual ramp-up)..."
+
+# Start with reduced position limits (50%)
+./scripts/set_position_limits.sh --percentage 50
+log "Position limits set to 50% (gradual recovery)"
+
+# Enable low-risk strategies first
+./scripts/enable_strategies.sh --risk-level low
+log "Low-risk strategies enabled"
+sleep 30
+
+# Monitor for 1 minute
+log "Monitoring for 60 seconds..."
+for i in {1..12}; do
+    sleep 5
+    if ! ./scripts/health_check.sh --quick; then
+        log "ERROR: Health check failed during monitoring"
+        ./scripts/emergency_shutdown.sh
+        exit 1
+    fi
+done
+
+# Gradually increase to 75%
+./scripts/set_position_limits.sh --percentage 75
+log "Position limits increased to 75%"
+
+# Enable medium-risk strategies
+./scripts/enable_strategies.sh --risk-level medium
+log "Medium-risk strategies enabled"
+sleep 30
+
+# Final ramp to 100%
+./scripts/set_position_limits.sh --percentage 100
+log "Position limits at 100% - full recovery complete"
+
+# Enable all strategies
+./scripts/enable_strategies.sh --all
+log "All strategies enabled"
+
+# Step 10: Post-Recovery Actions
+log "Step 10: Post-recovery actions..."
+
+# Create recovery report
+./scripts/create_recovery_report.sh \
+    --crash-dir "$CRASH_DIR" \
+    --recovery-log "$LOG_FILE" \
+    --output /var/log/trading/recovery_report_$(date +%Y%m%d_%H%M%S).pdf
+
+# Notify stakeholders
+./scripts/notify_recovery.sh \
+    --status "SUCCESS" \
+    --duration "$SECONDS seconds" \
+    --log "$LOG_FILE"
+
+log "===================================================================="
+log "CRASH RECOVERY COMPLETE"
+log "Duration: $SECONDS seconds"
+log "===================================================================="
+
+exit 0
+```
+
+================================================================================
+POSITION RECONCILIATION AFTER CRASH
+================================================================================
+
+**Critical: Always reconcile positions before resuming trading**
+
+```bash
+#!/bin/bash
+# reconcile_positions.sh - Reconcile positions after crash
+
+STRICT_MODE=${1:---strict}  # Exit on any discrepancy
+
+log() {
+    echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1"
+}
+
+log "Starting position reconciliation..."
+
+# Load internal state (from checkpoint or reconstructed)
+INTERNAL_POSITIONS=$(./scripts/get_internal_positions.sh --json)
+
+# Query each exchange
+declare -A EXCHANGE_POSITIONS
+for exchange in Binance Coinbase Kraken; do
+    log "Querying positions from $exchange..."
+    EXCHANGE_POSITIONS[$exchange]=$(./scripts/query_exchange_positions.sh \
+        --exchange "$exchange" --json)
+done
+
+# Compare
+DISCREPANCIES=0
+
+for symbol in $(echo "$INTERNAL_POSITIONS" | jq -r 'keys[]'); do
+    INTERNAL_QTY=$(echo "$INTERNAL_POSITIONS" | jq -r ".\"$symbol\".quantity")
+
+    # Sum across all exchanges
+    EXCHANGE_QTY=0
+    for exchange in "${!EXCHANGE_POSITIONS[@]}"; do
+        QTY=$(echo "${EXCHANGE_POSITIONS[$exchange]}" | \
+            jq -r ".\"$symbol\".quantity // 0")
+        EXCHANGE_QTY=$(echo "$EXCHANGE_QTY + $QTY" | bc)
+    done
+
+    # Compare
+    DIFF=$(echo "$INTERNAL_QTY - $EXCHANGE_QTY" | bc)
+    ABS_DIFF=$(echo "$DIFF" | sed 's/-//')
+
+    if [ $(echo "$ABS_DIFF > 0.0001" | bc) -eq 1 ]; then
+        log "DISCREPANCY: $symbol"
+        log "  Internal: $INTERNAL_QTY"
+        log "  Exchange: $EXCHANGE_QTY"
+        log "  Difference: $DIFF"
+        DISCREPANCIES=$((DISCREPANCIES + 1))
+
+        # Update internal to match exchange (source of truth)
+        ./scripts/update_internal_position.sh \
+            --symbol "$symbol" \
+            --quantity "$EXCHANGE_QTY" \
+            --reason "Reconciliation after crash"
+    else
+        log "OK: $symbol (Internal=$INTERNAL_QTY, Exchange=$EXCHANGE_QTY)"
+    fi
+done
+
+if [ $DISCREPANCIES -gt 0 ]; then
+    log "WARNING: $DISCREPANCIES discrepancies found and corrected"
+
+    if [ "$STRICT_MODE" = "--strict" ]; then
+        log "Strict mode enabled - exiting for manual review"
+        exit 1
+    fi
+else
+    log "All positions reconciled successfully"
+fi
+
+exit 0
+```
+
+================================================================================
+ORDER RECOVERY AFTER CRASH
+================================================================================
+
+**Recover open orders from exchanges:**
+
+```bash
+#!/bin/bash
+# recover_open_orders.sh - Recover open orders after crash
+
+log() {
+    echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1"
+}
+
+log "Recovering open orders from exchanges..."
+
+TOTAL_RECOVERED=0
+
+for exchange in Binance Coinbase Kraken; do
+    log "Querying open orders from $exchange..."
+
+    # Query exchange for open orders
+    OPEN_ORDERS=$(./scripts/query_exchange_open_orders.sh \
+        --exchange "$exchange" --json)
+
+    ORDER_COUNT=$(echo "$OPEN_ORDERS" | jq 'length')
+    log "Found $ORDER_COUNT open orders on $exchange"
+
+    # Import each order into internal system
+    echo "$OPEN_ORDERS" | jq -c '.[]' | while read order; do
+        ORDER_ID=$(echo "$order" | jq -r '.id')
+        SYMBOL=$(echo "$order" | jq -r '.symbol')
+        SIDE=$(echo "$order" | jq -r '.side')
+        PRICE=$(echo "$order" | jq -r '.price')
+        QTY=$(echo "$order" | jq -r '.quantity')
+        FILLED=$(echo "$order" | jq -r '.filled')
+
+        log "Recovering order: $ORDER_ID ($SYMBOL $SIDE $QTY @ $PRICE)"
+
+        # Import into internal order management system
+        ./scripts/import_order.sh \
+            --exchange "$exchange" \
+            --order-id "$ORDER_ID" \
+            --symbol "$SYMBOL" \
+            --side "$SIDE" \
+            --price "$PRICE" \
+            --quantity "$QTY" \
+            --filled "$FILLED"
+
+        TOTAL_RECOVERED=$((TOTAL_RECOVERED + 1))
+    done
+done
+
+log "Total orders recovered: $TOTAL_RECOVERED"
+exit 0
+```
+
+================================================================================
+DATA INTEGRITY VALIDATION
+================================================================================
+
+**Validate checkpoint data before loading:**
+
+```cpp
+// checkpoint_validator.cpp
+class CheckpointValidator {
+public:
+    ValidationResult Validate(const std::string& checkpoint_path) {
+        ValidationResult result;
+
+        // 1. File exists and readable
+        if (!std::filesystem::exists(checkpoint_path)) {
+            result.errors.push_back("Checkpoint file does not exist");
+            return result;
+        }
+
+        // 2. Load checkpoint
+        auto checkpoint = LoadCheckpoint(checkpoint_path);
+
+        // 3. Checksum validation
+        uint64_t calculated_checksum = CalculateChecksum(checkpoint);
+        if (calculated_checksum != checkpoint.checksum) {
+            result.errors.push_back("Checksum mismatch - possible corruption");
+            return result;
+        }
+
+        // 4. Timestamp validation
+        uint64_t now = GetCurrentTimeNanos();
+        if (checkpoint.timestamp > now) {
+            result.errors.push_back("Checkpoint timestamp is in the future");
+        }
+
+        uint64_t age = now - checkpoint.timestamp;
+        if (age > 3600'000'000'000) {  // 1 hour
+            result.warnings.push_back("Checkpoint is over 1 hour old");
+        }
+
+        // 5. Position validation
+        for (const auto& [symbol, position] : checkpoint.positions) {
+            // Check for absurd quantities
+            if (std::abs(position.quantity) > 1000000) {
+                result.errors.push_back(
+                    "Absurd position quantity for " + symbol);
+            }
+
+            // Check for negative prices
+            if (position.avg_price <= 0) {
+                result.errors.push_back(
+                    "Invalid avg_price for " + symbol);
+            }
+        }
+
+        // 6. Balance validation
+        for (const auto& [exchange, balance] : checkpoint.balances) {
+            if (balance.total < 0) {
+                result.errors.push_back(
+                    "Negative balance on " + exchange);
+            }
+        }
+
+        // 7. Version compatibility
+        if (checkpoint.version != CURRENT_VERSION) {
+            result.warnings.push_back(
+                "Checkpoint version mismatch (need migration)");
+        }
+
+        result.valid = result.errors.empty();
+        return result;
+    }
+};
+```
+
+================================================================================
+COMMON CRASH SCENARIOS & RECOVERY
+================================================================================
+
+**Scenario 1: Segmentation Fault**
+- Cause: Null pointer dereference, buffer overflow
+- Detection: Core dump + segfault in dmesg
+- Recovery:
+  1. Analyze core dump (find root cause)
+  2. Fix bug
+  3. Load last checkpoint
+  4. Resume trading
+
+**Scenario 2: Out of Memory (OOM)**
+- Cause: Memory leak, excessive allocation
+- Detection: OOM killer in dmesg
+- Recovery:
+  1. Identify memory leak (Valgrind, heaptrack)
+  2. Fix leak
+  3. Increase memory limit (temporary)
+  4. Load checkpoint and resume
+
+**Scenario 3: Deadlock**
+- Cause: Lock ordering issue
+- Detection: Process hung (no heartbeat, no CPU usage)
+- Recovery:
+  1. Force kill (SIGKILL)
+  2. Analyze deadlock (gdb attach or core dump)
+  3. Fix lock ordering bug
+  4. Resume with checkpoint
+
+**Scenario 4: Assertion Failure**
+- Cause: Invariant violated
+- Detection: Abort signal, assertion message in log
+- Recovery:
+  1. Read assertion message
+  2. Understand why invariant was violated
+  3. Fix bug
+  4. Validate data integrity
+  5. Resume
+
+**Scenario 5: Exchange Disconnect During Crash**
+- Cause: Network issue during crash
+- Detection: Connection status
+- Recovery:
+  1. Reconnect to exchange
+  2. Reconcile positions (critical!)
+  3. Recover open orders
+  4. Resume carefully
+
+================================================================================
+MANUAL RECOVERY CHECKLIST
+================================================================================
+
+When auto-recovery fails, follow this manual procedure:
+
+□ **Analyze Crash**
+  □ Read crash analysis report
+  □ Examine core dump (if available)
+  □ Review logs around crash time
+  □ Identify root cause
+
+□ **Fix Issue**
+  □ Code fix (if bug)
+  □ Configuration fix (if misconfiguration)
+  □ Infrastructure fix (if system issue)
+  □ Test fix in non-production
+
+□ **Validate Checkpoint**
+  □ Checkpoint file exists
+  □ Checksum valid
+  □ Data reasonable (no absurd values)
+  □ Not too old (<1 hour preferred)
+
+□ **Reconcile State**
+  □ Query all exchange positions
+  □ Compare with checkpoint
+  □ Resolve discrepancies (exchange is source of truth)
+  □ Document any differences
+
+□ **Pre-Recovery Tests**
+  □ Start system in test mode (no trading)
+  □ Verify services start correctly
+  □ Verify connections to exchanges
+  □ Verify market data flowing
+  □ Verify risk checks functional
+
+□ **Resume Trading**
+  □ Risk manager approval
+  □ Start with reduced limits
+  □ Enable low-risk strategies first
+  □ Monitor closely for 15 minutes
+  □ Gradually ramp up to full capacity
+
+□ **Post-Recovery**
+  □ Document recovery process
+  □ Create incident report
+  □ Post-mortem meeting
+  □ Update runbooks with learnings
+
+================================================================================

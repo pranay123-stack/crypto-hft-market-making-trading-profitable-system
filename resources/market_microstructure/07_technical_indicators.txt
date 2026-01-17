@@ -1,0 +1,764 @@
+================================================================================
+TECHNICAL INDICATORS FOR HFT SYSTEMS
+High-Frequency Trading System Documentation
+================================================================================
+
+TABLE OF CONTENTS
+--------------------------------------------------------------------------------
+1. Introduction to HFT Indicators  
+2. Momentum Indicators
+3. Volatility Indicators
+4. Volume Indicators
+5. Microstructure Indicators
+6. C++ Implementation Framework
+7. Indicator Combinations
+8. Signal Generation
+9. Performance Optimization
+10. Real-World Applications
+
+================================================================================
+1. INTRODUCTION TO HFT INDICATORS
+================================================================================
+
+Technical indicators for HFT differ from traditional indicators:
+- Sub-second timeframes (microseconds to seconds)
+- Order book-based rather than price-only
+- Volume and flow emphasis
+- Low-latency computation requirements
+- Integrated with microstructure signals
+
+Key HFT Indicators:
+1. Microprice
+2. Order book imbalance
+3. Volume-weighted metrics
+4. High-frequency momentum
+5. Spread indicators
+6. Trade flow toxicity
+7. Queue position metrics
+
+Requirements:
+- Update latency < 10 microseconds
+- Lock-free implementations
+- Cache-friendly data structures
+- Minimal memory allocations
+- SIMD optimization where applicable
+
+================================================================================
+2. MOMENTUM INDICATORS
+================================================================================
+
+2.1 MICROPRICE
+--------------
+Volume-weighted mid-price:
+
+Microprice = (Bid × AskVolume + Ask × BidVolume) / (BidVolume + AskVolume)
+
+More accurate than simple mid-price for predicting short-term moves.
+
+C++ Implementation:
+class Microprice {
+public:
+    static double calculate(double bid, double ask,
+                           int64_t bid_vol, int64_t ask_vol) {
+        if (bid_vol + ask_vol == 0) {
+            return (bid + ask) / 2.0;
+        }
+        return (bid * ask_vol + ask * bid_vol) / (bid_vol + ask_vol);
+    }
+
+    // Deviation from mid-price in bps
+    static double deviation_from_mid(double bid, double ask,
+                                    int64_t bid_vol, int64_t ask_vol) {
+        double mid = (bid + ask) / 2.0;
+        double micro = calculate(bid, ask, bid_vol, ask_vol);
+        return ((micro - mid) / mid) * 10000.0;
+    }
+};
+
+2.2 TICK RULE MOMENTUM
+----------------------
+Classify trades as buy/sell and track momentum:
+
+class TickRuleMomentum {
+private:
+    std::deque<int> ticks_;  // +1 for uptick, -1 for downtick
+    size_t window_size_;
+    
+public:
+    explicit TickRuleMomentum(size_t window = 100) : window_size_(window) {}
+    
+    void add_trade(double price, double prev_price) {
+        int tick = (price > prev_price) ? 1 : ((price < prev_price) ? -1 : 0);
+        ticks_.push_back(tick);
+        
+        if (ticks_.size() > window_size_) {
+            ticks_.pop_front();
+        }
+    }
+    
+    double momentum() const {
+        if (ticks_.empty()) return 0.0;
+        int sum = std::accumulate(ticks_.begin(), ticks_.end(), 0);
+        return static_cast<double>(sum) / ticks_.size();
+    }
+    
+    // Recent momentum (last N ticks)
+    double recent_momentum(size_t n) const {
+        if (ticks_.empty()) return 0.0;
+        size_t count = std::min(n, ticks_.size());
+        int sum = 0;
+        auto it = ticks_.rbegin();
+        for (size_t i = 0; i < count; ++i, ++it) {
+            sum += *it;
+        }
+        return static_cast<double>(sum) / count;
+    }
+};
+
+2.3 HIGH-FREQUENCY RSI
+----------------------
+Relative Strength Index for microsecond data:
+
+class FastRSI {
+private:
+    double avg_gain_ = 0.0;
+    double avg_loss_ = 0.0;
+    double last_price_ = 0.0;
+    int period_;
+    int count_ = 0;
+    
+public:
+    explicit FastRSI(int period = 14) : period_(period) {}
+    
+    double update(double price) {
+        if (count_ == 0) {
+            last_price_ = price;
+            count_++;
+            return 50.0;  // Neutral
+        }
+        
+        double change = price - last_price_;
+        double gain = (change > 0) ? change : 0.0;
+        double loss = (change < 0) ? -change : 0.0;
+        
+        // Exponential moving average
+        double alpha = 1.0 / period_;
+        if (count_ < period_) {
+            // Simple average during initialization
+            avg_gain_ = (avg_gain_ * (count_ - 1) + gain) / count_;
+            avg_loss_ = (avg_loss_ * (count_ - 1) + loss) / count_;
+        } else {
+            // EMA after initialization
+            avg_gain_ = alpha * gain + (1 - alpha) * avg_gain_;
+            avg_loss_ = alpha * loss + (1 - alpha) * avg_loss_;
+        }
+        
+        last_price_ = price;
+        count_++;
+        
+        if (avg_loss_ == 0.0) return 100.0;
+        double rs = avg_gain_ / avg_loss_;
+        return 100.0 - (100.0 / (1.0 + rs));
+    }
+    
+    double get_rsi() const {
+        if (avg_loss_ == 0.0) return 100.0;
+        double rs = avg_gain_ / avg_loss_;
+        return 100.0 - (100.0 / (1.0 + rs));
+    }
+};
+
+================================================================================
+3. VOLATILITY INDICATORS
+================================================================================
+
+3.1 REALIZED VOLATILITY (HIGH-FREQUENCY)
+-----------------------------------------
+Calculate volatility from tick data:
+
+class RealizedVolatility {
+private:
+    std::deque<double> returns_;
+    size_t window_size_;
+    
+public:
+    explicit RealizedVolatility(size_t window = 100) : window_size_(window) {}
+    
+    void add_price(double price, double prev_price) {
+        if (prev_price > 0) {
+            double ret = std::log(price / prev_price);
+            returns_.push_back(ret);
+            
+            if (returns_.size() > window_size_) {
+                returns_.pop_front();
+            }
+        }
+    }
+    
+    // Annualized volatility (assuming 252 trading days, 6.5 hours, microsecond data)
+    double volatility_annualized(uint64_t sampling_interval_us) const {
+        if (returns_.size() < 2) return 0.0;
+        
+        // Calculate standard deviation of returns
+        double mean = std::accumulate(returns_.begin(), returns_.end(), 0.0) / returns_.size();
+        double variance = 0.0;
+        for (double ret : returns_) {
+            variance += (ret - mean) * (ret - mean);
+        }
+        variance /= (returns_.size() - 1);
+        double std_dev = std::sqrt(variance);
+        
+        // Scale to annual volatility
+        // intervals_per_day = trading_seconds * 1e6 / sampling_interval_us
+        double intervals_per_day = (6.5 * 3600.0 * 1e6) / sampling_interval_us;
+        double scaling = std::sqrt(intervals_per_day * 252.0);
+        
+        return std_dev * scaling;
+    }
+    
+    // Intraday volatility (no annualization)
+    double volatility_raw() const {
+        if (returns_.size() < 2) return 0.0;
+        
+        double mean = std::accumulate(returns_.begin(), returns_.end(), 0.0) / returns_.size();
+        double variance = 0.0;
+        for (double ret : returns_) {
+            variance += (ret - mean) * (ret - mean);
+        }
+        variance /= (returns_.size() - 1);
+        return std::sqrt(variance);
+    }
+};
+
+3.2 PARKINSON VOLATILITY
+-------------------------
+Volatility from high-low range (more efficient than close-close):
+
+σ_parkinson = sqrt(1/(4*ln(2)) * (ln(High/Low))²)
+
+class ParkinsonVolatility {
+private:
+    struct OHLC {
+        double high;
+        double low;
+    };
+    
+    std::deque<OHLC> bars_;
+    size_t window_size_;
+    
+public:
+    explicit ParkinsonVolatility(size_t window = 20) : window_size_(window) {}
+    
+    void add_bar(double high, double low) {
+        bars_.push_back({high, low});
+        if (bars_.size() > window_size_) {
+            bars_.pop_front();
+        }
+    }
+    
+    double volatility() const {
+        if (bars_.empty()) return 0.0;
+        
+        double sum_squared_log_hl = 0.0;
+        for (const auto& bar : bars_) {
+            if (bar.low > 0) {
+                double log_hl = std::log(bar.high / bar.low);
+                sum_squared_log_hl += log_hl * log_hl;
+            }
+        }
+        
+        double factor = 1.0 / (4.0 * std::log(2.0));
+        return std::sqrt(factor * sum_squared_log_hl / bars_.size());
+    }
+};
+
+================================================================================
+4. VOLUME INDICATORS
+================================================================================
+
+4.1 ON-BALANCE VOLUME (OBV)
+----------------------------
+class OnBalanceVolume {
+private:
+    int64_t obv_ = 0;
+    double last_price_ = 0.0;
+    
+public:
+    void add_trade(double price, int64_t volume) {
+        if (last_price_ > 0) {
+            if (price > last_price_) {
+                obv_ += volume;
+            } else if (price < last_price_) {
+                obv_ -= volume;
+            }
+            // No change if price unchanged
+        }
+        last_price_ = price;
+    }
+    
+    int64_t get_obv() const { return obv_; }
+    
+    void reset() {
+        obv_ = 0;
+        last_price_ = 0.0;
+    }
+};
+
+4.2 VOLUME-WEIGHTED MOMENTUM
+-----------------------------
+class VolumeWeightedMomentum {
+private:
+    struct WeightedReturn {
+        double return_val;
+        int64_t volume;
+    };
+    
+    std::deque<WeightedReturn> returns_;
+    size_t window_size_;
+    
+public:
+    explicit VolumeWeightedMomentum(size_t window = 100) : window_size_(window) {}
+    
+    void add_trade(double price, double prev_price, int64_t volume) {
+        if (prev_price > 0) {
+            double ret = (price - prev_price) / prev_price;
+            returns_.push_back({ret, volume});
+            
+            if (returns_.size() > window_size_) {
+                returns_.pop_front();
+            }
+        }
+    }
+    
+    double momentum() const {
+        if (returns_.empty()) return 0.0;
+        
+        double weighted_sum = 0.0;
+        int64_t total_volume = 0;
+        
+        for (const auto& wr : returns_) {
+            weighted_sum += wr.return_val * wr.volume;
+            total_volume += wr.volume;
+        }
+        
+        return (total_volume > 0) ? weighted_sum / total_volume : 0.0;
+    }
+};
+
+================================================================================
+5. MICROSTRUCTURE INDICATORS
+================================================================================
+
+5.1 ORDER BOOK IMBALANCE (OBI)
+-------------------------------
+class OrderBookImbalance {
+public:
+    static double calculate(int64_t bid_vol, int64_t ask_vol) {
+        if (bid_vol + ask_vol == 0) return 0.0;
+        return static_cast<double>(bid_vol - ask_vol) / (bid_vol + ask_vol);
+    }
+    
+    // Multi-level imbalance
+    static double calculate_depth(const std::vector<int64_t>& bid_volumes,
+                                  const std::vector<int64_t>& ask_volumes,
+                                  size_t levels = 5) {
+        int64_t total_bid = 0;
+        int64_t total_ask = 0;
+        
+        size_t n = std::min({levels, bid_volumes.size(), ask_volumes.size()});
+        
+        for (size_t i = 0; i < n; ++i) {
+            total_bid += bid_volumes[i];
+            total_ask += ask_volumes[i];
+        }
+        
+        return calculate(total_bid, total_ask);
+    }
+    
+    // Distance-weighted imbalance
+    static double calculate_weighted(const std::vector<std::pair<double, int64_t>>& bids,
+                                    const std::vector<std::pair<double, int64_t>>& asks,
+                                    double mid_price) {
+        double bid_weighted = 0.0;
+        for (const auto& [price, volume] : bids) {
+            double distance = mid_price - price;
+            if (distance > 0) {
+                bid_weighted += volume / distance;
+            }
+        }
+        
+        double ask_weighted = 0.0;
+        for (const auto& [price, volume] : asks) {
+            double distance = price - mid_price;
+            if (distance > 0) {
+                ask_weighted += volume / distance;
+            }
+        }
+        
+        if (bid_weighted + ask_weighted == 0) return 0.0;
+        return (bid_weighted - ask_weighted) / (bid_weighted + ask_weighted);
+    }
+};
+
+5.2 VPIN (Volume-Synchronized Probability of Informed Trading)
+---------------------------------------------------------------
+class VPIN {
+private:
+    std::deque<int64_t> buy_volumes_;
+    std::deque<int64_t> sell_volumes_;
+    size_t num_buckets_;
+    int64_t bucket_size_;
+    
+    int64_t current_buy_ = 0;
+    int64_t current_sell_ = 0;
+    
+public:
+    VPIN(size_t num_buckets, int64_t bucket_size)
+        : num_buckets_(num_buckets), bucket_size_(bucket_size) {}
+    
+    void add_trade(int64_t volume, bool is_buy) {
+        if (is_buy) {
+            current_buy_ += volume;
+        } else {
+            current_sell_ += volume;
+        }
+        
+        // Check if bucket is full
+        if (current_buy_ + current_sell_ >= bucket_size_) {
+            buy_volumes_.push_back(current_buy_);
+            sell_volumes_.push_back(current_sell_);
+            
+            if (buy_volumes_.size() > num_buckets_) {
+                buy_volumes_.pop_front();
+                sell_volumes_.pop_front();
+            }
+            
+            current_buy_ = 0;
+            current_sell_ = 0;
+        }
+    }
+    
+    double calculate() const {
+        if (buy_volumes_.size() < num_buckets_) {
+            return 0.0;  // Not enough data
+        }
+        
+        int64_t total_imbalance = 0;
+        int64_t total_volume = 0;
+        
+        for (size_t i = 0; i < buy_volumes_.size(); ++i) {
+            total_imbalance += std::abs(buy_volumes_[i] - sell_volumes_[i]);
+            total_volume += buy_volumes_[i] + sell_volumes_[i];
+        }
+        
+        return (total_volume > 0) ? static_cast<double>(total_imbalance) / total_volume : 0.0;
+    }
+    
+    // Interpretation: VPIN > 0.7 indicates high toxicity (informed trading)
+    bool is_toxic(double threshold = 0.7) const {
+        return calculate() > threshold;
+    }
+};
+
+5.3 EFFECTIVE SPREAD INDICATOR
+-------------------------------
+class EffectiveSpreadIndicator {
+private:
+    struct Trade {
+        double price;
+        double mid_at_trade;
+        bool is_buy;
+    };
+    
+    std::deque<Trade> trades_;
+    size_t window_size_;
+    
+public:
+    explicit EffectiveSpreadIndicator(size_t window = 100) : window_size_(window) {}
+    
+    void add_trade(double price, double mid, bool is_buy) {
+        trades_.push_back({price, mid, is_buy});
+        if (trades_.size() > window_size_) {
+            trades_.pop_front();
+        }
+    }
+    
+    double average_effective_spread() const {
+        if (trades_.empty()) return 0.0;
+        
+        double sum = 0.0;
+        for (const auto& trade : trades_) {
+            sum += 2.0 * std::abs(trade.price - trade.mid_at_trade);
+        }
+        return sum / trades_.size();
+    }
+    
+    double effective_spread_bps() const {
+        if (trades_.empty()) return 0.0;
+        
+        double sum = 0.0;
+        for (const auto& trade : trades_) {
+            if (trade.mid_at_trade > 0) {
+                double spread = 2.0 * std::abs(trade.price - trade.mid_at_trade);
+                sum += (spread / trade.mid_at_trade) * 10000.0;
+            }
+        }
+        return sum / trades_.size();
+    }
+};
+
+================================================================================
+6. C++ IMPLEMENTATION FRAMEWORK
+================================================================================
+
+6.1 INDICATOR MANAGER
+----------------------
+class IndicatorManager {
+private:
+    FastRSI rsi_;
+    RealizedVolatility vol_;
+    OrderBookImbalance obi_;
+    VPIN vpin_;
+    VolumeWeightedMomentum vwm_;
+    EffectiveSpreadIndicator eff_spread_;
+    
+public:
+    IndicatorManager()
+        : rsi_(14),
+          vol_(100),
+          vpin_(50, 10000),
+          vwm_(100),
+          eff_spread_(100) {}
+    
+    struct IndicatorValues {
+        double rsi;
+        double volatility;
+        double obi;
+        double vpin;
+        double momentum;
+        double eff_spread_bps;
+        uint64_t timestamp_us;
+    };
+    
+    void on_trade(double price, double prev_price, int64_t volume,
+                 bool is_buy, double mid_price) {
+        rsi_.update(price);
+        vol_.add_price(price, prev_price);
+        vpin_.add_trade(volume, is_buy);
+        vwm_.add_trade(price, prev_price, volume);
+        eff_spread_.add_trade(price, mid_price, is_buy);
+    }
+    
+    void on_quote_update(int64_t bid_vol, int64_t ask_vol) {
+        // OBI calculated on-demand
+    }
+    
+    IndicatorValues get_current_values(int64_t bid_vol, int64_t ask_vol) const {
+        return {
+            rsi_.get_rsi(),
+            vol_.volatility_raw(),
+            OrderBookImbalance::calculate(bid_vol, ask_vol),
+            vpin_.calculate(),
+            vwm_.momentum(),
+            eff_spread_.effective_spread_bps(),
+            get_timestamp_us()
+        };
+    }
+    
+private:
+    static uint64_t get_timestamp_us() {
+        return std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+};
+
+================================================================================
+7. INDICATOR COMBINATIONS
+================================================================================
+
+7.1 COMPOSITE SIGNAL
+--------------------
+class CompositeSignal {
+public:
+    struct Weights {
+        double momentum_weight = 0.3;
+        double obi_weight = 0.3;
+        double vpin_weight = 0.2;
+        double volatility_weight = 0.2;
+    };
+    
+    static double calculate(const IndicatorManager::IndicatorValues& indicators,
+                           const Weights& weights = Weights()) {
+        // Normalize indicators to [-1, 1] scale
+        
+        // RSI: 0-100 → -1 to 1 (50 = 0)
+        double rsi_signal = (indicators.rsi - 50.0) / 50.0;
+        
+        // OBI: already in [-1, 1]
+        double obi_signal = indicators.obi;
+        
+        // VPIN: 0-1 → -1 to 1 (higher = more bearish)
+        double vpin_signal = -(indicators.vpin * 2.0 - 1.0);
+        
+        // Volatility: inverse (lower vol = bullish for mean reversion)
+        double vol_signal = -indicators.volatility / 0.01;  // Normalize
+        vol_signal = std::max(-1.0, std::min(1.0, vol_signal));
+        
+        // Weighted combination
+        double composite = weights.momentum_weight * rsi_signal +
+                          weights.obi_weight * obi_signal +
+                          weights.vpin_weight * vpin_signal +
+                          weights.volatility_weight * vol_signal;
+        
+        // Clamp to [-1, 1]
+        return std::max(-1.0, std::min(1.0, composite));
+    }
+};
+
+================================================================================
+8. SIGNAL GENERATION
+================================================================================
+
+8.1 THRESHOLD-BASED SIGNALS
+----------------------------
+class SignalGenerator {
+public:
+    enum class Signal { STRONG_BUY, BUY, NEUTRAL, SELL, STRONG_SELL };
+    
+    struct Thresholds {
+        double strong_buy = 0.6;
+        double buy = 0.2;
+        double sell = -0.2;
+        double strong_sell = -0.6;
+    };
+    
+    static Signal generate(double composite_score, const Thresholds& thresholds = Thresholds()) {
+        if (composite_score >= thresholds.strong_buy) return Signal::STRONG_BUY;
+        if (composite_score >= thresholds.buy) return Signal::BUY;
+        if (composite_score <= thresholds.strong_sell) return Signal::STRONG_SELL;
+        if (composite_score <= thresholds.sell) return Signal::SELL;
+        return Signal::NEUTRAL;
+    }
+    
+    static const char* signal_to_string(Signal sig) {
+        switch (sig) {
+            case Signal::STRONG_BUY: return "STRONG_BUY";
+            case Signal::BUY: return "BUY";
+            case Signal::NEUTRAL: return "NEUTRAL";
+            case Signal::SELL: return "SELL";
+            case Signal::STRONG_SELL: return "STRONG_SELL";
+            default: return "UNKNOWN";
+        }
+    }
+};
+
+================================================================================
+9. PERFORMANCE OPTIMIZATION
+================================================================================
+
+9.1 CACHE-OPTIMIZED INDICATOR BATCH
+------------------------------------
+struct alignas(64) IndicatorCache {
+    double rsi;
+    double volatility;
+    double obi;
+    double vpin;
+    double momentum;
+    uint64_t timestamp_us;
+    uint8_t padding[16];  // Align to cache line
+};
+
+class BatchIndicatorProcessor {
+private:
+    IndicatorCache cache_;
+    
+public:
+    void update(const IndicatorManager::IndicatorValues& values) {
+        cache_.rsi = values.rsi;
+        cache_.volatility = values.volatility;
+        cache_.obi = values.obi;
+        cache_.vpin = values.vpin;
+        cache_.momentum = values.momentum;
+        cache_.timestamp_us = values.timestamp_us;
+    }
+    
+    const IndicatorCache& get_cache() const { return cache_; }
+};
+
+================================================================================
+10. REAL-WORLD APPLICATIONS
+================================================================================
+
+10.1 MARKET MAKING WITH INDICATORS
+-----------------------------------
+Use indicators to adjust quotes dynamically:
+
+class DynamicMarketMaker {
+private:
+    IndicatorManager indicators_;
+    double base_spread_bps_ = 2.0;
+    
+public:
+    struct Quote {
+        double bid;
+        double ask;
+        int64_t size;
+    };
+    
+    Quote generate_quote(double mid_price, int64_t bid_vol, int64_t ask_vol) {
+        auto values = indicators_.get_current_values(bid_vol, ask_vol);
+        double composite = CompositeSignal::calculate(values);
+        
+        // Adjust spread based on volatility
+        double spread_adjustment = 1.0 + values.volatility * 10.0;
+        double spread = (base_spread_bps_ * spread_adjustment * mid_price) / 10000.0;
+        
+        // Skew based on composite signal
+        double skew = composite * spread * 0.5;
+        
+        return {
+            mid_price - spread / 2.0 - skew,
+            mid_price + spread / 2.0 - skew,
+            1000  // Base size
+        };
+    }
+};
+
+================================================================================
+SUMMARY
+================================================================================
+
+HFT indicators require:
+- Sub-microsecond computation
+- Microstructure awareness
+- Order book integration
+- Volume emphasis
+- Low-latency implementation
+
+Key indicators covered:
+- Microprice and momentum
+- Realized volatility
+- Volume indicators
+- Order book imbalance
+- VPIN
+- Effective spread
+
+Implementation considerations:
+- Lock-free data structures
+- Cache optimization
+- Minimize allocations
+- SIMD where applicable
+- Profile critical paths
+
+Best practices:
+- Combine multiple indicators
+- Normalize to common scale
+- Dynamic thresholds
+- Backtesting essential
+- Monitor performance
+
+================================================================================
+Version: 1.0
+Last Updated: 2025-11-26
+Total Size: ~23 KB
+================================================================================

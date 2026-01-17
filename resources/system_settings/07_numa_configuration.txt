@@ -1,0 +1,793 @@
+================================================================================
+NUMA CONFIGURATION FOR HFT OPTIMIZATION
+================================================================================
+
+OVERVIEW:
+Non-Uniform Memory Access (NUMA) architecture provides separate memory banks
+for different CPUs/sockets. Proper NUMA configuration is critical for HFT
+systems to minimize memory access latency and avoid cross-node traffic.
+
+TARGET METRICS:
+- Local Memory Access: < 100 nanoseconds
+- Remote Memory Access: < 200 nanoseconds (avoid if possible)
+- NUMA Hit Rate: > 99.9%
+- NUMA Miss Rate: < 0.1%
+- Cross-Node Bandwidth: Minimized
+
+================================================================================
+1. NUMA TOPOLOGY ANALYSIS
+================================================================================
+
+CHECK NUMA AVAILABILITY:
+----------------------------------------
+# Check if NUMA is available
+numactl --hardware
+
+# Sample output for 2-socket system:
+# available: 2 nodes (0-1)
+# node 0 cpus: 0 2 4 6 8 10 12 14
+# node 0 size: 64384 MB
+# node 0 free: 32156 MB
+# node 1 cpus: 1 3 5 7 9 11 13 15
+# node 1 size: 65536 MB
+# node 1 free: 33892 MB
+# node distances:
+# node   0   1
+#   0:  10  21
+#   1:  21  10
+
+# Distance interpretation:
+# 10 = local access
+# 21 = remote access (2.1x latency penalty)
+----------------------------------------
+
+DETAILED TOPOLOGY:
+----------------------------------------
+# Install numactl and hwloc
+apt-get install numactl hwloc
+
+# View detailed topology
+lstopo-no-graphics
+
+# CPU to NUMA node mapping
+lscpu | grep NUMA
+
+# Example output:
+# NUMA node(s):          2
+# NUMA node0 CPU(s):     0-7,16-23
+# NUMA node1 CPU(s):     8-15,24-31
+
+# Memory per node
+cat /sys/devices/system/node/node*/meminfo
+
+# CPU cache sharing
+cat /sys/devices/system/cpu/cpu*/cache/index*/shared_cpu_list
+----------------------------------------
+
+MEMORY BANDWIDTH PER NODE:
+----------------------------------------
+# Install Intel Memory Latency Checker (MLC)
+# Download from Intel website
+
+# Measure memory bandwidth
+mlc --bandwidth_matrix
+
+# Sample output showing GB/s bandwidth:
+# Node  0      1
+#   0   120.5  25.3
+#   1   25.3   121.8
+
+# Local (diagonal): ~120 GB/s
+# Remote (off-diagonal): ~25 GB/s (5x slower)
+
+# Measure latency
+mlc --latency_matrix
+
+# Sample output (nanoseconds):
+# Node  0      1
+#   0   89.2   142.5
+#   1   143.1  88.7
+
+# Local: ~90 ns
+# Remote: ~143 ns (1.6x slower)
+----------------------------------------
+
+================================================================================
+2. NUMA MEMORY POLICIES
+================================================================================
+
+AVAILABLE POLICIES:
+- default: Allocate on node where thread runs
+- bind: Strictly allocate from specific nodes (fail if not available)
+- preferred: Prefer specific node, fall back to others
+- interleave: Round-robin allocation across nodes
+
+SET MEMORY POLICY (COMMAND LINE):
+----------------------------------------
+# Bind to single node
+numactl --membind=0 --cpunodebind=0 ./trading_engine
+
+# Bind to specific CPUs and memory
+numactl --physcpubind=0,2,4,6 --membind=0 ./trading_engine
+
+# Interleave memory (for large shared data)
+numactl --interleave=all ./trading_engine
+
+# Preferred node (soft binding)
+numactl --preferred=0 ./trading_engine
+
+# Local allocation (allocate on node where running)
+numactl --localalloc ./trading_engine
+----------------------------------------
+
+SET MEMORY POLICY (C++ CODE):
+----------------------------------------
+#include <numa.h>
+#include <numaif.h>
+
+class NUMAController {
+public:
+    static bool initialize() {
+        if (numa_available() < 0) {
+            std::cerr << "NUMA not available" << std::endl;
+            return false;
+        }
+        return true;
+    }
+
+    static int get_num_nodes() {
+        return numa_max_node() + 1;
+    }
+
+    static void bind_to_node(int node) {
+        struct bitmask *nodemask = numa_allocate_nodemask();
+        numa_bitmask_setbit(nodemask, node);
+        numa_bind(nodemask);
+        numa_free_nodemask(nodemask);
+    }
+
+    static void* allocate_on_node(size_t size, int node) {
+        void* ptr = numa_alloc_onnode(size, node);
+        if (!ptr) {
+            std::cerr << "Failed to allocate on node " << node << std::endl;
+        }
+        return ptr;
+    }
+
+    static void free_numa(void* ptr, size_t size) {
+        numa_free(ptr, size);
+    }
+
+    static int get_current_node() {
+        return numa_node_of_cpu(sched_getcpu());
+    }
+
+    static void set_preferred_node(int node) {
+        numa_set_preferred(node);
+    }
+
+    static void interleave_all() {
+        numa_set_interleave_mask(numa_all_nodes_ptr);
+    }
+};
+
+// Usage example
+int main() {
+    if (!NUMAController::initialize()) {
+        return 1;
+    }
+
+    std::cout << "NUMA nodes: " << NUMAController::get_num_nodes() << std::endl;
+
+    // Bind to node 0
+    NUMAController::bind_to_node(0);
+
+    // Allocate memory on node 0
+    size_t size = 1024 * 1024 * 1024; // 1GB
+    void* buffer = NUMAController::allocate_on_node(size, 0);
+
+    if (buffer) {
+        // Use buffer...
+
+        // Free
+        NUMAController::free_numa(buffer, size);
+    }
+
+    return 0;
+}
+
+// Compile with: -lnuma
+----------------------------------------
+
+NUMA-AWARE STL ALLOCATOR:
+----------------------------------------
+template<typename T>
+class NumaAllocator {
+private:
+    int node_;
+
+public:
+    using value_type = T;
+
+    explicit NumaAllocator(int node = -1) : node_(node) {
+        if (node_ < 0) {
+            node_ = numa_node_of_cpu(sched_getcpu());
+        }
+    }
+
+    template<typename U>
+    NumaAllocator(const NumaAllocator<U>& other) : node_(other.node_) {}
+
+    T* allocate(std::size_t n) {
+        T* ptr = static_cast<T*>(numa_alloc_onnode(n * sizeof(T), node_));
+        if (!ptr) throw std::bad_alloc();
+        return ptr;
+    }
+
+    void deallocate(T* ptr, std::size_t n) {
+        numa_free(ptr, n * sizeof(T));
+    }
+
+    int node() const { return node_; }
+
+    template<typename U>
+    friend class NumaAllocator;
+};
+
+// Usage
+std::vector<Order, NumaAllocator<Order>> orders(NumaAllocator<Order>(0));
+----------------------------------------
+
+================================================================================
+3. CPU-TO-NUMA-NODE BINDING
+================================================================================
+
+BINDING STRATEGY FOR HFT:
+----------------------------------------
+# Single-socket system: No NUMA considerations needed
+
+# Dual-socket system with isolated CPUs:
+# Node 0: CPU 0 (OS), CPUs 1-7 (trading)
+# Node 1: CPU 8 (OS backup), CPUs 9-15 (monitoring/backup)
+
+# Bind critical trading threads to Node 0
+numactl --cpunodebind=0 --membind=0 --physcpubind=1,2,3,4 \
+    ./trading_engine
+
+# Bind market data processor to Node 0
+numactl --cpunodebind=0 --membind=0 --physcpubind=5,6,7 \
+    ./market_data_processor
+
+# Bind monitoring to Node 1
+numactl --cpunodebind=1 --membind=1 --physcpubind=9,10 \
+    ./monitoring_agent
+----------------------------------------
+
+SYSTEMD INTEGRATION:
+----------------------------------------
+# Create systemd service with NUMA binding
+cat > /etc/systemd/system/trading_engine.service << EOF
+[Unit]
+Description=Trading Engine
+After=network.target
+
+[Service]
+Type=simple
+User=trading
+Group=trading
+ExecStart=/usr/bin/numactl --cpunodebind=0 --membind=0 \\
+    --physcpubind=1,2,3,4 /opt/trading/trading_engine
+Restart=always
+CPUAffinity=1 2 3 4
+MemoryPolicy=bind:0
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable trading_engine
+systemctl start trading_engine
+----------------------------------------
+
+VERIFY BINDINGS:
+----------------------------------------
+# Check process NUMA binding
+numastat -p <PID>
+
+# Sample output:
+# Per-node process memory usage (in MBs)
+# PID              Node 0 Node 1 Total
+# ---------------  ------ ------ -----
+# 12345 (trading)  4096.5    0.2  4096.7
+
+# Node 0: 99.99% (good)
+# Node 1: 0.01% (minimal cross-node access)
+
+# Check CPU affinity
+taskset -cp <PID>
+
+# Continuous monitoring
+watch -n 1 "numastat -p <PID>"
+----------------------------------------
+
+================================================================================
+4. NUMA BALANCING (MUST DISABLE)
+================================================================================
+
+CONCEPT:
+Automatic NUMA balancing moves pages between nodes to optimize locality.
+While helpful for general workloads, it introduces unpredictable latency
+for HFT systems.
+
+DISABLE AUTOMATIC NUMA BALANCING:
+----------------------------------------
+# Check current status
+cat /proc/sys/kernel/numa_balancing
+# 1 = enabled, 0 = disabled
+
+# Disable runtime
+echo 0 > /proc/sys/kernel/numa_balancing
+
+# Make persistent
+echo "kernel.numa_balancing = 0" >> /etc/sysctl.conf
+sysctl -p
+
+# Kernel parameter (additional safety)
+# Edit /etc/default/grub
+GRUB_CMDLINE_LINUX="numa_balancing=disable"
+
+update-grub && reboot
+
+# Verify
+cat /proc/sys/kernel/numa_balancing
+# Should be: 0
+----------------------------------------
+
+WHY DISABLE:
+- Page migrations add 10-100 microsecond latency spikes
+- Non-deterministic behavior
+- Increased TLB shootdown overhead
+- HFT applications know their NUMA topology
+- Manual binding is more predictable
+
+================================================================================
+5. ZONE RECLAIM MODE
+================================================================================
+
+ZONE RECLAIM CONFIGURATION:
+----------------------------------------
+# Check current setting
+cat /proc/sys/vm/zone_reclaim_mode
+
+# Values:
+# 0 = Prefer remote memory over local reclaim (RECOMMENDED for HFT)
+# 1 = Enable zone reclaim
+# 2 = Zone reclaim writes dirty pages
+# 4 = Zone reclaim swaps pages
+
+# Set to 0 (disable zone reclaim)
+echo 0 > /proc/sys/vm/zone_reclaim_mode
+
+# Make persistent
+echo "vm.zone_reclaim_mode = 0" >> /etc/sysctl.conf
+sysctl -p
+
+# Why disable:
+# - Avoid latency spikes from local memory reclamation
+# - Prefer remote memory access over reclaim overhead
+# - Remote access (143ns) < reclaim latency (microseconds)
+----------------------------------------
+
+================================================================================
+6. NUMA STATISTICS AND MONITORING
+================================================================================
+
+NUMA STATISTICS:
+----------------------------------------
+# System-wide NUMA stats
+numastat
+
+# Sample output:
+#                            node0           node1
+# numa_hit              1234567890      1098765432
+# numa_miss                   1234            5678
+# numa_foreign                5678            1234
+# interleave_hit             12345           23456
+# local_node            1234560000      1098760000
+# other_node                  7890            5432
+
+# Key metrics:
+# numa_hit: Allocations on intended node (good)
+# numa_miss: Allocations on unintended node (bad)
+# numa_foreign: From remote node (bad)
+# local_node: Allocations on local node (good)
+# other_node: Allocations on remote node (bad)
+
+# Per-process stats
+numastat -p <PID>
+
+# Calculate NUMA efficiency:
+# Hit Rate = numa_hit / (numa_hit + numa_miss) * 100
+# Target: > 99.9%
+----------------------------------------
+
+CONTINUOUS MONITORING:
+----------------------------------------
+#!/bin/bash
+# NUMA monitoring script
+
+PID=$1
+INTERVAL=1
+
+while true; do
+    echo "=== $(date) ==="
+
+    # Process NUMA stats
+    numastat -p $PID
+
+    # Memory distribution
+    cat /proc/$PID/numa_maps | grep -E "N[0-9]=" | head -10
+
+    # Current node
+    NODE=$(numactl -s | grep cpunodebind | awk '{print $2}')
+    echo "Bound to node: $NODE"
+
+    echo "---"
+    sleep $INTERVAL
+done
+----------------------------------------
+
+PERF NUMA PROFILING:
+----------------------------------------
+# Record NUMA events
+perf stat -e 'node-loads,node-load-misses,node-stores,node-store-misses' \
+    -p <PID> sleep 10
+
+# Sample output:
+#  1,234,567,890  node-loads
+#      1,234,567  node-load-misses      # 0.1% miss rate (good)
+#    987,654,321  node-stores
+#        987,654  node-store-misses     # 0.1% miss rate (good)
+
+# Detailed profiling
+perf mem record -p <PID> sleep 10
+perf mem report
+
+# This shows which data structures have remote access
+----------------------------------------
+
+================================================================================
+7. NUMA MEMORY MIGRATION
+================================================================================
+
+MIGRATE PAGES BETWEEN NODES:
+----------------------------------------
+# Move pages from node 1 to node 0
+# Use migrate_pages utility
+
+# Migrate all pages of process to node 0
+migrate_pages <PID> 1 0
+
+# This is useful for:
+# - Fixing incorrect initial allocation
+# - Moving after process fork/exec
+# - Rebalancing after topology changes
+
+# In C++ code:
+#include <numaif.h>
+
+void migrate_to_node(void* addr, size_t size, int target_node) {
+    int status[1];
+    int nodes[1] = {target_node};
+    unsigned long nodemask = 1 << target_node;
+
+    long ret = mbind(addr, size, MPOL_BIND, &nodemask, sizeof(nodemask) * 8, MPOL_MF_MOVE);
+    if (ret < 0) {
+        perror("mbind failed");
+    }
+}
+----------------------------------------
+
+PRE-FAULT AND PRE-ALLOCATE:
+----------------------------------------
+// Ensure pages are allocated on correct node before use
+void* allocate_and_prefault(size_t size, int node) {
+    void* ptr = numa_alloc_onnode(size, node);
+    if (!ptr) return nullptr;
+
+    // Touch all pages to fault them in
+    // This ensures allocation on correct node
+    char* p = (char*)ptr;
+    for (size_t i = 0; i < size; i += 4096) {
+        p[i] = 0;
+    }
+
+    // Lock in memory
+    mlock(ptr, size);
+
+    return ptr;
+}
+----------------------------------------
+
+================================================================================
+8. NUMA-AWARE DATA STRUCTURES
+================================================================================
+
+NUMA-AWARE QUEUE:
+----------------------------------------
+// Lock-free NUMA-aware queue
+template<typename T>
+class NumaAwareQueue {
+private:
+    struct Node {
+        T data;
+        std::atomic<Node*> next;
+        int numa_node;
+
+        Node(const T& d, int node) : data(d), next(nullptr), numa_node(node) {}
+    };
+
+    alignas(64) std::atomic<Node*> head;
+    alignas(64) std::atomic<Node*> tail;
+    int numa_node;
+
+public:
+    explicit NumaAwareQueue(int node) : numa_node(node) {
+        Node* dummy = allocate_node(T(), node);
+        head.store(dummy);
+        tail.store(dummy);
+    }
+
+private:
+    Node* allocate_node(const T& data, int node) {
+        void* mem = numa_alloc_onnode(sizeof(Node), node);
+        return new (mem) Node(data, node);
+    }
+
+    void deallocate_node(Node* node) {
+        node->~Node();
+        numa_free(node, sizeof(Node));
+    }
+
+public:
+    void enqueue(const T& data) {
+        Node* new_node = allocate_node(data, numa_node);
+
+        while (true) {
+            Node* last = tail.load();
+            Node* next = last->next.load();
+
+            if (last == tail.load()) {
+                if (next == nullptr) {
+                    if (last->next.compare_exchange_weak(next, new_node)) {
+                        tail.compare_exchange_weak(last, new_node);
+                        return;
+                    }
+                } else {
+                    tail.compare_exchange_weak(last, next);
+                }
+            }
+        }
+    }
+
+    bool dequeue(T& data) {
+        while (true) {
+            Node* first = head.load();
+            Node* last = tail.load();
+            Node* next = first->next.load();
+
+            if (first == head.load()) {
+                if (first == last) {
+                    if (next == nullptr) return false;
+                    tail.compare_exchange_weak(last, next);
+                } else {
+                    data = next->data;
+                    if (head.compare_exchange_weak(first, next)) {
+                        deallocate_node(first);
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+};
+----------------------------------------
+
+NUMA-AWARE MEMORY POOL:
+----------------------------------------
+template<typename T, size_t PoolSize>
+class NumaMemoryPool {
+private:
+    T* pool;
+    std::bitset<PoolSize> allocated;
+    int numa_node;
+    std::mutex mutex;
+
+public:
+    explicit NumaMemoryPool(int node) : numa_node(node) {
+        size_t size = sizeof(T) * PoolSize;
+        pool = static_cast<T*>(numa_alloc_onnode(size, node));
+
+        if (!pool) {
+            throw std::bad_alloc();
+        }
+
+        // Pre-fault all pages
+        memset(pool, 0, size);
+        mlock(pool, size);
+    }
+
+    ~NumaMemoryPool() {
+        munlock(pool, sizeof(T) * PoolSize);
+        numa_free(pool, sizeof(T) * PoolSize);
+    }
+
+    T* allocate() {
+        std::lock_guard<std::mutex> lock(mutex);
+
+        for (size_t i = 0; i < PoolSize; i++) {
+            if (!allocated[i]) {
+                allocated[i] = true;
+                return &pool[i];
+            }
+        }
+
+        return nullptr;
+    }
+
+    void deallocate(T* ptr) {
+        std::lock_guard<std::mutex> lock(mutex);
+
+        size_t idx = ptr - pool;
+        if (idx < PoolSize) {
+            allocated[idx] = false;
+        }
+    }
+
+    int get_numa_node() const { return numa_node; }
+};
+----------------------------------------
+
+================================================================================
+9. MULTI-SOCKET OPTIMIZATION STRATEGIES
+================================================================================
+
+STRATEGY 1: SINGLE NODE ISOLATION (RECOMMENDED):
+----------------------------------------
+# Use only Node 0 for trading
+# Ignore Node 1 (or use for monitoring only)
+
+# Advantages:
+# - No cross-node traffic
+# - Lowest latency
+# - Simplest configuration
+# - Most deterministic
+
+# Configuration:
+numactl --cpunodebind=0 --membind=0 ./trading_engine
+
+# Kernel parameters:
+isolcpus=domain,managed_irq,1-7  # Node 0 CPUs
+nohz_full=1-7
+rcu_nocbs=1-7
+
+# Leave Node 1 CPUs for OS tasks
+----------------------------------------
+
+STRATEGY 2: PARTITIONED WORKLOADS:
+----------------------------------------
+# Node 0: Market data processing
+# Node 1: Order execution
+
+# Advantages:
+# - More CPU resources available
+# - Can scale to higher throughput
+# - Workload isolation
+
+# Disadvantages:
+# - Shared data must be carefully placed
+# - Cross-node communication overhead
+# - More complex configuration
+
+# Configuration:
+numactl --cpunodebind=0 --membind=0 ./market_data_processor &
+numactl --cpunodebind=1 --membind=1 ./order_executor &
+
+# Use shared memory on Node 0 (or interleaved)
+----------------------------------------
+
+STRATEGY 3: REPLICATED DATA:
+----------------------------------------
+# Replicate read-only data on both nodes
+# Write-only or exclusive data on single node
+
+# Implementation:
+# - Configuration data: Interleaved
+# - Market data: Replicated per node
+# - Order state: Node-local
+
+# Code example:
+class ReplicatedMarketData {
+private:
+    struct NodeData {
+        void* data;
+        int node;
+    };
+
+    std::vector<NodeData> replicas;
+
+public:
+    void replicate_to_all_nodes(const void* src, size_t size) {
+        int num_nodes = numa_num_configured_nodes();
+
+        for (int node = 0; node < num_nodes; node++) {
+            void* replica = numa_alloc_onnode(size, node);
+            memcpy(replica, src, size);
+            replicas.push_back({replica, node});
+        }
+    }
+
+    void* get_local_replica() {
+        int current_node = numa_node_of_cpu(sched_getcpu());
+
+        for (auto& replica : replicas) {
+            if (replica.node == current_node) {
+                return replica.data;
+            }
+        }
+
+        return nullptr; // Fallback
+    }
+};
+----------------------------------------
+
+================================================================================
+10. NUMA CONFIGURATION CHECKLIST
+================================================================================
+
+ANALYSIS:
+[ ] NUMA topology documented
+[ ] Node distances measured
+[ ] Memory bandwidth per node benchmarked
+[ ] CPU-to-node mapping understood
+[ ] Memory per node verified
+
+CONFIGURATION:
+[ ] Automatic NUMA balancing disabled
+[ ] Zone reclaim mode set to 0
+[ ] Memory policy configured (bind to node 0)
+[ ] CPU affinity set to match memory binding
+[ ] Processes bound to appropriate nodes
+
+APPLICATION:
+[ ] NUMA-aware allocations in code
+[ ] Memory pre-faulted and locked
+[ ] Data structures optimized for NUMA
+[ ] Shared data placement optimized
+[ ] Cross-node access minimized
+
+MONITORING:
+[ ] NUMA statistics monitoring enabled
+[ ] NUMA hit rate > 99.9%
+[ ] NUMA miss rate < 0.1%
+[ ] Cross-node traffic minimal
+[ ] Continuous monitoring in place
+
+VALIDATION:
+[ ] numastat shows >99% local allocation
+[ ] perf shows minimal node-load-misses
+[ ] Latency benchmarks passing
+[ ] No cross-node traffic in steady state
+[ ] Configuration persists across reboot
+
+TARGET METRICS:
+- NUMA Hit Rate: > 99.9%
+- Local Memory: > 99% of allocations
+- Remote Access: < 0.1% of accesses
+- Cross-Node Latency: Avoided
+- Memory Bandwidth: Maximized
+
+================================================================================
+END OF DOCUMENT
+================================================================================

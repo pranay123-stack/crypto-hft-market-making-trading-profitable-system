@@ -1,0 +1,901 @@
+================================================================================
+LINUX KERNEL CONFIGURATION FOR HFT OPTIMIZATION
+================================================================================
+
+OVERVIEW:
+The Linux kernel configuration is fundamental to achieving ultra-low latency
+in HFT systems. This document covers real-time kernel patches, kernel boot
+parameters, CPU isolation, scheduler configuration, and preemption models.
+
+TARGET METRICS:
+- Kernel Latency: < 10 microseconds (99.99th percentile)
+- IRQ Response Time: < 5 microseconds
+- Scheduler Tick Overhead: Eliminated on isolated CPUs
+- System Call Latency: < 1 microsecond
+- Page Fault Latency: < 10 microseconds
+
+================================================================================
+1. REAL-TIME KERNEL (PREEMPT_RT) PATCHES
+================================================================================
+
+CONCEPT:
+The PREEMPT_RT patch set transforms Linux into a hard real-time operating
+system by making all kernel code preemptible. This dramatically reduces
+worst-case latency.
+
+STANDARD VS RT KERNEL:
+Standard Linux:
+- Max latency: 100-1000+ microseconds
+- Preemption: Limited (voluntary, kernel)
+- Spinlocks: Non-preemptible
+- Interrupt handlers: Non-preemptible
+
+RT-Patched Linux:
+- Max latency: 10-50 microseconds
+- Preemption: Full (everything preemptible)
+- Spinlocks: Converted to rt_mutex
+- Interrupt handlers: Threadable/preemptible
+
+CHECK CURRENT KERNEL:
+----------------------------------------
+# Check kernel version
+uname -r
+
+# Check if RT kernel is installed
+uname -a | grep -i rt
+
+# Check preemption model
+cat /boot/config-$(uname -r) | grep PREEMPT
+
+# Possible values:
+# CONFIG_PREEMPT_NONE=y      # No forced preemption (server)
+# CONFIG_PREEMPT_VOLUNTARY=y # Voluntary preemption (desktop)
+# CONFIG_PREEMPT=y            # Preemptible kernel (low latency desktop)
+# CONFIG_PREEMPT_RT=y         # Fully preemptible (real-time)
+----------------------------------------
+
+INSTALL RT KERNEL:
+
+UBUNTU/DEBIAN:
+----------------------------------------
+# Method 1: Use pre-built RT kernel
+sudo apt-get update
+sudo apt-get install linux-image-rt-amd64  # Debian
+sudo apt-get install linux-lowlatency       # Ubuntu (not full RT)
+
+# Method 2: Build from source (recommended for production)
+# Download kernel source
+cd /usr/src
+wget https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.tar.xz
+tar xvf linux-6.6.tar.xz
+cd linux-6.6
+
+# Download RT patch
+wget https://cdn.kernel.org/pub/linux/kernel/projects/rt/6.6/patch-6.6-rt.patch.xz
+xz -d patch-6.6-rt.patch.xz
+
+# Apply RT patch
+patch -p1 < patch-6.6-rt.patch
+
+# Configure kernel
+make menuconfig
+
+# Enable these options:
+# General setup -> Preemption Model -> Fully Preemptible Kernel (Real-Time)
+# CONFIG_PREEMPT_RT=y
+# CONFIG_HIGH_RES_TIMERS=y
+# CONFIG_NO_HZ_FULL=y
+# CONFIG_HZ_1000=y
+# CONFIG_RCU_NOCB_CPU=y
+
+# Compile kernel (use number of cores)
+make -j$(nproc)
+make modules_install
+make install
+
+# Update grub
+update-grub
+
+# Reboot into RT kernel
+reboot
+----------------------------------------
+
+RHEL/CENTOS:
+----------------------------------------
+# RHEL provides RT kernel as separate package
+# Requires RT subscription
+
+# RHEL 8/9
+sudo dnf install kernel-rt kernel-rt-core kernel-rt-modules
+
+# CentOS Stream
+sudo dnf install kernel-rt kernel-rt-core
+
+# Configure kernel for RT
+sudo grubby --set-default /boot/vmlinuz-<RT-KERNEL-VERSION>
+
+# Verify default kernel
+sudo grubby --default-kernel
+
+# Reboot
+reboot
+----------------------------------------
+
+RT KERNEL VERIFICATION:
+----------------------------------------
+# Verify RT kernel is running
+uname -a | grep PREEMPT_RT
+
+# Check preemption config
+zcat /proc/config.gz | grep PREEMPT_RT
+# Should show: CONFIG_PREEMPT_RT=y
+
+# Check timer frequency
+zcat /proc/config.gz | grep CONFIG_HZ
+# Should show: CONFIG_HZ=1000
+
+# Verify high-resolution timers
+cat /proc/timer_list | grep resolution
+# Should show: .resolution: 1 nsecs
+
+# Check for threaded interrupts
+ps aux | grep irq
+# Should see kernel threads like [irq/0-timer]
+----------------------------------------
+
+================================================================================
+2. KERNEL BOOT PARAMETERS (CRITICAL)
+================================================================================
+
+CONCEPT:
+Kernel boot parameters (cmdline) configure kernel behavior at startup.
+These are the most important parameters for HFT optimization.
+
+EDIT GRUB CONFIGURATION:
+----------------------------------------
+# Ubuntu/Debian
+sudo nano /etc/default/grub
+
+# RHEL/CentOS
+sudo nano /etc/default/grub
+
+# Find line starting with GRUB_CMDLINE_LINUX
+# Add parameters (see sections below)
+
+# Update grub
+sudo update-grub  # Ubuntu/Debian
+sudo grub2-mkconfig -o /boot/grub2/grub.cfg  # RHEL/CentOS
+
+# Reboot
+sudo reboot
+----------------------------------------
+
+COMPREHENSIVE HFT KERNEL PARAMETERS:
+----------------------------------------
+GRUB_CMDLINE_LINUX="
+    isolcpus=domain,managed_irq,1-7
+    nohz_full=1-7
+    rcu_nocbs=1-7
+    rcu_nocb_poll
+    intel_idle.max_cstate=0
+    processor.max_cstate=0
+    intel_pstate=disable
+    nosoftlockup
+    tsc=reliable
+    clocksource=tsc
+    idle=poll
+    processor.ignore_ppc=1
+    intel_iommu=off
+    iommu=off
+    default_hugepagesz=1G
+    hugepagesz=1G
+    hugepages=8
+    transparent_hugepage=never
+    nmi_watchdog=0
+    audit=0
+    mce=ignore_ce
+    quiet
+    loglevel=3
+    rd.systemd.show_status=false
+"
+
+# Note: Adjust isolcpus range based on your CPU count
+# CPU 0 typically reserved for OS, isolate 1-N for trading
+----------------------------------------
+
+PARAMETER BREAKDOWN:
+
+CPU ISOLATION:
+----------------------------------------
+isolcpus=domain,managed_irq,1-7
+# Isolate CPUs 1-7 from scheduler
+# domain: Remove from SMP balancing domains
+# managed_irq: Prevent managed IRQs on these CPUs
+# Range: Adjust based on CPU count (leave CPU 0 for OS)
+
+nohz_full=1-7
+# Disable scheduler tick on CPUs 1-7 (tickless mode)
+# Reduces timer interrupts from 1000 Hz to near zero
+# CRITICAL for latency reduction
+
+rcu_nocbs=1-7
+# Move RCU callbacks off CPUs 1-7
+# Eliminates RCU overhead on isolated CPUs
+
+rcu_nocb_poll
+# Poll for RCU callbacks instead of wake-up
+# Reduces latency further
+----------------------------------------
+
+CPU POWER MANAGEMENT:
+----------------------------------------
+intel_idle.max_cstate=0
+# Disable Intel idle driver C-states
+# Prevents CPU from entering sleep states
+
+processor.max_cstate=0
+# Limit maximum C-state to C0 (running)
+# Alternative/additional to intel_idle
+
+intel_pstate=disable
+# Disable Intel P-state driver
+# Allows acpi-cpufreq for manual frequency control
+# Optional: Use if you need fine-grained control
+
+idle=poll
+# Force CPU to poll when idle (never halt)
+# Maximum performance, maximum power consumption
+# Use on isolated CPUs only
+
+processor.ignore_ppc=1
+# Ignore processor power control requests
+# Prevents external power management
+----------------------------------------
+
+TIME AND CLOCK:
+----------------------------------------
+tsc=reliable
+# Mark TSC (Time Stamp Counter) as reliable
+# Disables fallback to slower clock sources
+# Required for RDTSC instruction accuracy
+
+clocksource=tsc
+# Use TSC as primary clock source
+# Fastest and most accurate on modern CPUs
+# Verify TSC is constant: cat /sys/devices/system/clocksource/clocksource0/available_clocksource
+
+hpet=disable
+# Disable HPET (High Precision Event Timer)
+# TSC is faster and sufficient with reliable TSC
+----------------------------------------
+
+MEMORY:
+----------------------------------------
+default_hugepagesz=1G
+# Set default huge page size to 1GB
+# Reduces TLB misses dramatically
+
+hugepagesz=1G
+# Specify huge page size
+
+hugepages=8
+# Allocate 8x1GB huge pages (8GB total)
+# Adjust based on memory requirements
+
+transparent_hugepage=never
+# Disable THP (Transparent Huge Pages)
+# THP causes unpredictable latency spikes
+# Use manual huge pages instead
+----------------------------------------
+
+SYSTEM:
+----------------------------------------
+nosoftlockup
+# Disable soft lockup detection
+# Prevents false alarms on isolated CPUs running busy loops
+
+nmi_watchdog=0
+# Disable NMI watchdog
+# Reduces interrupt overhead
+# WARNING: Disables kernel panic on lockup
+
+audit=0
+# Disable audit subsystem
+# Reduces system call overhead
+# WARNING: Disables security auditing
+
+mce=ignore_ce
+# Ignore corrected machine check errors
+# Reduces MCE interrupt overhead
+# WARNING: Disables some error reporting
+
+quiet loglevel=3
+# Reduce console logging
+# Minimizes overhead from kernel messages
+
+rd.systemd.show_status=false
+# Disable systemd status messages during boot
+----------------------------------------
+
+IOMMU (INPUT/OUTPUT MEMORY MANAGEMENT UNIT):
+----------------------------------------
+intel_iommu=off
+iommu=off
+# Disable IOMMU for performance
+# IOMMU adds latency to DMA operations
+# WARNING: Reduces security (DMA attacks)
+# Only disable if not using virtualization
+----------------------------------------
+
+VERIFICATION:
+----------------------------------------
+# View active kernel parameters
+cat /proc/cmdline
+
+# Verify isolated CPUs
+cat /sys/devices/system/cpu/isolated
+
+# Verify nohz_full
+cat /sys/devices/system/cpu/nohz_full
+
+# Verify RCU offloading
+cat /sys/module/rcutree/parameters/rcu_nocbs
+
+# Verify clock source
+cat /sys/devices/system/clocksource/clocksource0/current_clocksource
+
+# Verify huge pages
+cat /proc/meminfo | grep Huge
+----------------------------------------
+
+================================================================================
+3. CPU ISOLATION DEEP DIVE
+================================================================================
+
+ISOLATION STRATEGY:
+CPU 0: OS, interrupts, system services
+CPUs 1-N: Trading threads (isolated)
+
+ISOLCPUS PARAMETER VARIANTS:
+----------------------------------------
+# Basic isolation (deprecated but still works)
+isolcpus=1-7
+
+# Domain isolation (remove from load balancing)
+isolcpus=domain,1-7
+
+# Managed IRQ isolation (prevent managed interrupts)
+isolcpus=managed_irq,1-7
+
+# Combined (recommended)
+isolcpus=domain,managed_irq,1-7
+
+# With specific CPUs
+isolcpus=domain,managed_irq,1,2,5,6
+----------------------------------------
+
+VERIFYING ISOLATION:
+----------------------------------------
+# Check isolated CPUs
+cat /sys/devices/system/cpu/isolated
+
+# Monitor scheduler activity on isolated CPUs
+# Should be minimal/zero
+perf stat -C 1 -e sched:sched_switch sleep 10
+
+# Check task placement
+ps -eo psr,comm | sort -n | head -20
+# PSR column shows CPU number
+# Should see most tasks on CPU 0
+
+# Real-time monitoring
+mpstat -P ALL 1
+# Isolated CPUs should show ~0% system time
+----------------------------------------
+
+MIGRATING KERNEL THREADS:
+----------------------------------------
+# Some kernel threads may still run on isolated CPUs
+# Manually migrate them to CPU 0
+
+# List kernel threads
+ps -eo pid,psr,comm | grep '\['
+
+# Move kworker threads to CPU 0
+for pid in $(pgrep kworker); do
+    taskset -cp 0 $pid 2>/dev/null
+done
+
+# Move other kernel threads
+for pid in $(pgrep -P 2); do
+    taskset -cp 0 $pid 2>/dev/null
+done
+
+# Create systemd service to run at boot
+# /etc/systemd/system/migrate-kernel-threads.service
+----------------------------------------
+
+================================================================================
+4. SCHEDULER CONFIGURATION
+================================================================================
+
+SCHEDULER TYPES:
+- CFS (Completely Fair Scheduler): Default for SCHED_OTHER
+- RT Scheduler: For SCHED_FIFO/SCHED_RR
+- Deadline Scheduler: For SCHED_DEADLINE (advanced)
+
+RT SCHEDULER TUNING:
+----------------------------------------
+# RT runtime and period (microseconds)
+# Default: RT tasks can use 95% of CPU time
+
+# View current settings
+cat /proc/sys/kernel/sched_rt_period_us
+cat /proc/sys/kernel/sched_rt_runtime_us
+
+# Allow RT tasks to use 100% CPU (disable throttling)
+echo -1 > /proc/sys/kernel/sched_rt_runtime_us
+
+# Make persistent
+echo "kernel.sched_rt_runtime_us = -1" >> /etc/sysctl.conf
+
+# WARNING: This allows RT tasks to monopolize CPU
+# Ensure proper CPU isolation to prevent system lockup
+----------------------------------------
+
+SCHEDULER LATENCY:
+----------------------------------------
+# Minimum preemption granularity (nanoseconds)
+cat /proc/sys/kernel/sched_min_granularity_ns
+
+# Reduce for lower latency (default: 3000000 = 3ms)
+echo 1000000 > /proc/sys/kernel/sched_min_granularity_ns
+
+# Wakeup granularity (nanoseconds)
+cat /proc/sys/kernel/sched_wakeup_granularity_ns
+
+# Reduce for faster wakeups (default: 4000000 = 4ms)
+echo 1000000 > /proc/sys/kernel/sched_wakeup_granularity_ns
+
+# Make persistent
+cat >> /etc/sysctl.conf << EOF
+kernel.sched_min_granularity_ns = 1000000
+kernel.sched_wakeup_granularity_ns = 1000000
+EOF
+
+sysctl -p
+----------------------------------------
+
+MIGRATION COST:
+----------------------------------------
+# CPU migration cost (nanoseconds)
+cat /proc/sys/kernel/sched_migration_cost_ns
+
+# Increase to reduce unnecessary migrations (default: 500000)
+echo 5000000 > /proc/sys/kernel/sched_migration_cost_ns
+
+# Make persistent
+echo "kernel.sched_migration_cost_ns = 5000000" >> /etc/sysctl.conf
+----------------------------------------
+
+AUTOGROUP DISABLE:
+----------------------------------------
+# Disable scheduler autogroup (reduces latency variance)
+echo 0 > /proc/sys/kernel/sched_autogroup_enabled
+
+# Make persistent
+echo "kernel.sched_autogroup_enabled = 0" >> /etc/sysctl.conf
+----------------------------------------
+
+VERIFICATION:
+----------------------------------------
+# Monitor scheduler statistics
+cat /proc/schedstat
+
+# Per-CPU scheduler info
+cat /proc/sched_debug
+
+# Scheduling latency test
+perf sched record -a sleep 10
+perf sched latency
+----------------------------------------
+
+================================================================================
+5. HIGH-RESOLUTION TIMERS
+================================================================================
+
+CONCEPT:
+High-resolution timers provide nanosecond precision for time-based operations.
+
+CHECK TIMER RESOLUTION:
+----------------------------------------
+# Timer list and resolution
+cat /proc/timer_list | head -20
+
+# Should show:
+# .resolution: 1 nsecs
+# .max_delta_ns: [large number]
+# .min_delta_ns: 1
+
+# Timer stats
+cat /proc/timer_stats  # If available
+----------------------------------------
+
+HRTIMER CONFIGURATION:
+----------------------------------------
+# Already enabled with RT kernel
+# Verify in kernel config
+zcat /proc/config.gz | grep HIGH_RES_TIMERS
+# Should show: CONFIG_HIGH_RES_TIMERS=y
+
+# Verify hrtimer in use
+cat /proc/timer_list | grep -i hrtimer
+----------------------------------------
+
+TIMER INTERRUPT FREQUENCY:
+----------------------------------------
+# Check kernel timer frequency
+zcat /proc/config.gz | grep CONFIG_HZ=
+# Recommended: CONFIG_HZ=1000 (1ms tick)
+
+# Verify effective rate on non-isolated CPUs
+grep "^cpu" /proc/stat; sleep 1; grep "^cpu" /proc/stat
+
+# On isolated CPUs with nohz_full:
+# Timer interrupts should be near zero
+----------------------------------------
+
+================================================================================
+6. RCU (READ-COPY-UPDATE) CONFIGURATION
+================================================================================
+
+CONCEPT:
+RCU provides scalable synchronization but adds overhead. Offload RCU
+callbacks from isolated CPUs.
+
+RCU PARAMETERS:
+----------------------------------------
+# Already covered in boot parameters:
+rcu_nocbs=1-7        # Offload RCU callbacks
+rcu_nocb_poll        # Poll for callbacks (lower latency)
+
+# Additional options:
+rcu_expedited=1      # Expedite grace periods (higher throughput)
+# Add to kernel parameters if needed
+----------------------------------------
+
+RCU VERIFICATION:
+----------------------------------------
+# Check RCU offloading
+cat /sys/module/rcutree/parameters/rcu_nocbs
+
+# RCU statistics
+cat /sys/kernel/debug/rcu/rcu_data
+
+# Monitor RCU activity
+perf stat -e 'rcu:*' -a sleep 10
+----------------------------------------
+
+RCU RUNTIME TUNING:
+----------------------------------------
+# Force synchronous RCU (lower latency, lower throughput)
+echo 1 > /sys/module/rcutree/parameters/rcu_expedited
+
+# Adjust RCU boost priority (if using RCU boosting)
+cat /sys/module/rcutree/parameters/rcu_boost_prio
+# Default: 1, increase if needed
+----------------------------------------
+
+================================================================================
+7. WATCHDOGS AND DEBUGGING
+================================================================================
+
+CONCEPT:
+Disable watchdogs and debugging features that add overhead.
+
+DISABLE NMI WATCHDOG:
+----------------------------------------
+# Already in boot parameters:
+nmi_watchdog=0
+
+# Runtime disable (if not in boot params)
+echo 0 > /proc/sys/kernel/nmi_watchdog
+
+# Verify
+cat /proc/sys/kernel/nmi_watchdog
+# Should be: 0
+----------------------------------------
+
+SOFT LOCKUP DETECTION:
+----------------------------------------
+# Disable soft lockup detection (boot parameter)
+nosoftlockup
+
+# Runtime (if not in boot params)
+echo 0 > /proc/sys/kernel/soft_watchdog
+
+# Adjust timeout if keeping enabled
+echo 60 > /proc/sys/kernel/watchdog_thresh
+----------------------------------------
+
+PERF EVENT PARANOID:
+----------------------------------------
+# Allow non-root performance monitoring
+echo -1 > /proc/sys/kernel/perf_event_paranoid
+
+# Make persistent
+echo "kernel.perf_event_paranoid = -1" >> /etc/sysctl.conf
+----------------------------------------
+
+KERNEL DEBUGGING:
+----------------------------------------
+# Disable debugging features for production
+# In kernel config:
+# CONFIG_DEBUG_KERNEL=n
+# CONFIG_DEBUG_INFO=n
+# CONFIG_SLUB_DEBUG=n
+
+# Check if debugging is enabled
+zcat /proc/config.gz | grep CONFIG_DEBUG_KERNEL
+----------------------------------------
+
+================================================================================
+8. TIME STAMP COUNTER (TSC)
+================================================================================
+
+CONCEPT:
+TSC provides the fastest and most accurate time source on modern CPUs.
+
+TSC VERIFICATION:
+----------------------------------------
+# Check if TSC is constant and reliable
+grep -i "constant_tsc" /proc/cpuinfo
+grep -i "nonstop_tsc" /proc/cpuinfo
+
+# Both should be present
+# constant_tsc: TSC frequency doesn't change
+# nonstop_tsc: TSC doesn't stop in sleep states
+
+# Check current clock source
+cat /sys/devices/system/clocksource/clocksource0/current_clocksource
+# Should be: tsc
+
+# Available clock sources
+cat /sys/devices/system/clocksource/clocksource0/available_clocksource
+# Typical: tsc hpet acpi_pm
+----------------------------------------
+
+TSC SYNCHRONIZATION:
+----------------------------------------
+# Verify TSC is synchronized across CPUs
+# Run on different CPUs
+taskset -c 0 rdtsc_test &
+taskset -c 1 rdtsc_test &
+
+# TSC should be synchronized on modern systems
+# If not, consider HPET as fallback
+
+# Check TSC drift
+cat /sys/devices/system/clocksource/clocksource0/unbind
+# Should be empty (no drift)
+----------------------------------------
+
+RDTSC IN C++:
+----------------------------------------
+#include <cstdint>
+
+inline uint64_t rdtsc() {
+    uint32_t lo, hi;
+    __asm__ __volatile__ ("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+// Serializing RDTSC (prevents reordering)
+inline uint64_t rdtscp() {
+    uint32_t lo, hi;
+    __asm__ __volatile__ ("rdtscp" : "=a"(lo), "=d"(hi) :: "rcx");
+    return ((uint64_t)hi << 32) | lo;
+}
+
+// Usage for latency measurement
+uint64_t start = rdtscp();
+// ... operation to measure ...
+uint64_t end = rdtscp();
+uint64_t cycles = end - start;
+
+// Convert to nanoseconds
+double ghz = 3.5; // Your CPU frequency
+double ns = cycles / ghz;
+----------------------------------------
+
+================================================================================
+9. KERNEL MODULES AND SERVICES
+================================================================================
+
+DISABLE UNNECESSARY MODULES:
+----------------------------------------
+# List loaded modules
+lsmod
+
+# Modules to consider disabling (if not needed):
+# - bluetooth
+# - wifi drivers (if using wired network)
+# - audio drivers
+# - USB drivers (if not needed)
+# - virtualization (kvm, etc.)
+
+# Blacklist module
+echo "blacklist bluetooth" >> /etc/modprobe.d/blacklist-hft.conf
+
+# Reload
+update-initramfs -u
+----------------------------------------
+
+DISABLE KERNEL SERVICES:
+----------------------------------------
+# Stop and disable unnecessary services
+systemctl stop bluetooth
+systemctl disable bluetooth
+
+systemctl stop cups
+systemctl disable cups
+
+systemctl stop avahi-daemon
+systemctl disable avahi-daemon
+
+# List all services
+systemctl list-unit-files --type=service
+----------------------------------------
+
+================================================================================
+10. KERNEL TUNING VALIDATION
+================================================================================
+
+LATENCY BENCHMARKS:
+----------------------------------------
+# Cyclictest: Primary latency test
+# Run on isolated CPU with RT priority
+cyclictest -p 99 -t 1 -n -m -a 1 -i 200 -l 1000000
+
+# Target results:
+# Min: < 1 us
+# Avg: < 5 us
+# Max: < 10 us
+
+# Full system test (all isolated CPUs)
+cyclictest -p 99 -t 7 -m -a 1-7 -i 200 -l 1000000 -h 100 -q
+# Generates histogram
+
+# Under load
+cyclictest -p 99 -t 1 -m -a 1 -i 200 -l 1000000 & \
+stress-ng --cpu 4 --timeout 60s
+----------------------------------------
+
+KERNEL OVERHEAD MONITORING:
+----------------------------------------
+# System call latency
+perf stat -e 'syscalls:*' ./trading_engine
+
+# Context switches (should be minimal)
+perf stat -e context-switches,cpu-migrations ./trading_engine
+
+# IRQ latency
+cat /sys/kernel/debug/tracing/trace_stat/irq_latency
+
+# Scheduler latency
+perf sched record -a sleep 60
+perf sched latency -s max
+----------------------------------------
+
+JITTER MEASUREMENT:
+----------------------------------------
+# CPU jitter test
+jitterbug --cpu 1 --duration 60
+
+# hwlatdetect: Hardware latency detector
+hwlatdetect --duration=60 --threshold=10
+
+# Should show < 10 us latency
+----------------------------------------
+
+================================================================================
+COMPREHENSIVE SYSCTL CONFIGURATION
+================================================================================
+
+Create: /etc/sysctl.d/99-hft-kernel.conf
+----------------------------------------
+# Scheduler
+kernel.sched_rt_runtime_us = -1
+kernel.sched_min_granularity_ns = 1000000
+kernel.sched_wakeup_granularity_ns = 1000000
+kernel.sched_migration_cost_ns = 5000000
+kernel.sched_autogroup_enabled = 0
+
+# Watchdogs
+kernel.nmi_watchdog = 0
+kernel.soft_watchdog = 0
+
+# Performance monitoring
+kernel.perf_event_paranoid = -1
+
+# Reduce printk overhead
+kernel.printk = 3 3 3 3
+
+# Core dumps (disable for production)
+kernel.core_pattern = /dev/null
+fs.suid_dumpable = 0
+
+# Apply
+sysctl -p /etc/sysctl.d/99-hft-kernel.conf
+----------------------------------------
+
+================================================================================
+KERNEL UPGRADE PROCEDURE
+================================================================================
+
+SAFE KERNEL UPGRADE:
+----------------------------------------
+# 1. Backup current configuration
+cp /boot/config-$(uname -r) ~/kernel-config-backup
+
+# 2. Note current boot parameters
+cat /proc/cmdline > ~/kernel-cmdline-backup
+
+# 3. Install new kernel (don't remove old)
+# (See RT kernel installation section)
+
+# 4. Update grub but keep old kernel as option
+update-grub
+
+# 5. Test new kernel
+reboot
+
+# 6. Validate (see validation sections)
+
+# 7. If issues, reboot to old kernel
+# Select old kernel in grub menu
+# Or set default:
+grub-set-default "Advanced options for Ubuntu>Ubuntu, with Linux X.X.X"
+update-grub
+----------------------------------------
+
+================================================================================
+SUMMARY CHECKLIST
+================================================================================
+
+[ ] RT kernel installed and running
+[ ] Kernel boot parameters configured
+[ ] CPU isolation verified (isolcpus, nohz_full, rcu_nocbs)
+[ ] Clock source set to TSC
+[ ] High-resolution timers enabled
+[ ] C-states and P-states disabled
+[ ] Scheduler tuned for low latency
+[ ] RCU callbacks offloaded
+[ ] Watchdogs disabled
+[ ] Unnecessary kernel modules blacklisted
+[ ] Sysctl parameters configured
+[ ] Latency benchmarks passing (< 10 us max)
+[ ] Configuration persisted across reboots
+
+VALIDATION COMMANDS:
+----------------------------------------
+# Quick validation script
+cat << 'EOF' > /usr/local/bin/validate-kernel.sh
+#!/bin/bash
+echo "=== Kernel Validation ==="
+echo "Kernel: $(uname -r)"
+uname -a | grep -q PREEMPT_RT && echo "RT: YES" || echo "RT: NO"
+echo "Isolated CPUs: $(cat /sys/devices/system/cpu/isolated)"
+echo "Nohz Full: $(cat /sys/devices/system/cpu/nohz_full)"
+echo "Clock Source: $(cat /sys/devices/system/clocksource/clocksource0/current_clocksource)"
+echo "NMI Watchdog: $(cat /proc/sys/kernel/nmi_watchdog)"
+echo "RT Runtime: $(cat /proc/sys/kernel/sched_rt_runtime_us)"
+EOF
+
+chmod +x /usr/local/bin/validate-kernel.sh
+/usr/local/bin/validate-kernel.sh
+----------------------------------------
+
+================================================================================
+END OF DOCUMENT
+================================================================================

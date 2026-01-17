@@ -1,0 +1,617 @@
+================================================================================
+                         CIRCUIT BREAKER PATTERNS
+                   Automatic Protection Mechanisms
+================================================================================
+
+DOCUMENT: Circuit Breaker Implementation for HFT
+VERSION: 2.1.0
+LAST UPDATED: 2025-11-26
+SCOPE: Circuit breaker patterns and implementations
+
+================================================================================
+                          TABLE OF CONTENTS
+================================================================================
+
+1. Circuit Breaker Pattern Overview
+2. State Machine Implementation
+3. Configuration & Tuning
+4. Multiple Circuit Breakers
+5. Performance Impact
+6. Testing & Validation
+7. Monitoring & Metrics
+8. HFT-Specific Considerations
+9. Code Examples
+
+================================================================================
+                1. CIRCUIT BREAKER PATTERN OVERVIEW
+================================================================================
+
+PURPOSE:
+--------
+Prevent cascading failures by automatically stopping operations
+when failure threshold is reached.
+
+STATES:
+-------
+CLOSED: Normal operation, requests flow through
+OPEN: Failure threshold exceeded, requests rejected immediately
+HALF_OPEN: Testing if service recovered, limited requests allowed
+
+STATE TRANSITIONS:
+------------------
+
+    +--------+  Failures < Threshold  +--------+
+    | CLOSED |---------------------->| CLOSED |
+    +--------+                        +--------+
+        |                                 ^
+        | Failures >= Threshold           |
+        v                                 |
+    +------+      Timeout Elapsed    +-----------+
+    | OPEN |------------------------>| HALF_OPEN |
+    +------+                         +-----------+
+        ^                                 |
+        |      Test Requests Failed       |
+        +---------------------------------+
+                                         |
+                              Test Requests Succeeded
+                                         v
+                                    +--------+
+                                    | CLOSED |
+                                    +--------+
+
+IMPLEMENTATION:
+
+namespace hft::protection {
+
+class CircuitBreaker {
+public:
+    enum class State {
+        CLOSED,
+        OPEN,
+        HALF_OPEN
+    };
+    
+    struct Config {
+        uint32_t failure_threshold{5};
+        std::chrono::milliseconds timeout{30000};  // 30 seconds
+        uint32_t half_open_max_calls{3};
+        std::chrono::milliseconds rolling_window{60000};  // 1 minute
+    };
+    
+private:
+    Config config_;
+    std::atomic<State> state_{State::CLOSED};
+    std::atomic<uint32_t> failure_count_{0};
+    std::atomic<uint32_t> success_count_{0};
+    std::atomic<uint32_t> half_open_calls_{0};
+    std::chrono::steady_clock::time_point last_failure_time_;
+    std::chrono::steady_clock::time_point state_change_time_;
+    mutable std::mutex mutex_;
+    
+    // Rolling window for failure tracking
+    std::deque<std::chrono::steady_clock::time_point> failure_times_;
+    
+public:
+    CircuitBreaker(const Config& config) : config_(config) {
+        state_change_time_ = std::chrono::steady_clock::now();
+    }
+    
+    template<typename Func>
+    auto execute(Func&& func) -> decltype(func()) {
+        // Check state
+        if (!allow_request()) {
+            throw CircuitBreakerOpenException("Circuit breaker is OPEN");
+        }
+        
+        try {
+            // Execute function
+            auto start = std::chrono::steady_clock::now();
+            auto result = func();
+            auto duration = std::chrono::steady_clock::now() - start;
+            
+            // Record success
+            record_success();
+            
+            // Track latency
+            track_latency(duration);
+            
+            return result;
+            
+        } catch (...) {
+            // Record failure
+            record_failure();
+            throw;
+        }
+    }
+    
+    State get_state() const {
+        return state_.load(std::memory_order_acquire);
+    }
+    
+    void reset() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        
+        state_.store(State::CLOSED, std::memory_order_release);
+        failure_count_ = 0;
+        success_count_ = 0;
+        half_open_calls_ = 0;
+        failure_times_.clear();
+        state_change_time_ = std::chrono::steady_clock::now();
+        
+        logger_.info("Circuit breaker reset");
+    }
+    
+    void force_open() {
+        transition_to_open();
+        logger_.warn("Circuit breaker forced OPEN");
+    }
+    
+private:
+    bool allow_request() {
+        State current_state = state_.load(std::memory_order_acquire);
+        
+        switch (current_state) {
+            case State::CLOSED:
+                return true;
+                
+            case State::OPEN:
+                // Check if timeout elapsed
+                if (timeout_elapsed()) {
+                    transition_to_half_open();
+                    return true;
+                }
+                return false;
+                
+            case State::HALF_OPEN:
+                // Allow limited requests
+                uint32_t current_calls = half_open_calls_.load();
+                if (current_calls < config_.half_open_max_calls) {
+                    half_open_calls_++;
+                    return true;
+                }
+                return false;
+        }
+        
+        return false;
+    }
+    
+    void record_success() {
+        success_count_++;
+        
+        State current_state = state_.load(std::memory_order_acquire);
+        
+        if (current_state == State::HALF_OPEN) {
+            // Check if enough successful test requests
+            if (success_count_ >= config_.half_open_max_calls) {
+                transition_to_closed();
+            }
+        }
+    }
+    
+    void record_failure() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        
+        auto now = std::chrono::steady_clock::now();
+        last_failure_time_ = now;
+        failure_times_.push_back(now);
+        
+        // Remove failures outside rolling window
+        while (!failure_times_.empty() &&
+               now - failure_times_.front() > config_.rolling_window) {
+            failure_times_.pop_front();
+        }
+        
+        failure_count_++;
+        
+        State current_state = state_.load(std::memory_order_acquire);
+        
+        if (current_state == State::HALF_OPEN) {
+            // Test failed - back to open
+            transition_to_open();
+            
+        } else if (current_state == State::CLOSED) {
+            // Check if threshold exceeded
+            if (failure_times_.size() >= config_.failure_threshold) {
+                transition_to_open();
+            }
+        }
+    }
+    
+    bool timeout_elapsed() const {
+        auto now = std::chrono::steady_clock::now();
+        return now - state_change_time_ >= config_.timeout;
+    }
+    
+    void transition_to_open() {
+        State expected = State::CLOSED;
+        if (state_.compare_exchange_strong(expected, State::OPEN)) {
+            state_change_time_ = std::chrono::steady_clock::now();
+            
+            logger_.error("Circuit breaker transitioned to OPEN", {
+                {"failure_count", failure_count_.load()},
+                {"threshold", config_.failure_threshold}
+            });
+            
+            // Send alert
+            alert_system_.send_alert(
+                AlertSeverity::P2_HIGH,
+                "Circuit breaker opened - service protection activated",
+                {{"component", name_}}
+            );
+        }
+    }
+    
+    void transition_to_half_open() {
+        state_.store(State::HALF_OPEN, std::memory_order_release);
+        state_change_time_ = std::chrono::steady_clock::now();
+        half_open_calls_ = 0;
+        success_count_ = 0;
+        
+        logger_.info("Circuit breaker transitioned to HALF_OPEN");
+    }
+    
+    void transition_to_closed() {
+        state_.store(State::CLOSED, std::memory_order_release);
+        state_change_time_ = std::chrono::steady_clock::now();
+        failure_count_ = 0;
+        success_count_ = 0;
+        failure_times_.clear();
+        
+        logger_.info("Circuit breaker transitioned to CLOSED - service recovered");
+        
+        alert_system_.send_alert(
+            AlertSeverity::P4_LOW,
+            "Circuit breaker closed - service recovered",
+            {{"component", name_}}
+        );
+    }
+};
+
+} // namespace hft::protection
+
+================================================================================
+                    4. MULTIPLE CIRCUIT BREAKERS
+================================================================================
+
+class CircuitBreakerManager {
+private:
+    std::unordered_map<std::string, std::unique_ptr<CircuitBreaker>> breakers_;
+    mutable std::shared_mutex mutex_;
+    
+public:
+    void register_breaker(const std::string& name,
+                         const CircuitBreaker::Config& config) {
+        std::unique_lock<std::shared_mutex> lock(mutex_);
+        
+        breakers_[name] = std::make_unique<CircuitBreaker>(config);
+        
+        logger_.info("Circuit breaker registered", {
+            {"name", name},
+            {"failure_threshold", config.failure_threshold},
+            {"timeout_ms", config.timeout.count()}
+        });
+    }
+    
+    CircuitBreaker* get_breaker(const std::string& name) {
+        std::shared_lock<std::shared_mutex> lock(mutex_);
+        
+        auto it = breakers_.find(name);
+        if (it == breakers_.end()) {
+            return nullptr;
+        }
+        
+        return it->second.get();
+    }
+    
+    // Execute with specific circuit breaker
+    template<typename Func>
+    auto execute_protected(const std::string& breaker_name, Func&& func)
+        -> decltype(func()) {
+        auto* breaker = get_breaker(breaker_name);
+        if (!breaker) {
+            throw std::runtime_error("Circuit breaker not found: " + breaker_name);
+        }
+        
+        return breaker->execute(std::forward<Func>(func));
+    }
+    
+    // Get status of all breakers
+    std::map<std::string, CircuitBreaker::State> get_all_states() const {
+        std::shared_lock<std::shared_mutex> lock(mutex_);
+        
+        std::map<std::string, CircuitBreaker::State> states;
+        for (const auto& [name, breaker] : breakers_) {
+            states[name] = breaker->get_state();
+        }
+        
+        return states;
+    }
+};
+
+// Usage:
+CircuitBreakerManager breaker_manager;
+
+void initialize_circuit_breakers() {
+    // Exchange connection breaker
+    breaker_manager.register_breaker("exchange_connection", {
+        .failure_threshold = 5,
+        .timeout = std::chrono::seconds(30),
+        .half_open_max_calls = 3
+    });
+    
+    // Order submission breaker
+    breaker_manager.register_breaker("order_submission", {
+        .failure_threshold = 10,
+        .timeout = std::chrono::seconds(60),
+        .half_open_max_calls = 5
+    });
+    
+    // Market data breaker
+    breaker_manager.register_breaker("market_data", {
+        .failure_threshold = 3,
+        .timeout = std::chrono::seconds(15),
+        .half_open_max_calls = 2
+    });
+}
+
+void submit_order(const Order& order) {
+    breaker_manager.execute_protected("order_submission", [&]() {
+        exchange_api_.submit_order(order);
+    });
+}
+
+================================================================================
+                              END OF DOCUMENT
+================================================================================
+
+================================================================================
+                  6. ADAPTIVE CIRCUIT BREAKERS
+================================================================================
+
+class AdaptiveCircuitBreaker : public CircuitBreaker {
+private:
+    struct AdaptiveConfig {
+        double failure_rate_threshold{0.5};  // 50% failure rate
+        size_t min_requests_for_decision{20};
+        std::chrono::seconds learning_window{300};  // 5 minutes
+    };
+    
+    AdaptiveConfig adaptive_config_;
+    std::deque<bool> request_results_;  // true = success, false = failure
+    std::deque<std::chrono::steady_clock::time_point> request_times_;
+    
+public:
+    void record_request_result(bool success) {
+        auto now = std::chrono::steady_clock::now();
+        
+        request_results_.push_back(success);
+        request_times_.push_back(now);
+        
+        // Remove old results outside learning window
+        while (!request_times_.empty() &&
+               now - request_times_.front() > adaptive_config_.learning_window) {
+            request_times_.pop_front();
+            request_results_.pop_front();
+        }
+        
+        // Adjust failure threshold based on historical data
+        if (request_results_.size() >= adaptive_config_.min_requests_for_decision) {
+            adjust_failure_threshold();
+        }
+    }
+    
+private:
+    void adjust_failure_threshold() {
+        // Calculate current failure rate
+        size_t failures = std::count(request_results_.begin(),
+                                    request_results_.end(), false);
+        double failure_rate = static_cast<double>(failures) /
+                             request_results_.size();
+        
+        // Adjust threshold based on failure rate trend
+        if (failure_rate > adaptive_config_.failure_rate_threshold) {
+            // High failure rate - make circuit breaker more sensitive
+            uint32_t new_threshold = std::max(3U,
+                config_.failure_threshold - 1);
+            
+            if (new_threshold != config_.failure_threshold) {
+                logger_.info("Adapting circuit breaker - more sensitive", {
+                    {"old_threshold", config_.failure_threshold},
+                    {"new_threshold", new_threshold},
+                    {"failure_rate", failure_rate}
+                });
+                
+                config_.failure_threshold = new_threshold;
+            }
+            
+        } else if (failure_rate < 0.1) {
+            // Low failure rate - make circuit breaker less sensitive
+            uint32_t new_threshold = std::min(15U,
+                config_.failure_threshold + 1);
+            
+            if (new_threshold != config_.failure_threshold) {
+                logger_.info("Adapting circuit breaker - less sensitive", {
+                    {"old_threshold", config_.failure_threshold},
+                    {"new_threshold", new_threshold},
+                    {"failure_rate", failure_rate}
+                });
+                
+                config_.failure_threshold = new_threshold;
+            }
+        }
+    }
+};
+
+================================================================================
+                  7. CIRCUIT BREAKER MONITORING
+================================================================================
+
+class CircuitBreakerMonitor {
+private:
+    struct CircuitBreakerMetrics {
+        std::string name;
+        CircuitBreaker::State state;
+        uint64_t total_requests{0};
+        uint64_t successful_requests{0};
+        uint64_t failed_requests{0};
+        uint64_t rejected_requests{0};
+        std::chrono::steady_clock::time_point last_state_change;
+        std::chrono::milliseconds time_in_open_state{0};
+        uint64_t times_opened{0};
+    };
+    
+    std::unordered_map<std::string, CircuitBreakerMetrics> metrics_;
+    
+public:
+    void record_request(const std::string& breaker_name, bool success) {
+        auto& m = metrics_[breaker_name];
+        m.total_requests++;
+        
+        if (success) {
+            m.successful_requests++;
+        } else {
+            m.failed_requests++;
+        }
+    }
+    
+    void record_rejection(const std::string& breaker_name) {
+        auto& m = metrics_[breaker_name];
+        m.rejected_requests++;
+    }
+    
+    void record_state_change(const std::string& breaker_name,
+                            CircuitBreaker::State old_state,
+                            CircuitBreaker::State new_state) {
+        auto& m = metrics_[breaker_name];
+        auto now = std::chrono::steady_clock::now();
+        
+        if (old_state == CircuitBreaker::State::OPEN) {
+            auto duration = now - m.last_state_change;
+            m.time_in_open_state += std::chrono::duration_cast<
+                std::chrono::milliseconds>(duration);
+        }
+        
+        if (new_state == CircuitBreaker::State::OPEN) {
+            m.times_opened++;
+        }
+        
+        m.state = new_state;
+        m.last_state_change = now;
+    }
+    
+    std::map<std::string, CircuitBreakerMetrics> get_all_metrics() const {
+        std::map<std::string, CircuitBreakerMetrics> sorted_metrics(
+            metrics_.begin(), metrics_.end()
+        );
+        return sorted_metrics;
+    }
+    
+    void export_prometheus_metrics() {
+        for (const auto& [name, metrics] : metrics_) {
+            // Export Prometheus format metrics
+            std::cout << "circuit_breaker_requests_total{"
+                     << "name=\"" << name << "\",result=\"success\"} "
+                     << metrics.successful_requests << std::endl;
+            
+            std::cout << "circuit_breaker_requests_total{"
+                     << "name=\"" << name << "\",result=\"failure\"} "
+                     << metrics.failed_requests << std::endl;
+            
+            std::cout << "circuit_breaker_requests_rejected_total{"
+                     << "name=\"" << name << "\"} "
+                     << metrics.rejected_requests << std::endl;
+            
+            std::cout << "circuit_breaker_state{"
+                     << "name=\"" << name << "\"} "
+                     << static_cast<int>(metrics.state) << std::endl;
+            
+            std::cout << "circuit_breaker_times_opened_total{"
+                     << "name=\"" << name << "\"} "
+                     << metrics.times_opened << std::endl;
+        }
+    }
+};
+
+================================================================================
+                  8. PRODUCTION DEPLOYMENT
+================================================================================
+
+DEPLOYMENT CHECKLIST:
+---------------------
+
+1. CONFIGURATION
+   [ ] Circuit breaker thresholds reviewed for each service
+   [ ] Timeout values appropriate for service SLAs
+   [ ] Half-open test request count configured
+   [ ] Monitoring and alerting configured
+
+2. TESTING
+   [ ] Unit tests for all state transitions
+   [ ] Integration tests with actual services
+   [ ] Load tests under failure conditions
+   [ ] Recovery time measurements
+
+3. MONITORING
+   [ ] Prometheus metrics exported
+   [ ] Grafana dashboards created
+   [ ] PagerDuty alerts configured
+   [ ] Log aggregation enabled
+
+4. DOCUMENTATION
+   [ ] Runbooks for circuit breaker incidents
+   [ ] Configuration guide
+   [ ] Troubleshooting guide
+   [ ] Training for ops team
+
+EXAMPLE PRODUCTION CONFIGURATION:
+
+{
+  "circuit_breakers": {
+    "exchange_nasdaq": {
+      "failure_threshold": 5,
+      "timeout_ms": 30000,
+      "half_open_max_calls": 3,
+      "enabled": true
+    },
+    "exchange_nyse": {
+      "failure_threshold": 5,
+      "timeout_ms": 30000,
+      "half_open_max_calls": 3,
+      "enabled": true
+    },
+    "market_data_feed": {
+      "failure_threshold": 3,
+      "timeout_ms": 15000,
+      "half_open_max_calls": 2,
+      "enabled": true
+    },
+    "risk_service": {
+      "failure_threshold": 10,
+      "timeout_ms": 60000,
+      "half_open_max_calls": 5,
+      "enabled": true
+    }
+  }
+}
+
+GRAFANA DASHBOARD QUERIES:
+
+// Request rate
+rate(circuit_breaker_requests_total[5m])
+
+// Failure rate
+rate(circuit_breaker_requests_total{result="failure"}[5m]) /
+rate(circuit_breaker_requests_total[5m])
+
+// Rejection rate
+rate(circuit_breaker_requests_rejected_total[5m])
+
+// Circuit breaker state (0=CLOSED, 1=OPEN, 2=HALF_OPEN)
+circuit_breaker_state
+
+// Times opened per hour
+increase(circuit_breaker_times_opened_total[1h])
+
+================================================================================
+                              END OF DOCUMENT
+================================================================================

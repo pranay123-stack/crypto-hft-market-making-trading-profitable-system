@@ -1,0 +1,1567 @@
+================================================================================
+AUTHENTICATION AND AUTHORIZATION FOR HFT TRADING SYSTEMS
+================================================================================
+
+OVERVIEW
+--------
+This document provides comprehensive guidelines for implementing robust
+authentication and authorization mechanisms in high-frequency trading systems.
+Proper identity management and access control are critical to ensure only
+authorized users and systems can access trading functionality and sensitive data.
+
+================================================================================
+SECURITY ARCHITECTURE
+================================================================================
+
+1. AUTHENTICATION ARCHITECTURE
+-------------------------------
+
+Multi-Layer Authentication Strategy:
+
+Layer 1: User Authentication
+├── Multi-Factor Authentication (MFA)
+│   ├── Something you know (Password/PIN)
+│   ├── Something you have (Hardware Token/OTP)
+│   └── Something you are (Biometric)
+├── Single Sign-On (SSO) Integration
+└── Certificate-Based Authentication
+
+Layer 2: Service Authentication
+├── Mutual TLS (mTLS)
+├── API Key Authentication
+├── JWT Token Validation
+└── OAuth 2.0 / OpenID Connect
+
+Layer 3: Machine Authentication
+├── Hardware Security Module (HSM)
+├── Trusted Platform Module (TPM)
+└── Secure Boot Chain
+
+2. AUTHORIZATION ARCHITECTURE
+------------------------------
+
+Role-Based Access Control (RBAC) Model:
+
+Roles Hierarchy:
+├── Super Administrator (Full System Access)
+│   └── System Administrator (Infrastructure Management)
+├── Trading Operations
+│   ├── Head Trader (Strategy Approval, Risk Override)
+│   ├── Senior Trader (Multi-Asset Trading, High Limits)
+│   ├── Trader (Limited Assets, Standard Limits)
+│   └── Junior Trader (Read-Only Market Data)
+├── Risk Management
+│   ├── Chief Risk Officer (Risk Policy, Kill Switch)
+│   ├── Risk Manager (Risk Monitoring, Limit Adjustment)
+│   └── Risk Analyst (Read-Only Risk Metrics)
+├── Development & Engineering
+│   ├── Lead Engineer (Production Deployment)
+│   ├── Senior Engineer (Staging Deployment)
+│   └── Engineer (Development Environment Only)
+└── Compliance & Audit
+    ├── Compliance Officer (Full Audit Access)
+    └── Auditor (Read-Only Logs and Reports)
+
+Attribute-Based Access Control (ABAC):
+- Time-based access (Trading hours only)
+- Location-based access (Office IP ranges)
+- Device-based access (Registered workstations)
+- Risk-level-based access (P&L thresholds)
+
+3. IDENTITY PROVIDER INTEGRATION
+---------------------------------
+
+Supported Identity Providers:
+- LDAP/Active Directory
+- OAuth 2.0 Providers (Google, Azure AD, Okta)
+- SAML 2.0 Identity Providers
+- Custom JWT Token Issuer
+
+4. SESSION MANAGEMENT
+----------------------
+
+Session Lifecycle:
+1. Authentication → Session Creation
+2. Activity → Session Refresh
+3. Inactivity Timeout → Session Warning
+4. Absolute Timeout / Logout → Session Termination
+5. Concurrent Session Detection → Security Alert
+
+Session Security:
+- Secure session tokens (cryptographically random)
+- HttpOnly and Secure cookie flags
+- Session binding to IP address and User-Agent
+- Session fixation protection
+- Concurrent session limits
+
+================================================================================
+IMPLEMENTATION CODE EXAMPLES
+================================================================================
+
+1. MULTI-FACTOR AUTHENTICATION (MFA) ENGINE
+--------------------------------------------
+
+```cpp
+#include <openssl/rand.h>
+#include <openssl/hmac.h>
+#include <string>
+#include <chrono>
+#include <memory>
+
+class MFAAuthenticator {
+public:
+    enum class MFAMethod {
+        TOTP,          // Time-based One-Time Password
+        HOTP,          // HMAC-based One-Time Password
+        SMS,           // SMS-based verification
+        HARDWARE_TOKEN // Hardware security token
+    };
+
+    struct MFAConfig {
+        MFAMethod method;
+        std::string secret_key;
+        uint32_t time_step;      // Seconds (typically 30)
+        uint32_t digits;         // OTP digits (typically 6 or 8)
+        std::string algorithm;   // "SHA1", "SHA256", "SHA512"
+    };
+
+private:
+    static constexpr uint32_t DEFAULT_TIME_STEP = 30;
+    static constexpr uint32_t DEFAULT_DIGITS = 6;
+    static constexpr uint32_t WINDOW_SIZE = 1; // Accept ±1 time step
+
+public:
+    // Generate TOTP secret for new user
+    static std::string generateSecret(size_t length = 32) {
+        std::vector<unsigned char> random_bytes(length);
+        if (RAND_bytes(random_bytes.data(), length) != 1) {
+            throw std::runtime_error("Failed to generate random secret");
+        }
+
+        return base32Encode(random_bytes);
+    }
+
+    // Generate current TOTP code
+    static std::string generateTOTP(const MFAConfig& config) {
+        uint64_t time_counter = getCurrentTimeCounter(config.time_step);
+        return generateOTP(config, time_counter);
+    }
+
+    // Verify TOTP code with time window
+    static bool verifyTOTP(const MFAConfig& config,
+                          const std::string& user_code) {
+        uint64_t current_counter = getCurrentTimeCounter(config.time_step);
+
+        // Check current time and ±WINDOW_SIZE time steps
+        for (int offset = -WINDOW_SIZE; offset <= WINDOW_SIZE; ++offset) {
+            uint64_t test_counter = current_counter + offset;
+            std::string expected_code = generateOTP(config, test_counter);
+
+            if (constantTimeCompare(expected_code, user_code)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // Generate QR code URI for authenticator apps
+    static std::string generateQRCodeURI(const std::string& account_name,
+                                        const std::string& issuer,
+                                        const MFAConfig& config) {
+        std::ostringstream uri;
+        uri << "otpauth://totp/"
+            << urlEncode(issuer) << ":" << urlEncode(account_name)
+            << "?secret=" << config.secret_key
+            << "&issuer=" << urlEncode(issuer)
+            << "&algorithm=" << config.algorithm
+            << "&digits=" << config.digits
+            << "&period=" << config.time_step;
+
+        return uri.str();
+    }
+
+private:
+    static uint64_t getCurrentTimeCounter(uint32_t time_step) {
+        auto now = std::chrono::system_clock::now();
+        auto epoch = now.time_since_epoch();
+        auto seconds = std::chrono::duration_cast<std::chrono::seconds>(epoch);
+        return seconds.count() / time_step;
+    }
+
+    static std::string generateOTP(const MFAConfig& config,
+                                   uint64_t counter) {
+        // Convert counter to big-endian bytes
+        unsigned char counter_bytes[8];
+        for (int i = 7; i >= 0; --i) {
+            counter_bytes[i] = counter & 0xff;
+            counter >>= 8;
+        }
+
+        // Decode base32 secret
+        std::vector<unsigned char> secret = base32Decode(config.secret_key);
+
+        // Generate HMAC
+        unsigned char hmac_result[EVP_MAX_MD_SIZE];
+        unsigned int hmac_len;
+
+        const EVP_MD* md_algorithm = getHashAlgorithm(config.algorithm);
+
+        HMAC(md_algorithm,
+             secret.data(), secret.size(),
+             counter_bytes, sizeof(counter_bytes),
+             hmac_result, &hmac_len);
+
+        // Dynamic truncation
+        uint32_t offset = hmac_result[hmac_len - 1] & 0x0f;
+        uint32_t binary_code =
+            ((hmac_result[offset] & 0x7f) << 24) |
+            ((hmac_result[offset + 1] & 0xff) << 16) |
+            ((hmac_result[offset + 2] & 0xff) << 8) |
+            (hmac_result[offset + 3] & 0xff);
+
+        // Generate OTP
+        uint32_t modulo = 1;
+        for (uint32_t i = 0; i < config.digits; ++i) {
+            modulo *= 10;
+        }
+
+        uint32_t otp = binary_code % modulo;
+
+        // Format with leading zeros
+        std::ostringstream oss;
+        oss << std::setfill('0') << std::setw(config.digits) << otp;
+        return oss.str();
+    }
+
+    static const EVP_MD* getHashAlgorithm(const std::string& algorithm) {
+        if (algorithm == "SHA1") return EVP_sha1();
+        if (algorithm == "SHA256") return EVP_sha256();
+        if (algorithm == "SHA512") return EVP_sha512();
+        throw std::invalid_argument("Unsupported hash algorithm");
+    }
+
+    static bool constantTimeCompare(const std::string& a,
+                                   const std::string& b) {
+        if (a.length() != b.length()) {
+            return false;
+        }
+
+        volatile unsigned char result = 0;
+        for (size_t i = 0; i < a.length(); ++i) {
+            result |= a[i] ^ b[i];
+        }
+
+        return result == 0;
+    }
+
+    static std::string base32Encode(const std::vector<unsigned char>& input) {
+        static const char* alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+        std::string output;
+        uint32_t buffer = 0;
+        int bits_in_buffer = 0;
+
+        for (unsigned char byte : input) {
+            buffer = (buffer << 8) | byte;
+            bits_in_buffer += 8;
+
+            while (bits_in_buffer >= 5) {
+                output += alphabet[(buffer >> (bits_in_buffer - 5)) & 0x1f];
+                bits_in_buffer -= 5;
+            }
+        }
+
+        if (bits_in_buffer > 0) {
+            output += alphabet[(buffer << (5 - bits_in_buffer)) & 0x1f];
+        }
+
+        return output;
+    }
+
+    static std::vector<unsigned char> base32Decode(const std::string& input) {
+        std::vector<unsigned char> output;
+        uint32_t buffer = 0;
+        int bits_in_buffer = 0;
+
+        for (char c : input) {
+            if (c == '=') break;
+
+            int value;
+            if (c >= 'A' && c <= 'Z') {
+                value = c - 'A';
+            } else if (c >= '2' && c <= '7') {
+                value = c - '2' + 26;
+            } else {
+                continue; // Skip invalid characters
+            }
+
+            buffer = (buffer << 5) | value;
+            bits_in_buffer += 5;
+
+            if (bits_in_buffer >= 8) {
+                output.push_back((buffer >> (bits_in_buffer - 8)) & 0xff);
+                bits_in_buffer -= 8;
+            }
+        }
+
+        return output;
+    }
+
+    static std::string urlEncode(const std::string& str) {
+        std::ostringstream escaped;
+        escaped << std::hex << std::uppercase << std::setfill('0');
+
+        for (char c : str) {
+            if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+                escaped << c;
+            } else {
+                escaped << '%' << std::setw(2) << int((unsigned char)c);
+            }
+        }
+
+        return escaped.str();
+    }
+};
+```
+
+2. JWT TOKEN AUTHENTICATION MANAGER
+------------------------------------
+
+```cpp
+#include <jwt-cpp/jwt.h>
+#include <json/json.h>
+#include <chrono>
+
+class JWTAuthenticationManager {
+public:
+    struct TokenClaims {
+        std::string user_id;
+        std::string username;
+        std::string email;
+        std::vector<std::string> roles;
+        std::map<std::string, std::string> attributes;
+        std::chrono::system_clock::time_point issued_at;
+        std::chrono::system_clock::time_point expires_at;
+    };
+
+private:
+    std::string secret_key_;
+    std::string issuer_;
+    std::chrono::seconds token_lifetime_;
+    std::chrono::seconds refresh_token_lifetime_;
+
+public:
+    JWTAuthenticationManager(const std::string& secret_key,
+                            const std::string& issuer,
+                            std::chrono::seconds token_lifetime = std::chrono::hours(1),
+                            std::chrono::seconds refresh_lifetime = std::chrono::hours(24 * 7))
+        : secret_key_(secret_key),
+          issuer_(issuer),
+          token_lifetime_(token_lifetime),
+          refresh_token_lifetime_(refresh_lifetime) {}
+
+    // Generate access token
+    std::string generateAccessToken(const TokenClaims& claims) {
+        auto token = jwt::create()
+            .set_issuer(issuer_)
+            .set_type("JWT")
+            .set_id(generateTokenID())
+            .set_issued_at(std::chrono::system_clock::now())
+            .set_expires_at(std::chrono::system_clock::now() + token_lifetime_)
+            .set_subject(claims.user_id)
+            .set_payload_claim("username", jwt::claim(claims.username))
+            .set_payload_claim("email", jwt::claim(claims.email));
+
+        // Add roles
+        Json::Value roles_json(Json::arrayValue);
+        for (const auto& role : claims.roles) {
+            roles_json.append(role);
+        }
+        token.set_payload_claim("roles", jwt::claim(roles_json.toStyledString()));
+
+        // Add custom attributes
+        for (const auto& [key, value] : claims.attributes) {
+            token.set_payload_claim(key, jwt::claim(value));
+        }
+
+        return token.sign(jwt::algorithm::hs256{secret_key_});
+    }
+
+    // Generate refresh token
+    std::string generateRefreshToken(const std::string& user_id) {
+        auto token = jwt::create()
+            .set_issuer(issuer_)
+            .set_type("JWT")
+            .set_id(generateTokenID())
+            .set_issued_at(std::chrono::system_clock::now())
+            .set_expires_at(std::chrono::system_clock::now() +
+                          refresh_token_lifetime_)
+            .set_subject(user_id)
+            .set_payload_claim("token_type", jwt::claim("refresh"));
+
+        return token.sign(jwt::algorithm::hs256{secret_key_});
+    }
+
+    // Verify and decode token
+    std::optional<TokenClaims> verifyToken(const std::string& token) {
+        try {
+            auto verifier = jwt::verify()
+                .allow_algorithm(jwt::algorithm::hs256{secret_key_})
+                .with_issuer(issuer_);
+
+            auto decoded = jwt::decode(token);
+            verifier.verify(decoded);
+
+            // Extract claims
+            TokenClaims claims;
+            claims.user_id = decoded.get_subject();
+            claims.username = decoded.get_payload_claim("username").as_string();
+            claims.email = decoded.get_payload_claim("email").as_string();
+            claims.issued_at = decoded.get_issued_at();
+            claims.expires_at = decoded.get_expires_at();
+
+            // Extract roles
+            if (decoded.has_payload_claim("roles")) {
+                std::string roles_str = decoded.get_payload_claim("roles").as_string();
+                Json::CharReaderBuilder builder;
+                Json::Value roles_json;
+                std::istringstream ss(roles_str);
+                std::string errs;
+
+                if (Json::parseFromStream(builder, ss, &roles_json, &errs)) {
+                    for (const auto& role : roles_json) {
+                        claims.roles.push_back(role.asString());
+                    }
+                }
+            }
+
+            return claims;
+
+        } catch (const std::exception& e) {
+            std::cerr << "Token verification failed: " << e.what() << std::endl;
+            return std::nullopt;
+        }
+    }
+
+    // Check if token is expired
+    bool isTokenExpired(const std::string& token) {
+        try {
+            auto decoded = jwt::decode(token);
+            auto exp = decoded.get_expires_at();
+            return std::chrono::system_clock::now() >= exp;
+        } catch (...) {
+            return true;
+        }
+    }
+
+private:
+    std::string generateTokenID() {
+        unsigned char random_bytes[16];
+        if (RAND_bytes(random_bytes, sizeof(random_bytes)) != 1) {
+            throw std::runtime_error("Failed to generate token ID");
+        }
+
+        std::ostringstream oss;
+        oss << std::hex << std::setfill('0');
+        for (unsigned char byte : random_bytes) {
+            oss << std::setw(2) << static_cast<int>(byte);
+        }
+
+        return oss.str();
+    }
+};
+```
+
+3. ROLE-BASED ACCESS CONTROL (RBAC) MANAGER
+--------------------------------------------
+
+```cpp
+#include <unordered_map>
+#include <unordered_set>
+#include <shared_mutex>
+#include <string>
+#include <vector>
+
+class RBACManager {
+public:
+    enum class Permission {
+        // Market Data Permissions
+        READ_MARKET_DATA,
+        SUBSCRIBE_MARKET_DATA,
+
+        // Trading Permissions
+        VIEW_ORDERS,
+        CREATE_ORDER,
+        MODIFY_ORDER,
+        CANCEL_ORDER,
+        CANCEL_ALL_ORDERS,
+
+        // Position Management
+        VIEW_POSITIONS,
+        CLOSE_POSITION,
+
+        // Risk Management
+        VIEW_RISK_METRICS,
+        MODIFY_RISK_LIMITS,
+        ACTIVATE_KILL_SWITCH,
+
+        // Strategy Management
+        VIEW_STRATEGIES,
+        DEPLOY_STRATEGY,
+        MODIFY_STRATEGY,
+        STOP_STRATEGY,
+
+        // System Administration
+        VIEW_SYSTEM_CONFIG,
+        MODIFY_SYSTEM_CONFIG,
+        VIEW_LOGS,
+        MANAGE_USERS,
+
+        // Compliance
+        VIEW_AUDIT_LOGS,
+        EXPORT_COMPLIANCE_REPORTS
+    };
+
+    struct Role {
+        std::string name;
+        std::string description;
+        std::unordered_set<Permission> permissions;
+        std::unordered_set<std::string> parent_roles;
+        std::map<std::string, std::string> attributes;
+    };
+
+    struct User {
+        std::string user_id;
+        std::string username;
+        std::unordered_set<std::string> roles;
+        std::map<std::string, std::string> attributes;
+        bool is_active;
+    };
+
+private:
+    std::unordered_map<std::string, Role> roles_;
+    std::unordered_map<std::string, User> users_;
+    mutable std::shared_mutex mutex_;
+
+public:
+    RBACManager() {
+        initializeDefaultRoles();
+    }
+
+    // Add or update role
+    void defineRole(const std::string& role_name,
+                   const std::string& description,
+                   const std::unordered_set<Permission>& permissions,
+                   const std::unordered_set<std::string>& parent_roles = {}) {
+        std::unique_lock lock(mutex_);
+
+        Role role;
+        role.name = role_name;
+        role.description = description;
+        role.permissions = permissions;
+        role.parent_roles = parent_roles;
+
+        roles_[role_name] = role;
+    }
+
+    // Assign role to user
+    bool assignRole(const std::string& user_id, const std::string& role_name) {
+        std::unique_lock lock(mutex_);
+
+        auto user_it = users_.find(user_id);
+        if (user_it == users_.end()) {
+            return false;
+        }
+
+        auto role_it = roles_.find(role_name);
+        if (role_it == roles_.end()) {
+            return false;
+        }
+
+        user_it->second.roles.insert(role_name);
+        logAuditEvent("ROLE_ASSIGNED", user_id, role_name);
+
+        return true;
+    }
+
+    // Remove role from user
+    bool revokeRole(const std::string& user_id, const std::string& role_name) {
+        std::unique_lock lock(mutex_);
+
+        auto user_it = users_.find(user_id);
+        if (user_it == users_.end()) {
+            return false;
+        }
+
+        user_it->second.roles.erase(role_name);
+        logAuditEvent("ROLE_REVOKED", user_id, role_name);
+
+        return true;
+    }
+
+    // Check if user has specific permission
+    bool hasPermission(const std::string& user_id, Permission permission) const {
+        std::shared_lock lock(mutex_);
+
+        auto user_it = users_.find(user_id);
+        if (user_it == users_.end() || !user_it->second.is_active) {
+            return false;
+        }
+
+        // Check all user's roles (including inherited permissions)
+        std::unordered_set<std::string> checked_roles;
+        return hasPermissionRecursive(user_it->second.roles, permission,
+                                     checked_roles);
+    }
+
+    // Check if user has any of the specified permissions
+    bool hasAnyPermission(const std::string& user_id,
+                         const std::vector<Permission>& permissions) const {
+        for (const auto& permission : permissions) {
+            if (hasPermission(user_id, permission)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Check if user has all specified permissions
+    bool hasAllPermissions(const std::string& user_id,
+                          const std::vector<Permission>& permissions) const {
+        for (const auto& permission : permissions) {
+            if (!hasPermission(user_id, permission)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // Get all permissions for a user
+    std::unordered_set<Permission> getUserPermissions(
+        const std::string& user_id) const {
+        std::shared_lock lock(mutex_);
+
+        auto user_it = users_.find(user_id);
+        if (user_it == users_.end()) {
+            return {};
+        }
+
+        std::unordered_set<Permission> all_permissions;
+        std::unordered_set<std::string> checked_roles;
+
+        collectPermissionsRecursive(user_it->second.roles, all_permissions,
+                                    checked_roles);
+
+        return all_permissions;
+    }
+
+    // Create new user
+    bool createUser(const User& user) {
+        std::unique_lock lock(mutex_);
+
+        if (users_.find(user.user_id) != users_.end()) {
+            return false; // User already exists
+        }
+
+        users_[user.user_id] = user;
+        logAuditEvent("USER_CREATED", user.user_id, user.username);
+
+        return true;
+    }
+
+    // Deactivate user
+    bool deactivateUser(const std::string& user_id) {
+        std::unique_lock lock(mutex_);
+
+        auto it = users_.find(user_id);
+        if (it == users_.end()) {
+            return false;
+        }
+
+        it->second.is_active = false;
+        logAuditEvent("USER_DEACTIVATED", user_id, "");
+
+        return true;
+    }
+
+private:
+    void initializeDefaultRoles() {
+        // Super Administrator
+        defineRole("super_admin",
+                  "Full system access",
+                  {
+                      Permission::READ_MARKET_DATA,
+                      Permission::SUBSCRIBE_MARKET_DATA,
+                      Permission::VIEW_ORDERS,
+                      Permission::CREATE_ORDER,
+                      Permission::MODIFY_ORDER,
+                      Permission::CANCEL_ORDER,
+                      Permission::CANCEL_ALL_ORDERS,
+                      Permission::VIEW_POSITIONS,
+                      Permission::CLOSE_POSITION,
+                      Permission::VIEW_RISK_METRICS,
+                      Permission::MODIFY_RISK_LIMITS,
+                      Permission::ACTIVATE_KILL_SWITCH,
+                      Permission::VIEW_STRATEGIES,
+                      Permission::DEPLOY_STRATEGY,
+                      Permission::MODIFY_STRATEGY,
+                      Permission::STOP_STRATEGY,
+                      Permission::VIEW_SYSTEM_CONFIG,
+                      Permission::MODIFY_SYSTEM_CONFIG,
+                      Permission::VIEW_LOGS,
+                      Permission::MANAGE_USERS,
+                      Permission::VIEW_AUDIT_LOGS,
+                      Permission::EXPORT_COMPLIANCE_REPORTS
+                  });
+
+        // Senior Trader
+        defineRole("senior_trader",
+                  "Full trading access with risk management",
+                  {
+                      Permission::READ_MARKET_DATA,
+                      Permission::SUBSCRIBE_MARKET_DATA,
+                      Permission::VIEW_ORDERS,
+                      Permission::CREATE_ORDER,
+                      Permission::MODIFY_ORDER,
+                      Permission::CANCEL_ORDER,
+                      Permission::CANCEL_ALL_ORDERS,
+                      Permission::VIEW_POSITIONS,
+                      Permission::CLOSE_POSITION,
+                      Permission::VIEW_RISK_METRICS,
+                      Permission::VIEW_STRATEGIES,
+                      Permission::DEPLOY_STRATEGY,
+                      Permission::MODIFY_STRATEGY,
+                      Permission::STOP_STRATEGY
+                  });
+
+        // Trader
+        defineRole("trader",
+                  "Standard trading access",
+                  {
+                      Permission::READ_MARKET_DATA,
+                      Permission::SUBSCRIBE_MARKET_DATA,
+                      Permission::VIEW_ORDERS,
+                      Permission::CREATE_ORDER,
+                      Permission::MODIFY_ORDER,
+                      Permission::CANCEL_ORDER,
+                      Permission::VIEW_POSITIONS,
+                      Permission::CLOSE_POSITION,
+                      Permission::VIEW_RISK_METRICS,
+                      Permission::VIEW_STRATEGIES
+                  });
+
+        // Risk Manager
+        defineRole("risk_manager",
+                  "Risk monitoring and control",
+                  {
+                      Permission::READ_MARKET_DATA,
+                      Permission::VIEW_ORDERS,
+                      Permission::CANCEL_ORDER,
+                      Permission::CANCEL_ALL_ORDERS,
+                      Permission::VIEW_POSITIONS,
+                      Permission::CLOSE_POSITION,
+                      Permission::VIEW_RISK_METRICS,
+                      Permission::MODIFY_RISK_LIMITS,
+                      Permission::ACTIVATE_KILL_SWITCH,
+                      Permission::VIEW_STRATEGIES,
+                      Permission::STOP_STRATEGY
+                  });
+
+        // Analyst (Read-Only)
+        defineRole("analyst",
+                  "Read-only access for analysis",
+                  {
+                      Permission::READ_MARKET_DATA,
+                      Permission::VIEW_ORDERS,
+                      Permission::VIEW_POSITIONS,
+                      Permission::VIEW_RISK_METRICS,
+                      Permission::VIEW_STRATEGIES,
+                      Permission::VIEW_LOGS
+                  });
+    }
+
+    bool hasPermissionRecursive(const std::unordered_set<std::string>& user_roles,
+                               Permission permission,
+                               std::unordered_set<std::string>& checked_roles) const {
+        for (const auto& role_name : user_roles) {
+            if (checked_roles.count(role_name)) {
+                continue; // Already checked this role
+            }
+
+            checked_roles.insert(role_name);
+
+            auto role_it = roles_.find(role_name);
+            if (role_it == roles_.end()) {
+                continue;
+            }
+
+            const auto& role = role_it->second;
+
+            // Check if role has the permission
+            if (role.permissions.count(permission)) {
+                return true;
+            }
+
+            // Check parent roles recursively
+            if (hasPermissionRecursive(role.parent_roles, permission,
+                                      checked_roles)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    void collectPermissionsRecursive(
+        const std::unordered_set<std::string>& user_roles,
+        std::unordered_set<Permission>& all_permissions,
+        std::unordered_set<std::string>& checked_roles) const {
+
+        for (const auto& role_name : user_roles) {
+            if (checked_roles.count(role_name)) {
+                continue;
+            }
+
+            checked_roles.insert(role_name);
+
+            auto role_it = roles_.find(role_name);
+            if (role_it == roles_.end()) {
+                continue;
+            }
+
+            const auto& role = role_it->second;
+
+            // Add role permissions
+            all_permissions.insert(role.permissions.begin(),
+                                 role.permissions.end());
+
+            // Collect from parent roles
+            collectPermissionsRecursive(role.parent_roles, all_permissions,
+                                       checked_roles);
+        }
+    }
+
+    void logAuditEvent(const std::string& event_type,
+                      const std::string& user_id,
+                      const std::string& details) const {
+        // Implementation: Log to audit system
+        std::cout << "[AUDIT] " << event_type << " | User: " << user_id
+                  << " | Details: " << details << std::endl;
+    }
+};
+```
+
+4. SESSION MANAGEMENT SYSTEM
+-----------------------------
+
+```cpp
+#include <random>
+#include <chrono>
+#include <unordered_map>
+#include <mutex>
+
+class SessionManager {
+public:
+    struct Session {
+        std::string session_id;
+        std::string user_id;
+        std::string ip_address;
+        std::string user_agent;
+        std::chrono::system_clock::time_point created_at;
+        std::chrono::system_clock::time_point last_activity;
+        std::chrono::system_clock::time_point expires_at;
+        std::map<std::string, std::string> attributes;
+        bool is_valid;
+    };
+
+private:
+    std::unordered_map<std::string, Session> sessions_;
+    std::unordered_map<std::string, std::unordered_set<std::string>> user_sessions_;
+    mutable std::shared_mutex mutex_;
+
+    // Configuration
+    std::chrono::seconds session_timeout_{std::chrono::minutes(30)};
+    std::chrono::seconds absolute_timeout_{std::chrono::hours(12)};
+    size_t max_concurrent_sessions_{3};
+
+public:
+    SessionManager() = default;
+
+    // Create new session
+    std::string createSession(const std::string& user_id,
+                             const std::string& ip_address,
+                             const std::string& user_agent) {
+        std::unique_lock lock(mutex_);
+
+        // Check concurrent session limit
+        auto& user_sessions = user_sessions_[user_id];
+        if (user_sessions.size() >= max_concurrent_sessions_) {
+            // Remove oldest session
+            removeOldestSession(user_id);
+        }
+
+        // Generate secure session ID
+        std::string session_id = generateSessionID();
+
+        // Create session
+        Session session;
+        session.session_id = session_id;
+        session.user_id = user_id;
+        session.ip_address = ip_address;
+        session.user_agent = user_agent;
+        session.created_at = std::chrono::system_clock::now();
+        session.last_activity = session.created_at;
+        session.expires_at = session.created_at + absolute_timeout_;
+        session.is_valid = true;
+
+        sessions_[session_id] = session;
+        user_sessions[user_id].insert(session_id);
+
+        logAuditEvent("SESSION_CREATED", user_id, session_id, ip_address);
+
+        return session_id;
+    }
+
+    // Validate session
+    bool validateSession(const std::string& session_id,
+                        const std::string& ip_address,
+                        const std::string& user_agent) {
+        std::unique_lock lock(mutex_);
+
+        auto it = sessions_.find(session_id);
+        if (it == sessions_.end()) {
+            return false;
+        }
+
+        auto& session = it->second;
+
+        // Check if session is valid
+        if (!session.is_valid) {
+            return false;
+        }
+
+        auto now = std::chrono::system_clock::now();
+
+        // Check absolute timeout
+        if (now >= session.expires_at) {
+            invalidateSession(session_id);
+            return false;
+        }
+
+        // Check inactivity timeout
+        if (now - session.last_activity >= session_timeout_) {
+            invalidateSession(session_id);
+            return false;
+        }
+
+        // Verify IP address binding (optional, can be relaxed)
+        if (session.ip_address != ip_address) {
+            logSecurityEvent("IP_MISMATCH", session.user_id, session_id,
+                           "Expected: " + session.ip_address +
+                           ", Got: " + ip_address);
+            // Optionally invalidate session on IP mismatch
+            // invalidateSession(session_id);
+            // return false;
+        }
+
+        // Verify User-Agent binding
+        if (session.user_agent != user_agent) {
+            logSecurityEvent("USER_AGENT_MISMATCH", session.user_id,
+                           session_id, "User-Agent changed");
+        }
+
+        // Update last activity
+        session.last_activity = now;
+
+        return true;
+    }
+
+    // Refresh session
+    bool refreshSession(const std::string& session_id) {
+        std::unique_lock lock(mutex_);
+
+        auto it = sessions_.find(session_id);
+        if (it == sessions_.end() || !it->second.is_valid) {
+            return false;
+        }
+
+        auto& session = it->second;
+        auto now = std::chrono::system_clock::now();
+
+        session.last_activity = now;
+        session.expires_at = now + absolute_timeout_;
+
+        return true;
+    }
+
+    // Get session details
+    std::optional<Session> getSession(const std::string& session_id) const {
+        std::shared_lock lock(mutex_);
+
+        auto it = sessions_.find(session_id);
+        if (it == sessions_.end()) {
+            return std::nullopt;
+        }
+
+        return it->second;
+    }
+
+    // Invalidate session (logout)
+    bool invalidateSession(const std::string& session_id) {
+        std::unique_lock lock(mutex_);
+
+        auto it = sessions_.find(session_id);
+        if (it == sessions_.end()) {
+            return false;
+        }
+
+        auto& session = it->second;
+        session.is_valid = false;
+
+        // Remove from user sessions
+        auto user_sessions_it = user_sessions_.find(session.user_id);
+        if (user_sessions_it != user_sessions_.end()) {
+            user_sessions_it->second.erase(session_id);
+        }
+
+        logAuditEvent("SESSION_INVALIDATED", session.user_id, session_id, "");
+
+        return true;
+    }
+
+    // Invalidate all user sessions
+    void invalidateAllUserSessions(const std::string& user_id) {
+        std::unique_lock lock(mutex_);
+
+        auto user_sessions_it = user_sessions_.find(user_id);
+        if (user_sessions_it == user_sessions_.end()) {
+            return;
+        }
+
+        for (const auto& session_id : user_sessions_it->second) {
+            auto session_it = sessions_.find(session_id);
+            if (session_it != sessions_.end()) {
+                session_it->second.is_valid = false;
+            }
+        }
+
+        user_sessions_it->second.clear();
+
+        logAuditEvent("ALL_SESSIONS_INVALIDATED", user_id, "", "");
+    }
+
+    // Clean up expired sessions
+    void cleanupExpiredSessions() {
+        std::unique_lock lock(mutex_);
+
+        auto now = std::chrono::system_clock::now();
+        std::vector<std::string> to_remove;
+
+        for (auto& [session_id, session] : sessions_) {
+            if (!session.is_valid ||
+                now >= session.expires_at ||
+                now - session.last_activity >= session_timeout_) {
+
+                to_remove.push_back(session_id);
+
+                // Remove from user sessions
+                auto user_sessions_it = user_sessions_.find(session.user_id);
+                if (user_sessions_it != user_sessions_.end()) {
+                    user_sessions_it->second.erase(session_id);
+                }
+            }
+        }
+
+        for (const auto& session_id : to_remove) {
+            sessions_.erase(session_id);
+        }
+    }
+
+private:
+    std::string generateSessionID() {
+        unsigned char random_bytes[32];
+        if (RAND_bytes(random_bytes, sizeof(random_bytes)) != 1) {
+            throw std::runtime_error("Failed to generate session ID");
+        }
+
+        std::ostringstream oss;
+        oss << std::hex << std::setfill('0');
+        for (unsigned char byte : random_bytes) {
+            oss << std::setw(2) << static_cast<int>(byte);
+        }
+
+        return oss.str();
+    }
+
+    void removeOldestSession(const std::string& user_id) {
+        auto& user_sessions = user_sessions_[user_id];
+        if (user_sessions.empty()) {
+            return;
+        }
+
+        std::string oldest_session_id;
+        auto oldest_time = std::chrono::system_clock::time_point::max();
+
+        for (const auto& session_id : user_sessions) {
+            auto session_it = sessions_.find(session_id);
+            if (session_it != sessions_.end() &&
+                session_it->second.created_at < oldest_time) {
+                oldest_time = session_it->second.created_at;
+                oldest_session_id = session_id;
+            }
+        }
+
+        if (!oldest_session_id.empty()) {
+            auto session_it = sessions_.find(oldest_session_id);
+            if (session_it != sessions_.end()) {
+                session_it->second.is_valid = false;
+            }
+            user_sessions.erase(oldest_session_id);
+
+            logAuditEvent("SESSION_EVICTED", user_id, oldest_session_id,
+                         "Max concurrent sessions reached");
+        }
+    }
+
+    void logAuditEvent(const std::string& event_type,
+                      const std::string& user_id,
+                      const std::string& session_id,
+                      const std::string& details) const {
+        std::cout << "[AUDIT] " << event_type
+                  << " | User: " << user_id
+                  << " | Session: " << session_id
+                  << " | Details: " << details << std::endl;
+    }
+
+    void logSecurityEvent(const std::string& event_type,
+                         const std::string& user_id,
+                         const std::string& session_id,
+                         const std::string& details) const {
+        std::cerr << "[SECURITY] " << event_type
+                  << " | User: " << user_id
+                  << " | Session: " << session_id
+                  << " | Details: " << details << std::endl;
+    }
+};
+```
+
+================================================================================
+CONFIGURATION TEMPLATES
+================================================================================
+
+1. AUTHENTICATION CONFIGURATION (YAML)
+---------------------------------------
+
+```yaml
+authentication:
+  methods:
+    - type: password
+      enabled: true
+      min_length: 12
+      require_uppercase: true
+      require_lowercase: true
+      require_digits: true
+      require_special_chars: true
+      password_history: 5
+      max_age_days: 90
+
+    - type: mfa
+      enabled: true
+      required_for_roles:
+        - super_admin
+        - senior_trader
+        - risk_manager
+      methods:
+        - totp
+        - hardware_token
+      backup_codes: 10
+
+    - type: certificate
+      enabled: true
+      required_for:
+        - api_services
+        - automated_systems
+      ca_certificate: /etc/ssl/certs/hft-ca.crt
+      crl_check: true
+
+    - type: sso
+      enabled: true
+      providers:
+        - name: azure_ad
+          type: saml
+          entity_id: https://hft-system.local
+          sso_url: https://login.microsoftonline.com/...
+          certificate: /etc/ssl/certs/azure-ad.crt
+
+  session:
+    timeout_minutes: 30
+    absolute_timeout_hours: 12
+    max_concurrent: 3
+    secure_cookie: true
+    httponly_cookie: true
+    samesite: strict
+
+  password_policy:
+    min_length: 12
+    max_length: 128
+    require_complexity: true
+    prevent_common_passwords: true
+    lockout_threshold: 5
+    lockout_duration_minutes: 30
+
+authorization:
+  model: rbac
+  default_deny: true
+
+  roles:
+    super_admin:
+      description: "Full system access"
+      inherits: []
+      permissions: ["*"]
+
+    senior_trader:
+      description: "Full trading capabilities"
+      inherits: []
+      permissions:
+        - "trading:*"
+        - "market_data:read"
+        - "risk:view"
+        - "strategy:*"
+
+    trader:
+      description: "Standard trading access"
+      inherits: []
+      permissions:
+        - "trading:view"
+        - "trading:create_order"
+        - "trading:modify_order"
+        - "trading:cancel_order"
+        - "market_data:read"
+        - "risk:view"
+
+    risk_manager:
+      description: "Risk control and monitoring"
+      inherits: []
+      permissions:
+        - "risk:*"
+        - "trading:view"
+        - "trading:cancel_order"
+        - "trading:cancel_all"
+        - "system:kill_switch"
+
+    analyst:
+      description: "Read-only access"
+      inherits: []
+      permissions:
+        - "market_data:read"
+        - "trading:view"
+        - "risk:view"
+        - "reports:view"
+
+  attribute_policies:
+    - name: trading_hours_only
+      condition: "time >= 09:30 AND time <= 16:00 AND day IN ['Mon','Tue','Wed','Thu','Fri']"
+      apply_to:
+        - "trading:create_order"
+        - "trading:modify_order"
+
+    - name: office_network_only
+      condition: "ip_address IN ['10.0.0.0/8', '192.168.1.0/24']"
+      apply_to:
+        - "system:modify_config"
+        - "user:manage"
+
+    - name: high_risk_approval
+      condition: "order_value > 1000000"
+      require_approval_from:
+        - "senior_trader"
+        - "risk_manager"
+```
+
+2. LDAP INTEGRATION CONFIGURATION
+----------------------------------
+
+```ini
+[ldap]
+server_uri = ldaps://ldap.hft-system.local:636
+bind_dn = cn=hft-service,ou=services,dc=hft-system,dc=local
+bind_password = ${LDAP_BIND_PASSWORD}
+
+# TLS Configuration
+tls_require_cert = demand
+tls_ca_cert_file = /etc/ssl/certs/ldap-ca.crt
+tls_cert_file = /etc/ssl/certs/ldap-client.crt
+tls_key_file = /etc/ssl/private/ldap-client.key
+
+# User Search
+user_search_base = ou=users,dc=hft-system,dc=local
+user_search_filter = (&(objectClass=person)(uid={username}))
+user_attributes = uid,cn,mail,employeeNumber,department
+
+# Group Search
+group_search_base = ou=groups,dc=hft-system,dc=local
+group_search_filter = (member={user_dn})
+group_attribute = cn
+
+# Role Mapping
+role_mapping:
+  cn=HFT-Admins,ou=groups: super_admin
+  cn=HFT-Traders,ou=groups: trader
+  cn=HFT-Senior-Traders,ou=groups: senior_trader
+  cn=HFT-Risk-Managers,ou=groups: risk_manager
+  cn=HFT-Analysts,ou=groups: analyst
+
+# Connection Pool
+pool_size = 10
+pool_timeout = 30
+connection_timeout = 10
+```
+
+================================================================================
+THREAT MODELS
+================================================================================
+
+THREAT 1: CREDENTIAL STUFFING ATTACK
+-------------------------------------
+Threat Actor: External attacker with leaked credentials
+Attack Vector: Automated login attempts using credential databases
+Impact: HIGH - Unauthorized account access
+
+Mitigation:
+1. Implement rate limiting on authentication endpoints
+2. Require MFA for all users
+3. Monitor for suspicious login patterns
+4. Use CAPTCHA after failed attempts
+5. Implement account lockout policies
+6. Check credentials against known breach databases
+
+Detection:
+- Multiple failed login attempts from same IP
+- Login attempts from unusual geolocations
+- High volume of authentication requests
+- Login attempts during off-hours
+
+Response:
+1. Immediately lock affected accounts
+2. Force password reset
+3. Block attacker IP addresses
+4. Notify affected users
+5. Review authentication logs
+
+THREAT 2: SESSION HIJACKING
+----------------------------
+Threat Actor: Man-in-the-middle attacker
+Attack Vector: Steal or intercept session tokens
+Impact: CRITICAL - Complete account takeover
+
+Mitigation:
+1. Use HTTPS only for all communications
+2. Implement secure, HttpOnly cookies
+3. Bind sessions to IP address and User-Agent
+4. Implement session token rotation
+5. Use short session timeouts
+6. Implement CSRF protection
+
+Detection:
+- Session usage from multiple IP addresses
+- Sudden change in User-Agent
+- Impossible travel (geolocation)
+- Session activity patterns anomalies
+
+Response:
+1. Immediately invalidate suspicious sessions
+2. Force re-authentication
+3. Alert user of potential compromise
+4. Review session activity logs
+5. Investigate network security
+
+THREAT 3: PRIVILEGE ESCALATION
+-------------------------------
+Threat Actor: Malicious insider or compromised account
+Attack Vector: Exploit RBAC misconfiguration or vulnerabilities
+Impact: CRITICAL - Unauthorized access to privileged functions
+
+Mitigation:
+1. Implement principle of least privilege
+2. Regular access reviews and audits
+3. Separation of duties
+4. Require approval for privilege escalation
+5. Comprehensive audit logging
+6. Automated permission monitoring
+
+Detection:
+- Unauthorized access to privileged functions
+- Unexpected role assignments
+- Privilege usage outside normal patterns
+- Failed authorization attempts
+
+Response:
+1. Revoke escalated privileges immediately
+2. Investigate how escalation occurred
+3. Review all actions taken with elevated privileges
+4. Perform security audit of RBAC configuration
+5. Disciplinary action if intentional
+
+================================================================================
+SECURITY CHECKLISTS
+================================================================================
+
+AUTHENTICATION IMPLEMENTATION CHECKLIST
+----------------------------------------
+[ ] Password complexity requirements enforced
+[ ] Multi-factor authentication enabled for all users
+[ ] Account lockout policy configured
+[ ] Password history tracking implemented
+[ ] Secure password storage (Argon2, bcrypt, scrypt)
+[ ] Failed login attempt monitoring
+[ ] CAPTCHA implemented after failed attempts
+[ ] Session timeout configured appropriately
+[ ] Absolute session timeout enforced
+[ ] Concurrent session limiting implemented
+[ ] Certificate-based authentication for services
+[ ] SSO integration configured securely
+[ ] Authentication audit logging enabled
+
+AUTHORIZATION IMPLEMENTATION CHECKLIST
+---------------------------------------
+[ ] RBAC model fully implemented
+[ ] Default deny policy enforced
+[ ] Principle of least privilege applied
+[ ] Role hierarchy properly defined
+[ ] Permission granularity appropriate
+[ ] Attribute-based policies configured
+[ ] Authorization checks on all endpoints
+[ ] Permission caching implemented securely
+[ ] Regular access reviews scheduled
+[ ] Orphaned permissions cleaned up
+[ ] Authorization audit logging enabled
+[ ] Emergency access procedures defined
+
+SESSION SECURITY CHECKLIST
+---------------------------
+[ ] Secure session ID generation (CSPRNG)
+[ ] Session fixation protection implemented
+[ ] Session binding to IP/User-Agent
+[ ] Secure cookie flags set (Secure, HttpOnly, SameSite)
+[ ] Session timeout configured
+[ ] Absolute timeout enforced
+[ ] Session cleanup routine running
+[ ] Concurrent session limits enforced
+[ ] Session invalidation on logout
+[ ] Session refresh implemented
+[ ] Session hijacking detection
+[ ] CSRF protection implemented
+
+================================================================================
+INCIDENT RESPONSE PROCEDURES
+================================================================================
+
+INCIDENT: UNAUTHORIZED ACCESS DETECTED
+---------------------------------------
+
+PHASE 1: DETECTION AND ASSESSMENT (0-15 minutes)
+-------------------------------------------------
+1. Identify compromised account(s)
+   - User ID and username
+   - Account privileges
+   - Last known legitimate access
+   - Suspicious activity timeline
+
+2. Assess scope of breach
+   - What data was accessed
+   - What actions were performed
+   - What systems were affected
+   - Potential data exfiltration
+
+3. Classify severity
+   - CRITICAL: Privileged account compromised
+   - HIGH: Trading account compromised
+   - MEDIUM: Limited access account compromised
+
+PHASE 2: CONTAINMENT (15-30 minutes)
+-------------------------------------
+1. Immediately disable compromised account(s)
+2. Invalidate all active sessions for affected users
+3. Reset passwords for compromised accounts
+4. Review and revoke any new permissions granted
+5. Block suspicious IP addresses
+6. Enable enhanced monitoring on related accounts
+
+PHASE 3: INVESTIGATION (30 minutes - 4 hours)
+----------------------------------------------
+1. Review authentication logs
+   - All login attempts for affected accounts
+   - Source IP addresses and geolocations
+   - Timestamp analysis
+
+2. Review authorization logs
+   - All permissions checked
+   - Resources accessed
+   - Failed authorization attempts
+
+3. Review application logs
+   - Trading activity
+   - Configuration changes
+   - Data exports
+
+4. Determine attack vector
+   - Credential compromise
+   - Session hijacking
+   - Phishing attack
+   - Insider threat
+
+PHASE 4: RECOVERY (4-24 hours)
+-------------------------------
+1. Re-enable accounts with new credentials
+2. Restore legitimate user access
+3. Review and restore proper permissions
+4. Implement additional security controls
+5. Enhanced monitoring for 30 days
+
+PHASE 5: POST-INCIDENT (24-72 hours)
+-------------------------------------
+1. Complete incident report
+2. Notify affected users
+3. Regulatory reporting if required
+4. Update security policies
+5. Conduct security awareness training
+6. Implement preventive measures
+
+EMERGENCY CONTACTS
+------------------
+Security Operations: security-ops@hft-system.com
+Identity Team: identity-team@hft-system.com
+Incident Commander: incident-commander@hft-system.com
+Legal/Compliance: legal@hft-system.com
+
+================================================================================
+BEST PRACTICES SUMMARY
+================================================================================
+
+AUTHENTICATION BEST PRACTICES:
+1. REQUIRE multi-factor authentication for all users
+2. IMPLEMENT strong password policies
+3. USE secure session management
+4. ENABLE account lockout after failed attempts
+5. MONITOR authentication attempts continuously
+6. IMPLEMENT certificate-based authentication for services
+7. USE SSO for improved security and usability
+8. ROTATE credentials regularly
+9. NEVER store plaintext passwords
+10. IMPLEMENT defense against common attacks (brute force, credential stuffing)
+
+AUTHORIZATION BEST PRACTICES:
+1. APPLY principle of least privilege
+2. IMPLEMENT role-based access control (RBAC)
+3. USE attribute-based policies for dynamic access control
+4. ENFORCE default deny policy
+5. CONDUCT regular access reviews
+6. IMPLEMENT separation of duties
+7. REQUIRE approval for privilege escalation
+8. LOG all authorization decisions
+9. IMPLEMENT just-in-time (JIT) privileged access
+10. AUTOMATE access provisioning and deprovisioning
+
+================================================================================
+END OF DOCUMENT
+================================================================================

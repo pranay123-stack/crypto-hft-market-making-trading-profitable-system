@@ -1,0 +1,699 @@
+================================================================================
+TICK CAPTURE SYSTEM - CAPTURING LIVE TICKS FOR REPLAY
+================================================================================
+
+PURPOSE: Capture all market data updates with nanosecond precision timestamps,
+preserving exact sequencing and causality for high-fidelity replay.
+
+CRITICAL REQUIREMENTS:
+- Zero message loss during capture
+- Nanosecond timestamp precision
+- Minimal capture overhead (<5% CPU)
+- Preserved message ordering
+- Efficient storage (compression)
+
+================================================================================
+TICK CAPTURE ARCHITECTURE
+================================================================================
+
+CAPTURE PIPELINE:
+-----------------
+
+[Market Data Feed] --> [Network Tap] --> [Capture Thread] --> [Ring Buffer]
+                                             |                      |
+                                      [Timestamp]            [Compression]
+                                             |                      |
+                                             v                      v
+                                    [Sequence Check]         [Batch Write]
+                                                                    |
+                                                                    v
+                                                           [Disk Writer Thread]
+                                                                    |
+                                                                    v
+                                                            [Validation Thread]
+
+KEY PRINCIPLES:
+1. Minimal latency impact on live trading system
+2. Lockless data structures for capture
+3. Batch writes to minimize disk I/O
+4. Continuous validation during capture
+5. Graceful degradation under load
+
+================================================================================
+TIMESTAMP CAPTURE
+================================================================================
+
+THREE CRITICAL TIMESTAMPS:
+--------------------------
+
+1. EXCHANGE TIMESTAMP (t_exchange)
+   - Timestamp assigned by exchange
+   - Most authoritative for event ordering
+   - May have clock skew vs our clock
+   - Primary timestamp for replay
+
+2. RECEIVE TIMESTAMP (t_receive)
+   - Timestamp when packet hits our NIC
+   - Captured via hardware timestamping (SO_TIMESTAMPING)
+   - Used to measure network latency
+   - Critical for latency analysis
+
+3. PROCESSING TIMESTAMP (t_process)
+   - Timestamp when our software processes message
+   - Measures our internal processing delay
+   - Used for performance profiling
+   - Not used in replay directly
+
+TIMESTAMP CAPTURE IMPLEMENTATION:
+----------------------------------
+
+class TimestampCapture {
+public:
+    // Capture all three timestamps for a message
+    struct MessageTimestamps {
+        uint64_t exchange_ns;      // From exchange message
+        uint64_t receive_ns;       // Hardware timestamp
+        uint64_t processing_ns;    // Software timestamp
+        uint64_t sequence_number;  // Exchange sequence
+
+        // Derived metrics
+        uint64_t network_latency() const {
+            return receive_ns - exchange_ns;
+        }
+
+        uint64_t processing_latency() const {
+            return processing_ns - receive_ns;
+        }
+
+        uint64_t total_latency() const {
+            return processing_ns - exchange_ns;
+        }
+    };
+
+    // Enable hardware timestamping on socket
+    static bool enableHardwareTimestamping(int sockfd) {
+        int flags = SOF_TIMESTAMPING_RX_HARDWARE |
+                   SOF_TIMESTAMPING_RAW_HARDWARE |
+                   SOF_TIMESTAMPING_SOFTWARE;
+
+        if (setsockopt(sockfd, SOL_SOCKET, SO_TIMESTAMPING,
+                      &flags, sizeof(flags)) < 0) {
+            LOG_ERROR("Failed to enable hardware timestamping: {}", strerror(errno));
+            return false;
+        }
+
+        LOG_INFO("Hardware timestamping enabled on socket {}", sockfd);
+        return true;
+    }
+
+    // Receive message with hardware timestamp
+    static ssize_t receiveWithTimestamp(int sockfd, void* buffer, size_t len,
+                                       MessageTimestamps& timestamps) {
+        struct iovec iov;
+        iov.iov_base = buffer;
+        iov.iov_len = len;
+
+        // Control message buffer for timestamp
+        char control[512];
+        struct msghdr msg;
+        memset(&msg, 0, sizeof(msg));
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control;
+        msg.msg_controllen = sizeof(control);
+
+        // Receive message
+        ssize_t n = recvmsg(sockfd, &msg, 0);
+        if (n < 0) {
+            return n;
+        }
+
+        // Capture processing timestamp immediately
+        timestamps.processing_ns = rdtsc_to_ns(rdtsc());
+
+        // Extract hardware timestamp from control message
+        struct cmsghdr* cmsg;
+        for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != nullptr;
+             cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+
+            if (cmsg->cmsg_level == SOL_SOCKET &&
+                cmsg->cmsg_type == SO_TIMESTAMPING) {
+
+                struct timespec* ts = (struct timespec*)CMSG_DATA(cmsg);
+
+                // Hardware timestamp is the first timespec
+                timestamps.receive_ns = ts[0].tv_sec * 1000000000ULL + ts[0].tv_nsec;
+                break;
+            }
+        }
+
+        // Extract exchange timestamp from message payload
+        // (This is protocol-specific, example for FIX)
+        timestamps.exchange_ns = extractExchangeTimestamp(buffer, n);
+
+        // Extract sequence number
+        timestamps.sequence_number = extractSequenceNumber(buffer, n);
+
+        return n;
+    }
+
+private:
+    // Convert RDTSC to nanoseconds (calibrated)
+    static uint64_t rdtsc_to_ns(uint64_t tsc) {
+        static double tsc_freq_ghz = calibrateTSC();
+        return static_cast<uint64_t>(tsc / tsc_freq_ghz);
+    }
+
+    static double calibrateTSC() {
+        uint64_t start_tsc = rdtsc();
+        auto start_time = std::chrono::high_resolution_clock::now();
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+        uint64_t end_tsc = rdtsc();
+        auto end_time = std::chrono::high_resolution_clock::now();
+
+        auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            end_time - start_time
+        ).count();
+
+        double tsc_freq_ghz = static_cast<double>(end_tsc - start_tsc) / duration;
+
+        LOG_INFO("TSC frequency: {:.2f} GHz", tsc_freq_ghz);
+        return tsc_freq_ghz;
+    }
+};
+
+================================================================================
+SEQUENCE NUMBER TRACKING
+================================================================================
+
+CRITICAL FOR DETECTING MESSAGE LOSS:
+-------------------------------------
+
+class SequenceTracker {
+public:
+    struct SequenceGap {
+        uint64_t expected_seq;
+        uint64_t received_seq;
+        uint64_t timestamp_ns;
+        size_t gap_size;
+    };
+
+    // Check sequence number continuity
+    bool checkSequence(uint64_t sequence, uint64_t timestamp) {
+        if (expected_sequence_ == 0) {
+            // First message
+            expected_sequence_ = sequence + 1;
+            last_sequence_ = sequence;
+            return true;
+        }
+
+        if (sequence == expected_sequence_) {
+            // In sequence
+            expected_sequence_ = sequence + 1;
+            last_sequence_ = sequence;
+            messages_in_sequence_++;
+            return true;
+        }
+
+        if (sequence < expected_sequence_) {
+            // Duplicate or out-of-order
+            if (sequence == last_sequence_) {
+                duplicates_++;
+                LOG_WARN("Duplicate sequence: {}", sequence);
+            } else {
+                out_of_order_++;
+                LOG_WARN("Out of order: expected {}, got {}",
+                        expected_sequence_, sequence);
+            }
+            return false;
+        }
+
+        // Gap detected
+        size_t gap_size = sequence - expected_sequence_;
+        gaps_.push_back(SequenceGap{
+            expected_sequence_,
+            sequence,
+            timestamp,
+            gap_size
+        });
+
+        total_gaps_ += gap_size;
+
+        LOG_ERROR("Sequence gap: expected {}, got {} (gap size: {})",
+                 expected_sequence_, sequence, gap_size);
+
+        expected_sequence_ = sequence + 1;
+        last_sequence_ = sequence;
+
+        return false;
+    }
+
+    // Statistics
+    void printStatistics() const {
+        LOG_INFO("Sequence Statistics:");
+        LOG_INFO("  Messages in sequence: {}", messages_in_sequence_);
+        LOG_INFO("  Duplicates: {}", duplicates_);
+        LOG_INFO("  Out of order: {}", out_of_order_);
+        LOG_INFO("  Total gaps: {} messages", total_gaps_);
+        LOG_INFO("  Gap events: {}", gaps_.size());
+
+        if (!gaps_.empty()) {
+            LOG_WARN("Sequence gaps detected:");
+            for (const auto& gap : gaps_) {
+                LOG_WARN("  Gap at {}: {} messages (seq {} -> {})",
+                        formatTimestamp(gap.timestamp_ns),
+                        gap.gap_size,
+                        gap.expected_seq,
+                        gap.received_seq);
+            }
+        }
+    }
+
+    double getMessageLossRate() const {
+        uint64_t total = messages_in_sequence_ + total_gaps_;
+        return total > 0 ? static_cast<double>(total_gaps_) / total : 0.0;
+    }
+
+private:
+    uint64_t expected_sequence_{0};
+    uint64_t last_sequence_{0};
+    uint64_t messages_in_sequence_{0};
+    uint64_t duplicates_{0};
+    uint64_t out_of_order_{0};
+    uint64_t total_gaps_{0};
+    std::vector<SequenceGap> gaps_;
+};
+
+================================================================================
+LOCKLESS RING BUFFER FOR CAPTURE
+================================================================================
+
+HIGH-PERFORMANCE SPSC (Single Producer Single Consumer) RING BUFFER:
+--------------------------------------------------------------------
+
+template<typename T, size_t Size>
+class SPSCRingBuffer {
+    static_assert((Size & (Size - 1)) == 0, "Size must be power of 2");
+
+public:
+    SPSCRingBuffer() {
+        // Allocate with huge pages for performance
+        buffer_ = static_cast<T*>(
+            aligned_alloc(4096, sizeof(T) * Size)
+        );
+
+        if (madvise(buffer_, sizeof(T) * Size, MADV_HUGEPAGE) < 0) {
+            LOG_WARN("Failed to use huge pages for ring buffer");
+        }
+    }
+
+    ~SPSCRingBuffer() {
+        free(buffer_);
+    }
+
+    // Producer: Try to push item (non-blocking)
+    bool tryPush(const T& item) {
+        size_t current_head = head_.load(std::memory_order_relaxed);
+        size_t next_head = (current_head + 1) & (Size - 1);
+
+        if (next_head == tail_.load(std::memory_order_acquire)) {
+            // Buffer full
+            drops_++;
+            return false;
+        }
+
+        buffer_[current_head] = item;
+        head_.store(next_head, std::memory_order_release);
+
+        return true;
+    }
+
+    // Consumer: Try to pop item (non-blocking)
+    bool tryPop(T& item) {
+        size_t current_tail = tail_.load(std::memory_order_relaxed);
+
+        if (current_tail == head_.load(std::memory_order_acquire)) {
+            // Buffer empty
+            return false;
+        }
+
+        item = buffer_[current_tail];
+        tail_.store((current_tail + 1) & (Size - 1), std::memory_order_release);
+
+        return true;
+    }
+
+    size_t size() const {
+        size_t h = head_.load(std::memory_order_acquire);
+        size_t t = tail_.load(std::memory_order_acquire);
+        return (h - t) & (Size - 1);
+    }
+
+    bool empty() const {
+        return head_.load(std::memory_order_acquire) ==
+               tail_.load(std::memory_order_acquire);
+    }
+
+    uint64_t getDrops() const { return drops_.load(); }
+
+private:
+    T* buffer_;
+
+    // Cache line alignment to avoid false sharing
+    alignas(64) std::atomic<size_t> head_{0};
+    alignas(64) std::atomic<size_t> tail_{0};
+    alignas(64) std::atomic<uint64_t> drops_{0};
+};
+
+================================================================================
+COMPLETE TICK CAPTURE IMPLEMENTATION
+================================================================================
+
+class TickCapture {
+public:
+    struct CaptureConfig {
+        std::vector<std::string> symbols;
+        std::string multicast_group;
+        int multicast_port;
+        std::string output_directory;
+        size_t ring_buffer_size = 1024 * 1024;  // 1M entries
+        size_t batch_size = 10000;              // Write batch
+        bool enable_compression = true;
+        bool enable_validation = true;
+        int cpu_affinity_capture = 2;
+        int cpu_affinity_writer = 3;
+    };
+
+    explicit TickCapture(const CaptureConfig& config)
+        : config_(config)
+        , ring_buffer_(std::make_unique<SPSCRingBuffer<CapturedTick, 1024*1024>>())
+    {
+        // Create output directory
+        std::filesystem::create_directories(config_.output_directory);
+    }
+
+    bool start() {
+        if (running_.load()) {
+            LOG_ERROR("Capture already running");
+            return false;
+        }
+
+        // Setup multicast socket
+        sockfd_ = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sockfd_ < 0) {
+            LOG_ERROR("Failed to create socket");
+            return false;
+        }
+
+        // Enable hardware timestamping
+        if (!TimestampCapture::enableHardwareTimestamping(sockfd_)) {
+            LOG_WARN("Hardware timestamping not available, using software timestamps");
+        }
+
+        // Bind to multicast group
+        struct sockaddr_in addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = INADDR_ANY;
+        addr.sin_port = htons(config_.multicast_port);
+
+        if (bind(sockfd_, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+            LOG_ERROR("Failed to bind socket: {}", strerror(errno));
+            close(sockfd_);
+            return false;
+        }
+
+        // Join multicast group
+        struct ip_mreq mreq;
+        mreq.imr_multiaddr.s_addr = inet_addr(config_.multicast_group.c_str());
+        mreq.imr_interface.s_addr = INADDR_ANY;
+
+        if (setsockopt(sockfd_, IPPROTO_IP, IP_ADD_MEMBERSHIP,
+                      &mreq, sizeof(mreq)) < 0) {
+            LOG_ERROR("Failed to join multicast group: {}", strerror(errno));
+            close(sockfd_);
+            return false;
+        }
+
+        // Increase socket buffer
+        int bufsize = 128 * 1024 * 1024;  // 128 MB
+        setsockopt(sockfd_, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
+
+        running_.store(true);
+
+        // Start capture thread
+        capture_thread_ = std::thread([this]() { captureLoop(); });
+
+        // Set CPU affinity
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(config_.cpu_affinity_capture, &cpuset);
+        pthread_setaffinity_np(capture_thread_.native_handle(),
+                              sizeof(cpu_set_t), &cpuset);
+
+        // Start writer thread
+        writer_thread_ = std::thread([this]() { writerLoop(); });
+
+        CPU_ZERO(&cpuset);
+        CPU_SET(config_.cpu_affinity_writer, &cpuset);
+        pthread_setaffinity_np(writer_thread_.native_handle(),
+                              sizeof(cpu_set_t), &cpuset);
+
+        LOG_INFO("Tick capture started");
+        return true;
+    }
+
+    void stop() {
+        if (!running_.load()) {
+            return;
+        }
+
+        running_.store(false);
+
+        if (capture_thread_.joinable()) {
+            capture_thread_.join();
+        }
+
+        if (writer_thread_.joinable()) {
+            writer_thread_.join();
+        }
+
+        close(sockfd_);
+
+        LOG_INFO("Tick capture stopped");
+        printStatistics();
+    }
+
+    void finalize() {
+        // Flush all buffers
+        flushBuffers();
+
+        // Write index files
+        writeIndexFiles();
+
+        // Validate captured data
+        if (config_.enable_validation) {
+            validateCapturedData();
+        }
+
+        LOG_INFO("Tick capture finalized");
+    }
+
+private:
+    struct CapturedTick {
+        TimestampCapture::MessageTimestamps timestamps;
+        uint8_t data[2048];  // Raw message data
+        size_t data_len;
+        std::string symbol;
+    };
+
+    void captureLoop() {
+        // Set thread priority
+        struct sched_param param;
+        param.sched_priority = 90;
+        pthread_setschedparam(pthread_self(), SCHED_FIFO, &param);
+
+        uint8_t recv_buffer[4096];
+
+        while (running_.load()) {
+            CapturedTick tick;
+
+            // Receive with hardware timestamp
+            ssize_t n = TimestampCapture::receiveWithTimestamp(
+                sockfd_, recv_buffer, sizeof(recv_buffer), tick.timestamps
+            );
+
+            if (n < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    continue;
+                }
+                LOG_ERROR("Receive error: {}", strerror(errno));
+                break;
+            }
+
+            if (n == 0) {
+                continue;
+            }
+
+            // Copy message data
+            tick.data_len = std::min(static_cast<size_t>(n), sizeof(tick.data));
+            memcpy(tick.data, recv_buffer, tick.data_len);
+
+            // Parse symbol (protocol-specific)
+            tick.symbol = parseSymbol(recv_buffer, n);
+
+            // Check sequence
+            if (!sequence_tracker_.checkSequence(
+                    tick.timestamps.sequence_number,
+                    tick.timestamps.exchange_ns)) {
+                sequence_errors_++;
+            }
+
+            // Push to ring buffer
+            if (!ring_buffer_->tryPush(tick)) {
+                // Buffer full - this is bad!
+                buffer_overruns_++;
+                if (buffer_overruns_ % 1000 == 0) {
+                    LOG_ERROR("Ring buffer full! Drops: {}", buffer_overruns_);
+                }
+            }
+
+            messages_captured_++;
+        }
+    }
+
+    void writerLoop() {
+        std::vector<CapturedTick> batch;
+        batch.reserve(config_.batch_size);
+
+        // Open output files per symbol
+        std::unordered_map<std::string, std::unique_ptr<TickWriter>> writers;
+
+        while (running_.load() || !ring_buffer_->empty()) {
+            CapturedTick tick;
+
+            // Collect batch
+            while (batch.size() < config_.batch_size && ring_buffer_->tryPop(tick)) {
+                batch.push_back(tick);
+            }
+
+            if (batch.empty()) {
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+                continue;
+            }
+
+            // Write batch to disk
+            for (const auto& tick : batch) {
+                auto it = writers.find(tick.symbol);
+                if (it == writers.end()) {
+                    // Create writer for new symbol
+                    std::string filename = config_.output_directory + "/" +
+                                         tick.symbol + ".ticks";
+                    writers[tick.symbol] = std::make_unique<TickWriter>(filename);
+                    it = writers.find(tick.symbol);
+                }
+
+                it->second->writeTick(tick);
+                messages_written_++;
+            }
+
+            batch.clear();
+
+            // Periodic flush
+            if (messages_written_ % 100000 == 0) {
+                for (auto& [symbol, writer] : writers) {
+                    writer->flush();
+                }
+            }
+        }
+
+        // Final flush
+        for (auto& [symbol, writer] : writers) {
+            writer->close();
+        }
+    }
+
+    void printStatistics() {
+        LOG_INFO("Capture Statistics:");
+        LOG_INFO("  Messages captured: {}", messages_captured_);
+        LOG_INFO("  Messages written: {}", messages_written_);
+        LOG_INFO("  Buffer overruns: {}", buffer_overruns_);
+        LOG_INFO("  Sequence errors: {}", sequence_errors_);
+        LOG_INFO("  Ring buffer drops: {}", ring_buffer_->getDrops());
+
+        sequence_tracker_.printStatistics();
+    }
+
+    CaptureConfig config_;
+    std::unique_ptr<SPSCRingBuffer<CapturedTick, 1024*1024>> ring_buffer_;
+
+    int sockfd_{-1};
+    std::atomic<bool> running_{false};
+
+    std::thread capture_thread_;
+    std::thread writer_thread_;
+
+    SequenceTracker sequence_tracker_;
+
+    std::atomic<uint64_t> messages_captured_{0};
+    std::atomic<uint64_t> messages_written_{0};
+    std::atomic<uint64_t> buffer_overruns_{0};
+    std::atomic<uint64_t> sequence_errors_{0};
+};
+
+================================================================================
+COMPRESSION STRATEGIES
+================================================================================
+
+DELTA ENCODING FOR TIMESTAMPS:
+-------------------------------
+
+class DeltaEncoder {
+public:
+    // Encode timestamp as delta from last timestamp
+    static size_t encodeTimestamp(uint64_t timestamp, uint8_t* output) {
+        static uint64_t last_timestamp = 0;
+
+        int64_t delta = timestamp - last_timestamp;
+        last_timestamp = timestamp;
+
+        // Variable-length encoding
+        return encodeVarint(delta, output);
+    }
+
+    // Encode price as delta from last price
+    static size_t encodePrice(int64_t price, uint8_t* output) {
+        static int64_t last_price = 0;
+
+        int64_t delta = price - last_price;
+        last_price = delta;
+
+        return encodeVarint(delta, output);
+    }
+
+private:
+    static size_t encodeVarint(int64_t value, uint8_t* output) {
+        // Zigzag encoding for signed values
+        uint64_t zigzag = (value << 1) ^ (value >> 63);
+
+        size_t n = 0;
+        while (zigzag >= 0x80) {
+            output[n++] = static_cast<uint8_t>((zigzag & 0x7F) | 0x80);
+            zigzag >>= 7;
+        }
+        output[n++] = static_cast<uint8_t>(zigzag & 0x7F);
+
+        return n;
+    }
+};
+
+TYPICAL COMPRESSION RATIOS:
+- Raw ticks: 100-500 MB/hour/symbol
+- Delta encoding: 30-100 MB/hour/symbol (3-5x)
+- ZSTD compression: 10-30 MB/hour/symbol (10-20x)
+
+================================================================================
+NEXT: Read 03_replay_engine_impl.txt for complete replay implementation
+================================================================================

@@ -1,0 +1,591 @@
+================================================================================
+MARKET MAKING RISK MANAGEMENT
+================================================================================
+
+File: 09_mm_risk_management.txt
+Purpose: Comprehensive risk controls for market making systems
+Topics: Position limits, P&L limits, circuit breakers, stress testing
+Last Updated: 2025-11-26
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+
+1. Risk Management Framework
+2. Position Limits and Controls
+3. P&L Limits
+4. Circuit Breakers
+5. Greeks Management
+6. Concentration Limits
+7. Stress Testing
+8. Real-Time Risk Monitoring
+9. Kill Switches
+10. C++ Risk Management System
+
+================================================================================
+1. RISK MANAGEMENT FRAMEWORK
+================================================================================
+
+MULTI-LAYER DEFENSE:
+--------------------
+
+Layer 1: Pre-Trade Risk Checks (< 1μs)
+├── Order size validation
+├── Position limit check
+├── Price collar check
+└── Duplicate prevention
+
+Layer 2: Intra-Trade Monitoring (continuous)
+├── Position accumulation rate
+├── Fill rate anomalies
+├── P&L drawdown
+└── Toxicity monitoring
+
+Layer 3: Portfolio Controls (periodic)
+├── Total notional exposure
+├── Sector concentration
+├── Correlation risk
+└── Var/CVaR limits
+
+Layer 4: Circuit Breakers (event-driven)
+├── Rapid loss events
+├── System anomalies
+├── Market disruptions
+└── Operational failures
+
+RISK CONTROL OBJECTIVES:
+------------------------
+
+1. Prevent Catastrophic Losses
+   - Max daily loss: 1-2% of capital
+   - Max position: Based on ADV
+
+2. Maintain Operational Integrity
+   - No runaway algorithms
+   - Graceful degradation
+   - Quick recovery
+
+3. Regulatory Compliance
+   - SEC Rule 15c3-5 (Market Access)
+   - Position reporting
+   - Audit trail
+
+4. Capital Efficiency
+   - Don't over-constrain profitable trading
+   - Dynamic limits based on conditions
+   - Risk-adjusted position sizing
+
+================================================================================
+2. POSITION LIMITS AND CONTROLS
+================================================================================
+
+POSITION LIMIT TYPES:
+---------------------
+
+1. Absolute Position Limits
+   Max_Position_Shares = f(ADV, Volatility, Capital)
+
+   Typical: 2-5% of ADV
+   Example: Stock with 10M ADV → 200K-500K share limit
+
+2. Notional Limits
+   Max_Notional = Max_Position_Shares × Price
+   
+   Example: $10M notional limit
+   $100 stock → 100K shares
+   $50 stock → 200K shares
+
+3. Greeks Limits (for options)
+   - Delta: ±$500K
+   - Gamma: ±$100K per 1% move
+   - Vega: ±$50K per 1% vol change
+
+4. Concentration Limits
+   - Max 20% of capital in single name
+   - Max 40% in single sector
+
+DYNAMIC POSITION LIMITS:
+------------------------
+
+Adjust limits based on conditions:
+
+Limit(t) = Base_Limit × Liquidity_Factor × Vol_Factor × Time_Factor
+
+Liquidity_Factor:
+- High volume → 1.5×
+- Low volume → 0.5×
+
+Vol_Factor:
+- Low volatility → 1.3×
+- High volatility → 0.7×
+
+Time_Factor:
+- Morning: 1.0×
+- Midday: 1.2×
+- Near close: 0.5× (reduce positions)
+
+C++ POSITION LIMIT MANAGER:
+----------------------------
+
+class PositionLimitManager {
+private:
+    struct SymbolLimits {
+        std::string symbol;
+        int base_limit;
+        int current_limit;
+        int current_position;
+        double price;
+        double avg_daily_volume;
+    };
+
+    std::unordered_map<std::string, SymbolLimits> limits_;
+    double total_capital_;
+    double max_notional_per_symbol_;
+    double max_portfolio_notional_;
+
+public:
+    PositionLimitManager(double capital, double max_notional_per_symbol)
+        : total_capital_(capital)
+        , max_notional_per_symbol_(max_notional_per_symbol)
+        , max_portfolio_notional_(capital * 5.0) {}  // 5× leverage
+
+    void setSymbolLimit(const std::string& symbol,
+                       int base_limit,
+                       double price,
+                       double adv) {
+        limits_[symbol] = {symbol, base_limit, base_limit, 0, price, adv};
+    }
+
+    // Pre-trade check
+    bool checkOrderAllowed(const std::string& symbol,
+                          int order_size,
+                          double price,
+                          std::string& rejection_reason) {
+        auto it = limits_.find(symbol);
+        if (it == limits_.end()) {
+            rejection_reason = "Symbol not configured";
+            return false;
+        }
+
+        auto& limits = it->second;
+
+        // New position after this order
+        int new_position = limits.current_position + order_size;
+
+        // Check absolute position
+        if (std::abs(new_position) > limits.current_limit) {
+            rejection_reason = "Position limit exceeded: " +
+                             std::to_string(limits.current_limit);
+            return false;
+        }
+
+        // Check notional limit
+        double new_notional = std::abs(new_position) * price;
+        if (new_notional > max_notional_per_symbol_) {
+            rejection_reason = "Notional limit exceeded: $" +
+                             std::to_string(max_notional_per_symbol_);
+            return false;
+        }
+
+        // Check portfolio notional
+        double total_notional = calculateTotalNotional();
+        total_notional -= std::abs(limits.current_position) * limits.price;
+        total_notional += new_notional;
+
+        if (total_notional > max_portfolio_notional_) {
+            rejection_reason = "Portfolio notional limit exceeded";
+            return false;
+        }
+
+        return true;
+    }
+
+    void updatePosition(const std::string& symbol, int fill_size) {
+        auto it = limits_.find(symbol);
+        if (it != limits_.end()) {
+            it->second.current_position += fill_size;
+        }
+    }
+
+    // Dynamic limit adjustment
+    void adjustLimits(double liquidity_factor,
+                     double volatility_factor,
+                     double time_factor) {
+        for (auto& [symbol, limits] : limits_) {
+            limits.current_limit = static_cast<int>(
+                limits.base_limit * liquidity_factor *
+                volatility_factor * time_factor
+            );
+
+            // Ensure minimum limit
+            limits.current_limit = std::max(limits.current_limit, 100);
+        }
+    }
+
+private:
+    double calculateTotalNotional() const {
+        double total = 0.0;
+        for (const auto& [symbol, limits] : limits_) {
+            total += std::abs(limits.current_position) * limits.price;
+        }
+        return total;
+    }
+};
+
+================================================================================
+3. P&L LIMITS
+================================================================================
+
+P&L LIMIT TYPES:
+----------------
+
+1. Daily Loss Limit
+   Max_Daily_Loss = -1% to -2% of capital
+
+2. Intraday Drawdown
+   Max_Drawdown_From_High = -0.5% to -1% of capital
+
+3. Per-Symbol Loss Limit
+   Max_Loss_Per_Symbol = -0.2% to -0.5% of capital
+
+4. Consecutive Loss Limit
+   Max_Consecutive_Losing_Trades = 5-10
+
+5. Hourly Loss Limit
+   Max_Hourly_Loss = -0.3% to -0.5% of capital
+
+P&L ACTIONS:
+------------
+
+Warning Level (50% of limit):
+- Alert traders
+- Increase monitoring
+- Reduce position sizes
+
+Critical Level (80% of limit):
+- Stop new positions
+- Flatten risky positions
+- Aggressive hedging
+
+Breach Level (100% of limit):
+- Immediate stop trading
+- Flatten ALL positions
+- Investigate root cause
+
+C++ P&L LIMIT MONITOR:
+----------------------
+
+class PnLLimitMonitor {
+private:
+    double capital_;
+    double daily_loss_limit_;
+    double drawdown_limit_;
+
+    double daily_pnl_;
+    double high_water_mark_;
+    double starting_pnl_;
+
+    std::unordered_map<std::string, double> symbol_pnl_;
+    std::unordered_map<std::string, double> symbol_loss_limits_;
+
+public:
+    enum class LimitStatus {
+        NORMAL,
+        WARNING,
+        CRITICAL,
+        BREACHED
+    };
+
+    PnLLimitMonitor(double capital)
+        : capital_(capital)
+        , daily_loss_limit_(-capital * 0.02)  // -2%
+        , drawdown_limit_(-capital * 0.01)     // -1%
+        , daily_pnl_(0.0)
+        , high_water_mark_(0.0)
+        , starting_pnl_(0.0) {}
+
+    void updatePnL(double realized_pnl, double unrealized_pnl) {
+        daily_pnl_ = realized_pnl + unrealized_pnl;
+
+        // Update high water mark
+        if (daily_pnl_ > high_water_mark_) {
+            high_water_mark_ = daily_pnl_;
+        }
+    }
+
+    void updateSymbolPnL(const std::string& symbol, double pnl) {
+        symbol_pnl_[symbol] = pnl;
+    }
+
+    LimitStatus checkDailyLossLimit() const {
+        if (daily_pnl_ < daily_loss_limit_) {
+            return LimitStatus::BREACHED;
+        } else if (daily_pnl_ < daily_loss_limit_ * 0.8) {
+            return LimitStatus::CRITICAL;
+        } else if (daily_pnl_ < daily_loss_limit_ * 0.5) {
+            return LimitStatus::WARNING;
+        }
+        return LimitStatus::NORMAL;
+    }
+
+    LimitStatus checkDrawdownLimit() const {
+        double drawdown = daily_pnl_ - high_water_mark_;
+
+        if (drawdown < drawdown_limit_) {
+            return LimitStatus::BREACHED;
+        } else if (drawdown < drawdown_limit_ * 0.8) {
+            return LimitStatus::CRITICAL;
+        } else if (drawdown < drawdown_limit_ * 0.5) {
+            return LimitStatus::WARNING;
+        }
+        return LimitStatus::NORMAL;
+    }
+
+    LimitStatus checkSymbolLossLimit(const std::string& symbol) const {
+        auto it = symbol_pnl_.find(symbol);
+        if (it == symbol_pnl_.end()) return LimitStatus::NORMAL;
+
+        double loss_limit = -capital_ * 0.005;  // -0.5%
+        double pnl = it->second;
+
+        if (pnl < loss_limit) {
+            return LimitStatus::BREACHED;
+        } else if (pnl < loss_limit * 0.8) {
+            return LimitStatus::CRITICAL;
+        }
+        return LimitStatus::NORMAL;
+    }
+
+    bool shouldStopTrading() const {
+        return checkDailyLossLimit() == LimitStatus::BREACHED ||
+               checkDrawdownLimit() == LimitStatus::BREACHED;
+    }
+
+    void reset() {
+        daily_pnl_ = 0.0;
+        high_water_mark_ = 0.0;
+        starting_pnl_ = 0.0;
+        symbol_pnl_.clear();
+    }
+};
+
+================================================================================
+4. CIRCUIT BREAKERS
+================================================================================
+
+CIRCUIT BREAKER TRIGGERS:
+--------------------------
+
+1. Rapid Loss Event
+   Loss > $X in < Y seconds
+   Example: -$5K in < 10 seconds
+
+2. Fill Rate Anomaly
+   Fill rate > 95% (usually 70-80%)
+   Indicates potential picking-off
+
+3. Position Accumulation Rate
+   Position change > X shares/minute
+   Example: > 10K shares/min
+
+4. System Health Degradation
+   - Latency spike (> 100ms)
+   - Feed loss
+   - Execution errors
+
+5. Market Disruption
+   - Volatility circuit breaker
+   - Trading halt
+   - News event
+
+CIRCUIT BREAKER ACTIONS:
+-------------------------
+
+Level 1 (Warning):
+- Log alert
+- Notify operators
+- Reduce quote sizes by 50%
+
+Level 2 (Critical):
+- Cancel all orders
+- Stop new orders
+- Hold positions
+
+Level 3 (Emergency):
+- Cancel all orders
+- Flatten all positions
+- Lockout trading
+
+C++ CIRCUIT BREAKER SYSTEM:
+----------------------------
+
+class CircuitBreakerSystem {
+private:
+    struct CircuitBreaker {
+        std::string name;
+        bool is_triggered;
+        uint64_t trigger_time;
+        std::string trigger_reason;
+    };
+
+    std::unordered_map<std::string, CircuitBreaker> breakers_;
+
+    PnLLimitMonitor& pnl_monitor_;
+    PositionLimitManager& position_manager_;
+
+    double rapid_loss_threshold_;
+    uint64_t rapid_loss_window_ms_;
+
+public:
+    CircuitBreakerSystem(PnLLimitMonitor& pnl, PositionLimitManager& pos)
+        : pnl_monitor_(pnl)
+        , position_manager_(pos)
+        , rapid_loss_threshold_(-5000.0)
+        , rapid_loss_window_ms_(10000) {}
+
+    enum class Action {
+        ALLOW_TRADING,
+        REDUCE_SIZES,
+        STOP_NEW_ORDERS,
+        FLATTEN_POSITIONS
+    };
+
+    Action checkAll(double current_pnl,
+                   double pnl_1_min_ago,
+                   int fill_rate_pct,
+                   uint64_t avg_latency_us) {
+        bool any_triggered = false;
+
+        // Check rapid loss
+        if (current_pnl - pnl_1_min_ago < rapid_loss_threshold_) {
+            triggerBreaker("rapid_loss", "Loss exceeded threshold in short period");
+            any_triggered = true;
+        }
+
+        // Check fill rate anomaly
+        if (fill_rate_pct > 95) {
+            triggerBreaker("fill_rate", "Fill rate suspiciously high");
+            any_triggered = true;
+        }
+
+        // Check latency
+        if (avg_latency_us > 100'000) {  // 100ms
+            triggerBreaker("latency", "System latency degraded");
+            any_triggered = true;
+        }
+
+        // Check P&L limits
+        if (pnl_monitor_.shouldStopTrading()) {
+            triggerBreaker("pnl_limit", "P&L limit breached");
+            any_triggered = true;
+        }
+
+        // Determine action based on triggers
+        if (hasBreaker("pnl_limit") || hasBreaker("rapid_loss")) {
+            return Action::FLATTEN_POSITIONS;
+        } else if (hasBreaker("fill_rate") || hasBreaker("latency")) {
+            return Action::STOP_NEW_ORDERS;
+        } else if (any_triggered) {
+            return Action::REDUCE_SIZES;
+        }
+
+        return Action::ALLOW_TRADING;
+    }
+
+    void triggerBreaker(const std::string& name, const std::string& reason) {
+        auto& breaker = breakers_[name];
+        if (!breaker.is_triggered) {
+            breaker.name = name;
+            breaker.is_triggered = true;
+            breaker.trigger_time = getCurrentTime();
+            breaker.trigger_reason = reason;
+
+            logBreaker(breaker);
+        }
+    }
+
+    bool hasBreaker(const std::string& name) const {
+        auto it = breakers_.find(name);
+        return it != breakers_.end() && it->second.is_triggered;
+    }
+
+    void resetBreaker(const std::string& name) {
+        auto it = breakers_.find(name);
+        if (it != breakers_.end()) {
+            it->second.is_triggered = false;
+        }
+    }
+
+    void resetAll() {
+        breakers_.clear();
+    }
+
+private:
+    uint64_t getCurrentTime() const {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()
+        ).count();
+    }
+
+    void logBreaker(const CircuitBreaker& breaker) {
+        // Log to file/alert system
+        std::cerr << "CIRCUIT BREAKER TRIGGERED: " << breaker.name
+                  << " - " << breaker.trigger_reason << std::endl;
+    }
+};
+
+================================================================================
+COMPREHENSIVE RISK SUMMARY
+================================================================================
+
+Risk Control Checklist:
+-----------------------
+□ Position limits per symbol
+□ Portfolio notional limits
+□ Daily P&L loss limit
+□ Intraday drawdown limit
+□ Per-symbol loss limit
+□ Rapid loss circuit breaker
+□ Fill rate anomaly detection
+□ Latency monitoring
+□ Order rate limits
+□ Duplicate order prevention
+□ Price collar checks
+□ Market disruption monitoring
+
+Risk Metrics Dashboard:
+-----------------------
+- Current Positions: Monitor real-time
+- P&L: Update every 100ms
+- VaR (95%): Calculate every minute
+- Sharpe Ratio: Track intraday
+- Max Drawdown: Update continuously
+- Fill Rate: Monitor per minute
+- Adverse Selection Ratio: Track hourly
+
+Kill Switch Criteria:
+---------------------
+1. Daily loss > 2% of capital
+2. Drawdown > 1% from high
+3. System latency > 100ms sustained
+4. Fill rate > 95% for 5 minutes
+5. Position accumulation > 3× normal
+6. Manual override by risk manager
+
+Recovery Procedures:
+--------------------
+1. Flatten all positions
+2. Cancel all orders
+3. Disconnect from exchanges
+4. Analyze logs
+5. Identify root cause
+6. Fix issue
+7. Gradual restart with small sizes
+8. Monitor closely for 1 hour
+9. Return to full operation if stable
+
+Next: Read 10_mm_analytics.txt for performance metrics.
+
+================================================================================
+END OF RISK MANAGEMENT
+================================================================================

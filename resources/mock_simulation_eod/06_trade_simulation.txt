@@ -1,0 +1,849 @@
+================================================================================
+TRADE EXECUTION SIMULATION
+Trade Fill Simulation, Slippage, and Market Impact Modeling
+================================================================================
+
+VERSION: 1.0
+DOCUMENT: Comprehensive Trade Execution Simulation
+LAST UPDATED: 2025-11-26
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+
+1. Overview
+2. Fill Models and Algorithms
+3. Slippage Simulation
+4. Market Impact Modeling
+5. Partial Fill Simulation
+6. Adverse Selection
+7. Complete Implementation
+8. Realistic Fill Profiles
+
+================================================================================
+1. OVERVIEW
+================================================================================
+
+The Trade Execution Simulator models realistic order fills including partial
+fills, slippage, market impact, and adverse selection - critical for accurate
+backtest results.
+
+KEY FEATURES:
+-------------
+- Multiple fill models (immediate, probabilistic, queue-based)
+- Realistic slippage based on order size and market conditions
+- Market impact (temporary and permanent)
+- Adverse selection modeling
+- Partial fill simulation with time priority
+- Fill probability based on order book depth
+- Information leakage detection
+
+FILL MODELS:
+------------
+1. Immediate Fill: Instant execution at best price
+2. Probabilistic Fill: Based on order book depth and volume
+3. Queue Position: Track position in order book queue
+4. Market Impact: Price moves based on order size
+5. Adverse Selection: Informed traders get better fills
+
+================================================================================
+2. FILL MODELS AND ALGORITHMS
+================================================================================
+
+2.1 FILL MODEL INTERFACE
+-------------------------
+
+enum class FillModel : uint8_t {
+    IMMEDIATE,          // Fill immediately at market price
+    PROBABILISTIC,      // Fill based on probability
+    QUEUE_BASED,        // Track queue position
+    MARKET_IMPACT,      // Include market impact
+    ADVERSE_SELECTION   // Model adverse selection
+};
+
+class IFillModel {
+public:
+    virtual ~IFillModel() = default;
+
+    virtual FillResult simulateFill(
+        const Order& order,
+        const OrderBook& book,
+        uint64_t timestamp_ns) = 0;
+
+    virtual void updateMarketState(const MarketData& data) = 0;
+};
+
+struct FillResult {
+    bool filled;
+    bool partial_fill;
+    uint64_t filled_quantity;
+    double fill_price;
+    uint64_t fill_timestamp_ns;
+    double slippage_bps;
+    double market_impact_bps;
+
+    FillResult()
+        : filled(false), partial_fill(false), filled_quantity(0),
+          fill_price(0.0), fill_timestamp_ns(0), slippage_bps(0.0),
+          market_impact_bps(0.0) {}
+};
+
+2.2 PROBABILISTIC FILL MODEL
+-----------------------------
+
+class ProbabilisticFillModel : public IFillModel {
+public:
+    struct Config {
+        double base_fill_probability{0.9};
+        double liquidity_factor{1.0};
+        bool use_volume_weighting{true};
+        bool use_spread_adjustment{true};
+    };
+
+    explicit ProbabilisticFillModel(const Config& config = Config())
+        : config_(config), rng_(std::random_device{}()) {}
+
+    FillResult simulateFill(const Order& order, const OrderBook& book,
+                           uint64_t timestamp_ns) override {
+        FillResult result;
+
+        // Calculate fill probability
+        double fill_prob = calculateFillProbability(order, book);
+
+        std::uniform_real_distribution<double> dist(0.0, 1.0);
+        if (dist(rng_) < fill_prob) {
+            // Determine fill quantity
+            result.filled_quantity = calculateFillQuantity(order, book);
+            result.filled = true;
+            result.partial_fill = (result.filled_quantity < order.remaining_quantity);
+
+            // Calculate fill price with slippage
+            result.fill_price = calculateFillPrice(order, book, result.filled_quantity);
+            result.fill_timestamp_ns = timestamp_ns;
+
+            // Calculate slippage
+            result.slippage_bps = ((result.fill_price - order.price) /
+                                  order.price) * 10000.0;
+        }
+
+        return result;
+    }
+
+    void updateMarketState(const MarketData& data) override {
+        recent_volume_.push_back(data.volume);
+        if (recent_volume_.size() > 100) {
+            recent_volume_.pop_front();
+        }
+    }
+
+private:
+    Config config_;
+    std::mt19937_64 rng_;
+    std::deque<uint64_t> recent_volume_;
+
+    double calculateFillProbability(const Order& order, const OrderBook& book) {
+        double base_prob = config_.base_fill_probability;
+
+        // Adjust for order size relative to book depth
+        uint64_t book_depth = (order.side == OrderSide::BUY)
+            ? book.getAskSize(order.price)
+            : book.getBidSize(order.price);
+
+        if (book_depth > 0) {
+            double size_ratio = static_cast<double>(order.remaining_quantity) /
+                              book_depth;
+            base_prob *= std::exp(-size_ratio * 0.5);  // Exponential decay
+        }
+
+        // Adjust for spread
+        if (config_.use_spread_adjustment) {
+            double spread_bps = (book.getSpread() / book.getMidPrice()) * 10000.0;
+            if (spread_bps > 10.0) {  // Wide spread
+                base_prob *= 0.8;
+            }
+        }
+
+        // Adjust for market volatility
+        if (config_.use_volume_weighting) {
+            double avg_volume = getAverageVolume();
+            if (avg_volume > 0) {
+                double volume_ratio = book.getTotalVolume() / avg_volume;
+                base_prob *= std::min(1.5, volume_ratio);
+            }
+        }
+
+        return std::min(1.0, base_prob);
+    }
+
+    uint64_t calculateFillQuantity(const Order& order, const OrderBook& book) {
+        uint64_t book_depth = (order.side == OrderSide::BUY)
+            ? book.getAskSize(order.price)
+            : book.getBidSize(order.price);
+
+        // Can't fill more than available in book
+        uint64_t max_fill = std::min(order.remaining_quantity, book_depth);
+
+        // Probabilistic partial fill
+        std::uniform_real_distribution<double> dist(0.7, 1.0);
+        double fill_fraction = dist(rng_);
+
+        return static_cast<uint64_t>(max_fill * fill_fraction);
+    }
+
+    double calculateFillPrice(const Order& order, const OrderBook& book,
+                             uint64_t fill_quantity) {
+        // Walk the book to determine average fill price
+        double total_value = 0.0;
+        uint64_t remaining = fill_quantity;
+
+        auto levels = (order.side == OrderSide::BUY)
+            ? book.getAsks(10)
+            : book.getBids(10);
+
+        for (const auto& level : levels) {
+            if (remaining == 0) break;
+
+            uint64_t fill_at_level = std::min(remaining, level.total_quantity);
+            total_value += fill_at_level * level.price;
+            remaining -= fill_at_level;
+        }
+
+        if (fill_quantity > 0) {
+            return total_value / fill_quantity;
+        }
+
+        return order.price;
+    }
+
+    double getAverageVolume() const {
+        if (recent_volume_.empty()) return 0.0;
+        return std::accumulate(recent_volume_.begin(), recent_volume_.end(), 0ULL) /
+               static_cast<double>(recent_volume_.size());
+    }
+};
+
+2.3 QUEUE-BASED FILL MODEL
+---------------------------
+
+class QueueBasedFillModel : public IFillModel {
+public:
+    struct QueuePosition {
+        uint64_t order_id;
+        double price;
+        uint64_t initial_quantity;
+        uint64_t position_in_queue;
+        uint64_t join_timestamp_ns;
+    };
+
+    FillResult simulateFill(const Order& order, const OrderBook& book,
+                           uint64_t timestamp_ns) override {
+        FillResult result;
+
+        // Get or create queue position
+        auto it = queue_positions_.find(order.order_id);
+        if (it == queue_positions_.end()) {
+            // New order - add to queue
+            QueuePosition pos;
+            pos.order_id = order.order_id;
+            pos.price = order.price;
+            pos.initial_quantity = order.quantity;
+            pos.position_in_queue = estimateQueuePosition(order, book);
+            pos.join_timestamp_ns = timestamp_ns;
+            queue_positions_[order.order_id] = pos;
+            return result;  // No fill on first tick
+        }
+
+        QueuePosition& pos = it->second;
+
+        // Simulate queue advancement based on market trades
+        uint64_t volume_traded = estimateVolumeTraded(order, book, timestamp_ns);
+        if (volume_traded > pos.position_in_queue) {
+            // Our order is at front of queue
+            uint64_t fill_qty = std::min(order.remaining_quantity,
+                                        volume_traded - pos.position_in_queue);
+
+            result.filled = true;
+            result.filled_quantity = fill_qty;
+            result.fill_price = pos.price;
+            result.fill_timestamp_ns = timestamp_ns;
+            result.partial_fill = (fill_qty < order.remaining_quantity);
+
+            // Update queue position
+            pos.position_in_queue = 0;
+
+            if (!result.partial_fill) {
+                queue_positions_.erase(it);
+            }
+        } else {
+            // Still waiting in queue
+            pos.position_in_queue -= volume_traded;
+        }
+
+        return result;
+    }
+
+    void updateMarketState(const MarketData& data) override {
+        last_market_data_ = data;
+    }
+
+private:
+    std::unordered_map<uint64_t, QueuePosition> queue_positions_;
+    MarketData last_market_data_;
+
+    uint64_t estimateQueuePosition(const Order& order, const OrderBook& book) {
+        // Estimate position based on existing book depth
+        uint64_t depth = (order.side == OrderSide::BUY)
+            ? book.getBidSize(order.price)
+            : book.getAskSize(order.price);
+
+        // Assume we join at the back of the queue at this price
+        return depth;
+    }
+
+    uint64_t estimateVolumeTraded(const Order& order, const OrderBook& book,
+                                  uint64_t timestamp_ns) {
+        // Estimate based on recent market activity
+        // Simplified: use a fraction of available liquidity
+        uint64_t depth = (order.side == OrderSide::BUY)
+            ? book.getBidSize(order.price)
+            : book.getAskSize(order.price);
+
+        // Assume 10% of depth trades per tick
+        return depth / 10;
+    }
+};
+
+================================================================================
+3. SLIPPAGE SIMULATION
+================================================================================
+
+3.1 SLIPPAGE CALCULATOR
+------------------------
+
+class SlippageCalculator {
+public:
+    struct SlippageModel {
+        double fixed_slippage_bps;          // Fixed component
+        double proportional_factor;         // Proportional to size
+        double volatility_factor;           // Proportional to volatility
+        double spread_factor;               // Proportional to spread
+        bool use_sqrt_model;                // Square root model for impact
+    };
+
+    explicit SlippageCalculator(const SlippageModel& model)
+        : model_(model) {}
+
+    double calculateSlippage(const Order& order, const OrderBook& book,
+                            const MarketState& state) {
+        double slippage = model_.fixed_slippage_bps;
+
+        // Size-dependent component
+        double notional = order.quantity * order.price;
+        double avg_daily_volume = state.getAverageDailyVolume(order.symbol);
+
+        if (avg_daily_volume > 0) {
+            double participation_rate = notional / avg_daily_volume;
+
+            if (model_.use_sqrt_model) {
+                // Square root market impact model
+                slippage += model_.proportional_factor * std::sqrt(participation_rate) * 10000.0;
+            } else {
+                // Linear model
+                slippage += model_.proportional_factor * participation_rate * 10000.0;
+            }
+        }
+
+        // Volatility component
+        double volatility = state.getVolatility(order.symbol);
+        slippage += model_.volatility_factor * volatility * 10000.0;
+
+        // Spread component
+        double spread = book.getSpread();
+        double mid_price = book.getMidPrice();
+        if (mid_price > 0) {
+            double spread_bps = (spread / mid_price) * 10000.0;
+            slippage += model_.spread_factor * spread_bps;
+        }
+
+        // Direction: selling typically has worse slippage
+        if (order.side == OrderSide::SELL) {
+            slippage *= 1.2;  // 20% worse for sells
+        }
+
+        return slippage;
+    }
+
+private:
+    SlippageModel model_;
+};
+
+================================================================================
+4. MARKET IMPACT MODELING
+================================================================================
+
+4.1 MARKET IMPACT CALCULATOR
+-----------------------------
+
+class MarketImpactCalculator {
+public:
+    struct ImpactModel {
+        // Almgren-Chriss model parameters
+        double permanent_impact_factor;     // Permanent price impact
+        double temporary_impact_factor;     // Temporary (recovers over time)
+        double volatility_scaling;          // Scale by volatility
+
+        // Recovery parameters
+        double temp_impact_half_life_ns;    // Half-life of temporary impact
+    };
+
+    explicit MarketImpactCalculator(const ImpactModel& model)
+        : model_(model) {}
+
+    struct Impact {
+        double permanent_bps;
+        double temporary_bps;
+        double total_bps;
+    };
+
+    Impact calculateImpact(const Order& order, const MarketState& state) {
+        Impact impact;
+
+        double notional = order.quantity * order.price;
+        double avg_daily_volume = state.getAverageDailyVolume(order.symbol);
+        double volatility = state.getVolatility(order.symbol);
+
+        if (avg_daily_volume > 0) {
+            double participation_rate = notional / avg_daily_volume;
+
+            // Permanent impact (square root model)
+            impact.permanent_bps = model_.permanent_impact_factor *
+                                  volatility *
+                                  std::sqrt(participation_rate) * 10000.0;
+
+            // Temporary impact (linear in participation rate)
+            impact.temporary_bps = model_.temporary_impact_factor *
+                                  volatility *
+                                  participation_rate * 10000.0;
+
+            impact.total_bps = impact.permanent_bps + impact.temporary_bps;
+        }
+
+        return impact;
+    }
+
+    double calculateRecoveredImpact(double initial_impact_bps,
+                                   uint64_t time_elapsed_ns) {
+        // Exponential decay of temporary impact
+        double decay_factor = std::exp(-time_elapsed_ns /
+                                      model_.temp_impact_half_life_ns);
+        return initial_impact_bps * decay_factor;
+    }
+
+private:
+    ImpactModel model_;
+};
+
+================================================================================
+5. PARTIAL FILL SIMULATION
+================================================================================
+
+5.1 PARTIAL FILL ENGINE
+------------------------
+
+class PartialFillEngine {
+public:
+    struct PartialFillConfig {
+        double min_fill_ratio;              // Minimum fill % (e.g., 0.1 = 10%)
+        double avg_fills_per_order;         // Average number of fills
+        bool use_geometric_distribution;    // Geometric vs uniform distribution
+        double fill_arrival_rate_per_sec;   // Poisson arrival rate
+    };
+
+    explicit PartialFillEngine(const PartialFillConfig& config)
+        : config_(config), rng_(std::random_device{}()) {}
+
+    std::vector<FillResult> simulatePartialFills(
+        const Order& order,
+        const OrderBook& book,
+        uint64_t start_time_ns,
+        uint64_t max_duration_ns) {
+
+        std::vector<FillResult> fills;
+        uint64_t remaining_qty = order.remaining_quantity;
+        uint64_t current_time = start_time_ns;
+
+        // Determine number of fills using Poisson process
+        double lambda = config_.fill_arrival_rate_per_sec *
+                       (max_duration_ns / 1e9);
+        std::poisson_distribution<int> num_fills_dist(lambda);
+        int num_fills = num_fills_dist(rng_);
+        num_fills = std::max(1, std::min(num_fills, 10));  // Cap at 10
+
+        for (int i = 0; i < num_fills && remaining_qty > 0; ++i) {
+            FillResult fill;
+            fill.filled = true;
+
+            // Determine fill size
+            if (i == num_fills - 1) {
+                // Last fill gets remainder
+                fill.filled_quantity = remaining_qty;
+            } else {
+                // Geometric or uniform distribution
+                double fill_ratio = generateFillRatio();
+                fill.filled_quantity = static_cast<uint64_t>(
+                    remaining_qty * fill_ratio);
+                fill.filled_quantity = std::max(1ULL, fill.filled_quantity);
+            }
+
+            // Determine fill time
+            std::exponential_distribution<double> time_dist(
+                config_.fill_arrival_rate_per_sec);
+            uint64_t time_delta = static_cast<uint64_t>(time_dist(rng_) * 1e9);
+            current_time += time_delta;
+
+            if (current_time > start_time_ns + max_duration_ns) {
+                break;  // Exceeded time limit
+            }
+
+            fill.fill_timestamp_ns = current_time;
+            fill.fill_price = calculatePartialFillPrice(order, book, i, num_fills);
+            fill.partial_fill = (fill.filled_quantity < remaining_qty);
+
+            fills.push_back(fill);
+            remaining_qty -= fill.filled_quantity;
+        }
+
+        return fills;
+    }
+
+private:
+    PartialFillConfig config_;
+    std::mt19937_64 rng_;
+
+    double generateFillRatio() {
+        if (config_.use_geometric_distribution) {
+            // Geometric: many small fills, few large
+            std::exponential_distribution<double> dist(2.0);
+            double ratio = dist(rng_);
+            return std::min(0.5, ratio);  // Cap at 50%
+        } else {
+            // Uniform distribution
+            std::uniform_real_distribution<double> dist(
+                config_.min_fill_ratio, 0.5);
+            return dist(rng_);
+        }
+    }
+
+    double calculatePartialFillPrice(const Order& order, const OrderBook& book,
+                                    int fill_index, int total_fills) {
+        // Later fills may have worse prices due to market impact
+        double base_price = order.price;
+        double impact_bps = 2.0 * fill_index / total_fills;  // Linear increase
+
+        if (order.side == OrderSide::BUY) {
+            return base_price * (1.0 + impact_bps / 10000.0);
+        } else {
+            return base_price * (1.0 - impact_bps / 10000.0);
+        }
+    }
+};
+
+================================================================================
+6. ADVERSE SELECTION
+================================================================================
+
+6.1 ADVERSE SELECTION MODEL
+----------------------------
+
+class AdverseSelectionModel {
+public:
+    struct Config {
+        double information_leakage_rate;    // How fast info leaks (0-1)
+        double informed_trader_fraction;     // % of informed traders
+        double adverse_move_bps;            // Expected adverse move
+        bool model_quote_stuffing;          // Model quote stuffing detection
+    };
+
+    explicit AdverseSelectionModel(const Config& config)
+        : config_(config), rng_(std::random_device{}()) {}
+
+    // Determine if trade experiences adverse selection
+    bool isAdverselySelected(const Order& order, const MarketState& state) {
+        // Check if order is likely to face adverse selection
+        std::uniform_real_distribution<double> dist(0.0, 1.0);
+
+        // Larger orders more likely to be adversely selected
+        double size_factor = calculateSizeFactor(order, state);
+
+        // Fast market movements increase adverse selection
+        double momentum_factor = calculateMomentumFactor(state);
+
+        double adverse_prob = config_.information_leakage_rate *
+                            size_factor * momentum_factor;
+
+        return dist(rng_) < adverse_prob;
+    }
+
+    // Calculate expected adverse price move
+    double calculateAdverseMove(const Order& order, const MarketState& state) {
+        if (!isAdverselySelected(order, state)) {
+            return 0.0;
+        }
+
+        double base_move = config_.adverse_move_bps;
+
+        // Scale by order size
+        double notional = order.quantity * order.price;
+        double avg_volume = state.getAverageDailyVolume(order.symbol);
+        if (avg_volume > 0) {
+            double size_ratio = notional / avg_volume;
+            base_move *= (1.0 + size_ratio);
+        }
+
+        // Scale by market volatility
+        double volatility = state.getVolatility(order.symbol);
+        base_move *= (1.0 + volatility);
+
+        return base_move;
+    }
+
+private:
+    Config config_;
+    std::mt19937_64 rng_;
+
+    double calculateSizeFactor(const Order& order, const MarketState& state) {
+        double notional = order.quantity * order.price;
+        double avg_volume = state.getAverageDailyVolume(order.symbol);
+
+        if (avg_volume == 0) return 1.0;
+
+        double participation = notional / avg_volume;
+        return std::min(2.0, 1.0 + participation * 10.0);
+    }
+
+    double calculateMomentumFactor(const MarketState& state) {
+        double momentum = state.getRecentMomentum();
+        return 1.0 + std::abs(momentum) * 0.5;
+    }
+};
+
+================================================================================
+7. COMPLETE IMPLEMENTATION
+================================================================================
+
+File: include/trade_simulator.hpp
+
+#ifndef TRADE_SIMULATOR_HPP
+#define TRADE_SIMULATOR_HPP
+
+#include "simulation_engine.hpp"
+#include <memory>
+#include <vector>
+
+namespace hft {
+namespace simulation {
+
+class TradeExecutionSimulator : public ISimulationComponent {
+public:
+    struct Config {
+        FillModel fill_model;
+        SlippageCalculator::SlippageModel slippage_model;
+        MarketImpactCalculator::ImpactModel impact_model;
+        PartialFillEngine::PartialFillConfig partial_fill_config;
+        AdverseSelectionModel::Config adverse_selection_config;
+
+        bool enable_partial_fills;
+        bool enable_market_impact;
+        bool enable_adverse_selection;
+    };
+
+    explicit TradeExecutionSimulator(const Config& config);
+    ~TradeExecutionSimulator() override;
+
+    // ISimulationComponent interface
+    void initialize(SimulationContext& ctx) override;
+    void start() override;
+    void stop() override;
+    void shutdown() override;
+    void onEvent(const IEvent& event) override;
+    void onTimerTick(uint64_t timestamp_ns) override;
+    ComponentState getState() const override;
+    std::string getName() const override { return "TradeExecutionSimulator"; }
+
+    // Execution simulation
+    std::vector<FillResult> simulateExecution(const Order& order,
+                                              const OrderBook& book,
+                                              uint64_t timestamp_ns);
+
+    // Statistics
+    struct ExecutionStats {
+        uint64_t total_orders{0};
+        uint64_t filled_orders{0};
+        uint64_t partial_fills{0};
+        double avg_slippage_bps{0.0};
+        double avg_market_impact_bps{0.0};
+        double avg_fill_time_ms{0.0};
+        double adverse_selection_rate{0.0};
+    };
+
+    const ExecutionStats& getStats() const { return stats_; }
+
+private:
+    Config config_;
+    ComponentState state_;
+    SimulationContext* ctx_;
+
+    std::unique_ptr<IFillModel> fill_model_;
+    std::unique_ptr<SlippageCalculator> slippage_calc_;
+    std::unique_ptr<MarketImpactCalculator> impact_calc_;
+    std::unique_ptr<PartialFillEngine> partial_fill_engine_;
+    std::unique_ptr<AdverseSelectionModel> adverse_selection_;
+
+    ExecutionStats stats_;
+
+    void processFillResult(const FillResult& result);
+};
+
+} // namespace simulation
+} // namespace hft
+
+#endif // TRADE_SIMULATOR_HPP
+
+================================================================================
+8. REALISTIC FILL PROFILES
+================================================================================
+
+8.1 HIGH-FREQUENCY TRADING PROFILE
+-----------------------------------
+
+TradeExecutionSimulator::Config createHFTExecutionProfile() {
+    TradeExecutionSimulator::Config config;
+
+    config.fill_model = FillModel::QUEUE_BASED;
+
+    // Low slippage (aggressive pricing)
+    config.slippage_model.fixed_slippage_bps = 0.5;
+    config.slippage_model.proportional_factor = 0.1;
+    config.slippage_model.volatility_factor = 0.05;
+    config.slippage_model.spread_factor = 0.3;
+    config.slippage_model.use_sqrt_model = true;
+
+    // Minimal market impact (small sizes)
+    config.impact_model.permanent_impact_factor = 0.05;
+    config.impact_model.temporary_impact_factor = 0.1;
+    config.impact_model.volatility_scaling = 0.5;
+    config.impact_model.temp_impact_half_life_ns = 100000000;  // 100ms
+
+    // Frequent partial fills
+    config.partial_fill_config.min_fill_ratio = 0.1;
+    config.partial_fill_config.avg_fills_per_order = 3.0;
+    config.partial_fill_config.use_geometric_distribution = true;
+    config.partial_fill_config.fill_arrival_rate_per_sec = 10.0;
+
+    // Some adverse selection
+    config.adverse_selection_config.information_leakage_rate = 0.1;
+    config.adverse_selection_config.informed_trader_fraction = 0.2;
+    config.adverse_selection_config.adverse_move_bps = 1.0;
+
+    config.enable_partial_fills = true;
+    config.enable_market_impact = true;
+    config.enable_adverse_selection = true;
+
+    return config;
+}
+
+8.2 RETAIL/SLOWER TRADING PROFILE
+----------------------------------
+
+TradeExecutionSimulator::Config createRetailExecutionProfile() {
+    TradeExecutionSimulator::Config config;
+
+    config.fill_model = FillModel::PROBABILISTIC;
+
+    // Higher slippage
+    config.slippage_model.fixed_slippage_bps = 3.0;
+    config.slippage_model.proportional_factor = 0.5;
+    config.slippage_model.volatility_factor = 0.2;
+    config.slippage_model.spread_factor = 0.5;
+    config.slippage_model.use_sqrt_model = true;
+
+    // More market impact
+    config.impact_model.permanent_impact_factor = 0.2;
+    config.impact_model.temporary_impact_factor = 0.5;
+    config.impact_model.volatility_scaling = 1.0;
+    config.impact_model.temp_impact_half_life_ns = 1000000000;  // 1 second
+
+    // Fewer, larger partial fills
+    config.partial_fill_config.min_fill_ratio = 0.3;
+    config.partial_fill_config.avg_fills_per_order = 1.5;
+    config.partial_fill_config.use_geometric_distribution = false;
+    config.partial_fill_config.fill_arrival_rate_per_sec = 2.0;
+
+    // More adverse selection
+    config.adverse_selection_config.information_leakage_rate = 0.3;
+    config.adverse_selection_config.informed_trader_fraction = 0.4;
+    config.adverse_selection_config.adverse_move_bps = 5.0;
+
+    config.enable_partial_fills = true;
+    config.enable_market_impact = true;
+    config.enable_adverse_selection = true;
+
+    return config;
+}
+
+================================================================================
+USAGE EXAMPLE
+================================================================================
+
+#include "trade_simulator.hpp"
+#include <iostream>
+
+int main() {
+    using namespace hft::simulation;
+
+    // Create HFT execution profile
+    auto config = createHFTExecutionProfile();
+    TradeExecutionSimulator sim(config);
+
+    // Create test order
+    Order order;
+    strcpy(order.symbol, "AAPL");
+    order.side = OrderSide::BUY;
+    order.type = OrderType::LIMIT;
+    order.price = 150.00;
+    order.quantity = 100;
+    order.remaining_quantity = 100;
+
+    // Simulate execution
+    OrderBook book("AAPL");
+    // ... populate book ...
+
+    uint64_t timestamp = getCurrentTimeNs();
+    auto fills = sim.simulateExecution(order, book, timestamp);
+
+    // Print results
+    std::cout << "Execution simulation:" << std::endl;
+    for (size_t i = 0; i < fills.size(); ++i) {
+        const auto& fill = fills[i];
+        std::cout << "Fill " << (i+1) << ":" << std::endl;
+        std::cout << "  Quantity: " << fill.filled_quantity << std::endl;
+        std::cout << "  Price: $" << fill.fill_price << std::endl;
+        std::cout << "  Slippage: " << fill.slippage_bps << " bps" << std::endl;
+        std::cout << "  Impact: " << fill.market_impact_bps << " bps" << std::endl;
+    }
+
+    // Print statistics
+    const auto& stats = sim.getStats();
+    std::cout << "\nExecution Statistics:" << std::endl;
+    std::cout << "Total orders: " << stats.total_orders << std::endl;
+    std::cout << "Fill rate: " << (stats.filled_orders * 100.0 / stats.total_orders)
+             << "%" << std::endl;
+    std::cout << "Avg slippage: " << stats.avg_slippage_bps << " bps" << std::endl;
+    std::cout << "Avg impact: " << stats.avg_market_impact_bps << " bps" << std::endl;
+
+    return 0;
+}
+
+================================================================================
+END OF DOCUMENT
+================================================================================

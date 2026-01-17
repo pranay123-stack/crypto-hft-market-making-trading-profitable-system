@@ -1,0 +1,974 @@
+================================================================================
+DISASTER RECOVERY - DATA CENTER REDUNDANCY
+High-Frequency Trading System
+Multi-Region Architecture | Geographic Distribution
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Data Center Architecture
+2. Geographic Distribution Strategy
+3. Cross-DC Replication
+4. Network Interconnections
+5. Latency Optimization
+6. DR Site Configuration
+7. Multi-Region Failover
+8. Data Consistency Across DCs
+9. Disaster Scenarios & Response
+10. Capacity Planning
+
+================================================================================
+1. DATA CENTER ARCHITECTURE
+================================================================================
+
+1.1 MULTI-DC TOPOLOGY
+---------------------
+
+┌──────────────────────────────────────────────────────────────────────┐
+│                   MULTI-DATA CENTER ARCHITECTURE                     │
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  PRIMARY DC (New York)          DR DC (Chicago)      BACKUP (London) │
+│  ┌────────────────────┐        ┌─────────────────┐  ┌──────────────┐│
+│  │ Production         │        │ Hot Standby     │  │ Cold Archive ││
+│  │ - Trading Engine   │───────▶│ - Trading (DR)  │  │ - Backups    ││
+│  │ - Market Data      │ Sync   │ - Market Data   │  │ - Compliance ││
+│  │ - Order Mgmt       │        │ - Order Mgmt    │  │ - Historical ││
+│  │ - Database Primary │        │ - DB Standby    │  │ - Reports    ││
+│  │                    │        │                 │  │              ││
+│  │ Latency to Exch:   │        │ Latency to Exch:│  │ Offline      ││
+│  │ <1ms (Co-located)  │        │ ~3ms            │  │ Storage Only ││
+│  └────────────────────┘        └─────────────────┘  └──────────────┘│
+│           │                             │                     │      │
+│           │                             │                     │      │
+│  ┌────────┴─────────┐         ┌────────┴──────┐    ┌────────┴────┐ │
+│  │ 10Gbps Fiber     │─────────│ 10Gbps Fiber  │────│ 1Gbps Link  │ │
+│  │ Dedicated Link   │         │ Dedicated Link│    │ Internet VPN│ │
+│  └──────────────────┘         └───────────────┘    └─────────────┘ │
+│                                                                      │
+│  Geographic Separation: >500 miles between DCs                       │
+│  Network: Diverse fiber paths, no single point of failure           │
+│  Power: Independent grid connections                                 │
+└──────────────────────────────────────────────────────────────────────┘
+
+DC Selection Criteria:
+----------------------
+1. Proximity to exchanges (<5ms)
+2. Network infrastructure quality
+3. Power reliability (99.999%)
+4. Natural disaster risk profile
+5. Regulatory compliance
+6. Cost optimization
+
+1.2 DATA CENTER SPECIFICATIONS
+-------------------------------
+
+PRIMARY DC (NY4 - Equinix)
+--------------------------
+Location: Secaucus, NJ (NYSE Co-location)
+Connectivity: Direct fiber to NYSE, NASDAQ
+Power: N+2 redundancy, diesel generators
+Cooling: N+1 redundant HVAC
+Network: 4x 10Gbps uplinks
+Latency to Exchange: <500 microseconds
+
+DR DC (CH1 - Equinix)
+---------------------
+Location: Chicago, IL (CME Co-location)
+Connectivity: Direct fiber to CME
+Power: N+1 redundancy
+Cooling: N+1 redundant HVAC
+Network: 4x 10Gbps uplinks
+Latency to Primary: ~8ms
+Latency to Exchange: ~3ms
+
+BACKUP DC (LD5 - Equinix)
+--------------------------
+Location: London, UK
+Purpose: Regulatory compliance, cold storage
+Connectivity: Internet + VPN
+Power: N+1 redundancy
+Storage: 500TB capacity
+Latency to Primary: ~75ms (transatlantic)
+
+================================================================================
+2. CROSS-DC REPLICATION
+================================================================================
+
+2.1 DATABASE REPLICATION TOPOLOGY
+----------------------------------
+
+Configuration: Primary + Sync Standby + Async Replica
+
+```
+Primary (NYC) ─────sync────▶ Standby (Chicago) ─────async────▶ Replica (London)
+    │                              │
+    │                              │
+    ▼                              ▼
+WAL Archive (NYC)            WAL Archive (Chicago)
+```
+
+PostgreSQL Configuration for Cross-DC Replication:
+
+Primary postgresql.conf:
+```conf
+# Replication
+wal_level = replica
+max_wal_senders = 10
+synchronous_commit = remote_apply
+synchronous_standby_names = 'chicago_standby'
+
+# Archive to both local and DR site
+archive_mode = on
+archive_command = 'rsync -az %p wal-nyc:/archive/%f && rsync -az %p wal-chicago:/archive/%f'
+
+# Performance for WAN
+wal_sender_timeout = 60s
+wal_receiver_timeout = 60s
+```
+
+Chicago Standby recovery.conf:
+```conf
+standby_mode = on
+primary_conninfo = 'host=nyc-primary.hft.local port=5432 user=replicator application_name=chicago_standby'
+restore_command = 'cp /wal_archive/%f %p'
+recovery_target_timeline = 'latest'
+```
+
+2.2 REDIS CROSS-DC REPLICATION
+-------------------------------
+
+Redis Replication Chain:
+
+```bash
+# Setup Redis replication to DR site
+redis-cli -h chicago-redis CONFIG SET replicaof nyc-redis 6379
+redis-cli -h chicago-redis CONFIG SET replica-read-only yes
+
+# Monitor replication
+redis-cli -h chicago-redis INFO replication
+```
+
+================================================================================
+3. NETWORK INTERCONNECTIONS
+================================================================================
+
+3.1 NETWORK TOPOLOGY
+---------------------
+
+Layer 2/3 Design with BGP:
+
+```
+Primary DC                      DR DC
+─────────────                  ─────────
+Router1 (AS65001)  ◄────BGP────▶  Router1 (AS65002)
+    │                                  │
+Router2 (AS65001)  ◄────BGP────▶  Router2 (AS65002)
+    │                                  │
+    └─────── VRRP ────────────────────┘
+           (VIP: 10.0.0.1)
+```
+
+BGP Configuration for Failover:
+
+```
+router bgp 65001
+ bgp router-id 10.0.1.1
+ neighbor 10.0.2.1 remote-as 65002
+ !
+ address-family ipv4
+  network 10.0.1.0/24
+  neighbor 10.0.2.1 activate
+  neighbor 10.0.2.1 route-map PREFER-PRIMARY in
+ exit-address-family
+!
+route-map PREFER-PRIMARY permit 10
+ set local-preference 200
+```
+
+3.2 DEDICATED DARK FIBER
+-------------------------
+
+NYC <──────> Chicago: 10Gbps dedicated dark fiber
+- Latency: ~8ms
+- Bandwidth: 10Gbps (can upgrade to 100Gbps)
+- Provider: Level3/Zayo diverse paths
+- SLA: 99.99% uptime
+
+VPN Backup:
+- IPsec tunnel over Internet
+- Bandwidth: 1Gbps
+- Used only if primary link fails
+
+================================================================================
+4. LATENCY OPTIMIZATION
+================================================================================
+
+4.1 LATENCY BUDGETS
+--------------------
+
+End-to-End Latency Budget (Order to Exchange):
+- Application Processing: <100μs
+- Kernel Network Stack: <50μs
+- NIC: <10μs
+- Switch (Co-lo): <1μs
+- Fiber to Exchange: <500μs
+─────────────────────────────────
+Total Target: <1ms
+
+Cross-DC Latency:
+- NYC to Chicago: ~8ms (speed of light + switching)
+- NYC to London: ~75ms
+- Chicago to London: ~90ms
+
+4.2 LATENCY MONITORING
+-----------------------
+
+Monitoring Script: /opt/hft/scripts/monitor_dc_latency.sh
+
+```bash
+#!/bin/bash
+# Monitor inter-DC latency
+
+DCS=("nyc-primary" "chicago-dr" "london-backup")
+
+while true; do
+    echo "=== DC Latency Check $(date) ==="
+
+    for dc in "${DCS[@]}"; do
+        # ICMP ping
+        PING=$(ping -c 10 $dc | grep avg | awk -F'/' '{print $5}')
+        echo "$dc ICMP: ${PING}ms"
+
+        # TCP ping (port 5432)
+        TCP=$(hping3 -S -p 5432 -c 10 $dc 2>/dev/null | grep avg | awk '{print $4}')
+        echo "$dc TCP: ${TCP}ms"
+
+        # Application-level ping
+        APP=$(curl -w "%{time_total}" -s -o /dev/null http://$dc:8080/ping)
+        APP_MS=$(echo "$APP * 1000" | bc)
+        echo "$dc APP: ${APP_MS}ms"
+
+        echo ""
+    done
+
+    sleep 60
+done
+```
+
+================================================================================
+5. DISASTER SCENARIOS & RESPONSE
+================================================================================
+
+5.1 SCENARIO MATRIX
+--------------------
+
+┌─────────────────────┬──────────────┬─────────────┬──────────────┐
+│ Scenario            │ Probability  │ RTO Target  │ Response     │
+├─────────────────────┼──────────────┼─────────────┼──────────────┤
+│ Single Server Down  │ High (2/yr)  │ 30s         │ Auto Failover│
+│ Rack Failure        │ Medium(1/yr) │ 2min        │ Auto Failover│
+│ DC Network Loss     │ Low (1/5yr)  │ 5min        │ Manual       │
+│ DC Power Failure    │ Low (1/10yr) │ 5min        │ Semi-Auto    │
+│ Full DC Loss        │ Rare(1/20yr) │ 15min       │ Manual       │
+│ Regional Disaster   │ Very Rare    │ 4hr         │ Manual       │
+│ Multi-Region Event  │ Extremely R. │ 24hr        │ BCP          │
+└─────────────────────┴──────────────┴─────────────┴──────────────┘
+
+5.2 FULL DC FAILOVER PROCEDURE
+--------------------------------
+
+Script: /opt/hft/scripts/failover_datacenter.sh
+
+```bash
+#!/bin/bash
+# Full Data Center Failover
+
+SOURCE_DC=$1  # e.g., "nyc"
+TARGET_DC=$2  # e.g., "chicago"
+
+if [ -z "$SOURCE_DC" ] || [ -z "$TARGET_DC" ]; then
+    echo "Usage: $0 <source_dc> <target_dc>"
+    exit 1
+fi
+
+echo "=== DATA CENTER FAILOVER ==="
+echo "From: $SOURCE_DC"
+echo "To: $TARGET_DC"
+echo "Start: $(date)"
+
+START_TIME=$(date +%s)
+
+# 1. Verify DR site health
+echo "[1/10] Verifying DR site health..."
+ssh $TARGET_DC-admin "/opt/hft/scripts/prefailover_check.sh" || exit 1
+
+# 2. Stop trading on primary (if accessible)
+echo "[2/10] Stopping trading on primary DC..."
+ssh $SOURCE_DC-admin "redis-cli SET trading:enabled false" || echo "Primary unreachable"
+
+# 3. Ensure latest data sync
+echo "[3/10] Ensuring data synchronization..."
+ssh $TARGET_DC-admin "/opt/hft/scripts/check_replication_lag.sh" || echo "WARNING: May have data lag"
+
+# 4. Promote DR database to primary
+echo "[4/10] Promoting DR database..."
+ssh $TARGET_DC-db "pg_ctl promote -D /var/lib/pgsql/data"
+sleep 10
+
+# 5. Start trading engine on DR
+echo "[5/10] Starting trading engine on DR..."
+ssh $TARGET_DC-app "systemctl start hft-trading-engine-primary"
+sleep 15
+
+# 6. Update DNS
+echo "[6/10] Updating DNS..."
+curl -X POST http://dns-api.hft.local/failover \
+    -d "service=trading&from=$SOURCE_DC&to=$TARGET_DC"
+
+# 7. Update load balancer
+echo "[7/10] Updating load balancers..."
+curl -X POST http://lb.hft.local/api/failover \
+    -d "from=$SOURCE_DC&to=$TARGET_DC"
+
+# 8. Update BGP routing
+echo "[8/10] Updating BGP routing..."
+ssh $TARGET_DC-router "vtysh -c 'conf t' -c 'router bgp 65002' -c 'no neighbor $SOURCE_DC-router'"
+
+# 9. Validate services
+echo "[9/10] Validating services..."
+ssh $TARGET_DC-admin "/opt/hft/scripts/postfailover_check.sh"
+
+# 10. Enable trading
+echo "[10/10] Enabling trading on DR..."
+ssh $TARGET_DC-admin "redis-cli SET trading:enabled true"
+
+END_TIME=$(date +%s)
+DURATION=$((END_TIME - START_TIME))
+
+echo "=== FAILOVER COMPLETE ==="
+echo "Duration: ${DURATION} seconds"
+echo "End: $(date)"
+
+# Send notification
+/opt/hft/scripts/send_alert.sh "CRITICAL" \
+    "Data center failover completed: $SOURCE_DC -> $TARGET_DC in ${DURATION}s"
+```
+
+================================================================================
+6. CAPACITY PLANNING
+================================================================================
+
+6.1 RESOURCE ALLOCATION PER DC
+--------------------------------
+
+Primary DC (NYC):
+- Servers: 20 (10 trading, 4 DB, 4 cache, 2 gateway)
+- Storage: 100TB SSD (hot data)
+- Network: 4x 10Gbps
+- CPU Cores: 800
+- RAM: 4TB
+- Utilization Target: 60% (40% headroom)
+
+DR DC (Chicago):
+- Servers: 20 (identical to primary)
+- Storage: 100TB SSD
+- Network: 4x 10Gbps
+- CPU Cores: 800
+- RAM: 4TB
+- Utilization: 20% (standby mode), 60% (active)
+
+Backup DC (London):
+- Servers: 5 (storage/backup only)
+- Storage: 500TB HDD
+- Network: 2x 1Gbps
+- Purpose: Archive and compliance
+
+6.2 GROWTH PLANNING
+--------------------
+
+Annual Growth Rate: 50% data, 30% transaction volume
+
+Year 1:
+- Storage: +50TB
+- Servers: +10
+- Network: Upgrade to 40Gbps
+
+Year 2:
+- Storage: +75TB
+- Servers: +15
+- Consider 3rd live DC
+
+Year 3:
+- Major architecture review
+- Consider cloud integration for bursting
+
+================================================================================
+7. COMPLIANCE & AUDITING
+================================================================================
+
+7.1 REGULATORY REQUIREMENTS
+-----------------------------
+
+Data Residency:
+- US trades: Must remain in US (NYC/Chicago)
+- EU trades: Must have copy in EU (London)
+- Data retention: 7 years minimum
+
+Audit Trail:
+- All cross-DC replication logged
+- Failover events recorded
+- Access logs maintained
+- Quarterly DR tests documented
+
+7.2 DR TESTING SCHEDULE
+------------------------
+
+Monthly:
+- Component failover test
+- Backup restoration test
+- Cross-DC latency validation
+
+Quarterly:
+- Full DR site activation (non-production hours)
+- Runbook validation
+- Team training exercise
+
+Annually:
+- Complete DR drill (simulated disaster)
+- Third-party audit
+- Capacity planning review
+- Contract renewals (DC, network, etc.)
+
+================================================================================
+END OF DOCUMENT
+================================================================================
+
+================================================================================
+8. DATA CENTER SELECTION & PROCUREMENT
+================================================================================
+
+8.1 DC EVALUATION CRITERIA MATRIX
+-----------------------------------
+
+┌────────────────────┬────────┬─────────┬────────┬──────────────┐
+│ Criteria           │ Weight │ NYC     │ Chicago│ London       │
+├────────────────────┼────────┼─────────┼────────┼──────────────┤
+│ Latency to Exch    │ 30%    │ 10/10   │ 8/10   │ 2/10         │
+│ Power Reliability  │ 20%    │ 9/10    │ 9/10   │ 8/10         │
+│ Network Quality    │ 20%    │ 10/10   │ 9/10   │ 7/10         │
+│ Cost               │ 15%    │ 4/10    │ 6/10   │ 5/10         │
+│ Disaster Risk      │ 10%    │ 6/10    │ 8/10   │ 7/10         │
+│ Compliance         │ 5%     │ 10/10   │ 10/10  │ 10/10        │
+├────────────────────┼────────┼─────────┼────────┼──────────────┤
+│ Total Score        │        │ 8.45    │ 8.10   │ 5.90         │
+└────────────────────┴────────┴─────────┴────────┴──────────────┘
+
+8.2 INFRASTRUCTURE SPECIFICATIONS
+-----------------------------------
+
+Power Requirements per DC:
+- Primary (NYC): 150kW
+  * Trading Servers: 80kW
+  * Database Servers: 30kW
+  * Network Equipment: 20kW
+  * Cooling: 20kW
+
+- DR (Chicago): 150kW (identical)
+- Backup (London): 30kW (storage only)
+
+Cooling Requirements:
+- BTU Removal: 512,000 BTU/hr per DC
+- Precision AC Units: N+1 redundancy
+- Hot/Cold Aisle Containment
+- Temperature: 68-72°F (20-22°C)
+- Humidity: 40-60% RH
+
+Network Specifications:
+- Primary Uplinks: 4x 10Gbps (BGP multihoming)
+- Cross-DC Links: 2x 10Gbps (diverse paths)
+- Internet: 2x 1Gbps (backup)
+- Providers: Level3, Zayo, Cogent (diversity)
+
+8.3 PHYSICAL SECURITY
+----------------------
+
+Multi-Layer Security:
+1. Perimeter: 24/7 security guards, cameras
+2. Building: Badge access, mantrap doors
+3. Data Hall: Biometric access
+4. Cage: Dual authentication, logs
+5. Rack: Locked, monitored
+
+Access Control:
+- Primary: 5 authorized personnel
+- DR: 3 authorized personnel
+- Backup: 2 authorized personnel
+- All access logged and audited
+
+Surveillance:
+- 360° camera coverage
+- 90-day video retention
+- Motion detection alerts
+- Integration with SOC
+
+================================================================================
+9. INTER-DC DATA SYNCHRONIZATION
+================================================================================
+
+9.1 SYNCHRONIZATION METHODS
+-----------------------------
+
+Method 1: Synchronous Replication (NYC → Chicago)
+--------------------------------------------------
+Technology: PostgreSQL Streaming Replication
+Lag Target: <10ms
+Use Case: Critical trading data
+Bandwidth: ~100Mbps sustained, 1Gbps burst
+
+Configuration:
+```postgresql
+-- Primary (NYC)
+synchronous_commit = remote_apply
+synchronous_standby_names = 'FIRST 1 (chicago_standby)'
+
+-- This ensures zero data loss between NYC and Chicago
+-- Transactions wait for Chicago confirmation before committing
+```
+
+Method 2: Asynchronous Replication (Chicago → London)
+-----------------------------------------------------
+Technology: PostgreSQL Streaming Replication
+Lag Target: <60s
+Use Case: Compliance, archival
+Bandwidth: ~50Mbps sustained
+
+Configuration:
+```postgresql
+-- Chicago (acting as primary for London)
+synchronous_commit = local  -- Don't wait for London
+-- London replica streams from Chicago
+```
+
+Method 3: Object Storage Replication
+-------------------------------------
+Technology: S3 Cross-Region Replication
+Use Case: Backups, historical data, reports
+Lag: <15 minutes
+Bandwidth: Varies by data volume
+
+9.2 BANDWIDTH UTILIZATION
+---------------------------
+
+NYC → Chicago Link (10Gbps):
+- Database Replication: ~100Mbps (1%)
+- Market Data Sync: ~500Mbps (5%)
+- File Replication: ~200Mbps (2%)
+- Monitoring/Logging: ~100Mbps (1%)
+- Available Headroom: ~9.1Gbps (91%)
+
+Bandwidth Monitoring:
+```bash
+#!/bin/bash
+# Monitor inter-DC bandwidth utilization
+
+INTERFACE="eth1"  # Inter-DC link interface
+
+while true; do
+    # Get current bandwidth
+    RX_BYTES_BEFORE=$(cat /sys/class/net/$INTERFACE/statistics/rx_bytes)
+    TX_BYTES_BEFORE=$(cat /sys/class/net/$INTERFACE/statistics/tx_bytes)
+
+    sleep 1
+
+    RX_BYTES_AFTER=$(cat /sys/class/net/$INTERFACE/statistics/rx_bytes)
+    TX_BYTES_AFTER=$(cat /sys/class/net/$INTERFACE/statistics/tx_bytes)
+
+    # Calculate Mbps
+    RX_MBPS=$(( (RX_BYTES_AFTER - RX_BYTES_BEFORE) * 8 / 1000000 ))
+    TX_MBPS=$(( (TX_BYTES_AFTER - TX_BYTES_BEFORE) * 8 / 1000000 ))
+
+    # Calculate utilization (assuming 10Gbps link)
+    RX_PCT=$(echo "scale=2; $RX_MBPS / 100" | bc)
+    TX_PCT=$(echo "scale=2; $TX_MBPS / 100" | bc)
+
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - RX: ${RX_MBPS}Mbps (${RX_PCT}%), TX: ${TX_MBPS}Mbps (${TX_PCT}%)"
+
+    # Alert if >80% utilization
+    if [ $RX_PCT -gt 80 ] || [ $TX_PCT -gt 80 ]; then
+        echo "ALERT: High bandwidth utilization!"
+        /opt/hft/scripts/send_alert.sh "WARNING" "Inter-DC bandwidth >80%: RX=${RX_PCT}%, TX=${TX_PCT}%"
+    fi
+
+    sleep 60
+done
+```
+
+9.3 DATA CONSISTENCY VALIDATION
+---------------------------------
+
+Validation Script: /opt/hft/scripts/validate_dc_consistency.sh
+
+```bash
+#!/bin/bash
+# Validate data consistency across DCs
+
+echo "=== DATA CONSISTENCY VALIDATION ==="
+
+# 1. Compare database record counts
+echo "[1/5] Comparing database record counts..."
+
+TABLES=("orders" "trades" "positions" "risk_limits")
+
+for table in "${TABLES[@]}"; do
+    NYC_COUNT=$(psql -h nyc-db -d trading -t -c "SELECT COUNT(*) FROM $table;" | tr -d ' ')
+    CHI_COUNT=$(psql -h chicago-db -d trading -t -c "SELECT COUNT(*) FROM $table;" | tr -d ' ')
+
+    DIFF=$((NYC_COUNT - CHI_COUNT))
+
+    if [ $DIFF -eq 0 ]; then
+        echo "  ✓ $table: $NYC_COUNT records (matched)"
+    else
+        echo "  ✗ $table: NYC=$NYC_COUNT, Chicago=$CHI_COUNT (diff=$DIFF)"
+    fi
+done
+
+# 2. Compare checksums of critical tables
+echo "[2/5] Comparing data checksums..."
+
+for table in "${TABLES[@]}"; do
+    NYC_CHECKSUM=$(psql -h nyc-db -d trading -t -c "SELECT MD5(STRING_AGG(CAST(* AS TEXT), '' ORDER BY *)) FROM (SELECT * FROM $table ORDER BY id LIMIT 1000) AS t;" | tr -d ' ')
+    CHI_CHECKSUM=$(psql -h chicago-db -d trading -t -c "SELECT MD5(STRING_AGG(CAST(* AS TEXT), '' ORDER BY *)) FROM (SELECT * FROM $table ORDER BY id LIMIT 1000) AS t;" | tr -d ' ')
+
+    if [ "$NYC_CHECKSUM" == "$CHI_CHECKSUM" ]; then
+        echo "  ✓ $table: Checksum matched"
+    else
+        echo "  ✗ $table: Checksum MISMATCH!"
+    fi
+done
+
+# 3. Compare Redis key counts
+echo "[3/5] Comparing Redis data..."
+
+NYC_KEYS=$(redis-cli -h nyc-redis DBSIZE | awk '{print $2}')
+CHI_KEYS=$(redis-cli -h chicago-redis DBSIZE | awk '{print $2}')
+
+echo "  Redis keys: NYC=$NYC_KEYS, Chicago=$CHI_KEYS"
+
+# 4. Compare file storage
+echo "[4/5] Comparing file storage..."
+
+NYC_FILE_COUNT=$(ssh nyc-storage "find /data -type f | wc -l")
+CHI_FILE_COUNT=$(ssh chicago-storage "find /data -type f | wc -l")
+
+echo "  Files: NYC=$NYC_FILE_COUNT, Chicago=$CHI_FILE_COUNT"
+
+# 5. Generate report
+echo "[5/5] Generating consistency report..."
+
+REPORT_FILE="/var/log/hft/dc_consistency_$(date +%Y%m%d_%H%M%S).txt"
+
+{
+    echo "Data Consistency Report"
+    echo "Generated: $(date)"
+    echo ""
+    echo "Database Consistency: Check logs above"
+    echo "Redis Consistency: NYC=$NYC_KEYS, Chicago=$CHI_KEYS"
+    echo "File Consistency: NYC=$NYC_FILE_COUNT, Chicago=$CHI_FILE_COUNT"
+} > "$REPORT_FILE"
+
+echo "=== VALIDATION COMPLETE ==="
+echo "Report saved: $REPORT_FILE"
+```
+
+================================================================================
+10. DISASTER RECOVERY DRILLS & TESTING
+================================================================================
+
+10.1 ANNUAL DR DRILL PLAN
+--------------------------
+
+Full DR Drill Schedule (Annually):
+- Date: First Saturday of April (low trading volume)
+- Duration: 8 hours
+- Participants: All engineering, operations, management
+- Observer: External auditor (compliance requirement)
+
+Drill Phases:
+
+Phase 1: Planning (Week -4 to -1)
+----------------------------------
+- Week -4: Announce drill, assign roles
+- Week -3: Review runbooks, update documentation
+- Week -2: Pre-drill system check, backup verification
+- Week -1: Final preparation, stakeholder briefing
+
+Phase 2: Execution (Drill Day)
+-------------------------------
+0800-0900: Pre-drill setup and briefing
+0900-0915: Simulate primary DC failure (controlled)
+0915-1000: Emergency response and failover to DR
+1000-1100: Service validation and testing
+1100-1200: Resume normal operations
+1200-1300: Lunch break
+1300-1500: Failback to primary DC
+1500-1600: Final validation
+1600-1700: Hot wash / lessons learned
+
+Phase 3: Post-Drill (Week +1 to +2)
+------------------------------------
+- Week +1: Compile drill report
+- Week +1: Identify gaps and improvements
+- Week +2: Update runbooks and procedures
+- Week +2: Submit compliance report
+
+10.2 DR DRILL EXECUTION SCRIPT
+--------------------------------
+
+Script: /opt/hft/scripts/dr_drill.sh
+
+```bash
+#!/bin/bash
+# Annual DR Drill Automation
+
+DRILL_LOG="/var/log/hft/dr_drills/drill_$(date +%Y%m%d).log"
+mkdir -p $(dirname $DRILL_LOG)
+
+exec > >(tee -a $DRILL_LOG)
+exec 2>&1
+
+echo "========================================"
+echo "    DISASTER RECOVERY DRILL"
+echo "========================================"
+echo "Date: $(date)"
+echo "Drill Master: $(whoami)"
+echo "========================================"
+echo ""
+
+# Drill Configuration
+PRIMARY_DC="nyc"
+DR_DC="chicago"
+DRILL_DURATION_HOURS=8
+
+# Phase 1: Pre-Drill Verification
+echo "PHASE 1: PRE-DRILL VERIFICATION"
+echo "--------------------------------"
+
+echo "[1.1] Verifying primary DC health..."
+/opt/hft/scripts/health_check_dc.sh $PRIMARY_DC
+PRIMARY_HEALTH=$?
+
+echo "[1.2] Verifying DR DC health..."
+/opt/hft/scripts/health_check_dc.sh $DR_DC
+DR_HEALTH=$?
+
+if [ $PRIMARY_HEALTH -ne 0 ] || [ $DR_HEALTH -ne 0 ]; then
+    echo "ERROR: Pre-drill health checks failed"
+    echo "Cannot proceed with drill"
+    exit 1
+fi
+
+echo "[1.3] Creating pre-drill snapshot..."
+/opt/hft/scripts/create_checkpoint.sh
+echo ""
+
+# Phase 2: Controlled Failure Simulation
+echo "PHASE 2: FAILURE SIMULATION"
+echo "----------------------------"
+
+read -p "Proceed with primary DC shutdown? (yes/no) " CONFIRM
+if [[ $CONFIRM != "yes" ]]; then
+    echo "Drill cancelled by operator"
+    exit 0
+fi
+
+echo "[2.1] Simulating primary DC failure..."
+START_FAILURE=$(date +%s)
+
+# Graceful shutdown of primary
+echo "  - Disabling trading..."
+ssh $PRIMARY_DC-admin "redis-cli SET trading:enabled false"
+
+echo "  - Stopping services..."
+ssh $PRIMARY_DC-admin "systemctl stop hft-*"
+
+echo "  - Simulating network partition..."
+ssh $PRIMARY_DC-router "iptables -I INPUT -j DROP"
+
+END_FAILURE=$(date +%s)
+echo "  - Failure simulated in $((END_FAILURE - START_FAILURE)) seconds"
+echo ""
+
+# Phase 3: DR Activation
+echo "PHASE 3: DR ACTIVATION"
+echo "----------------------"
+
+START_RECOVERY=$(date +%s)
+
+echo "[3.1] Initiating failover to DR..."
+/opt/hft/scripts/failover_datacenter.sh $PRIMARY_DC $DR_DC
+
+echo "[3.2] Validating DR services..."
+/opt/hft/scripts/postfailover_check.sh
+
+echo "[3.3] Performing test trades..."
+/opt/hft/scripts/test_trading_capability.sh
+
+END_RECOVERY=$(date +%s)
+RTO=$((END_RECOVERY - START_FAILURE))
+
+echo "  - Recovery completed in ${RTO} seconds"
+echo "  - RTO Target: 900 seconds (15 minutes)"
+if [ $RTO -le 900 ]; then
+    echo "  ✓ RTO target MET"
+else
+    echo "  ✗ RTO target MISSED"
+fi
+echo ""
+
+# Phase 4: DR Operation Period
+echo "PHASE 4: DR OPERATION"
+echo "---------------------"
+
+echo "Operating on DR site for 4 hours (simulated)..."
+echo "In production drill, trading would continue on DR site"
+echo "[Press Enter to continue to failback phase]"
+read
+
+# Phase 5: Failback to Primary
+echo "PHASE 5: FAILBACK TO PRIMARY"
+echo "----------------------------"
+
+echo "[5.1] Restoring primary DC..."
+ssh $PRIMARY_DC-router "iptables -F"  # Clear firewall rules
+ssh $PRIMARY_DC-admin "systemctl start hft-*"
+
+echo "[5.2] Synchronizing data from DR to Primary..."
+/opt/hft/scripts/sync_dr_to_primary.sh
+
+echo "[5.3] Failing back to primary..."
+/opt/hft/scripts/failover_datacenter.sh $DR_DC $PRIMARY_DC
+
+echo "[5.4] Validating primary services..."
+/opt/hft/scripts/postfailover_check.sh
+
+echo ""
+
+# Phase 6: Drill Summary
+echo "PHASE 6: DRILL SUMMARY"
+echo "----------------------"
+
+END_DRILL=$(date +%s)
+TOTAL_DURATION=$((END_DRILL - START_FAILURE))
+
+echo "Drill Statistics:"
+echo "  - Measured RTO: ${RTO} seconds"
+echo "  - Target RTO: 900 seconds"
+echo "  - RTO Status: $([ $RTO -le 900 ] && echo 'MET' || echo 'MISSED')"
+echo "  - Total Drill Duration: ${TOTAL_DURATION} seconds"
+echo "  - Primary DC Downtime: ${RTO} seconds"
+echo ""
+
+# Generate detailed report
+/opt/hft/scripts/generate_drill_report.sh $DRILL_LOG
+
+echo "========================================"
+echo "    DR DRILL COMPLETE"
+echo "========================================"
+echo "Detailed report: $DRILL_LOG"
+echo ""
+```
+
+10.3 DRILL EVALUATION CRITERIA
+-------------------------------
+
+Success Criteria:
+☐ RTO met (< 15 minutes for full DC failover)
+☐ RPO met (zero data loss for critical data)
+☐ All services restored successfully
+☐ Trading capability validated
+☐ Position reconciliation successful
+☐ No data corruption detected
+☐ All monitoring and alerting functional
+☐ Team coordination effective
+☐ Runbooks followed successfully
+☐ Failback completed without issues
+
+Scoring System:
+- Critical Criteria (must pass): RTO, RPO, Data Integrity
+- Important Criteria (90% target): Service Restoration, Trading
+- Standard Criteria (80% target): Documentation, Coordination
+
+Pass/Fail Threshold: 95% overall score, all critical criteria met
+
+10.4 POST-DRILL REPORT TEMPLATE
+---------------------------------
+
+```
+DISASTER RECOVERY DRILL REPORT
+==============================
+
+Drill Information:
+- Date: [DATE]
+- Duration: [X] hours
+- Scenario: Primary DC (NYC) Complete Failure
+- Drill Master: [NAME]
+- Participants: [LIST]
+- Observer: [AUDITOR NAME]
+
+Executive Summary:
+- Overall Result: [PASS/FAIL]
+- RTO Measured: [X] seconds (Target: 900s)
+- RPO Achieved: [X] seconds (Target: 0s)
+- Services Affected: [LIST]
+- Business Impact: [DESCRIPTION]
+
+Detailed Findings:
+
+1. Failover Performance
+   - Detection Time: [X]s
+   - Decision Time: [X]s
+   - Execution Time: [X]s
+   - Validation Time: [X]s
+   - Total RTO: [X]s
+
+2. Service Restoration
+   - Trading Engine: [STATUS] - [TIME]
+   - Order Management: [STATUS] - [TIME]
+   - Market Data: [STATUS] - [TIME]
+   - Risk Engine: [STATUS] - [TIME]
+   - Database: [STATUS] - [TIME]
+
+3. Data Integrity
+   - Position Reconciliation: [STATUS]
+   - Order Reconciliation: [STATUS]
+   - Transaction Consistency: [STATUS]
+   - Data Loss: [QUANTITY]
+
+4. Issues Encountered
+   [LIST OF ISSUES WITH SEVERITY]
+
+5. Lessons Learned
+   [KEY TAKEAWAYS]
+
+6. Action Items
+   [NUMBERED LIST WITH OWNERS AND DUE DATES]
+
+7. Recommendations
+   [STRATEGIC RECOMMENDATIONS]
+
+Attachments:
+- Detailed timeline
+- System logs
+- Communication logs
+- Performance metrics
+
+Approval:
+- CTO: _________________ Date: _______
+- Risk Officer: ________ Date: _______
+- Compliance: __________ Date: _______
+```
+
+================================================================================
+END OF DOCUMENT
+================================================================================

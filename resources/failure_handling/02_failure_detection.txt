@@ -1,0 +1,1062 @@
+================================================================================
+                         FAILURE DETECTION SYSTEMS
+                    Comprehensive Detection Mechanisms
+================================================================================
+
+DOCUMENT: Failure Detection Architecture and Implementation
+VERSION: 2.1.0
+LAST UPDATED: 2025-11-26
+SCOPE: HFT System Failure Detection
+
+================================================================================
+                          TABLE OF CONTENTS
+================================================================================
+
+1. Detection Philosophy & Requirements
+2. Heartbeat Mechanisms
+3. Health Check Systems
+4. Anomaly Detection
+5. Performance Monitoring
+6. Statistical Process Control
+7. ML-Based Detection
+8. Detection Infrastructure
+9. Code Examples
+
+================================================================================
+            1. DETECTION PHILOSOPHY & REQUIREMENTS
+================================================================================
+
+CORE PRINCIPLES:
+----------------
+
+1. ASSUME FAILURE IS INEVITABLE
+   - Design for failure, not perfection
+   - Expect every component to fail eventually
+   - Have multiple detection layers
+
+2. DETECT FAST, REACT FASTER
+   - Detection latency < 100 microseconds for critical paths
+   - Immediate response to critical failures
+   - Graduated response for degraded conditions
+
+3. MULTIPLE INDEPENDENT DETECTORS
+   - Watchdog processes
+   - Peer monitoring
+   - Self-health reporting
+   - External monitoring
+
+4. DEFENSE IN DEPTH
+   - Hardware level (IPMI, BMC)
+   - OS level (systemd, cgroups)
+   - Application level (health endpoints)
+   - Business logic level (anomaly detection)
+
+DETECTION LATENCY BUDGET:
+-------------------------
+
+Failure Type              Detection Method       Target Latency    Max Latency
+--------------------------------------------------------------------------------
+Process crash            Watchdog               < 50μs            < 100μs
+Thread deadlock          Heartbeat timeout      < 100ms           < 500ms
+Network disconnect       TCP keepalive          < 1ms             < 10ms
+Exchange API timeout     Request timeout        < 10ms            < 100ms
+Memory leak             Resource monitor        < 1s              < 5s
+CPU overheating         Thermal monitor         < 100ms           < 500ms
+Disk failure            SMART monitoring        < 1s              < 10s
+Data corruption         Checksum validation     < 10μs            < 50μs
+Logic error             Assertion check         < 1μs             < 10μs
+Performance degradation  Statistical SPC        < 100ms           < 1s
+
+DETECTION ACCURACY REQUIREMENTS:
+--------------------------------
+
+False Positive Rate: < 0.1% (1 in 1000 detections is false alarm)
+False Negative Rate: < 0.01% (1 in 10,000 failures goes undetected)
+Detection Precision: > 99.9%
+Detection Recall: > 99.99%
+
+Cost of False Positives:
+  - Unnecessary alerts → alert fatigue
+  - Service disruption from unnecessary failover
+  - Operational overhead
+
+Cost of False Negatives:
+  - Continued trading with failures → financial loss
+  - Cascade failures
+  - Regulatory violations
+
+CALIBRATION STRATEGY:
+  - Bias toward false positives for critical systems (trading engine)
+  - Bias toward false negatives for monitoring systems
+  - Continuous threshold tuning based on historical data
+
+================================================================================
+                       2. HEARTBEAT MECHANISMS
+================================================================================
+
+2.1 TCP KEEPALIVE
+-----------------
+
+Purpose: Detect connection failures at the transport layer
+Level: Network/Transport
+Latency: 1-10ms depending on configuration
+
+IMPLEMENTATION:
+---------------
+
+namespace hft::detection {
+
+class TcpKeepaliveManager {
+private:
+    struct KeepaliveConfig {
+        int keepalive_time{1};      // Seconds before first probe
+        int keepalive_intvl{1};     // Interval between probes
+        int keepalive_probes{3};    // Number of probes before failure
+        int user_timeout{3000};     // Milliseconds before timeout
+    };
+
+public:
+    void configure_socket(int sockfd, const KeepaliveConfig& config) {
+        // Enable TCP keepalive
+        int enable = 1;
+        if (setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, &enable,
+                      sizeof(enable)) < 0) {
+            throw SocketConfigurationException("Failed to enable keepalive");
+        }
+
+        // Set keepalive time (time before first probe)
+        if (setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPIDLE,
+                      &config.keepalive_time, sizeof(int)) < 0) {
+            throw SocketConfigurationException("Failed to set keepalive time");
+        }
+
+        // Set keepalive interval (time between probes)
+        if (setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPINTVL,
+                      &config.keepalive_intvl, sizeof(int)) < 0) {
+            throw SocketConfigurationException("Failed to set keepalive interval");
+        }
+
+        // Set keepalive probe count
+        if (setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPCNT,
+                      &config.keepalive_probes, sizeof(int)) < 0) {
+            throw SocketConfigurationException("Failed to set keepalive probes");
+        }
+
+        // Set user timeout (total timeout for unacknowledged data)
+        if (setsockopt(sockfd, IPPROTO_TCP, TCP_USER_TIMEOUT,
+                      &config.user_timeout, sizeof(int)) < 0) {
+            throw SocketConfigurationException("Failed to set user timeout");
+        }
+
+        logger_.info("TCP keepalive configured", {
+            {"socket", sockfd},
+            {"time", config.keepalive_time},
+            {"interval", config.keepalive_intvl},
+            {"probes", config.keepalive_probes}
+        });
+    }
+
+    // Advanced: Per-socket monitoring with epoll
+    void monitor_connections() {
+        int epfd = epoll_create1(0);
+        if (epfd < 0) {
+            throw EpollException("Failed to create epoll instance");
+        }
+
+        while (monitoring_active_) {
+            epoll_event events[MAX_EVENTS];
+            int nfds = epoll_wait(epfd, events, MAX_EVENTS, EPOLL_TIMEOUT_MS);
+
+            for (int i = 0; i < nfds; ++i) {
+                if (events[i].events & EPOLLERR) {
+                    // Socket error detected
+                    int sockfd = events[i].data.fd;
+                    handle_socket_error(sockfd);
+                } else if (events[i].events & EPOLLHUP) {
+                    // Connection closed by peer
+                    int sockfd = events[i].data.fd;
+                    handle_connection_closed(sockfd);
+                }
+            }
+        }
+    }
+
+private:
+    void handle_socket_error(int sockfd) {
+        int error = 0;
+        socklen_t len = sizeof(error);
+        getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &error, &len);
+
+        logger_.error("Socket error detected", {
+            {"socket", sockfd},
+            {"error_code", error},
+            {"error_msg", strerror(error)}
+        });
+
+        // Trigger recovery
+        recovery_engine_.handle_failure(
+            FailureType::NETWORK_SOCKET_ERROR,
+            FailureSeverity::HIGH,
+            {{"socket", sockfd}, {"error", error}}
+        );
+    }
+};
+
+} // namespace hft::detection
+
+
+2.2 APPLICATION-LEVEL HEARTBEATS
+---------------------------------
+
+Purpose: Detect application logic failures and thread deadlocks
+Level: Application
+Latency: 10-1000ms depending on heartbeat frequency
+
+ARCHITECTURE:
+-------------
+
+           +-------------------+
+           | Heartbeat Monitor |
+           +-------------------+
+                    |
+        +-----------+-----------+
+        |           |           |
+        v           v           v
+   [Thread 1]  [Thread 2]  [Thread 3]
+   sends HB    sends HB    sends HB
+   every 10ms  every 10ms  every 10ms
+
+   If HB missing for > 30ms → ALERT
+
+IMPLEMENTATION:
+---------------
+
+namespace hft::detection {
+
+class HeartbeatMonitor {
+private:
+    struct HeartbeatSource {
+        std::string name;
+        std::chrono::milliseconds interval;
+        std::chrono::milliseconds timeout;
+        std::chrono::steady_clock::time_point last_heartbeat;
+        std::atomic<uint64_t> heartbeat_count{0};
+        std::atomic<uint64_t> missed_count{0};
+        bool is_critical{false};
+    };
+
+    std::unordered_map<std::string, HeartbeatSource> sources_;
+    std::thread monitor_thread_;
+    std::atomic<bool> monitoring_active_{true};
+
+public:
+    void register_source(const std::string& name,
+                        std::chrono::milliseconds interval,
+                        bool is_critical = false) {
+        HeartbeatSource source{
+            .name = name,
+            .interval = interval,
+            .timeout = interval * 3,  // 3x interval = timeout
+            .last_heartbeat = std::chrono::steady_clock::now(),
+            .is_critical = is_critical
+        };
+
+        sources_[name] = source;
+
+        logger_.info("Heartbeat source registered", {
+            {"name", name},
+            {"interval_ms", interval.count()},
+            {"timeout_ms", source.timeout.count()},
+            {"critical", is_critical}
+        });
+    }
+
+    void send_heartbeat(const std::string& name) {
+        auto it = sources_.find(name);
+        if (it == sources_.end()) {
+            logger_.warn("Heartbeat from unknown source", {{"name", name}});
+            return;
+        }
+
+        auto& source = it->second;
+        source.last_heartbeat = std::chrono::steady_clock::now();
+        source.heartbeat_count++;
+
+        // Reset missed count on successful heartbeat
+        if (source.missed_count > 0) {
+            logger_.info("Heartbeat recovered", {
+                {"name", name},
+                {"missed_count", source.missed_count.load()}
+            });
+            source.missed_count = 0;
+        }
+    }
+
+    void start_monitoring() {
+        monitor_thread_ = std::thread([this]() {
+            while (monitoring_active_) {
+                check_all_heartbeats();
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        });
+    }
+
+private:
+    void check_all_heartbeats() {
+        auto now = std::chrono::steady_clock::now();
+
+        for (auto& [name, source] : sources_) {
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - source.last_heartbeat);
+
+            if (elapsed > source.timeout) {
+                source.missed_count++;
+
+                logger_.error("Heartbeat timeout", {
+                    {"name", name},
+                    {"elapsed_ms", elapsed.count()},
+                    {"timeout_ms", source.timeout.count()},
+                    {"missed_count", source.missed_count.load()}
+                });
+
+                handle_heartbeat_timeout(source);
+            }
+        }
+    }
+
+    void handle_heartbeat_timeout(const HeartbeatSource& source) {
+        if (source.is_critical) {
+            // Critical component timeout → immediate action
+            logger_.critical("Critical heartbeat timeout", {
+                {"name", source.name}
+            });
+
+            // Send P1 alert
+            alert_system_.send_alert(
+                AlertSeverity::P1_CRITICAL,
+                "Critical component heartbeat timeout: " + source.name,
+                AlertChannel::PAGERDUTY | AlertChannel::SMS
+            );
+
+            // Trigger emergency procedures
+            if (source.name == "trading_engine") {
+                // Cancel all orders
+                order_manager_.cancel_all_orders();
+                // Stop trading
+                circuit_breaker_.open();
+            } else if (source.name == "risk_monitor") {
+                // Freeze all trading
+                trading_engine_.freeze();
+            }
+        } else {
+            // Non-critical timeout → alert and monitor
+            logger_.warn("Heartbeat timeout", {
+                {"name", source.name}
+            });
+
+            alert_system_.send_alert(
+                AlertSeverity::P3_MEDIUM,
+                "Component heartbeat timeout: " + source.name,
+                AlertChannel::SLACK
+            );
+        }
+    }
+};
+
+} // namespace hft::detection
+
+
+2.3 EXCHANGE CONNECTION HEARTBEATS
+-----------------------------------
+
+Purpose: Detect exchange connectivity issues
+Level: Business Logic
+Latency: 100-1000ms
+
+IMPLEMENTATION:
+---------------
+
+namespace hft::detection {
+
+class ExchangeHeartbeatMonitor {
+private:
+    struct ExchangeConnection {
+        std::string exchange_name;
+        std::chrono::steady_clock::time_point last_message;
+        std::chrono::milliseconds max_silence{1000};  // 1 second
+        std::atomic<uint64_t> messages_received{0};
+        std::atomic<bool> is_healthy{true};
+    };
+
+    std::unordered_map<std::string, ExchangeConnection> connections_;
+
+public:
+    void track_message(const std::string& exchange,
+                      const MarketDataMessage& msg) {
+        auto& conn = connections_[exchange];
+        conn.last_message = std::chrono::steady_clock::now();
+        conn.messages_received++;
+
+        if (!conn.is_healthy) {
+            logger_.info("Exchange connection recovered", {
+                {"exchange", exchange}
+            });
+            conn.is_healthy = true;
+        }
+    }
+
+    void monitor_silence() {
+        auto now = std::chrono::steady_clock::now();
+
+        for (auto& [exchange, conn] : connections_) {
+            auto silence = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - conn.last_message);
+
+            if (silence > conn.max_silence && conn.is_healthy) {
+                logger_.error("Exchange silence detected", {
+                    {"exchange", exchange},
+                    {"silence_ms", silence.count()},
+                    {"threshold_ms", conn.max_silence.count()}
+                });
+
+                conn.is_healthy = false;
+
+                // Trigger reconnection
+                recovery_engine_.handle_failure(
+                    FailureType::EXCHANGE_FEED_SILENCE,
+                    FailureSeverity::HIGH,
+                    {{"exchange", exchange}, {"silence_ms", silence.count()}}
+                );
+            }
+        }
+    }
+};
+
+} // namespace hft::detection
+
+================================================================================
+                       3. HEALTH CHECK SYSTEMS
+================================================================================
+
+3.1 ENDPOINT HEALTH CHECKS
+---------------------------
+
+Purpose: Verify service availability and responsiveness
+Level: Service
+Latency: 10-100ms
+
+HTTP HEALTH ENDPOINT:
+---------------------
+
+namespace hft::detection {
+
+class HealthCheckServer {
+private:
+    enum class HealthStatus {
+        HEALTHY,
+        DEGRADED,
+        UNHEALTHY
+    };
+
+    struct HealthCheckResult {
+        HealthStatus status;
+        std::string message;
+        std::unordered_map<std::string, std::string> details;
+        std::chrono::milliseconds response_time;
+    };
+
+    struct ComponentHealth {
+        std::function<HealthCheckResult()> check_function;
+        bool is_critical;
+        std::chrono::milliseconds timeout{100};
+    };
+
+    std::unordered_map<std::string, ComponentHealth> components_;
+
+public:
+    void register_component(const std::string& name,
+                           std::function<HealthCheckResult()> check_fn,
+                           bool is_critical = false) {
+        components_[name] = {
+            .check_function = check_fn,
+            .is_critical = is_critical
+        };
+    }
+
+    // Health check endpoint handler
+    std::string handle_health_check() {
+        auto start = std::chrono::steady_clock::now();
+
+        json::object response;
+        response["timestamp"] = get_iso8601_timestamp();
+        response["service"] = "hft-trading-system";
+
+        bool all_healthy = true;
+        bool any_critical_unhealthy = false;
+
+        json::object checks;
+
+        for (const auto& [name, component] : components_) {
+            auto check_start = std::chrono::steady_clock::now();
+
+            HealthCheckResult result;
+            try {
+                result = component.check_function();
+            } catch (const std::exception& e) {
+                result = {
+                    .status = HealthStatus::UNHEALTHY,
+                    .message = "Health check threw exception: " +
+                              std::string(e.what())
+                };
+            }
+
+            auto check_duration = std::chrono::duration_cast<
+                std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - check_start);
+
+            json::object check_result;
+            check_result["status"] = to_string(result.status);
+            check_result["message"] = result.message;
+            check_result["response_time_ms"] = check_duration.count();
+            check_result["critical"] = component.is_critical;
+
+            if (!result.details.empty()) {
+                check_result["details"] = result.details;
+            }
+
+            checks[name] = check_result;
+
+            if (result.status != HealthStatus::HEALTHY) {
+                all_healthy = false;
+                if (component.is_critical) {
+                    any_critical_unhealthy = true;
+                }
+            }
+        }
+
+        response["checks"] = checks;
+
+        if (any_critical_unhealthy) {
+            response["status"] = "unhealthy";
+        } else if (!all_healthy) {
+            response["status"] = "degraded";
+        } else {
+            response["status"] = "healthy";
+        }
+
+        auto total_duration = std::chrono::duration_cast<
+            std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start);
+
+        response["response_time_ms"] = total_duration.count();
+
+        return response.dump();
+    }
+};
+
+// Example component health checks
+class TradingEngineHealthChecks {
+public:
+    HealthCheckResult check_order_manager() {
+        // Check if order manager is responsive
+        auto start = std::chrono::steady_clock::now();
+
+        if (!order_manager_.is_initialized()) {
+            return {
+                .status = HealthStatus::UNHEALTHY,
+                .message = "Order manager not initialized"
+            };
+        }
+
+        // Check queue depths
+        auto pending_orders = order_manager_.get_pending_order_count();
+        if (pending_orders > MAX_PENDING_ORDERS) {
+            return {
+                .status = HealthStatus::DEGRADED,
+                .message = "High pending order count",
+                .details = {{"pending_orders", std::to_string(pending_orders)}}
+            };
+        }
+
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start);
+
+        return {
+            .status = HealthStatus::HEALTHY,
+            .message = "Order manager operational",
+            .details = {{"pending_orders", std::to_string(pending_orders)}},
+            .response_time = duration
+        };
+    }
+
+    HealthCheckResult check_exchange_connectivity() {
+        std::vector<std::string> disconnected_exchanges;
+
+        for (const auto& exchange : exchange_manager_.get_exchanges()) {
+            if (!exchange.is_connected()) {
+                disconnected_exchanges.push_back(exchange.name());
+            }
+        }
+
+        if (!disconnected_exchanges.empty()) {
+            return {
+                .status = HealthStatus::UNHEALTHY,
+                .message = "Exchange connectivity issues",
+                .details = {
+                    {"disconnected_count",
+                     std::to_string(disconnected_exchanges.size())},
+                    {"disconnected_exchanges",
+                     join(disconnected_exchanges, ", ")}
+                }
+            };
+        }
+
+        return {
+            .status = HealthStatus::HEALTHY,
+            .message = "All exchanges connected"
+        };
+    }
+
+    HealthCheckResult check_market_data() {
+        auto now = std::chrono::steady_clock::now();
+
+        for (const auto& feed : market_data_.get_feeds()) {
+            auto age = now - feed.last_update_time();
+            if (age > std::chrono::seconds(1)) {
+                return {
+                    .status = HealthStatus::DEGRADED,
+                    .message = "Stale market data",
+                    .details = {
+                        {"feed", feed.name()},
+                        {"age_ms", std::to_string(
+                            std::chrono::duration_cast<std::chrono::milliseconds>(
+                                age).count())}
+                    }
+                };
+            }
+        }
+
+        return {
+            .status = HealthStatus::HEALTHY,
+            .message = "Market data current"
+        };
+    }
+
+    HealthCheckResult check_risk_limits() {
+        auto exposure = risk_manager_.get_current_exposure();
+
+        if (exposure.position_pct > 90.0) {
+            return {
+                .status = HealthStatus::DEGRADED,
+                .message = "Near position limit",
+                .details = {
+                    {"position_utilization", std::to_string(exposure.position_pct)}
+                }
+            };
+        }
+
+        if (exposure.pnl_pct > 95.0) {
+            return {
+                .status = HealthStatus::UNHEALTHY,
+                .message = "Near P&L limit",
+                .details = {
+                    {"pnl_utilization", std::to_string(exposure.pnl_pct)}
+                }
+            };
+        }
+
+        return {
+            .status = HealthStatus::HEALTHY,
+            .message = "Risk limits healthy",
+            .details = {
+                {"position_utilization", std::to_string(exposure.position_pct)},
+                {"pnl_utilization", std::to_string(exposure.pnl_pct)}
+            }
+        };
+    }
+};
+
+} // namespace hft::detection
+
+
+3.2 DEPENDENCY HEALTH CHECKS
+-----------------------------
+
+Purpose: Verify external dependencies are operational
+Level: Integration
+Latency: 10-1000ms
+
+namespace hft::detection {
+
+class DependencyHealthMonitor {
+private:
+    struct Dependency {
+        std::string name;
+        std::string endpoint;
+        std::chrono::milliseconds timeout{1000};
+        std::function<bool()> health_check;
+        bool is_critical{false};
+    };
+
+    std::vector<Dependency> dependencies_;
+
+public:
+    void add_dependency(const Dependency& dep) {
+        dependencies_.push_back(dep);
+    }
+
+    bool check_all_dependencies() {
+        bool all_healthy = true;
+
+        for (const auto& dep : dependencies_) {
+            auto start = std::chrono::steady_clock::now();
+
+            bool is_healthy = false;
+            try {
+                is_healthy = dep.health_check();
+            } catch (const std::exception& e) {
+                logger_.error("Dependency health check failed", {
+                    {"dependency", dep.name},
+                    {"error", e.what()}
+                });
+            }
+
+            auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start);
+
+            if (!is_healthy) {
+                logger_.error("Dependency unhealthy", {
+                    {"dependency", dep.name},
+                    {"endpoint", dep.endpoint},
+                    {"critical", dep.is_critical}
+                });
+
+                all_healthy = false;
+
+                if (dep.is_critical) {
+                    handle_critical_dependency_failure(dep);
+                }
+            } else if (duration > dep.timeout) {
+                logger_.warn("Dependency slow to respond", {
+                    {"dependency", dep.name},
+                    {"duration_ms", duration.count()},
+                    {"timeout_ms", dep.timeout.count()}
+                });
+            }
+        }
+
+        return all_healthy;
+    }
+
+private:
+    void handle_critical_dependency_failure(const Dependency& dep) {
+        logger_.critical("Critical dependency failure", {
+            {"dependency", dep.name}
+        });
+
+        alert_system_.send_alert(
+            AlertSeverity::P1_CRITICAL,
+            "Critical dependency failure: " + dep.name,
+            AlertChannel::PAGERDUTY | AlertChannel::SMS
+        );
+
+        // Activate circuit breaker for this dependency
+        circuit_breakers_[dep.name].open();
+
+        // Enter degraded mode
+        system_state_.enter_degraded_mode(
+            "Critical dependency failure: " + dep.name
+        );
+    }
+};
+
+} // namespace hft::detection
+
+================================================================================
+                       4. ANOMALY DETECTION
+================================================================================
+
+4.1 STATISTICAL ANOMALY DETECTION
+----------------------------------
+
+Purpose: Detect abnormal behavior patterns
+Method: Statistical Process Control (SPC)
+Latency: 1-100ms
+
+IMPLEMENTATION:
+---------------
+
+namespace hft::detection {
+
+class StatisticalAnomalyDetector {
+private:
+    struct TimeSeriesData {
+        std::deque<double> values;
+        size_t max_samples{1000};
+
+        double mean{0.0};
+        double std_dev{0.0};
+        double min{std::numeric_limits<double>::max()};
+        double max{std::numeric_limits<double>::lowest()};
+
+        void add_sample(double value) {
+            values.push_back(value);
+
+            if (values.size() > max_samples) {
+                values.pop_front();
+            }
+
+            // Update statistics
+            update_statistics();
+        }
+
+        void update_statistics() {
+            if (values.empty()) return;
+
+            // Calculate mean
+            double sum = std::accumulate(values.begin(), values.end(), 0.0);
+            mean = sum / values.size();
+
+            // Calculate standard deviation
+            double sq_sum = std::accumulate(values.begin(), values.end(), 0.0,
+                [this](double acc, double val) {
+                    double diff = val - mean;
+                    return acc + diff * diff;
+                });
+            std_dev = std::sqrt(sq_sum / values.size());
+
+            // Update min/max
+            auto [min_it, max_it] = std::minmax_element(
+                values.begin(), values.end());
+            min = *min_it;
+            max = *max_it;
+        }
+
+        bool is_anomaly(double value, double sigma_threshold = 3.0) const {
+            if (std_dev == 0.0) return false;
+
+            double z_score = std::abs(value - mean) / std_dev;
+            return z_score > sigma_threshold;
+        }
+    };
+
+    std::unordered_map<std::string, TimeSeriesData> metrics_;
+
+public:
+    void track_metric(const std::string& metric_name, double value) {
+        auto& data = metrics_[metric_name];
+        data.add_sample(value);
+
+        // Check for anomaly (3-sigma rule)
+        if (data.is_anomaly(value, 3.0)) {
+            logger_.warn("Statistical anomaly detected", {
+                {"metric", metric_name},
+                {"value", value},
+                {"mean", data.mean},
+                {"std_dev", data.std_dev},
+                {"z_score", std::abs(value - data.mean) / data.std_dev}
+            });
+
+            handle_anomaly(metric_name, value, data);
+        }
+
+        // Check for extreme anomaly (5-sigma rule)
+        if (data.is_anomaly(value, 5.0)) {
+            logger_.error("Extreme anomaly detected", {
+                {"metric", metric_name},
+                {"value", value},
+                {"mean", data.mean},
+                {"std_dev", data.std_dev}
+            });
+
+            handle_extreme_anomaly(metric_name, value, data);
+        }
+    }
+
+    AnomalyReport generate_report(const std::string& metric_name) {
+        const auto& data = metrics_[metric_name];
+
+        return AnomalyReport{
+            .metric_name = metric_name,
+            .current_value = data.values.back(),
+            .mean = data.mean,
+            .std_dev = data.std_dev,
+            .min = data.min,
+            .max = data.max,
+            .sample_count = data.values.size()
+        };
+    }
+
+private:
+    void handle_anomaly(const std::string& metric,
+                       double value,
+                       const TimeSeriesData& data) {
+        // Metric-specific handling
+        if (metric == "order_latency_us") {
+            if (value > data.mean + 3 * data.std_dev) {
+                alert_system_.send_alert(
+                    AlertSeverity::P3_MEDIUM,
+                    "High order latency detected",
+                    {{"latency_us", value}, {"mean_us", data.mean}}
+                );
+            }
+        } else if (metric == "fill_rate") {
+            if (value < data.mean - 3 * data.std_dev) {
+                alert_system_.send_alert(
+                    AlertSeverity::P2_HIGH,
+                    "Low fill rate detected",
+                    {{"fill_rate", value}, {"mean", data.mean}}
+                );
+            }
+        }
+    }
+
+    void handle_extreme_anomaly(const std::string& metric,
+                                double value,
+                                const TimeSeriesData& data) {
+        logger_.critical("Extreme anomaly - possible system failure", {
+            {"metric", metric},
+            {"value", value}
+        });
+
+        // Extreme anomaly might indicate system failure
+        alert_system_.send_alert(
+            AlertSeverity::P1_CRITICAL,
+            "Extreme anomaly detected: " + metric,
+            {{"value", value}, {"mean", data.mean}, {"std_dev", data.std_dev}},
+            AlertChannel::PAGERDUTY | AlertChannel::SMS
+        );
+
+        // Consider activating circuit breaker
+        if (metric == "order_rejection_rate" && value > 0.5) {
+            circuit_breaker_.open();
+        }
+    }
+};
+
+} // namespace hft::detection
+
+
+4.2 PATTERN-BASED ANOMALY DETECTION
+------------------------------------
+
+Purpose: Detect known failure patterns
+Method: Pattern matching and rules engine
+Latency: < 1ms
+
+namespace hft::detection {
+
+class PatternAnomalyDetector {
+private:
+    struct AnomalyPattern {
+        std::string name;
+        std::function<bool(const SystemState&)> matcher;
+        FailureSeverity severity;
+        std::string description;
+    };
+
+    std::vector<AnomalyPattern> patterns_;
+
+public:
+    void initialize_patterns() {
+        // Pattern 1: Sustained high error rate
+        patterns_.push_back({
+            .name = "sustained_high_error_rate",
+            .matcher = [](const SystemState& state) {
+                return state.error_rate_1min > 0.01 &&  // > 1% errors
+                       state.error_rate_5min > 0.01;    // Sustained
+            },
+            .severity = FailureSeverity::HIGH,
+            .description = "Sustained high error rate"
+        });
+
+        // Pattern 2: Cascading failures
+        patterns_.push_back({
+            .name = "cascading_failures",
+            .matcher = [](const SystemState& state) {
+                // Multiple components failing in short time
+                return state.failed_components.size() >= 3 &&
+                       state.time_since_first_failure < std::chrono::seconds(60);
+            },
+            .severity = FailureSeverity::CRITICAL,
+            .description = "Cascading failures detected"
+        });
+
+        // Pattern 3: Memory leak
+        patterns_.push_back({
+            .name = "memory_leak",
+            .matcher = [](const SystemState& state) {
+                // Memory usage increasing steadily
+                return state.memory_growth_rate_mb_per_min > 10.0 &&
+                       state.memory_usage_pct > 80.0;
+            },
+            .severity = FailureSeverity::HIGH,
+            .description = "Possible memory leak"
+        });
+
+        // Pattern 4: Clock drift
+        patterns_.push_back({
+            .name = "clock_drift",
+            .matcher = [](const SystemState& state) {
+                return std::abs(state.clock_offset_us) > 1000;  // > 1ms drift
+            },
+            .severity = FailureSeverity::HIGH,
+            .description = "Clock drift detected"
+        });
+
+        // Pattern 5: Resource starvation
+        patterns_.push_back({
+            .name = "resource_starvation",
+            .matcher = [](const SystemState& state) {
+                return (state.cpu_usage_pct > 95.0 ||
+                       state.memory_usage_pct > 95.0 ||
+                       state.disk_usage_pct > 95.0) &&
+                       state.queue_depth > MAX_QUEUE_DEPTH;
+            },
+            .severity = FailureSeverity::CRITICAL,
+            .description = "Resource starvation"
+        });
+    }
+
+    void check_patterns(const SystemState& state) {
+        for (const auto& pattern : patterns_) {
+            if (pattern.matcher(state)) {
+                handle_pattern_match(pattern, state);
+            }
+        }
+    }
+
+private:
+    void handle_pattern_match(const AnomalyPattern& pattern,
+                             const SystemState& state) {
+        logger_.error("Anomaly pattern detected", {
+            {"pattern", pattern.name},
+            {"description", pattern.description},
+            {"severity", to_string(pattern.severity)}
+        });
+
+        // Alert based on severity
+        if (pattern.severity == FailureSeverity::CRITICAL) {
+            alert_system_.send_alert(
+                AlertSeverity::P1_CRITICAL,
+                "Critical anomaly pattern: " + pattern.description,
+                AlertChannel::PAGERDUTY | AlertChannel::SMS
+            );
+
+            // Trigger automatic recovery
+            recovery_engine_.handle_pattern_failure(pattern.name, state);
+        } else {
+            alert_system_.send_alert(
+                AlertSeverity::P2_HIGH,
+                "Anomaly pattern: " + pattern.description,
+                AlertChannel::SLACK
+            );
+        }
+    }
+};
+
+} // namespace hft::detection
+
+================================================================================
+                              END OF DOCUMENT
+================================================================================

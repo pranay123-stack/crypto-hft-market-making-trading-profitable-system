@@ -1,0 +1,778 @@
+================================================================================
+STRATEGY VALIDATION - COMPARING REPLAY VS LIVE RESULTS
+================================================================================
+
+PURPOSE: Validate that replayed results match live trading results within
+acceptable tolerances, ensuring replay engine accurately models reality.
+
+KEY PRINCIPLE: If replay results differ significantly from live results, either:
+1. Replay engine is inaccurate (fix the simulator)
+2. Strategy is not robust to real market conditions (fix the strategy)
+
+================================================================================
+VALIDATION METRICS
+================================================================================
+
+METRICS TO COMPARE:
+-------------------
+
+1. PNL METRICS
+   - Total PnL (should match within 5-10%)
+   - PnL by session (morning/afternoon)
+   - PnL by strategy component
+   - Cumulative PnL trajectory
+
+2. EXECUTION METRICS
+   - Number of orders submitted
+   - Fill rate (fills / orders)
+   - Average fill time
+   - Cancel rate
+   - Reject rate
+
+3. PERFORMANCE METRICS
+   - Sharpe ratio
+   - Maximum drawdown
+   - Win rate
+   - Profit factor
+   - Average trade PnL
+
+4. RISK METRICS
+   - Maximum position
+   - Average position
+   - Time in market
+   - Largest loss
+   - Number of stop loss triggers
+
+5. MICROSTRUCTURE METRICS
+   - Average slippage
+   - Adverse selection rate
+   - Queue position estimates
+   - Spread capture rate
+
+================================================================================
+VALIDATION FRAMEWORK
+================================================================================
+
+class StrategyValidator {
+public:
+    struct LiveResults {
+        // PnL
+        double total_pnl;
+        std::vector<double> trade_pnls;
+        std::map<uint64_t, double> pnl_by_time;  // timestamp -> cumulative PnL
+
+        // Execution
+        size_t orders_submitted;
+        size_t orders_filled;
+        size_t orders_cancelled;
+        size_t orders_rejected;
+        double avg_fill_time_us;
+
+        // Positions
+        std::vector<int64_t> position_snapshots;
+        int64_t max_position;
+
+        // Fills
+        struct FillDetail {
+            uint64_t timestamp;
+            std::string symbol;
+            Side side;
+            int64_t price;
+            int64_t quantity;
+            int64_t decision_price;  // Price when decision made
+        };
+        std::vector<FillDetail> fills;
+
+        // Timestamps
+        uint64_t start_time;
+        uint64_t end_time;
+    };
+
+    struct ReplayResults {
+        // Same structure as LiveResults
+        double total_pnl;
+        std::vector<double> trade_pnls;
+        std::map<uint64_t, double> pnl_by_time;
+        size_t orders_submitted;
+        size_t orders_filled;
+        size_t orders_cancelled;
+        size_t orders_rejected;
+        double avg_fill_time_us;
+        std::vector<int64_t> position_snapshots;
+        int64_t max_position;
+        std::vector<LiveResults::FillDetail> fills;
+        uint64_t start_time;
+        uint64_t end_time;
+    };
+
+    struct ValidationReport {
+        bool passed;
+        std::vector<std::string> failures;
+        std::vector<std::string> warnings;
+
+        struct MetricComparison {
+            std::string metric_name;
+            double live_value;
+            double replay_value;
+            double diff_pct;
+            double threshold_pct;
+            bool within_tolerance;
+        };
+        std::vector<MetricComparison> comparisons;
+    };
+
+    ValidationReport validate(const LiveResults& live,
+                             const ReplayResults& replay,
+                             double tolerance_pct = 10.0) {
+        ValidationReport report;
+        report.passed = true;
+
+        // Compare PnL
+        {
+            auto comp = compareMetric("Total PnL",
+                                     live.total_pnl,
+                                     replay.total_pnl,
+                                     tolerance_pct);
+            report.comparisons.push_back(comp);
+
+            if (!comp.within_tolerance) {
+                report.passed = false;
+                report.failures.push_back(
+                    "PnL mismatch: " + std::to_string(comp.diff_pct) + "%"
+                );
+            }
+        }
+
+        // Compare fill rate
+        {
+            double live_fill_rate = static_cast<double>(live.orders_filled) /
+                                   live.orders_submitted;
+            double replay_fill_rate = static_cast<double>(replay.orders_filled) /
+                                      replay.orders_submitted;
+
+            auto comp = compareMetric("Fill Rate",
+                                     live_fill_rate * 100.0,
+                                     replay_fill_rate * 100.0,
+                                     15.0);  // Higher tolerance for fill rate
+            report.comparisons.push_back(comp);
+
+            if (!comp.within_tolerance) {
+                report.warnings.push_back(
+                    "Fill rate difference: " + std::to_string(comp.diff_pct) + "%"
+                );
+            }
+        }
+
+        // Compare order counts
+        {
+            auto comp = compareMetric("Orders Submitted",
+                                     static_cast<double>(live.orders_submitted),
+                                     static_cast<double>(replay.orders_submitted),
+                                     5.0);  // Should be very close
+            report.comparisons.push_back(comp);
+
+            if (!comp.within_tolerance) {
+                report.passed = false;
+                report.failures.push_back(
+                    "Order count mismatch: " + std::to_string(comp.diff_pct) + "%"
+                );
+            }
+        }
+
+        // Compare max position
+        {
+            auto comp = compareMetric("Max Position",
+                                     static_cast<double>(live.max_position),
+                                     static_cast<double>(replay.max_position),
+                                     5.0);
+            report.comparisons.push_back(comp);
+
+            if (!comp.within_tolerance) {
+                report.warnings.push_back(
+                    "Max position difference: " + std::to_string(comp.diff_pct) + "%"
+                );
+            }
+        }
+
+        // Compare fill latency
+        {
+            auto comp = compareMetric("Avg Fill Time (us)",
+                                     live.avg_fill_time_us,
+                                     replay.avg_fill_time_us,
+                                     20.0);  // Higher tolerance
+            report.comparisons.push_back(comp);
+
+            if (!comp.within_tolerance) {
+                report.warnings.push_back(
+                    "Fill latency difference: " + std::to_string(comp.diff_pct) + "%"
+                );
+            }
+        }
+
+        // Compare PnL trajectory correlation
+        double pnl_correlation = computePnLCorrelation(live, replay);
+        if (pnl_correlation < 0.95) {
+            report.warnings.push_back(
+                "Low PnL trajectory correlation: " + std::to_string(pnl_correlation)
+            );
+        }
+
+        // Compare slippage
+        double live_slippage = computeAverageSlippage(live.fills);
+        double replay_slippage = computeAverageSlippage(replay.fills);
+        {
+            auto comp = compareMetric("Avg Slippage (bps)",
+                                     live_slippage,
+                                     replay_slippage,
+                                     25.0);  // Slippage varies significantly
+            report.comparisons.push_back(comp);
+        }
+
+        return report;
+    }
+
+    void printValidationReport(const ValidationReport& report) {
+        LOG_INFO("=== Validation Report ===");
+
+        if (report.passed) {
+            LOG_INFO("VALIDATION PASSED");
+        } else {
+            LOG_ERROR("VALIDATION FAILED");
+        }
+
+        LOG_INFO("\nMetric Comparisons:");
+        LOG_INFO("{:<25} {:>15} {:>15} {:>10} {:>10}",
+                "Metric", "Live", "Replay", "Diff %", "Status");
+        LOG_INFO(std::string(80, '-'));
+
+        for (const auto& comp : report.comparisons) {
+            std::string status = comp.within_tolerance ? "PASS" : "FAIL";
+
+            LOG_INFO("{:<25} {:>15.2f} {:>15.2f} {:>10.2f} {:>10}",
+                    comp.metric_name,
+                    comp.live_value,
+                    comp.replay_value,
+                    comp.diff_pct,
+                    status);
+        }
+
+        if (!report.failures.empty()) {
+            LOG_ERROR("\nFailures:");
+            for (const auto& failure : report.failures) {
+                LOG_ERROR("  - {}", failure);
+            }
+        }
+
+        if (!report.warnings.empty()) {
+            LOG_WARN("\nWarnings:");
+            for (const auto& warning : report.warnings) {
+                LOG_WARN("  - {}", warning);
+            }
+        }
+    }
+
+private:
+    ValidationReport::MetricComparison compareMetric(
+        const std::string& name,
+        double live_value,
+        double replay_value,
+        double threshold_pct) {
+
+        ValidationReport::MetricComparison comp;
+        comp.metric_name = name;
+        comp.live_value = live_value;
+        comp.replay_value = replay_value;
+        comp.threshold_pct = threshold_pct;
+
+        if (std::abs(live_value) < 1e-6) {
+            comp.diff_pct = 0.0;
+        } else {
+            comp.diff_pct = 100.0 * std::abs(live_value - replay_value) /
+                           std::abs(live_value);
+        }
+
+        comp.within_tolerance = comp.diff_pct <= threshold_pct;
+
+        return comp;
+    }
+
+    double computePnLCorrelation(const LiveResults& live,
+                                const ReplayResults& replay) {
+        // Extract aligned PnL time series
+        std::vector<double> live_pnls;
+        std::vector<double> replay_pnls;
+
+        // Find common timestamps
+        for (const auto& [timestamp, pnl] : live.pnl_by_time) {
+            auto it = replay.pnl_by_time.find(timestamp);
+            if (it != replay.pnl_by_time.end()) {
+                live_pnls.push_back(pnl);
+                replay_pnls.push_back(it->second);
+            }
+        }
+
+        if (live_pnls.size() < 2) {
+            return 0.0;
+        }
+
+        // Compute Pearson correlation
+        return pearsonCorrelation(live_pnls, replay_pnls);
+    }
+
+    double pearsonCorrelation(const std::vector<double>& x,
+                             const std::vector<double>& y) {
+        if (x.size() != y.size() || x.empty()) {
+            return 0.0;
+        }
+
+        double mean_x = std::accumulate(x.begin(), x.end(), 0.0) / x.size();
+        double mean_y = std::accumulate(y.begin(), y.end(), 0.0) / y.size();
+
+        double cov = 0.0, var_x = 0.0, var_y = 0.0;
+
+        for (size_t i = 0; i < x.size(); ++i) {
+            double dx = x[i] - mean_x;
+            double dy = y[i] - mean_y;
+
+            cov += dx * dy;
+            var_x += dx * dx;
+            var_y += dy * dy;
+        }
+
+        if (var_x < 1e-10 || var_y < 1e-10) {
+            return 0.0;
+        }
+
+        return cov / std::sqrt(var_x * var_y);
+    }
+
+    double computeAverageSlippage(const std::vector<LiveResults::FillDetail>& fills) {
+        if (fills.empty()) return 0.0;
+
+        double total_slippage = 0.0;
+
+        for (const auto& fill : fills) {
+            int64_t slippage = (fill.side == Side::BUY)
+                ? (fill.price - fill.decision_price)
+                : (fill.decision_price - fill.price);
+
+            double slippage_bps = 10000.0 * slippage /
+                                 static_cast<double>(fill.decision_price);
+
+            total_slippage += slippage_bps;
+        }
+
+        return total_slippage / fills.size();
+    }
+};
+
+================================================================================
+DETAILED FILL ANALYSIS
+================================================================================
+
+class FillAnalyzer {
+public:
+    struct FillComparison {
+        uint64_t timestamp;
+        std::string symbol;
+
+        // Live
+        bool filled_live;
+        int64_t live_fill_price;
+        uint64_t live_fill_time;
+
+        // Replay
+        bool filled_replay;
+        int64_t replay_fill_price;
+        uint64_t replay_fill_time;
+
+        // Differences
+        bool fill_status_match;
+        int64_t price_diff_ticks;
+        int64_t time_diff_us;
+    };
+
+    std::vector<FillComparison> compareFills(
+        const StrategyValidator::LiveResults& live,
+        const StrategyValidator::ReplayResults& replay) {
+
+        std::vector<FillComparison> comparisons;
+
+        // Match fills by timestamp (within 100us window)
+        const uint64_t time_window = 100000;  // 100 microseconds
+
+        for (const auto& live_fill : live.fills) {
+            FillComparison comp;
+            comp.timestamp = live_fill.timestamp;
+            comp.symbol = live_fill.symbol;
+            comp.filled_live = true;
+            comp.live_fill_price = live_fill.price;
+            comp.live_fill_time = live_fill.timestamp;
+
+            // Find matching replay fill
+            comp.filled_replay = false;
+            for (const auto& replay_fill : replay.fills) {
+                if (replay_fill.symbol == live_fill.symbol &&
+                    std::abs(static_cast<int64_t>(replay_fill.timestamp - live_fill.timestamp))
+                        < static_cast<int64_t>(time_window)) {
+
+                    comp.filled_replay = true;
+                    comp.replay_fill_price = replay_fill.price;
+                    comp.replay_fill_time = replay_fill.timestamp;
+                    break;
+                }
+            }
+
+            comp.fill_status_match = comp.filled_live == comp.filled_replay;
+            comp.price_diff_ticks = comp.filled_replay
+                ? (comp.replay_fill_price - comp.live_fill_price)
+                : 0;
+            comp.time_diff_us = comp.filled_replay
+                ? static_cast<int64_t>(comp.replay_fill_time - comp.live_fill_time) / 1000
+                : 0;
+
+            comparisons.push_back(comp);
+        }
+
+        return comparisons;
+    }
+
+    void analyzeFillDifferences(const std::vector<FillComparison>& comparisons) {
+        LOG_INFO("=== Fill Analysis ===");
+
+        size_t total_fills = comparisons.size();
+        size_t matching_fills = 0;
+        size_t price_mismatches = 0;
+        size_t timing_mismatches = 0;
+
+        std::vector<int64_t> price_diffs;
+        std::vector<int64_t> time_diffs;
+
+        for (const auto& comp : comparisons) {
+            if (comp.fill_status_match && comp.filled_replay) {
+                matching_fills++;
+
+                if (comp.price_diff_ticks != 0) {
+                    price_mismatches++;
+                    price_diffs.push_back(comp.price_diff_ticks);
+                }
+
+                if (std::abs(comp.time_diff_us) > 1000) {  // >1ms difference
+                    timing_mismatches++;
+                    time_diffs.push_back(comp.time_diff_us);
+                }
+            }
+        }
+
+        LOG_INFO("Total fills: {}", total_fills);
+        LOG_INFO("Matching fills: {} ({:.1f}%)",
+                matching_fills, 100.0 * matching_fills / total_fills);
+        LOG_INFO("Price mismatches: {} ({:.1f}%)",
+                price_mismatches, 100.0 * price_mismatches / total_fills);
+        LOG_INFO("Timing mismatches (>1ms): {} ({:.1f}%)",
+                timing_mismatches, 100.0 * timing_mismatches / total_fills);
+
+        if (!price_diffs.empty()) {
+            std::sort(price_diffs.begin(), price_diffs.end());
+            LOG_INFO("Price difference (ticks):");
+            LOG_INFO("  Mean: {:.2f}", mean(price_diffs));
+            LOG_INFO("  Median: {}", price_diffs[price_diffs.size() / 2]);
+            LOG_INFO("  P95: {}", price_diffs[static_cast<size_t>(price_diffs.size() * 0.95)]);
+        }
+
+        if (!time_diffs.empty()) {
+            std::sort(time_diffs.begin(), time_diffs.end());
+            LOG_INFO("Time difference (us):");
+            LOG_INFO("  Mean: {:.2f}", mean(time_diffs));
+            LOG_INFO("  Median: {}", time_diffs[time_diffs.size() / 2]);
+            LOG_INFO("  P95: {}", time_diffs[static_cast<size_t>(time_diffs.size() * 0.95)]);
+        }
+    }
+
+private:
+    template<typename T>
+    double mean(const std::vector<T>& values) {
+        if (values.empty()) return 0.0;
+        return std::accumulate(values.begin(), values.end(), 0.0) / values.size();
+    }
+};
+
+================================================================================
+PNL ATTRIBUTION ANALYSIS
+================================================================================
+
+class PnLAttributionAnalyzer {
+public:
+    struct Attribution {
+        double signal_pnl;        // PnL from correct directional calls
+        double slippage_cost;     // Cost from slippage
+        double spread_cost;       // Cost from crossing spread
+        double adverse_selection; // Cost from being picked off
+        double market_impact;     // Cost from moving market
+        double timing_cost;       // Cost from suboptimal timing
+        double other;             // Unexplained
+    };
+
+    Attribution attributePnL(const StrategyValidator::LiveResults& results,
+                            const std::vector<Trade>& market_trades) {
+        Attribution attr;
+        memset(&attr, 0, sizeof(attr));
+
+        for (const auto& fill : results.fills) {
+            // Signal PnL: theoretical PnL if filled at decision price
+            int64_t position_sign = (fill.side == Side::BUY) ? 1 : -1;
+
+            // Find next opposite fill (exit)
+            const auto* exit_fill = findExitFill(fill, results.fills);
+
+            if (exit_fill) {
+                // Theoretical PnL (if filled at decision prices)
+                double theoretical_pnl = position_sign *
+                    (exit_fill->decision_price - fill.decision_price) *
+                    fill.quantity;
+
+                attr.signal_pnl += theoretical_pnl;
+
+                // Actual PnL
+                double actual_pnl = position_sign *
+                    (exit_fill->price - fill.price) *
+                    fill.quantity;
+
+                // Slippage on entry
+                double entry_slippage = position_sign *
+                    (fill.price - fill.decision_price) *
+                    fill.quantity;
+                attr.slippage_cost += entry_slippage;
+
+                // Slippage on exit
+                double exit_slippage = -position_sign *
+                    (exit_fill->price - exit_fill->decision_price) *
+                    exit_fill->quantity;
+                attr.slippage_cost += exit_slippage;
+
+                // Spread cost (if we crossed)
+                // (Simplified - would need book snapshot at time)
+                attr.spread_cost += estimateSpreadCost(fill);
+                attr.spread_cost += estimateSpreadCost(*exit_fill);
+            }
+        }
+
+        return attr;
+    }
+
+    void compareAttribution(const Attribution& live_attr,
+                           const Attribution& replay_attr) {
+        LOG_INFO("=== PnL Attribution Comparison ===");
+
+        LOG_INFO("{:<20} {:>15} {:>15} {:>15}",
+                "Component", "Live", "Replay", "Diff");
+        LOG_INFO(std::string(70, '-'));
+
+        auto print_component = [](const std::string& name,
+                                  double live, double replay) {
+            double diff = replay - live;
+            LOG_INFO("{:<20} {:>15.2f} {:>15.2f} {:>15.2f}",
+                    name, live, replay, diff);
+        };
+
+        print_component("Signal PnL", live_attr.signal_pnl, replay_attr.signal_pnl);
+        print_component("Slippage Cost", live_attr.slippage_cost, replay_attr.slippage_cost);
+        print_component("Spread Cost", live_attr.spread_cost, replay_attr.spread_cost);
+        print_component("Adverse Select", live_attr.adverse_selection, replay_attr.adverse_selection);
+        print_component("Market Impact", live_attr.market_impact, replay_attr.market_impact);
+        print_component("Timing Cost", live_attr.timing_cost, replay_attr.timing_cost);
+
+        LOG_INFO(std::string(70, '-'));
+
+        double live_total = live_attr.signal_pnl + live_attr.slippage_cost +
+                           live_attr.spread_cost + live_attr.adverse_selection +
+                           live_attr.market_impact + live_attr.timing_cost;
+
+        double replay_total = replay_attr.signal_pnl + replay_attr.slippage_cost +
+                             replay_attr.spread_cost + replay_attr.adverse_selection +
+                             replay_attr.market_impact + replay_attr.timing_cost;
+
+        print_component("TOTAL", live_total, replay_total);
+    }
+
+private:
+    const StrategyValidator::LiveResults::FillDetail* findExitFill(
+        const StrategyValidator::LiveResults::FillDetail& entry,
+        const std::vector<StrategyValidator::LiveResults::FillDetail>& fills) const {
+
+        // Find next opposite side fill
+        Side exit_side = (entry.side == Side::BUY) ? Side::SELL : Side::BUY;
+
+        for (const auto& fill : fills) {
+            if (fill.timestamp > entry.timestamp &&
+                fill.symbol == entry.symbol &&
+                fill.side == exit_side) {
+                return &fill;
+            }
+        }
+
+        return nullptr;
+    }
+
+    double estimateSpreadCost(const StrategyValidator::LiveResults::FillDetail& fill) const {
+        // Simplified - assume spread is 1 tick
+        return fill.quantity;  // 1 tick per contract
+    }
+};
+
+================================================================================
+CONTINUOUS VALIDATION SYSTEM
+================================================================================
+
+class ContinuousValidator {
+public:
+    // Automatically validate replay after each live trading session
+    void validateDailySession(const std::string& date,
+                             const std::string& live_results_path,
+                             const std::string& tick_data_path) {
+        LOG_INFO("Validating session: {}", date);
+
+        // Load live results
+        StrategyValidator::LiveResults live = loadLiveResults(live_results_path);
+
+        // Run replay
+        StrategyValidator::ReplayResults replay = runReplay(tick_data_path, live);
+
+        // Validate
+        StrategyValidator validator;
+        auto report = validator.validate(live, replay);
+
+        validator.printValidationReport(report);
+
+        // Store validation report
+        storeValidationReport(date, report);
+
+        // Alert if validation failed
+        if (!report.passed) {
+            sendAlert("Replay validation failed for " + date);
+        }
+
+        // Detailed analysis
+        FillAnalyzer fill_analyzer;
+        auto fill_comparisons = fill_analyzer.compareFills(live, replay);
+        fill_analyzer.analyzeFillDifferences(fill_comparisons);
+
+        // PnL attribution
+        PnLAttributionAnalyzer pnl_analyzer;
+        auto live_attr = pnl_analyzer.attributePnL(live, {});
+        auto replay_attr = pnl_analyzer.attributePnL(
+            reinterpret_cast<const StrategyValidator::LiveResults&>(replay), {}
+        );
+        pnl_analyzer.compareAttribution(live_attr, replay_attr);
+    }
+
+    // Track validation metrics over time
+    void printValidationTrends() {
+        LOG_INFO("=== Validation Trends (Last 30 Days) ===");
+
+        // Load historical validation reports
+        auto reports = loadHistoricalReports(30);
+
+        // Compute trends
+        std::vector<double> pnl_diffs;
+        std::vector<double> fill_rate_diffs;
+
+        for (const auto& report : reports) {
+            for (const auto& comp : report.comparisons) {
+                if (comp.metric_name == "Total PnL") {
+                    pnl_diffs.push_back(comp.diff_pct);
+                } else if (comp.metric_name == "Fill Rate") {
+                    fill_rate_diffs.push_back(comp.diff_pct);
+                }
+            }
+        }
+
+        if (!pnl_diffs.empty()) {
+            LOG_INFO("PnL difference trend:");
+            LOG_INFO("  Mean: {:.2f}%", mean(pnl_diffs));
+            LOG_INFO("  Std: {:.2f}%", stddev(pnl_diffs));
+            LOG_INFO("  Improving: {}", isTrendImproving(pnl_diffs) ? "Yes" : "No");
+        }
+
+        if (!fill_rate_diffs.empty()) {
+            LOG_INFO("Fill rate difference trend:");
+            LOG_INFO("  Mean: {:.2f}%", mean(fill_rate_diffs));
+            LOG_INFO("  Std: {:.2f}%", stddev(fill_rate_diffs));
+        }
+    }
+
+private:
+    StrategyValidator::LiveResults loadLiveResults(const std::string& path) {
+        // Load from file/database
+        StrategyValidator::LiveResults results;
+        // ... implementation ...
+        return results;
+    }
+
+    StrategyValidator::ReplayResults runReplay(
+        const std::string& tick_data_path,
+        const StrategyValidator::LiveResults& live) {
+        // Setup and run replay matching live session
+        StrategyValidator::ReplayResults results;
+        // ... implementation ...
+        return results;
+    }
+
+    void storeValidationReport(const std::string& date,
+                              const StrategyValidator::ValidationReport& report) {
+        // Store to database/file for trend analysis
+    }
+
+    void sendAlert(const std::string& message) {
+        LOG_ERROR("ALERT: {}", message);
+        // Send email/Slack notification
+    }
+
+    std::vector<StrategyValidator::ValidationReport> loadHistoricalReports(int days) {
+        // Load past validation reports
+        return {};
+    }
+
+    double mean(const std::vector<double>& values) {
+        return std::accumulate(values.begin(), values.end(), 0.0) / values.size();
+    }
+
+    double stddev(const std::vector<double>& values) {
+        double m = mean(values);
+        double variance = 0.0;
+        for (double v : values) {
+            variance += (v - m) * (v - m);
+        }
+        return std::sqrt(variance / values.size());
+    }
+
+    bool isTrendImproving(const std::vector<double>& values) {
+        // Simple linear regression to detect trend
+        // Positive slope = improving (differences getting smaller)
+        if (values.size() < 5) return false;
+
+        double slope = computeTrendSlope(values);
+        return slope < 0;  // Negative slope means differences decreasing
+    }
+
+    double computeTrendSlope(const std::vector<double>& values) {
+        double sum_x = 0, sum_y = 0, sum_xy = 0, sum_x2 = 0;
+        size_t n = values.size();
+
+        for (size_t i = 0; i < n; ++i) {
+            double x = static_cast<double>(i);
+            double y = values[i];
+
+            sum_x += x;
+            sum_y += y;
+            sum_xy += x * y;
+            sum_x2 += x * x;
+        }
+
+        return (n * sum_xy - sum_x * sum_y) / (n * sum_x2 - sum_x * sum_x);
+    }
+};
+
+================================================================================
+NEXT: Read 07_performance_comparison.txt for benchmarking replay performance
+================================================================================

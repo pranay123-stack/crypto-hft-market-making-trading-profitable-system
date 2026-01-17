@@ -1,0 +1,1172 @@
+COMPREHENSIVE ALERTING SYSTEM FOR HFT PLATFORMS
+===============================================
+
+TABLE OF CONTENTS
+-----------------
+1. Overview & Architecture
+2. AlertManager Configuration
+3. PagerDuty Integration
+4. Alert Rules & Thresholds
+5. Severity Levels & Escalation
+6. C++ Alert Generation
+7. Smart Alert Aggregation
+8. On-Call Management
+9. Incident Response Workflows
+10. Alert Templates & Runbooks
+11. Production Deployment
+
+============================================
+1. OVERVIEW & ARCHITECTURE
+============================================
+
+Multi-Tier Alerting Architecture:
+----------------------------------
+┌───────────────────────────────────────────────────────────┐
+│                  Monitoring Sources                        │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐ │
+│  │Prometheus│  │ InfluxDB │  │  Custom  │  │   Logs   │ │
+│  │  Metrics │  │  Metrics │  │  Checks  │  │ (ELK/    │ │
+│  │          │  │          │  │          │  │ Splunk)  │ │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘ │
+└───────┼─────────────┼─────────────┼─────────────┼────────┘
+        │             │             │             │
+        └─────────────┴─────────────┴─────────────┘
+                            │
+                    ┌───────▼────────┐
+                    │  AlertManager  │
+                    │   - Routing    │
+                    │   - Grouping   │
+                    │   - Silencing  │
+                    └───────┬────────┘
+                            │
+        ┌───────────────────┼───────────────────┐
+        │                   │                   │
+   ┌────▼─────┐      ┌─────▼──────┐     ┌─────▼──────┐
+   │PagerDuty │      │   Email    │     │   Slack    │
+   │  (P1/P2) │      │  (P3/P4)   │     │  Channel   │
+   └────┬─────┘      └─────┬──────┘     └─────┬──────┘
+        │                  │                   │
+   ┌────▼─────┐      ┌─────▼──────┐     ┌─────▼──────┐
+   │ On-Call  │      │   Team     │     │   Team     │
+   │ Engineer │      │  Channel   │     │  Dashboard │
+   └──────────┘      └────────────┘     └────────────┘
+
+Alert Categories:
+-----------------
+1. CRITICAL (P1) - Immediate page
+   - Trading halted
+   - Exchange connectivity lost
+   - Risk limits breached
+   - Data corruption detected
+
+2. HIGH (P2) - Page during business hours
+   - High latency (>99th percentile)
+   - Elevated error rates
+   - Risk warnings
+   - Position limit approaching
+
+3. MEDIUM (P3) - Email notification
+   - Performance degradation
+   - Resource utilization high
+   - Non-critical service degraded
+
+4. LOW (P4) - Slack/dashboard only
+   - Information alerts
+   - Scheduled maintenance
+   - Capacity planning warnings
+
+============================================
+2. ALERTMANAGER CONFIGURATION
+============================================
+
+AlertManager Configuration (alertmanager.yml):
+----------------------------------------------
+global:
+  resolve_timeout: 5m
+
+  # PagerDuty integration
+  pagerduty_url: 'https://events.pagerduty.com/v2/enqueue'
+
+  # Slack webhook
+  slack_api_url: 'https://hooks.slack.com/services/YOUR/WEBHOOK/URL'
+
+  # SMTP for email
+  smtp_smarthost: 'smtp.gmail.com:587'
+  smtp_from: 'alerts@hft-trading.com'
+  smtp_auth_username: 'alerts@hft-trading.com'
+  smtp_auth_password: '${SMTP_PASSWORD}'
+  smtp_require_tls: true
+
+# Templates for notifications
+templates:
+  - '/etc/alertmanager/templates/*.tmpl'
+
+# Route tree for alert distribution
+route:
+  # Default receiver
+  receiver: 'default'
+
+  # Grouping
+  group_by: ['alertname', 'cluster', 'service']
+  group_wait: 10s        # Wait before sending initial notification
+  group_interval: 5m     # Wait before sending batch of new alerts
+  repeat_interval: 4h    # Resend alert if not resolved
+
+  # Child routes for specific alert types
+  routes:
+    # Critical alerts - immediate page
+    - match:
+        severity: critical
+      receiver: 'pagerduty-critical'
+      group_wait: 5s
+      group_interval: 1m
+      repeat_interval: 30m
+      continue: true  # Also send to other receivers
+
+    # Trading engine alerts
+    - match:
+        component: trading_engine
+        severity: critical|high
+      receiver: 'pagerduty-trading'
+      group_by: ['alertname', 'exchange', 'symbol']
+      group_wait: 5s
+      repeat_interval: 15m
+
+    # Market data alerts
+    - match:
+        component: market_data
+        severity: critical
+      receiver: 'pagerduty-market-data'
+      group_wait: 10s
+      repeat_interval: 30m
+
+    # Risk alerts - always critical
+    - match:
+        component: risk
+      receiver: 'pagerduty-risk'
+      group_wait: 0s  # Immediate
+      repeat_interval: 5m
+      continue: true
+
+    # High severity - business hours page
+    - match:
+        severity: high
+      receiver: 'pagerduty-business-hours'
+      group_wait: 30s
+      repeat_interval: 1h
+      # Only during business hours
+      active_time_intervals:
+        - business_hours
+
+    # Medium severity - email
+    - match:
+        severity: medium
+      receiver: 'email-team'
+      group_wait: 5m
+      repeat_interval: 12h
+
+    # Low severity - Slack only
+    - match:
+        severity: low
+      receiver: 'slack-notifications'
+      group_wait: 10m
+      repeat_interval: 24h
+
+# Time intervals for business hours
+time_intervals:
+  - name: business_hours
+    time_intervals:
+      - times:
+          - start_time: '09:00'
+            end_time: '18:00'
+        weekdays: ['monday:friday']
+        location: 'America/New_York'
+
+# Inhibition rules (suppress redundant alerts)
+inhibit_rules:
+  # If exchange is down, suppress all symbol-specific alerts
+  - source_match:
+      alertname: 'ExchangeDown'
+    target_match:
+      component: 'trading_engine'
+    equal: ['exchange']
+
+  # If critical alert firing, suppress warnings
+  - source_match:
+      severity: 'critical'
+    target_match:
+      severity: 'warning'
+    equal: ['alertname', 'instance']
+
+  # If service is down, suppress degraded alerts
+  - source_match:
+      alertname: 'ServiceDown'
+    target_match_re:
+      alertname: '.*Degraded'
+    equal: ['service']
+
+# Receivers configuration
+receivers:
+  # Default catch-all
+  - name: 'default'
+    slack_configs:
+      - channel: '#hft-alerts-default'
+        title: 'HFT Alert: {{ .GroupLabels.alertname }}'
+        text: '{{ range .Alerts }}{{ .Annotations.description }}{{ end }}'
+
+  # PagerDuty for critical alerts
+  - name: 'pagerduty-critical'
+    pagerduty_configs:
+      - service_key: '${PAGERDUTY_SERVICE_KEY_CRITICAL}'
+        severity: '{{ .CommonLabels.severity }}'
+        description: '{{ .GroupLabels.alertname }}: {{ .CommonAnnotations.summary }}'
+        details:
+          firing: '{{ .Alerts.Firing | len }}'
+          resolved: '{{ .Alerts.Resolved | len }}'
+          num_alerts: '{{ len .Alerts }}'
+        client: 'AlertManager'
+        client_url: '{{ .ExternalURL }}'
+
+  # PagerDuty for trading engine
+  - name: 'pagerduty-trading'
+    pagerduty_configs:
+      - service_key: '${PAGERDUTY_SERVICE_KEY_TRADING}'
+        severity: '{{ .CommonLabels.severity }}'
+        description: '[{{ .CommonLabels.exchange }}] {{ .GroupLabels.alertname }}'
+
+  # PagerDuty for market data
+  - name: 'pagerduty-market-data'
+    pagerduty_configs:
+      - service_key: '${PAGERDUTY_SERVICE_KEY_MARKETDATA}'
+
+  # PagerDuty for risk
+  - name: 'pagerduty-risk'
+    pagerduty_configs:
+      - service_key: '${PAGERDUTY_SERVICE_KEY_RISK}'
+        severity: 'critical'
+    # Also send to Slack immediately
+    slack_configs:
+      - channel: '#hft-alerts-risk'
+        color: 'danger'
+        title: 'RISK ALERT: {{ .GroupLabels.alertname }}'
+        text: '{{ .CommonAnnotations.description }}'
+
+  # Business hours PagerDuty
+  - name: 'pagerduty-business-hours'
+    pagerduty_configs:
+      - service_key: '${PAGERDUTY_SERVICE_KEY_BUSINESS}'
+
+  # Email notifications
+  - name: 'email-team'
+    email_configs:
+      - to: 'hft-team@company.com'
+        headers:
+          Subject: '[HFT Alert] {{ .GroupLabels.alertname }}'
+        html: '{{ template "email.html" . }}'
+
+  # Slack notifications
+  - name: 'slack-notifications'
+    slack_configs:
+      - channel: '#hft-monitoring'
+        username: 'AlertManager'
+        icon_emoji: ':warning:'
+        title: '{{ .GroupLabels.alertname }}'
+        text: '{{ range .Alerts }}{{ .Annotations.description }}{{ end }}'
+        actions:
+          - type: button
+            text: 'View in Grafana'
+            url: '{{ .CommonAnnotations.grafana_url }}'
+          - type: button
+            text: 'Runbook'
+            url: '{{ .CommonAnnotations.runbook_url }}'
+
+============================================
+3. PROMETHEUS ALERT RULES
+============================================
+
+Trading Engine Alert Rules (trading_alerts.yml):
+-------------------------------------------------
+groups:
+  - name: trading_engine
+    interval: 10s  # Evaluate every 10 seconds
+    rules:
+      # Critical: Trading halted
+      - alert: TradingHalted
+        expr: hft_trading_status{status="halted"} == 1
+        for: 0s  # Immediate
+        labels:
+          severity: critical
+          component: trading_engine
+          page: 'true'
+        annotations:
+          summary: "Trading is halted on {{ $labels.exchange }}"
+          description: "Trading engine has halted operations for {{ $labels.exchange }}. Immediate investigation required."
+          runbook_url: "https://wiki.company.com/runbooks/trading-halted"
+          grafana_url: "https://grafana.company.com/d/trading-engine"
+
+      # Critical: Exchange connectivity lost
+      - alert: ExchangeDown
+        expr: hft_exchange_connected{} == 0
+        for: 10s
+        labels:
+          severity: critical
+          component: trading_engine
+          page: 'true'
+        annotations:
+          summary: "Exchange {{ $labels.exchange }} is disconnected"
+          description: "Lost connectivity to {{ $labels.exchange }}. Duration: {{ $value }}s"
+          runbook_url: "https://wiki.company.com/runbooks/exchange-down"
+
+      # Critical: Order latency extremely high
+      - alert: OrderLatencyCritical
+        expr: |
+          histogram_quantile(0.99,
+            rate(hft_order_latency_microseconds_bucket[1m])
+          ) > 10000
+        for: 30s
+        labels:
+          severity: critical
+          component: trading_engine
+          page: 'true'
+        annotations:
+          summary: "Order latency critical on {{ $labels.exchange }}"
+          description: "P99 order latency is {{ $value }}us (threshold: 10000us) for {{ $labels.exchange }}"
+          runbook_url: "https://wiki.company.com/runbooks/high-latency"
+
+      # High: Order rejection rate elevated
+      - alert: HighOrderRejectionRate
+        expr: |
+          (
+            rate(hft_rejects_total[5m]) /
+            rate(hft_orders_total[5m])
+          ) > 0.05
+        for: 2m
+        labels:
+          severity: high
+          component: trading_engine
+        annotations:
+          summary: "High order rejection rate on {{ $labels.exchange }}"
+          description: "Order rejection rate is {{ $value | humanizePercentage }} for {{ $labels.symbol }} on {{ $labels.exchange }}"
+
+      # High: Order fill rate low
+      - alert: LowOrderFillRate
+        expr: |
+          (
+            rate(hft_fills_total[10m]) /
+            rate(hft_orders_total[10m])
+          ) < 0.70
+        for: 5m
+        labels:
+          severity: high
+          component: trading_engine
+        annotations:
+          summary: "Low order fill rate for {{ $labels.symbol }}"
+          description: "Fill rate is {{ $value | humanizePercentage }} (threshold: 70%) for {{ $labels.symbol }}"
+
+      # High: Order backlog building
+      - alert: OrderBacklogHigh
+        expr: hft_order_queue_depth > 1000
+        for: 1m
+        labels:
+          severity: high
+          component: trading_engine
+        annotations:
+          summary: "Order queue backlog on {{ $labels.exchange }}"
+          description: "Order queue depth is {{ $value }} orders"
+
+      # Medium: Order latency elevated
+      - alert: OrderLatencyHigh
+        expr: |
+          histogram_quantile(0.99,
+            rate(hft_order_latency_microseconds_bucket[1m])
+          ) > 5000
+        for: 5m
+        labels:
+          severity: medium
+          component: trading_engine
+        annotations:
+          summary: "Order latency elevated on {{ $labels.exchange }}"
+          description: "P99 order latency is {{ $value }}us for {{ $labels.exchange }}"
+
+  - name: market_data
+    interval: 10s
+    rules:
+      # Critical: Market data feed down
+      - alert: MarketDataFeedDown
+        expr: hft_market_data_connected{} == 0
+        for: 5s
+        labels:
+          severity: critical
+          component: market_data
+          page: 'true'
+        annotations:
+          summary: "Market data feed {{ $labels.feed }} is down"
+          description: "Lost connectivity to market data feed {{ $labels.feed }} for {{ $labels.exchange }}"
+          runbook_url: "https://wiki.company.com/runbooks/market-data-down"
+
+      # Critical: Market data latency extreme
+      - alert: MarketDataLatencyCritical
+        expr: |
+          histogram_quantile(0.99,
+            rate(hft_market_data_latency_microseconds_bucket[30s])
+          ) > 5000
+        for: 30s
+        labels:
+          severity: critical
+          component: market_data
+          page: 'true'
+        annotations:
+          summary: "Market data latency critical for {{ $labels.exchange }}"
+          description: "P99 market data latency is {{ $value }}us (threshold: 5000us)"
+
+      # High: Market data gaps detected
+      - alert: MarketDataGaps
+        expr: rate(hft_market_data_gaps_total[5m]) > 0
+        for: 2m
+        labels:
+          severity: high
+          component: market_data
+        annotations:
+          summary: "Market data gaps detected for {{ $labels.symbol }}"
+          description: "Detected {{ $value }} gaps/sec in market data for {{ $labels.symbol }} on {{ $labels.exchange }}"
+
+      # High: Orderbook depth insufficient
+      - alert: OrderbookDepthLow
+        expr: hft_orderbook_depth_levels < 5
+        for: 1m
+        labels:
+          severity: high
+          component: market_data
+        annotations:
+          summary: "Low orderbook depth for {{ $labels.symbol }}"
+          description: "Orderbook depth is only {{ $value }} levels for {{ $labels.symbol }}"
+
+  - name: risk_management
+    interval: 5s  # More frequent evaluation for risk
+    rules:
+      # Critical: Risk limit breached
+      - alert: RiskLimitBreached
+        expr: hft_risk_limit_breached{} == 1
+        for: 0s  # Immediate
+        labels:
+          severity: critical
+          component: risk
+          page: 'true'
+        annotations:
+          summary: "RISK LIMIT BREACHED: {{ $labels.limit_type }}"
+          description: "Risk limit {{ $labels.limit_type }} has been breached for {{ $labels.strategy }}. Trading may be halted."
+          runbook_url: "https://wiki.company.com/runbooks/risk-breach"
+
+      # Critical: Position limit exceeded
+      - alert: PositionLimitExceeded
+        expr: abs(hft_position_size) > hft_position_limit
+        for: 0s
+        labels:
+          severity: critical
+          component: risk
+          page: 'true'
+        annotations:
+          summary: "Position limit exceeded for {{ $labels.symbol }}"
+          description: "Position size {{ $value }} exceeds limit for {{ $labels.symbol }}"
+
+      # Critical: Daily loss limit approaching
+      - alert: DailyLossLimitApproaching
+        expr: hft_daily_pnl_usd < (hft_daily_loss_limit * 0.8)
+        for: 0s
+        labels:
+          severity: critical
+          component: risk
+          page: 'true'
+        annotations:
+          summary: "Daily loss limit approaching for {{ $labels.strategy }}"
+          description: "Daily PnL is {{ $value }} (80% of limit reached)"
+
+      # High: VaR limit approaching
+      - alert: VaRLimitApproaching
+        expr: hft_var_usd > (hft_var_limit * 0.9)
+        for: 1m
+        labels:
+          severity: high
+          component: risk
+        annotations:
+          summary: "VaR approaching limit for {{ $labels.strategy }}"
+          description: "VaR is {{ $value }} (90% of limit)"
+
+      # High: Drawdown threshold reached
+      - alert: DrawdownThresholdReached
+        expr: hft_drawdown_percentage > 10
+        for: 2m
+        labels:
+          severity: high
+          component: risk
+        annotations:
+          summary: "Drawdown threshold reached for {{ $labels.strategy }}"
+          description: "Current drawdown is {{ $value }}% for {{ $labels.strategy }}"
+
+      # Medium: Risk warning
+      - alert: RiskWarning
+        expr: hft_risk_warnings_total > 0
+        for: 1m
+        labels:
+          severity: medium
+          component: risk
+        annotations:
+          summary: "Risk warnings detected for {{ $labels.strategy }}"
+          description: "{{ $value }} risk warnings in the last minute"
+
+  - name: system_health
+    interval: 30s
+    rules:
+      # Critical: High CPU usage
+      - alert: HighCPUUsage
+        expr: |
+          100 - (avg by (instance) (
+            rate(node_cpu_seconds_total{mode="idle"}[2m])
+          ) * 100) > 90
+        for: 2m
+        labels:
+          severity: high
+          component: system
+        annotations:
+          summary: "High CPU usage on {{ $labels.instance }}"
+          description: "CPU usage is {{ $value }}%"
+
+      # High: Memory pressure
+      - alert: HighMemoryUsage
+        expr: |
+          (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 85
+        for: 2m
+        labels:
+          severity: high
+          component: system
+        annotations:
+          summary: "High memory usage on {{ $labels.instance }}"
+          description: "Memory usage is {{ $value }}%"
+
+      # High: Disk space low
+      - alert: DiskSpaceLow
+        expr: |
+          (node_filesystem_avail_bytes / node_filesystem_size_bytes) * 100 < 15
+        for: 5m
+        labels:
+          severity: high
+          component: system
+        annotations:
+          summary: "Low disk space on {{ $labels.instance }}"
+          description: "Disk {{ $labels.mountpoint }} has only {{ $value }}% free"
+
+      # High: Service down
+      - alert: ServiceDown
+        expr: up{job=~"hft-.*"} == 0
+        for: 30s
+        labels:
+          severity: high
+          component: system
+        annotations:
+          summary: "Service {{ $labels.job }} is down"
+          description: "Service {{ $labels.job }} on {{ $labels.instance }} is not responding"
+
+  - name: performance
+    interval: 30s
+    rules:
+      # Medium: Throughput degraded
+      - alert: ThroughputDegraded
+        expr: |
+          rate(hft_orders_total[5m]) <
+          avg_over_time(rate(hft_orders_total[5m])[1h:5m]) * 0.5
+        for: 5m
+        labels:
+          severity: medium
+          component: performance
+        annotations:
+          summary: "Order throughput degraded for {{ $labels.exchange }}"
+          description: "Current throughput is 50% below average"
+
+      # Medium: Message processing slow
+      - alert: MessageProcessingSlow
+        expr: hft_message_queue_depth > 10000
+        for: 2m
+        labels:
+          severity: medium
+          component: performance
+        annotations:
+          summary: "Message processing backlog on {{ $labels.component }}"
+          description: "Message queue depth is {{ $value }}"
+
+============================================
+4. C++ ALERT GENERATION
+============================================
+
+Alert Manager Client:
+---------------------
+#include <curl/curl.h>
+#include <nlohmann/json.hpp>
+#include <string>
+#include <vector>
+#include <chrono>
+
+class AlertManagerClient {
+private:
+    std::string alertmanager_url_;
+    CURL* curl_;
+
+public:
+    AlertManagerClient(const std::string& url)
+        : alertmanager_url_(url + "/api/v2/alerts") {
+        curl_global_init(CURL_GLOBAL_DEFAULT);
+        curl_ = curl_easy_init();
+    }
+
+    ~AlertManagerClient() {
+        if (curl_) {
+            curl_easy_cleanup(curl_);
+        }
+        curl_global_cleanup();
+    }
+
+    struct Alert {
+        std::string name;
+        std::string severity;
+        std::string component;
+        std::string summary;
+        std::string description;
+        std::map<std::string, std::string> labels;
+        std::map<std::string, std::string> annotations;
+
+        // Optional
+        std::string starts_at;
+        std::string ends_at;
+        std::string generator_url;
+    };
+
+    bool sendAlert(const Alert& alert) {
+        nlohmann::json alert_json = alertToJson(alert);
+        nlohmann::json alerts_array = nlohmann::json::array({alert_json});
+
+        std::string payload = alerts_array.dump();
+
+        struct curl_slist* headers = nullptr;
+        headers = curl_slist_append(headers, "Content-Type: application/json");
+
+        curl_easy_setopt(curl_, CURLOPT_URL, alertmanager_url_.c_str());
+        curl_easy_setopt(curl_, CURLOPT_POSTFIELDS, payload.c_str());
+        curl_easy_setopt(curl_, CURLOPT_HTTPHEADER, headers);
+        curl_easy_setopt(curl_, CURLOPT_TIMEOUT, 5L);
+
+        CURLcode res = curl_easy_perform(curl_);
+
+        curl_slist_free_all(headers);
+
+        return res == CURLE_OK;
+    }
+
+    bool sendAlerts(const std::vector<Alert>& alerts) {
+        nlohmann::json alerts_array = nlohmann::json::array();
+
+        for (const auto& alert : alerts) {
+            alerts_array.push_back(alertToJson(alert));
+        }
+
+        std::string payload = alerts_array.dump();
+
+        struct curl_slist* headers = nullptr;
+        headers = curl_slist_append(headers, "Content-Type: application/json");
+
+        curl_easy_setopt(curl_, CURLOPT_URL, alertmanager_url_.c_str());
+        curl_easy_setopt(curl_, CURLOPT_POSTFIELDS, payload.c_str());
+        curl_easy_setopt(curl_, CURLOPT_HTTPHEADER, headers);
+        curl_easy_setopt(curl_, CURLOPT_TIMEOUT, 5L);
+
+        CURLcode res = curl_easy_perform(curl_);
+
+        curl_slist_free_all(headers);
+
+        return res == CURLE_OK;
+    }
+
+private:
+    nlohmann::json alertToJson(const Alert& alert) {
+        nlohmann::json j;
+
+        // Required fields
+        j["labels"] = {
+            {"alertname", alert.name},
+            {"severity", alert.severity},
+            {"component", alert.component}
+        };
+
+        // Add custom labels
+        for (const auto& [key, value] : alert.labels) {
+            j["labels"][key] = value;
+        }
+
+        // Annotations
+        j["annotations"] = {
+            {"summary", alert.summary},
+            {"description", alert.description}
+        };
+
+        // Add custom annotations
+        for (const auto& [key, value] : alert.annotations) {
+            j["annotations"][key] = value;
+        }
+
+        // Timestamps
+        if (!alert.starts_at.empty()) {
+            j["startsAt"] = alert.starts_at;
+        } else {
+            j["startsAt"] = getCurrentTimestamp();
+        }
+
+        if (!alert.ends_at.empty()) {
+            j["endsAt"] = alert.ends_at;
+        }
+
+        if (!alert.generator_url.empty()) {
+            j["generatorURL"] = alert.generator_url;
+        }
+
+        return j;
+    }
+
+    std::string getCurrentTimestamp() {
+        auto now = std::chrono::system_clock::now();
+        auto time_t = std::chrono::system_clock::to_time_t(now);
+        std::tm tm = *std::gmtime(&time_t);
+
+        char buf[32];
+        std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
+
+        return std::string(buf);
+    }
+};
+
+// Smart Alert Throttling
+class AlertThrottler {
+private:
+    struct AlertState {
+        std::chrono::steady_clock::time_point last_sent;
+        int count;
+    };
+
+    std::unordered_map<std::string, AlertState> alert_states_;
+    std::mutex mutex_;
+
+    std::chrono::seconds throttle_duration_{300};  // 5 minutes
+    int max_count_before_throttle_{3};
+
+public:
+    bool shouldSendAlert(const std::string& alert_key) {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        auto now = std::chrono::steady_clock::now();
+        auto& state = alert_states_[alert_key];
+
+        auto time_since_last = std::chrono::duration_cast<std::chrono::seconds>(
+            now - state.last_sent);
+
+        if (time_since_last > throttle_duration_) {
+            // Reset after throttle period
+            state.last_sent = now;
+            state.count = 1;
+            return true;
+        }
+
+        if (state.count < max_count_before_throttle_) {
+            state.count++;
+            state.last_sent = now;
+            return true;
+        }
+
+        // Throttled
+        return false;
+    }
+
+    void reset(const std::string& alert_key) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        alert_states_.erase(alert_key);
+    }
+};
+
+// Alert Helper Class
+class AlertHelper {
+private:
+    std::shared_ptr<AlertManagerClient> client_;
+    std::shared_ptr<AlertThrottler> throttler_;
+
+public:
+    AlertHelper(const std::string& alertmanager_url)
+        : client_(std::make_shared<AlertManagerClient>(alertmanager_url)),
+          throttler_(std::make_shared<AlertThrottler>()) {}
+
+    void alertRiskBreach(const std::string& limit_type,
+                        const std::string& strategy,
+                        double current_value,
+                        double limit_value) {
+        std::string alert_key = "risk_breach_" + limit_type + "_" + strategy;
+
+        if (!throttler_->shouldSendAlert(alert_key)) {
+            return;
+        }
+
+        AlertManagerClient::Alert alert;
+        alert.name = "RiskLimitBreached";
+        alert.severity = "critical";
+        alert.component = "risk";
+        alert.summary = "RISK LIMIT BREACHED: " + limit_type;
+        alert.description = fmt::format(
+            "Risk limit {} breached for strategy {}. Current: {}, Limit: {}",
+            limit_type, strategy, current_value, limit_value);
+
+        alert.labels = {
+            {"limit_type", limit_type},
+            {"strategy", strategy},
+            {"page", "true"}
+        };
+
+        alert.annotations = {
+            {"current_value", std::to_string(current_value)},
+            {"limit_value", std::to_string(limit_value)},
+            {"runbook_url", "https://wiki.company.com/runbooks/risk-breach"}
+        };
+
+        client_->sendAlert(alert);
+    }
+
+    void alertHighLatency(const std::string& exchange,
+                         const std::string& order_type,
+                         double latency_us,
+                         double threshold_us) {
+        std::string alert_key = "high_latency_" + exchange + "_" + order_type;
+
+        if (!throttler_->shouldSendAlert(alert_key)) {
+            return;
+        }
+
+        AlertManagerClient::Alert alert;
+        alert.name = "OrderLatencyHigh";
+        alert.severity = latency_us > threshold_us * 2 ? "critical" : "high";
+        alert.component = "trading_engine";
+        alert.summary = "High order latency on " + exchange;
+        alert.description = fmt::format(
+            "Order latency {}us exceeds threshold {}us for {} on {}",
+            latency_us, threshold_us, order_type, exchange);
+
+        alert.labels = {
+            {"exchange", exchange},
+            {"order_type", order_type}
+        };
+
+        alert.annotations = {
+            {"latency_us", std::to_string(latency_us)},
+            {"threshold_us", std::to_string(threshold_us)}
+        };
+
+        client_->sendAlert(alert);
+    }
+
+    void alertExchangeDown(const std::string& exchange) {
+        AlertManagerClient::Alert alert;
+        alert.name = "ExchangeDown";
+        alert.severity = "critical";
+        alert.component = "trading_engine";
+        alert.summary = "Exchange " + exchange + " is disconnected";
+        alert.description = "Lost connectivity to " + exchange;
+
+        alert.labels = {
+            {"exchange", exchange},
+            {"page", "true"}
+        };
+
+        alert.annotations = {
+            {"runbook_url", "https://wiki.company.com/runbooks/exchange-down"}
+        };
+
+        client_->sendAlert(alert);
+    }
+
+    void resolveAlert(const std::string& alert_name,
+                     const std::map<std::string, std::string>& labels) {
+        AlertManagerClient::Alert alert;
+        alert.name = alert_name;
+        alert.labels = labels;
+        alert.severity = "resolved";
+        alert.summary = "Alert resolved";
+        alert.description = alert_name + " has been resolved";
+
+        // Set end time to mark as resolved
+        auto now = std::chrono::system_clock::now();
+        auto time_t = std::chrono::system_clock::to_time_t(now);
+        std::tm tm = *std::gmtime(&time_t);
+
+        char buf[32];
+        std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
+        alert.ends_at = std::string(buf);
+
+        client_->sendAlert(alert);
+
+        // Reset throttler
+        throttler_->reset(alert_name);
+    }
+};
+
+Usage Example in Trading Engine:
+---------------------------------
+class TradingEngine {
+private:
+    std::shared_ptr<AlertHelper> alert_helper_;
+
+public:
+    TradingEngine(const std::string& alertmanager_url)
+        : alert_helper_(std::make_shared<AlertHelper>(alertmanager_url)) {}
+
+    void processOrder(const Order& order) {
+        auto start = std::chrono::high_resolution_clock::now();
+
+        // Process order
+        sendOrderToExchange(order);
+
+        auto end = std::chrono::high_resolution_clock::now();
+        auto latency_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            end - start).count();
+
+        // Check latency threshold
+        constexpr double LATENCY_THRESHOLD = 5000.0;  // 5ms
+        if (latency_us > LATENCY_THRESHOLD) {
+            alert_helper_->alertHighLatency(
+                order.exchange,
+                order.type,
+                latency_us,
+                LATENCY_THRESHOLD
+            );
+        }
+    }
+
+    void onExchangeDisconnect(const std::string& exchange) {
+        alert_helper_->alertExchangeDown(exchange);
+    }
+
+    void onExchangeReconnect(const std::string& exchange) {
+        alert_helper_->resolveAlert("ExchangeDown", {
+            {"exchange", exchange}
+        });
+    }
+
+    void checkRiskLimits(const std::string& strategy) {
+        double pnl = calculateDailyPnL(strategy);
+        constexpr double LOSS_LIMIT = -100000.0;  // $100k
+
+        if (pnl < LOSS_LIMIT) {
+            alert_helper_->alertRiskBreach(
+                "daily_loss_limit",
+                strategy,
+                pnl,
+                LOSS_LIMIT
+            );
+        }
+    }
+};
+
+============================================
+5. PAGERDUTY INTEGRATION
+============================================
+
+PagerDuty Events API v2 Client:
+--------------------------------
+class PagerDutyClient {
+private:
+    std::string routing_key_;
+    std::string api_url_ = "https://events.pagerduty.com/v2/enqueue";
+    CURL* curl_;
+
+public:
+    explicit PagerDutyClient(const std::string& routing_key)
+        : routing_key_(routing_key) {
+        curl_ = curl_easy_init();
+    }
+
+    ~PagerDutyClient() {
+        if (curl_) {
+            curl_easy_cleanup(curl_);
+        }
+    }
+
+    enum class Severity {
+        CRITICAL,
+        ERROR,
+        WARNING,
+        INFO
+    };
+
+    bool triggerIncident(const std::string& summary,
+                        const std::string& source,
+                        Severity severity,
+                        const nlohmann::json& custom_details = {}) {
+        nlohmann::json payload = {
+            {"routing_key", routing_key_},
+            {"event_action", "trigger"},
+            {"payload", {
+                {"summary", summary},
+                {"source", source},
+                {"severity", severityToString(severity)},
+                {"timestamp", getCurrentTimestamp()},
+                {"custom_details", custom_details}
+            }}
+        };
+
+        return sendRequest(payload);
+    }
+
+    bool acknowledgeIncident(const std::string& dedup_key) {
+        nlohmann::json payload = {
+            {"routing_key", routing_key_},
+            {"event_action", "acknowledge"},
+            {"dedup_key", dedup_key}
+        };
+
+        return sendRequest(payload);
+    }
+
+    bool resolveIncident(const std::string& dedup_key) {
+        nlohmann::json payload = {
+            {"routing_key", routing_key_},
+            {"event_action", "resolve"},
+            {"dedup_key", dedup_key}
+        };
+
+        return sendRequest(payload);
+    }
+
+private:
+    bool sendRequest(const nlohmann::json& payload) {
+        std::string payload_str = payload.dump();
+
+        struct curl_slist* headers = nullptr;
+        headers = curl_slist_append(headers, "Content-Type: application/json");
+
+        curl_easy_setopt(curl_, CURLOPT_URL, api_url_.c_str());
+        curl_easy_setopt(curl_, CURLOPT_POSTFIELDS, payload_str.c_str());
+        curl_easy_setopt(curl_, CURLOPT_HTTPHEADER, headers);
+        curl_easy_setopt(curl_, CURLOPT_TIMEOUT, 10L);
+
+        CURLcode res = curl_easy_perform(curl_);
+
+        curl_slist_free_all(headers);
+
+        return res == CURLE_OK;
+    }
+
+    std::string severityToString(Severity sev) {
+        switch (sev) {
+            case Severity::CRITICAL: return "critical";
+            case Severity::ERROR: return "error";
+            case Severity::WARNING: return "warning";
+            case Severity::INFO: return "info";
+            default: return "info";
+        }
+    }
+
+    std::string getCurrentTimestamp() {
+        auto now = std::chrono::system_clock::now();
+        auto time_t = std::chrono::system_clock::to_time_t(now);
+        std::tm tm = *std::gmtime(&time_t);
+
+        char buf[32];
+        std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
+
+        return std::string(buf);
+    }
+};
+
+============================================
+6. ALERT NOTIFICATION TEMPLATES
+============================================
+
+Email Template (email.tmpl):
+-----------------------------
+{{ define "email.html" }}
+<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        body { font-family: Arial, sans-serif; }
+        .alert { padding: 20px; margin: 10px; border-left: 5px solid; }
+        .critical { border-color: #d9534f; background-color: #f2dede; }
+        .high { border-color: #f0ad4e; background-color: #fcf8e3; }
+        .medium { border-color: #5bc0de; background-color: #d9edf7; }
+        .resolved { border-color: #5cb85c; background-color: #dff0d8; }
+    </style>
+</head>
+<body>
+    <h2>HFT System Alert</h2>
+    {{ range .Alerts }}
+    <div class="alert {{ .Labels.severity }}">
+        <h3>{{ .Labels.alertname }}</h3>
+        <p><strong>Severity:</strong> {{ .Labels.severity }}</p>
+        <p><strong>Component:</strong> {{ .Labels.component }}</p>
+        <p><strong>Summary:</strong> {{ .Annotations.summary }}</p>
+        <p><strong>Description:</strong> {{ .Annotations.description }}</p>
+        {{ if .Labels.exchange }}
+        <p><strong>Exchange:</strong> {{ .Labels.exchange }}</p>
+        {{ end }}
+        {{ if .Labels.symbol }}
+        <p><strong>Symbol:</strong> {{ .Labels.symbol }}</p>
+        {{ end }}
+        {{ if .Annotations.runbook_url }}
+        <p><a href="{{ .Annotations.runbook_url }}">Runbook</a></p>
+        {{ end }}
+        <p><strong>Time:</strong> {{ .StartsAt }}</p>
+    </div>
+    {{ end }}
+</body>
+</html>
+{{ end }}
+
+Slack Template (slack.tmpl):
+----------------------------
+{{ define "slack.title" }}
+{{ if eq .Status "firing" }}:rotating_light:{{ else }}:white_check_mark:{{ end }}
+[{{ .Status | toUpper }}{{ if eq .Status "firing" }}:{{ .Alerts.Firing | len }}{{ end }}]
+{{ .GroupLabels.alertname }}
+{{ end }}
+
+{{ define "slack.text" }}
+{{ range .Alerts }}
+*Severity:* {{ .Labels.severity }}
+*Component:* {{ .Labels.component }}
+*Summary:* {{ .Annotations.summary }}
+*Description:* {{ .Annotations.description }}
+{{ if .Labels.exchange }}*Exchange:* {{ .Labels.exchange }}{{ end }}
+{{ if .Labels.symbol }}*Symbol:* {{ .Labels.symbol }}{{ end }}
+{{ if .Annotations.runbook_url }}<{{ .Annotations.runbook_url }}|View Runbook>{{ end }}
+{{ if .Annotations.grafana_url }}<{{ .Annotations.grafana_url }}|View Dashboard>{{ end }}
+{{ end }}
+{{ end }}
+
+Production Deployment Script:
+------------------------------
+#!/bin/bash
+
+# Deploy AlertManager with configuration
+
+# Create directories
+mkdir -p /etc/alertmanager/{templates,alerts}
+mkdir -p /var/lib/alertmanager
+
+# Copy configuration
+cp alertmanager.yml /etc/alertmanager/
+cp templates/*.tmpl /etc/alertmanager/templates/
+cp alerts/*.yml /etc/alertmanager/alerts/
+
+# Start AlertManager
+docker run -d \
+  --name alertmanager \
+  -p 9093:9093 \
+  -v /etc/alertmanager:/etc/alertmanager \
+  -v /var/lib/alertmanager:/alertmanager \
+  prom/alertmanager:latest \
+  --config.file=/etc/alertmanager/alertmanager.yml \
+  --storage.path=/alertmanager \
+  --web.external-url=https://alertmanager.company.com
+
+echo "AlertManager deployed successfully"

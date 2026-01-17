@@ -1,0 +1,1332 @@
+================================================================================
+ENCRYPTION: TLS/SSL AND AT-REST ENCRYPTION FOR HFT SYSTEMS
+================================================================================
+
+OVERVIEW
+--------
+This document provides comprehensive guidelines for implementing encryption
+in high-frequency trading systems, covering both data in transit (TLS/SSL)
+and data at rest. Proper encryption is critical to protect sensitive trading
+data, API credentials, and proprietary algorithms from unauthorized access.
+
+================================================================================
+SECURITY ARCHITECTURE
+================================================================================
+
+1. ENCRYPTION LAYERING STRATEGY
+--------------------------------
+
+Layer 1: Network Transport Security (TLS 1.3)
+├── Exchange Connections
+├── Broker Connections
+├── Internal Microservices
+└── Management Interfaces
+
+Layer 2: Application-Level Encryption
+├── Message Payload Encryption
+├── Field-Level Encryption
+└── End-to-End Encryption
+
+Layer 3: Storage Encryption
+├── Database Encryption (Transparent Data Encryption)
+├── File System Encryption (LUKS, dm-crypt)
+├── Block Device Encryption
+└── Backup Encryption
+
+Layer 4: Memory Encryption
+├── Secure Memory Allocation
+├── Intel SGX / AMD SEV
+└── Memory Encryption Keys
+
+2. CRYPTOGRAPHIC ALGORITHM SELECTION
+-------------------------------------
+
+Symmetric Encryption:
+- Primary: AES-256-GCM (Authenticated Encryption)
+- Alternative: ChaCha20-Poly1305
+- Key Size: 256 bits minimum
+- IV/Nonce: 96 bits (random, never reused)
+
+Asymmetric Encryption:
+- Primary: RSA-4096 or ECC (P-384, P-521)
+- Key Exchange: ECDHE (Elliptic Curve Diffie-Hellman Ephemeral)
+- Digital Signatures: ECDSA, Ed25519
+
+Hash Functions:
+- Primary: SHA-256, SHA-384, SHA-512
+- HMAC: HMAC-SHA256 for message authentication
+- Password Hashing: Argon2id, scrypt, bcrypt
+
+3. KEY MANAGEMENT HIERARCHY
+----------------------------
+
+Master Encryption Key (MEK)
+├── Data Encryption Keys (DEK)
+│   ├── Database Encryption Key
+│   ├── File System Encryption Key
+│   └── Backup Encryption Key
+├── Key Encryption Keys (KEK)
+│   ├── Transport Key Wrapping Key
+│   └── Storage Key Wrapping Key
+└── Session Keys
+    ├── TLS Session Keys
+    └── Application Session Keys
+
+4. CERTIFICATE MANAGEMENT
+--------------------------
+
+Certificate Authority (CA) Hierarchy:
+Root CA (Offline, 10-year validity)
+└── Intermediate CA (Online, 5-year validity)
+    ├── Server Certificates (1-year validity)
+    ├── Client Certificates (1-year validity)
+    └── Code Signing Certificates (2-year validity)
+
+================================================================================
+IMPLEMENTATION CODE EXAMPLES
+================================================================================
+
+1. TLS 1.3 SECURE CONNECTION MANAGER (C++)
+-------------------------------------------
+
+```cpp
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <openssl/x509v3.h>
+#include <string>
+#include <memory>
+#include <vector>
+
+class SecureTLSConnection {
+private:
+    SSL_CTX* ctx_;
+    SSL* ssl_;
+    int socket_fd_;
+
+    static constexpr const char* CIPHER_SUITES =
+        "TLS_AES_256_GCM_SHA384:"
+        "TLS_CHACHA20_POLY1305_SHA256:"
+        "TLS_AES_128_GCM_SHA256";
+
+    static constexpr const char* SIGNATURE_ALGORITHMS =
+        "ECDSA+SHA384:"
+        "ECDSA+SHA256:"
+        "ed25519:"
+        "RSA+SHA384:"
+        "RSA+SHA256";
+
+public:
+    struct TLSConfig {
+        std::string cert_file;
+        std::string key_file;
+        std::string ca_file;
+        std::string ca_path;
+        bool verify_peer;
+        bool verify_hostname;
+        int verify_depth;
+        std::vector<std::string> allowed_protocols;  // TLSv1.3 only
+    };
+
+    SecureTLSConnection() : ctx_(nullptr), ssl_(nullptr), socket_fd_(-1) {
+        initializeOpenSSL();
+    }
+
+    ~SecureTLSConnection() {
+        cleanup();
+    }
+
+    bool initialize(const TLSConfig& config, bool is_server = false) {
+        // Create SSL context
+        const SSL_METHOD* method = is_server ?
+            TLS_server_method() : TLS_client_method();
+
+        ctx_ = SSL_CTX_new(method);
+        if (!ctx_) {
+            logOpenSSLError("Failed to create SSL context");
+            return false;
+        }
+
+        // Set minimum protocol version to TLS 1.3
+        if (!SSL_CTX_set_min_proto_version(ctx_, TLS1_3_VERSION)) {
+            logOpenSSLError("Failed to set minimum TLS version");
+            return false;
+        }
+
+        // Set maximum protocol version to TLS 1.3
+        if (!SSL_CTX_set_max_proto_version(ctx_, TLS1_3_VERSION)) {
+            logOpenSSLError("Failed to set maximum TLS version");
+            return false;
+        }
+
+        // Configure cipher suites for TLS 1.3
+        if (!SSL_CTX_set_ciphersuites(ctx_, CIPHER_SUITES)) {
+            logOpenSSLError("Failed to set cipher suites");
+            return false;
+        }
+
+        // Configure signature algorithms
+        if (!SSL_CTX_set1_sigalgs_list(ctx_, SIGNATURE_ALGORITHMS)) {
+            logOpenSSLError("Failed to set signature algorithms");
+            return false;
+        }
+
+        // Load certificates
+        if (!config.cert_file.empty()) {
+            if (SSL_CTX_use_certificate_file(ctx_, config.cert_file.c_str(),
+                                             SSL_FILETYPE_PEM) != 1) {
+                logOpenSSLError("Failed to load certificate");
+                return false;
+            }
+        }
+
+        // Load private key
+        if (!config.key_file.empty()) {
+            if (SSL_CTX_use_PrivateKey_file(ctx_, config.key_file.c_str(),
+                                            SSL_FILETYPE_PEM) != 1) {
+                logOpenSSLError("Failed to load private key");
+                return false;
+            }
+
+            // Verify private key matches certificate
+            if (!SSL_CTX_check_private_key(ctx_)) {
+                logOpenSSLError("Private key does not match certificate");
+                return false;
+            }
+        }
+
+        // Load CA certificates
+        if (!config.ca_file.empty() || !config.ca_path.empty()) {
+            if (!SSL_CTX_load_verify_locations(ctx_,
+                    config.ca_file.empty() ? nullptr : config.ca_file.c_str(),
+                    config.ca_path.empty() ? nullptr : config.ca_path.c_str())) {
+                logOpenSSLError("Failed to load CA certificates");
+                return false;
+            }
+        }
+
+        // Configure peer verification
+        if (config.verify_peer) {
+            int verify_mode = SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT;
+            SSL_CTX_set_verify(ctx_, verify_mode, verifyCallback);
+            SSL_CTX_set_verify_depth(ctx_, config.verify_depth);
+        }
+
+        // Enable session tickets for performance
+        SSL_CTX_set_session_cache_mode(ctx_,
+            SSL_SESS_CACHE_CLIENT | SSL_SESS_CACHE_SERVER);
+
+        // Enable OCSP stapling
+        SSL_CTX_set_tlsext_status_type(ctx_, TLSEXT_STATUSTYPE_ocsp);
+
+        return true;
+    }
+
+    bool connect(int socket_fd, const std::string& hostname) {
+        socket_fd_ = socket_fd;
+
+        ssl_ = SSL_new(ctx_);
+        if (!ssl_) {
+            logOpenSSLError("Failed to create SSL structure");
+            return false;
+        }
+
+        // Associate socket with SSL
+        if (SSL_set_fd(ssl_, socket_fd_) != 1) {
+            logOpenSSLError("Failed to set socket FD");
+            return false;
+        }
+
+        // Enable hostname verification
+        if (!hostname.empty()) {
+            SSL_set_hostflags(ssl_, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+            if (!SSL_set1_host(ssl_, hostname.c_str())) {
+                logOpenSSLError("Failed to set hostname for verification");
+                return false;
+            }
+        }
+
+        // Perform TLS handshake
+        if (SSL_connect(ssl_) != 1) {
+            logOpenSSLError("TLS handshake failed");
+            return false;
+        }
+
+        // Verify certificate chain
+        if (!verifyCertificate(hostname)) {
+            return false;
+        }
+
+        logConnectionInfo();
+        return true;
+    }
+
+    bool accept(int socket_fd) {
+        socket_fd_ = socket_fd;
+
+        ssl_ = SSL_new(ctx_);
+        if (!ssl_) {
+            logOpenSSLError("Failed to create SSL structure");
+            return false;
+        }
+
+        if (SSL_set_fd(ssl_, socket_fd_) != 1) {
+            logOpenSSLError("Failed to set socket FD");
+            return false;
+        }
+
+        if (SSL_accept(ssl_) != 1) {
+            logOpenSSLError("TLS accept failed");
+            return false;
+        }
+
+        logConnectionInfo();
+        return true;
+    }
+
+    ssize_t send(const void* data, size_t length) {
+        if (!ssl_) return -1;
+
+        int ret = SSL_write(ssl_, data, length);
+        if (ret <= 0) {
+            int error = SSL_get_error(ssl_, ret);
+            handleSSLError("SSL_write", error);
+            return -1;
+        }
+
+        return ret;
+    }
+
+    ssize_t receive(void* buffer, size_t length) {
+        if (!ssl_) return -1;
+
+        int ret = SSL_read(ssl_, buffer, length);
+        if (ret <= 0) {
+            int error = SSL_get_error(ssl_, ret);
+            if (error != SSL_ERROR_ZERO_RETURN) {
+                handleSSLError("SSL_read", error);
+            }
+            return -1;
+        }
+
+        return ret;
+    }
+
+    std::string getNegotiatedCipher() const {
+        if (!ssl_) return "";
+        const char* cipher = SSL_get_cipher_name(ssl_);
+        return cipher ? cipher : "";
+    }
+
+    std::string getNegotiatedProtocol() const {
+        if (!ssl_) return "";
+        const char* version = SSL_get_version(ssl_);
+        return version ? version : "";
+    }
+
+private:
+    static void initializeOpenSSL() {
+        SSL_library_init();
+        SSL_load_error_strings();
+        OpenSSL_add_all_algorithms();
+    }
+
+    void cleanup() {
+        if (ssl_) {
+            SSL_shutdown(ssl_);
+            SSL_free(ssl_);
+            ssl_ = nullptr;
+        }
+        if (ctx_) {
+            SSL_CTX_free(ctx_);
+            ctx_ = nullptr;
+        }
+    }
+
+    static int verifyCallback(int preverify_ok, X509_STORE_CTX* ctx) {
+        if (!preverify_ok) {
+            X509* cert = X509_STORE_CTX_get_current_cert(ctx);
+            int error = X509_STORE_CTX_get_error(ctx);
+            int depth = X509_STORE_CTX_get_error_depth(ctx);
+
+            char subject[256];
+            X509_NAME_oneline(X509_get_subject_name(cert), subject,
+                            sizeof(subject));
+
+            std::cerr << "Certificate verification failed at depth " << depth
+                     << "\n  Subject: " << subject
+                     << "\n  Error: " << X509_verify_cert_error_string(error)
+                     << std::endl;
+        }
+
+        return preverify_ok;
+    }
+
+    bool verifyCertificate(const std::string& expected_hostname) {
+        X509* cert = SSL_get_peer_certificate(ssl_);
+        if (!cert) {
+            std::cerr << "No peer certificate received" << std::endl;
+            return false;
+        }
+
+        long verify_result = SSL_get_verify_result(ssl_);
+        if (verify_result != X509_V_OK) {
+            std::cerr << "Certificate verification failed: "
+                     << X509_verify_cert_error_string(verify_result)
+                     << std::endl;
+            X509_free(cert);
+            return false;
+        }
+
+        // Verify hostname if provided
+        if (!expected_hostname.empty()) {
+            if (X509_check_host(cert, expected_hostname.c_str(),
+                               expected_hostname.length(), 0, nullptr) != 1) {
+                std::cerr << "Hostname verification failed" << std::endl;
+                X509_free(cert);
+                return false;
+            }
+        }
+
+        X509_free(cert);
+        return true;
+    }
+
+    void logConnectionInfo() const {
+        std::cout << "TLS Connection Established:\n"
+                 << "  Protocol: " << getNegotiatedProtocol() << "\n"
+                 << "  Cipher: " << getNegotiatedCipher() << std::endl;
+    }
+
+    void logOpenSSLError(const std::string& context) const {
+        unsigned long error = ERR_get_error();
+        char error_str[256];
+        ERR_error_string_n(error, error_str, sizeof(error_str));
+        std::cerr << context << ": " << error_str << std::endl;
+    }
+
+    void handleSSLError(const std::string& function, int error) const {
+        switch (error) {
+            case SSL_ERROR_WANT_READ:
+            case SSL_ERROR_WANT_WRITE:
+                // Non-blocking IO, would block
+                break;
+            case SSL_ERROR_ZERO_RETURN:
+                // Connection closed
+                std::cerr << function << ": Connection closed" << std::endl;
+                break;
+            case SSL_ERROR_SYSCALL:
+                std::cerr << function << ": System call error" << std::endl;
+                break;
+            case SSL_ERROR_SSL:
+                logOpenSSLError(function);
+                break;
+            default:
+                std::cerr << function << ": Unknown error " << error
+                         << std::endl;
+                break;
+        }
+    }
+};
+```
+
+2. AES-256-GCM ENCRYPTION ENGINE
+---------------------------------
+
+```cpp
+#include <openssl/evp.h>
+#include <openssl/rand.h>
+#include <vector>
+#include <memory>
+#include <cstring>
+
+class AESGCMEncryption {
+private:
+    static constexpr size_t KEY_SIZE = 32;      // 256 bits
+    static constexpr size_t IV_SIZE = 12;       // 96 bits
+    static constexpr size_t TAG_SIZE = 16;      // 128 bits
+
+    std::vector<unsigned char> key_;
+
+public:
+    struct EncryptedData {
+        std::vector<unsigned char> ciphertext;
+        std::vector<unsigned char> iv;
+        std::vector<unsigned char> tag;
+        std::vector<unsigned char> aad;  // Additional Authenticated Data
+    };
+
+    AESGCMEncryption() : key_(KEY_SIZE) {
+        // Generate random key
+        if (RAND_bytes(key_.data(), KEY_SIZE) != 1) {
+            throw std::runtime_error("Failed to generate encryption key");
+        }
+    }
+
+    explicit AESGCMEncryption(const std::vector<unsigned char>& key)
+        : key_(key) {
+        if (key_.size() != KEY_SIZE) {
+            throw std::invalid_argument("Invalid key size");
+        }
+    }
+
+    EncryptedData encrypt(const std::vector<unsigned char>& plaintext,
+                         const std::vector<unsigned char>& aad = {}) {
+        EncryptedData result;
+        result.iv.resize(IV_SIZE);
+        result.tag.resize(TAG_SIZE);
+        result.aad = aad;
+
+        // Generate random IV
+        if (RAND_bytes(result.iv.data(), IV_SIZE) != 1) {
+            throw std::runtime_error("Failed to generate IV");
+        }
+
+        // Create and initialize context
+        EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+        if (!ctx) {
+            throw std::runtime_error("Failed to create cipher context");
+        }
+
+        std::unique_ptr<EVP_CIPHER_CTX, decltype(&EVP_CIPHER_CTX_free)>
+            ctx_guard(ctx, EVP_CIPHER_CTX_free);
+
+        // Initialize encryption
+        if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr,
+                              key_.data(), result.iv.data()) != 1) {
+            throw std::runtime_error("Failed to initialize encryption");
+        }
+
+        // Provide AAD if present
+        int len;
+        if (!aad.empty()) {
+            if (EVP_EncryptUpdate(ctx, nullptr, &len, aad.data(),
+                                 aad.size()) != 1) {
+                throw std::runtime_error("Failed to process AAD");
+            }
+        }
+
+        // Encrypt plaintext
+        result.ciphertext.resize(plaintext.size() + EVP_CIPHER_block_size(
+                                 EVP_aes_256_gcm()));
+
+        if (EVP_EncryptUpdate(ctx, result.ciphertext.data(), &len,
+                             plaintext.data(), plaintext.size()) != 1) {
+            throw std::runtime_error("Encryption failed");
+        }
+
+        int ciphertext_len = len;
+
+        // Finalize encryption
+        if (EVP_EncryptFinal_ex(ctx, result.ciphertext.data() + len,
+                               &len) != 1) {
+            throw std::runtime_error("Failed to finalize encryption");
+        }
+
+        ciphertext_len += len;
+        result.ciphertext.resize(ciphertext_len);
+
+        // Get authentication tag
+        if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, TAG_SIZE,
+                               result.tag.data()) != 1) {
+            throw std::runtime_error("Failed to get authentication tag");
+        }
+
+        return result;
+    }
+
+    std::vector<unsigned char> decrypt(const EncryptedData& encrypted) {
+        // Create and initialize context
+        EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+        if (!ctx) {
+            throw std::runtime_error("Failed to create cipher context");
+        }
+
+        std::unique_ptr<EVP_CIPHER_CTX, decltype(&EVP_CIPHER_CTX_free)>
+            ctx_guard(ctx, EVP_CIPHER_CTX_free);
+
+        // Initialize decryption
+        if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr,
+                              key_.data(), encrypted.iv.data()) != 1) {
+            throw std::runtime_error("Failed to initialize decryption");
+        }
+
+        // Provide AAD if present
+        int len;
+        if (!encrypted.aad.empty()) {
+            if (EVP_DecryptUpdate(ctx, nullptr, &len, encrypted.aad.data(),
+                                 encrypted.aad.size()) != 1) {
+                throw std::runtime_error("Failed to process AAD");
+            }
+        }
+
+        // Decrypt ciphertext
+        std::vector<unsigned char> plaintext(encrypted.ciphertext.size() +
+                                            EVP_CIPHER_block_size(
+                                            EVP_aes_256_gcm()));
+
+        if (EVP_DecryptUpdate(ctx, plaintext.data(), &len,
+                             encrypted.ciphertext.data(),
+                             encrypted.ciphertext.size()) != 1) {
+            throw std::runtime_error("Decryption failed");
+        }
+
+        int plaintext_len = len;
+
+        // Set authentication tag
+        if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, TAG_SIZE,
+                               const_cast<unsigned char*>(
+                               encrypted.tag.data())) != 1) {
+            throw std::runtime_error("Failed to set authentication tag");
+        }
+
+        // Finalize decryption and verify tag
+        if (EVP_DecryptFinal_ex(ctx, plaintext.data() + len, &len) != 1) {
+            throw std::runtime_error("Authentication failed or "
+                                   "decryption error");
+        }
+
+        plaintext_len += len;
+        plaintext.resize(plaintext_len);
+
+        return plaintext;
+    }
+
+    // Secure key derivation from password
+    static std::vector<unsigned char> deriveKey(const std::string& password,
+                                               const std::vector<unsigned char>& salt,
+                                               int iterations = 100000) {
+        std::vector<unsigned char> key(KEY_SIZE);
+
+        if (PKCS5_PBKDF2_HMAC(password.c_str(), password.length(),
+                             salt.data(), salt.size(),
+                             iterations, EVP_sha256(),
+                             KEY_SIZE, key.data()) != 1) {
+            throw std::runtime_error("Key derivation failed");
+        }
+
+        return key;
+    }
+
+    const std::vector<unsigned char>& getKey() const {
+        return key_;
+    }
+};
+```
+
+3. DATABASE ENCRYPTION (TRANSPARENT DATA ENCRYPTION)
+-----------------------------------------------------
+
+```cpp
+#include <sqlite3.h>
+#include <string>
+#include <memory>
+
+class EncryptedDatabase {
+private:
+    sqlite3* db_;
+    AESGCMEncryption encryption_engine_;
+
+public:
+    EncryptedDatabase(const std::string& db_path,
+                     const std::vector<unsigned char>& encryption_key)
+        : db_(nullptr), encryption_engine_(encryption_key) {
+
+        int rc = sqlite3_open(db_path.c_str(), &db_);
+        if (rc != SQLITE_OK) {
+            throw std::runtime_error("Failed to open database: " +
+                                   std::string(sqlite3_errmsg(db_)));
+        }
+
+        // Enable encryption using SQLCipher or similar
+        executePragma("PRAGMA key = '" + keyToHex(encryption_key) + "';");
+        executePragma("PRAGMA cipher = 'aes-256-gcm';");
+        executePragma("PRAGMA kdf_iter = 256000;");
+
+        // Create metadata table for encrypted columns
+        createMetadataTable();
+    }
+
+    ~EncryptedDatabase() {
+        if (db_) {
+            sqlite3_close(db_);
+        }
+    }
+
+    // Insert with field-level encryption
+    bool insertEncryptedRecord(const std::string& table,
+                              const std::map<std::string, std::string>& data,
+                              const std::vector<std::string>& encrypted_fields) {
+        std::string sql = "INSERT INTO " + table + " (";
+        std::string values = " VALUES (";
+
+        bool first = true;
+        for (const auto& [field, value] : data) {
+            if (!first) {
+                sql += ", ";
+                values += ", ";
+            }
+
+            sql += field;
+
+            // Encrypt sensitive fields
+            if (std::find(encrypted_fields.begin(), encrypted_fields.end(),
+                         field) != encrypted_fields.end()) {
+                auto encrypted = encryption_engine_.encrypt(
+                    std::vector<unsigned char>(value.begin(), value.end()));
+
+                // Store as base64-encoded blob
+                values += "'" + base64Encode(encrypted) + "'";
+            } else {
+                values += "'" + value + "'";
+            }
+
+            first = false;
+        }
+
+        sql += ")" + values + ");";
+
+        char* error_msg = nullptr;
+        int rc = sqlite3_exec(db_, sql.c_str(), nullptr, nullptr, &error_msg);
+
+        if (rc != SQLITE_OK) {
+            std::string error(error_msg);
+            sqlite3_free(error_msg);
+            std::cerr << "Insert failed: " << error << std::endl;
+            return false;
+        }
+
+        return true;
+    }
+
+private:
+    void executePragma(const std::string& pragma) {
+        char* error_msg = nullptr;
+        int rc = sqlite3_exec(db_, pragma.c_str(), nullptr, nullptr,
+                            &error_msg);
+
+        if (rc != SQLITE_OK) {
+            std::string error(error_msg);
+            sqlite3_free(error_msg);
+            throw std::runtime_error("Pragma failed: " + error);
+        }
+    }
+
+    void createMetadataTable() {
+        const char* sql = R"(
+            CREATE TABLE IF NOT EXISTS encryption_metadata (
+                table_name TEXT NOT NULL,
+                column_name TEXT NOT NULL,
+                encryption_algorithm TEXT NOT NULL,
+                key_id TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (table_name, column_name)
+            );
+        )";
+
+        char* error_msg = nullptr;
+        int rc = sqlite3_exec(db_, sql, nullptr, nullptr, &error_msg);
+
+        if (rc != SQLITE_OK) {
+            std::string error(error_msg);
+            sqlite3_free(error_msg);
+            throw std::runtime_error("Failed to create metadata table: " +
+                                   error);
+        }
+    }
+
+    std::string keyToHex(const std::vector<unsigned char>& key) const {
+        std::stringstream ss;
+        ss << std::hex << std::setfill('0');
+        for (unsigned char byte : key) {
+            ss << std::setw(2) << static_cast<int>(byte);
+        }
+        return ss.str();
+    }
+
+    std::string base64Encode(const AESGCMEncryption::EncryptedData& data) const {
+        // Combine IV + ciphertext + tag for storage
+        std::vector<unsigned char> combined;
+        combined.insert(combined.end(), data.iv.begin(), data.iv.end());
+        combined.insert(combined.end(), data.ciphertext.begin(),
+                       data.ciphertext.end());
+        combined.insert(combined.end(), data.tag.begin(), data.tag.end());
+
+        // Base64 encode (implementation omitted for brevity)
+        // Use OpenSSL's base64 encoding or similar
+        return ""; // Placeholder
+    }
+};
+```
+
+4. FILE SYSTEM ENCRYPTION MANAGER
+----------------------------------
+
+```cpp
+#include <fstream>
+#include <filesystem>
+
+class FileEncryptionManager {
+private:
+    AESGCMEncryption encryption_engine_;
+    std::string base_directory_;
+
+public:
+    FileEncryptionManager(const std::vector<unsigned char>& master_key,
+                         const std::string& base_dir)
+        : encryption_engine_(master_key), base_directory_(base_dir) {
+
+        if (!std::filesystem::exists(base_directory_)) {
+            std::filesystem::create_directories(base_directory_);
+        }
+    }
+
+    bool encryptFile(const std::string& input_path,
+                    const std::string& output_path) {
+        // Read input file
+        std::ifstream input(input_path, std::ios::binary);
+        if (!input) {
+            std::cerr << "Failed to open input file: " << input_path
+                     << std::endl;
+            return false;
+        }
+
+        std::vector<unsigned char> plaintext(
+            (std::istreambuf_iterator<char>(input)),
+            std::istreambuf_iterator<char>());
+
+        input.close();
+
+        // Create AAD with file metadata
+        std::vector<unsigned char> aad;
+        std::string metadata = std::filesystem::path(input_path).filename();
+        aad.assign(metadata.begin(), metadata.end());
+
+        // Encrypt data
+        auto encrypted = encryption_engine_.encrypt(plaintext, aad);
+
+        // Write encrypted file
+        std::ofstream output(output_path, std::ios::binary);
+        if (!output) {
+            std::cerr << "Failed to open output file: " << output_path
+                     << std::endl;
+            return false;
+        }
+
+        // Write header
+        uint32_t iv_size = encrypted.iv.size();
+        uint32_t tag_size = encrypted.tag.size();
+        uint32_t aad_size = encrypted.aad.size();
+        uint32_t ciphertext_size = encrypted.ciphertext.size();
+
+        output.write(reinterpret_cast<const char*>(&iv_size),
+                    sizeof(iv_size));
+        output.write(reinterpret_cast<const char*>(&tag_size),
+                    sizeof(tag_size));
+        output.write(reinterpret_cast<const char*>(&aad_size),
+                    sizeof(aad_size));
+        output.write(reinterpret_cast<const char*>(&ciphertext_size),
+                    sizeof(ciphertext_size));
+
+        // Write data
+        output.write(reinterpret_cast<const char*>(encrypted.iv.data()),
+                    iv_size);
+        output.write(reinterpret_cast<const char*>(encrypted.tag.data()),
+                    tag_size);
+        output.write(reinterpret_cast<const char*>(encrypted.aad.data()),
+                    aad_size);
+        output.write(reinterpret_cast<const char*>(
+                    encrypted.ciphertext.data()), ciphertext_size);
+
+        output.close();
+
+        // Securely delete original file
+        secureDelete(input_path);
+
+        return true;
+    }
+
+    bool decryptFile(const std::string& input_path,
+                    const std::string& output_path) {
+        std::ifstream input(input_path, std::ios::binary);
+        if (!input) {
+            std::cerr << "Failed to open input file: " << input_path
+                     << std::endl;
+            return false;
+        }
+
+        // Read header
+        uint32_t iv_size, tag_size, aad_size, ciphertext_size;
+        input.read(reinterpret_cast<char*>(&iv_size), sizeof(iv_size));
+        input.read(reinterpret_cast<char*>(&tag_size), sizeof(tag_size));
+        input.read(reinterpret_cast<char*>(&aad_size), sizeof(aad_size));
+        input.read(reinterpret_cast<char*>(&ciphertext_size),
+                  sizeof(ciphertext_size));
+
+        // Read encrypted data
+        AESGCMEncryption::EncryptedData encrypted;
+        encrypted.iv.resize(iv_size);
+        encrypted.tag.resize(tag_size);
+        encrypted.aad.resize(aad_size);
+        encrypted.ciphertext.resize(ciphertext_size);
+
+        input.read(reinterpret_cast<char*>(encrypted.iv.data()), iv_size);
+        input.read(reinterpret_cast<char*>(encrypted.tag.data()), tag_size);
+        input.read(reinterpret_cast<char*>(encrypted.aad.data()), aad_size);
+        input.read(reinterpret_cast<char*>(encrypted.ciphertext.data()),
+                  ciphertext_size);
+
+        input.close();
+
+        // Decrypt
+        try {
+            auto plaintext = encryption_engine_.decrypt(encrypted);
+
+            // Write output file
+            std::ofstream output(output_path, std::ios::binary);
+            if (!output) {
+                std::cerr << "Failed to open output file: " << output_path
+                         << std::endl;
+                return false;
+            }
+
+            output.write(reinterpret_cast<const char*>(plaintext.data()),
+                        plaintext.size());
+            output.close();
+
+            return true;
+        } catch (const std::exception& e) {
+            std::cerr << "Decryption failed: " << e.what() << std::endl;
+            return false;
+        }
+    }
+
+private:
+    void secureDelete(const std::string& path) {
+        // Overwrite file multiple times before deletion
+        std::ifstream file_in(path, std::ios::binary | std::ios::ate);
+        if (!file_in) return;
+
+        std::streamsize size = file_in.tellg();
+        file_in.close();
+
+        // Overwrite with random data 3 times
+        for (int i = 0; i < 3; ++i) {
+            std::ofstream file_out(path, std::ios::binary);
+            if (!file_out) continue;
+
+            std::vector<unsigned char> random_data(size);
+            RAND_bytes(random_data.data(), size);
+            file_out.write(reinterpret_cast<const char*>(random_data.data()),
+                          size);
+            file_out.close();
+        }
+
+        // Delete file
+        std::filesystem::remove(path);
+    }
+};
+```
+
+================================================================================
+CONFIGURATION TEMPLATES
+================================================================================
+
+1. TLS/SSL CONFIGURATION (nginx)
+---------------------------------
+
+```nginx
+# HFT System TLS Configuration
+server {
+    listen 443 ssl http2;
+    server_name trading-api.hft-system.local;
+
+    # TLS 1.3 Only
+    ssl_protocols TLSv1.3;
+
+    # Cipher Suites
+    ssl_ciphers 'TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256';
+    ssl_prefer_server_ciphers on;
+
+    # Certificates
+    ssl_certificate /etc/ssl/certs/trading-api.crt;
+    ssl_certificate_key /etc/ssl/private/trading-api.key;
+    ssl_trusted_certificate /etc/ssl/certs/ca-chain.crt;
+
+    # OCSP Stapling
+    ssl_stapling on;
+    ssl_stapling_verify on;
+    resolver 8.8.8.8 8.8.4.4 valid=300s;
+    resolver_timeout 5s;
+
+    # Session Configuration
+    ssl_session_timeout 1d;
+    ssl_session_cache shared:SSL:50m;
+    ssl_session_tickets off;
+
+    # HSTS (HTTP Strict Transport Security)
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+
+    # Security Headers
+    add_header X-Frame-Options "DENY" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+
+    # Client Certificate Authentication
+    ssl_client_certificate /etc/ssl/certs/client-ca.crt;
+    ssl_verify_client on;
+    ssl_verify_depth 2;
+
+    location / {
+        proxy_pass http://backend_servers;
+        proxy_ssl_protocols TLSv1.3;
+        proxy_ssl_ciphers 'TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256';
+    }
+}
+```
+
+2. DATABASE ENCRYPTION CONFIGURATION (PostgreSQL)
+--------------------------------------------------
+
+```conf
+# PostgreSQL Encryption Configuration
+
+# SSL/TLS Configuration
+ssl = on
+ssl_cert_file = '/etc/postgresql/ssl/server.crt'
+ssl_key_file = '/etc/postgresql/ssl/server.key'
+ssl_ca_file = '/etc/postgresql/ssl/ca.crt'
+ssl_crl_file = '/etc/postgresql/ssl/root.crl'
+
+# Cipher Configuration
+ssl_ciphers = 'TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256'
+ssl_prefer_server_ciphers = on
+ssl_min_protocol_version = 'TLSv1.3'
+
+# Password Encryption
+password_encryption = scrypt
+
+# Connection Security
+db_user_namespace = off
+```
+
+```sql
+-- Transparent Data Encryption Setup
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+-- Create encryption key management table
+CREATE TABLE encryption_keys (
+    key_id SERIAL PRIMARY KEY,
+    key_name VARCHAR(255) UNIQUE NOT NULL,
+    encrypted_key BYTEA NOT NULL,
+    algorithm VARCHAR(50) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    rotated_at TIMESTAMP,
+    status VARCHAR(20) DEFAULT 'active'
+);
+
+-- Create encrypted trading orders table
+CREATE TABLE encrypted_orders (
+    order_id BIGSERIAL PRIMARY KEY,
+    encrypted_symbol BYTEA NOT NULL,
+    encrypted_price BYTEA NOT NULL,
+    encrypted_quantity BYTEA NOT NULL,
+    order_type VARCHAR(20) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    encryption_key_id INTEGER REFERENCES encryption_keys(key_id)
+);
+
+-- Encryption functions
+CREATE OR REPLACE FUNCTION encrypt_field(
+    plaintext TEXT,
+    key_name TEXT
+) RETURNS BYTEA AS $$
+DECLARE
+    encryption_key BYTEA;
+BEGIN
+    SELECT encrypted_key INTO encryption_key
+    FROM encryption_keys
+    WHERE key_name = $2 AND status = 'active';
+
+    RETURN pgp_sym_encrypt(plaintext, convert_from(encryption_key, 'UTF8'));
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+CREATE OR REPLACE FUNCTION decrypt_field(
+    ciphertext BYTEA,
+    key_name TEXT
+) RETURNS TEXT AS $$
+DECLARE
+    encryption_key BYTEA;
+BEGIN
+    SELECT encrypted_key INTO encryption_key
+    FROM encryption_keys
+    WHERE key_name = $2 AND status = 'active';
+
+    RETURN pgp_sym_decrypt(ciphertext, convert_from(encryption_key, 'UTF8'));
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+```
+
+3. DISK ENCRYPTION CONFIGURATION (LUKS)
+----------------------------------------
+
+```bash
+#!/bin/bash
+# LUKS Disk Encryption Setup for HFT System
+
+# Create encrypted partition
+cryptsetup luksFormat /dev/sdX \
+    --cipher aes-xts-plain64 \
+    --key-size 512 \
+    --hash sha256 \
+    --iter-time 5000 \
+    --use-urandom
+
+# Open encrypted partition
+cryptsetup open /dev/sdX hft_encrypted_data
+
+# Create filesystem
+mkfs.ext4 -L hft_data /dev/mapper/hft_encrypted_data
+
+# Mount configuration
+echo "hft_encrypted_data /dev/sdX none luks,discard" >> /etc/crypttab
+echo "/dev/mapper/hft_encrypted_data /mnt/hft_data ext4 defaults,noatime 0 2" >> /etc/fstab
+
+# Key file for automatic mounting
+dd if=/dev/urandom of=/root/hft_keyfile bs=1024 count=4
+chmod 0400 /root/hft_keyfile
+cryptsetup luksAddKey /dev/sdX /root/hft_keyfile
+```
+
+================================================================================
+THREAT MODELS
+================================================================================
+
+THREAT 1: TLS DOWNGRADE ATTACK
+-------------------------------
+Threat Actor: Man-in-the-Middle attacker
+Attack Vector: Force negotiation to weaker protocol/cipher
+Impact: HIGH - Potential data interception
+
+Mitigation:
+1. Enforce TLS 1.3 only (disable TLS 1.2 and earlier)
+2. Use strong cipher suites only
+3. Implement HSTS with preload
+4. Enable certificate pinning
+5. Monitor for protocol anomalies
+
+Detection:
+- Protocol version monitoring
+- Cipher suite logging
+- Certificate validation failures
+- Unexpected handshake patterns
+
+Response:
+1. Terminate suspicious connections immediately
+2. Block offending IP addresses
+3. Review TLS configuration
+4. Update cipher suite preferences
+
+THREAT 2: ENCRYPTION KEY EXTRACTION FROM MEMORY
+------------------------------------------------
+Threat Actor: Advanced persistent threat (APT)
+Attack Vector: Memory dump, cold boot attack
+Impact: CRITICAL - All encrypted data compromised
+
+Mitigation:
+1. Use hardware security modules (HSM)
+2. Implement memory encryption (Intel SGX, AMD SEV)
+3. Lock sensitive pages in memory (mlock)
+4. Clear keys immediately after use (explicit_bzero)
+5. Use key wrapping and rotation
+
+Detection:
+- Memory access monitoring
+- Process debugging attempts
+- Unauthorized memory reads
+- Cold boot attack indicators
+
+Response:
+1. Rotate all potentially compromised keys immediately
+2. Re-encrypt all data with new keys
+3. Perform forensic analysis
+4. Review memory protection mechanisms
+
+THREAT 3: DATABASE ENCRYPTION BYPASS
+-------------------------------------
+Threat Actor: Database administrator or attacker with DB access
+Attack Vector: Direct access to encrypted database files
+Impact: HIGH - Access to sensitive trading data
+
+Mitigation:
+1. Implement transparent data encryption (TDE)
+2. Use field-level encryption for sensitive data
+3. Store encryption keys separately from database
+4. Implement strict access controls
+5. Enable comprehensive audit logging
+
+Detection:
+- Unusual database queries
+- Large data exports
+- Key access anomalies
+- Failed decryption attempts
+
+Response:
+1. Revoke compromised credentials
+2. Rotate encryption keys
+3. Review audit logs for data exfiltration
+4. Implement additional access controls
+
+================================================================================
+SECURITY CHECKLISTS
+================================================================================
+
+TLS/SSL IMPLEMENTATION CHECKLIST
+---------------------------------
+[ ] TLS 1.3 enforced, older versions disabled
+[ ] Strong cipher suites configured
+[ ] Certificate validation implemented
+[ ] Hostname verification enabled
+[ ] OCSP stapling configured
+[ ] Certificate pinning implemented for critical connections
+[ ] Session resumption configured securely
+[ ] Perfect Forward Secrecy (PFS) enabled
+[ ] HSTS header configured
+[ ] Certificate expiration monitoring in place
+[ ] Automated certificate renewal configured
+[ ] TLS error logging enabled
+
+DATA AT REST ENCRYPTION CHECKLIST
+----------------------------------
+[ ] Full disk encryption enabled (LUKS, BitLocker)
+[ ] Database encryption configured (TDE)
+[ ] File system encryption implemented
+[ ] Backup encryption enabled
+[ ] Encryption key management system deployed
+[ ] Key rotation schedule defined and automated
+[ ] Secure key storage (HSM, Vault)
+[ ] Encryption algorithm standards met (AES-256)
+[ ] Access controls on encrypted data
+[ ] Encryption monitoring and alerting
+[ ] Disaster recovery procedures for encrypted data
+[ ] Regular encryption verification tests
+
+KEY MANAGEMENT CHECKLIST
+-------------------------
+[ ] Key generation uses CSPRNG
+[ ] Minimum key lengths enforced
+[ ] Key hierarchy established
+[ ] Key wrapping implemented
+[ ] Automated key rotation configured
+[ ] Key backup and recovery procedures
+[ ] Key access audit logging
+[ ] Secure key distribution mechanism
+[ ] Emergency key revocation procedures
+[ ] Key usage monitoring
+[ ] Cryptographic agility maintained
+[ ] Hardware security modules evaluated/deployed
+
+================================================================================
+INCIDENT RESPONSE PROCEDURES
+================================================================================
+
+INCIDENT: ENCRYPTION KEY COMPROMISE
+------------------------------------
+
+PHASE 1: DETECTION (0-15 minutes)
+----------------------------------
+1. Identify compromised key(s)
+   - Key ID and purpose
+   - Scope of key usage
+   - Systems affected
+   - Data encrypted with compromised key
+
+2. Assess impact
+   - Data exposure risk
+   - Active connections using key
+   - Historical data encrypted with key
+   - Potential unauthorized access
+
+3. Classify severity
+   - CRITICAL: Master key or root CA key compromised
+   - HIGH: Database or file encryption key compromised
+   - MEDIUM: Session or transport key compromised
+
+PHASE 2: CONTAINMENT (15-60 minutes)
+-------------------------------------
+1. Immediate key revocation
+   - Add to revocation list
+   - Update all systems
+   - Terminate active sessions using key
+
+2. Generate replacement keys
+   - Use emergency key generation procedures
+   - Verify secure generation environment
+   - Document new keys
+
+3. Isolate affected systems
+   - Disconnect from network if necessary
+   - Prevent further data access
+   - Preserve evidence
+
+PHASE 3: RECOVERY (1-24 hours)
+-------------------------------
+1. Re-encrypt affected data
+   - Prioritize by sensitivity
+   - Verify successful re-encryption
+   - Update encryption metadata
+
+2. Deploy new keys
+   - Distribute to authorized systems
+   - Update configurations
+   - Verify functionality
+
+3. Restore services
+   - Gradual service restoration
+   - Enhanced monitoring during recovery
+   - Verify no residual issues
+
+PHASE 4: POST-INCIDENT (24-72 hours)
+-------------------------------------
+1. Root cause analysis
+   - How was key compromised
+   - Timeline of events
+   - Systems and processes involved
+
+2. Improve security controls
+   - Address vulnerabilities
+   - Update procedures
+   - Enhance monitoring
+
+3. Documentation and reporting
+   - Complete incident report
+   - Update runbooks
+   - Regulatory notifications if required
+
+EMERGENCY CONTACTS
+------------------
+Security Operations: security-ops@hft-system.com
+Key Management Team: key-management@hft-system.com
+Incident Commander: incident-commander@hft-system.com
+Legal/Compliance: legal@hft-system.com
+
+================================================================================
+BEST PRACTICES SUMMARY
+================================================================================
+
+1. ALWAYS use TLS 1.3 for all network communications
+2. IMPLEMENT strong cipher suites (AES-256-GCM, ChaCha20-Poly1305)
+3. ENABLE full disk encryption on all systems
+4. USE hardware security modules for critical keys
+5. IMPLEMENT automated key rotation
+6. ENCRYPT sensitive data at field level in databases
+7. NEVER store encryption keys with encrypted data
+8. ENABLE comprehensive encryption audit logging
+9. IMPLEMENT perfect forward secrecy (PFS)
+10. REGULARLY test encryption and key recovery procedures
+11. USE authenticated encryption modes (GCM, CCM)
+12. IMPLEMENT defense in depth (multiple encryption layers)
+
+================================================================================
+END OF DOCUMENT
+================================================================================

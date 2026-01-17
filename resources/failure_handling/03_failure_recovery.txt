@@ -1,0 +1,993 @@
+================================================================================
+                         FAILURE RECOVERY SYSTEMS
+                   Automatic Recovery & State Restoration
+================================================================================
+
+DOCUMENT: Failure Recovery Architecture and Procedures
+VERSION: 2.1.0
+LAST UPDATED: 2025-11-26
+SCOPE: HFT System Recovery Mechanisms
+
+================================================================================
+                          TABLE OF CONTENTS
+================================================================================
+
+1. Recovery Philosophy & Objectives
+2. Automatic Recovery Procedures
+3. State Restoration Mechanisms
+4. Failover Strategies
+5. Recovery Validation
+6. Order Reconciliation
+7. Position Recovery
+8. Connection Recovery
+9. Code Examples
+
+================================================================================
+            1. RECOVERY PHILOSOPHY & OBJECTIVES
+================================================================================
+
+RECOVERY PRINCIPLES:
+--------------------
+
+1. SAFE FIRST, FAST SECOND
+   - Never prioritize speed over correctness
+   - Always verify state before resuming operations
+   - Cancel all uncertain orders/positions
+
+2. PROGRESSIVE RECOVERY
+   - Start with monitoring and observability
+   - Gradually restore trading capabilities
+   - Validate each step before proceeding
+
+3. IDEMPOTENT OPERATIONS
+   - Recovery can be retried safely
+   - No duplicate orders/fills
+   - Deterministic outcomes
+
+4. COMPREHENSIVE LOGGING
+   - Log every recovery action
+   - Record decision rationale
+   - Enable post-mortem analysis
+
+RECOVERY TIME OBJECTIVES (RTO):
+-------------------------------
+
+Failure Type              RTO Target    Maximum RTO    Impact
+--------------------------------------------------------------------------------
+Network disconnect        < 1 second    < 5 seconds    Trading paused
+Exchange API error        < 500ms       < 2 seconds    Strategy degraded
+Process crash            < 2 seconds    < 10 seconds   Full outage
+Market data gap          < 100ms        < 1 second     Stale data
+Order execution error    Immediate      < 100ms        Single order
+System memory error      < 5 seconds    < 30 seconds   Full outage
+Database failure         < 10 seconds   < 60 seconds   Degraded mode
+
+RECOVERY POINT OBJECTIVES (RPO):
+---------------------------------
+
+Data Type                 RPO Target    Maximum RPO    Mechanism
+--------------------------------------------------------------------------------
+Order state              Zero loss      Zero loss      Persistent queue
+Position data            Zero loss      Zero loss      Database + exchange sync
+Market data              < 100ms        < 1 second     Snapshot + replay
+Strategy state           Zero loss      < 1 second     State persistence
+Configuration            Zero loss      Zero loss      Version control
+Performance metrics      < 1 second     < 5 seconds    Buffer flush
+
+RECOVERY LEVELS:
+----------------
+
+Level 0: SELF-HEALING
+  - Automatic retry with backoff
+  - No human intervention
+  - < 1 second recovery
+  - Examples: Network reconnect, API retry
+
+Level 1: AUTOMATIC RECOVERY
+  - Automated recovery procedures
+  - Alert notification sent
+  - < 10 seconds recovery
+  - Examples: Process restart, failover
+
+Level 2: SEMI-AUTOMATIC RECOVERY
+  - Automated preparation
+  - Human approval required
+  - < 5 minutes recovery
+  - Examples: State migration, config change
+
+Level 3: MANUAL RECOVERY
+  - Human-driven recovery
+  - Complex decision making required
+  - > 5 minutes recovery
+  - Examples: Data corruption, infrastructure failure
+
+================================================================================
+                  2. AUTOMATIC RECOVERY PROCEDURES
+================================================================================
+
+2.1 RECOVERY ENGINE ARCHITECTURE
+---------------------------------
+
+namespace hft::recovery {
+
+class RecoveryEngine {
+private:
+    struct RecoveryProcedure {
+        std::string name;
+        FailureType failure_type;
+        std::function<RecoveryResult()> procedure;
+        std::chrono::milliseconds timeout;
+        uint32_t max_retries{3};
+        bool requires_approval{false};
+    };
+
+    struct RecoveryState {
+        FailureType failure_type;
+        std::chrono::steady_clock::time_point started_at;
+        uint32_t attempt_number{0};
+        RecoveryStatus status{RecoveryStatus::NOT_STARTED};
+        std::vector<std::string> steps_completed;
+        std::string error_message;
+    };
+
+    std::unordered_map<FailureType, RecoveryProcedure> procedures_;
+    std::vector<RecoveryState> recovery_history_;
+    std::mutex recovery_mutex_;
+
+public:
+    void register_procedure(FailureType type,
+                           const RecoveryProcedure& procedure) {
+        procedures_[type] = procedure;
+
+        logger_.info("Recovery procedure registered", {
+            {"failure_type", to_string(type)},
+            {"procedure", procedure.name},
+            {"timeout_ms", procedure.timeout.count()},
+            {"max_retries", procedure.max_retries}
+        });
+    }
+
+    RecoveryResult handle_failure(const Failure& failure) {
+        std::lock_guard<std::mutex> lock(recovery_mutex_);
+
+        logger_.info("Starting failure recovery", {
+            {"failure_type", to_string(failure.type)},
+            {"severity", to_string(failure.severity)},
+            {"description", failure.description}
+        });
+
+        auto it = procedures_.find(failure.type);
+        if (it == procedures_.end()) {
+            logger_.error("No recovery procedure for failure type", {
+                {"failure_type", to_string(failure.type)}
+            });
+
+            return RecoveryResult{
+                .success = false,
+                .error = "No recovery procedure registered"
+            };
+        }
+
+        const auto& procedure = it->second;
+
+        // Check if approval required
+        if (procedure.requires_approval) {
+            logger_.warn("Recovery requires manual approval", {
+                {"procedure", procedure.name}
+            });
+
+            alert_system_.send_alert(
+                AlertSeverity::P2_HIGH,
+                "Manual approval required for recovery: " + procedure.name,
+                AlertChannel::SLACK | AlertChannel::EMAIL
+            );
+
+            return RecoveryResult{
+                .success = false,
+                .error = "Manual approval required"
+            };
+        }
+
+        // Initialize recovery state
+        RecoveryState state{
+            .failure_type = failure.type,
+            .started_at = std::chrono::steady_clock::now(),
+            .attempt_number = 1,
+            .status = RecoveryStatus::IN_PROGRESS
+        };
+
+        // Execute recovery with retries
+        RecoveryResult result;
+        while (state.attempt_number <= procedure.max_retries) {
+            logger_.info("Executing recovery attempt", {
+                {"attempt", state.attempt_number},
+                {"max_retries", procedure.max_retries},
+                {"procedure", procedure.name}
+            });
+
+            try {
+                result = execute_with_timeout(
+                    procedure.procedure,
+                    procedure.timeout
+                );
+
+                if (result.success) {
+                    state.status = RecoveryStatus::SUCCEEDED;
+                    state.steps_completed = result.steps_completed;
+
+                    logger_.info("Recovery succeeded", {
+                        {"procedure", procedure.name},
+                        {"attempt", state.attempt_number},
+                        {"steps", result.steps_completed.size()}
+                    });
+
+                    break;
+                }
+            } catch (const std::exception& e) {
+                logger_.error("Recovery attempt failed", {
+                    {"attempt", state.attempt_number},
+                    {"error", e.what()}
+                });
+
+                result.error = e.what();
+            }
+
+            // Exponential backoff before retry
+            if (state.attempt_number < procedure.max_retries) {
+                auto backoff = calculate_backoff(state.attempt_number);
+                logger_.info("Waiting before retry", {
+                    {"backoff_ms", backoff.count()}
+                });
+                std::this_thread::sleep_for(backoff);
+            }
+
+            state.attempt_number++;
+        }
+
+        if (!result.success) {
+            state.status = RecoveryStatus::FAILED;
+            state.error_message = result.error;
+
+            logger_.error("Recovery failed after all retries", {
+                {"procedure", procedure.name},
+                {"attempts", state.attempt_number - 1},
+                {"error", result.error}
+            });
+
+            // Alert on recovery failure
+            alert_system_.send_alert(
+                AlertSeverity::P1_CRITICAL,
+                "Recovery failed: " + procedure.name,
+                {{"error", result.error}},
+                AlertChannel::PAGERDUTY | AlertChannel::SMS
+            );
+        }
+
+        recovery_history_.push_back(state);
+        return result;
+    }
+
+private:
+    std::chrono::milliseconds calculate_backoff(uint32_t attempt) {
+        // Exponential backoff: 100ms, 200ms, 400ms, 800ms, ...
+        uint64_t backoff_ms = 100 * (1 << (attempt - 1));
+        return std::chrono::milliseconds(
+            std::min(backoff_ms, MAX_BACKOFF_MS)
+        );
+    }
+
+    template<typename Func>
+    RecoveryResult execute_with_timeout(Func&& func,
+                                       std::chrono::milliseconds timeout) {
+        std::promise<RecoveryResult> promise;
+        auto future = promise.get_future();
+
+        std::thread worker([&promise, func = std::forward<Func>(func)]() {
+            try {
+                promise.set_value(func());
+            } catch (...) {
+                promise.set_exception(std::current_exception());
+            }
+        });
+
+        if (future.wait_for(timeout) == std::future_status::timeout) {
+            worker.detach();  // Let it finish in background
+            throw RecoveryTimeoutException("Recovery procedure timed out");
+        }
+
+        worker.join();
+        return future.get();
+    }
+};
+
+} // namespace hft::recovery
+
+
+2.2 NETWORK RECOVERY
+--------------------
+
+namespace hft::recovery {
+
+class NetworkRecoveryProcedures {
+public:
+    RecoveryResult recover_exchange_connection(const std::string& exchange) {
+        RecoveryResult result;
+        result.steps_completed.push_back("Starting exchange reconnection");
+
+        // Step 1: Close existing connection
+        logger_.info("Closing existing connection", {{"exchange", exchange}});
+        exchange_manager_.disconnect(exchange);
+        result.steps_completed.push_back("Disconnected from exchange");
+
+        // Step 2: Clear connection state
+        connection_state_.reset(exchange);
+        result.steps_completed.push_back("Reset connection state");
+
+        // Step 3: Reconnect with fresh credentials
+        logger_.info("Attempting reconnection", {{"exchange", exchange}});
+
+        try {
+            exchange_manager_.connect(exchange, {
+                .use_backup_endpoint = true,
+                .refresh_credentials = true,
+                .timeout_ms = 5000
+            });
+
+            result.steps_completed.push_back("Reconnected to exchange");
+
+        } catch (const ConnectionException& e) {
+            logger_.error("Reconnection failed", {
+                {"exchange", exchange},
+                {"error", e.what()}
+            });
+
+            result.success = false;
+            result.error = "Reconnection failed: " + std::string(e.what());
+            return result;
+        }
+
+        // Step 4: Verify connection health
+        if (!verify_connection_health(exchange)) {
+            result.success = false;
+            result.error = "Connection health check failed";
+            return result;
+        }
+
+        result.steps_completed.push_back("Verified connection health");
+
+        // Step 5: Re-subscribe to market data
+        resubscribe_market_data(exchange);
+        result.steps_completed.push_back("Resubscribed to market data");
+
+        // Step 6: Reconcile orders
+        reconcile_orders(exchange);
+        result.steps_completed.push_back("Reconciled orders");
+
+        // Step 7: Resume trading
+        trading_engine_.resume(exchange);
+        result.steps_completed.push_back("Resumed trading");
+
+        result.success = true;
+        return result;
+    }
+
+    RecoveryResult recover_market_data_gap(const std::string& symbol,
+                                          uint64_t gap_start,
+                                          uint64_t gap_end) {
+        RecoveryResult result;
+
+        logger_.info("Recovering market data gap", {
+            {"symbol", symbol},
+            {"gap_start", gap_start},
+            {"gap_end", gap_end},
+            {"gap_size", gap_end - gap_start}
+        });
+
+        // Step 1: Request retransmission from exchange
+        try {
+            auto messages = exchange_api_.request_retransmit(
+                symbol, gap_start, gap_end
+            );
+
+            result.steps_completed.push_back(
+                "Received " + std::to_string(messages.size()) +
+                " retransmitted messages"
+            );
+
+            // Step 2: Validate and process messages
+            for (const auto& msg : messages) {
+                if (!validate_message(msg)) {
+                    logger_.warn("Invalid retransmitted message", {
+                        {"sequence", msg.sequence_number}
+                    });
+                    continue;
+                }
+
+                market_data_handler_.process_message(msg);
+            }
+
+            result.steps_completed.push_back("Processed retransmitted messages");
+
+        } catch (const RetransmitException& e) {
+            // Retransmission failed - use snapshot recovery
+            logger_.warn("Retransmission failed, using snapshot", {
+                {"error", e.what()}
+            });
+
+            try {
+                auto snapshot = exchange_api_.request_snapshot(symbol);
+                market_data_handler_.apply_snapshot(snapshot);
+
+                result.steps_completed.push_back("Applied market data snapshot");
+
+            } catch (const SnapshotException& e2) {
+                result.success = false;
+                result.error = "Both retransmit and snapshot failed";
+                return result;
+            }
+        }
+
+        // Step 3: Mark orderbook as current
+        orderbook_[symbol].mark_current();
+        result.steps_completed.push_back("Orderbook marked current");
+
+        result.success = true;
+        return result;
+    }
+
+private:
+    bool verify_connection_health(const std::string& exchange) {
+        // Send test message
+        auto start = std::chrono::steady_clock::now();
+
+        try {
+            auto response = exchange_api_.ping(exchange);
+            auto latency = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start
+            );
+
+            if (latency > std::chrono::milliseconds(100)) {
+                logger_.warn("High connection latency", {
+                    {"exchange", exchange},
+                    {"latency_ms", latency.count()}
+                });
+                return false;
+            }
+
+            return response.success;
+
+        } catch (const std::exception& e) {
+            logger_.error("Connection health check failed", {
+                {"exchange", exchange},
+                {"error", e.what()}
+            });
+            return false;
+        }
+    }
+
+    void resubscribe_market_data(const std::string& exchange) {
+        auto symbols = strategy_manager_.get_active_symbols();
+
+        for (const auto& symbol : symbols) {
+            exchange_api_.subscribe_market_data(exchange, symbol, {
+                .depth = 10,
+                .include_trades = true,
+                .include_quotes = true
+            });
+
+            logger_.info("Resubscribed to market data", {
+                {"exchange", exchange},
+                {"symbol", symbol}
+            });
+        }
+    }
+
+    void reconcile_orders(const std::string& exchange) {
+        // Get all orders we think are open
+        auto local_orders = order_manager_.get_open_orders(exchange);
+
+        // Get actual open orders from exchange
+        auto exchange_orders = exchange_api_.get_open_orders(exchange);
+
+        // Find discrepancies
+        std::vector<Order> orphaned_orders;
+        std::vector<Order> unknown_orders;
+
+        for (const auto& local_order : local_orders) {
+            auto it = std::find_if(exchange_orders.begin(),
+                                  exchange_orders.end(),
+                                  [&](const Order& o) {
+                                      return o.id == local_order.id;
+                                  });
+
+            if (it == exchange_orders.end()) {
+                // Order in our system but not on exchange
+                orphaned_orders.push_back(local_order);
+            }
+        }
+
+        for (const auto& exchange_order : exchange_orders) {
+            auto it = std::find_if(local_orders.begin(),
+                                  local_orders.end(),
+                                  [&](const Order& o) {
+                                      return o.id == exchange_order.id;
+                                  });
+
+            if (it == local_orders.end()) {
+                // Order on exchange but not in our system
+                unknown_orders.push_back(exchange_order);
+            }
+        }
+
+        // Handle orphaned orders
+        if (!orphaned_orders.empty()) {
+            logger_.warn("Found orphaned orders", {
+                {"count", orphaned_orders.size()}
+            });
+
+            for (const auto& order : orphaned_orders) {
+                // Mark as filled/cancelled locally
+                order_manager_.mark_completed(order.id);
+            }
+        }
+
+        // Handle unknown orders
+        if (!unknown_orders.empty()) {
+            logger_.error("Found unknown orders on exchange", {
+                {"count", unknown_orders.size()}
+            });
+
+            alert_system_.send_alert(
+                AlertSeverity::P2_HIGH,
+                "Unknown orders found during reconciliation",
+                {{"exchange", exchange}, {"count", unknown_orders.size()}},
+                AlertChannel::SLACK
+            );
+
+            // Cancel unknown orders for safety
+            for (const auto& order : unknown_orders) {
+                try {
+                    exchange_api_.cancel_order(exchange, order.id);
+                } catch (const std::exception& e) {
+                    logger_.error("Failed to cancel unknown order", {
+                        {"order_id", order.id},
+                        {"error", e.what()}
+                    });
+                }
+            }
+        }
+    }
+};
+
+} // namespace hft::recovery
+
+
+2.3 PROCESS RECOVERY
+--------------------
+
+namespace hft::recovery {
+
+class ProcessRecoveryProcedures {
+public:
+    RecoveryResult recover_from_crash() {
+        RecoveryResult result;
+
+        logger_.info("Starting crash recovery");
+
+        // Step 1: Load persistent state
+        logger_.info("Loading persistent state");
+        try {
+            load_persistent_state();
+            result.steps_completed.push_back("Loaded persistent state");
+        } catch (const std::exception& e) {
+            result.success = false;
+            result.error = "Failed to load state: " + std::string(e.what());
+            return result;
+        }
+
+        // Step 2: Verify state consistency
+        if (!verify_state_consistency()) {
+            result.success = false;
+            result.error = "State consistency check failed";
+            return result;
+        }
+        result.steps_completed.push_back("Verified state consistency");
+
+        // Step 3: Reconnect to all exchanges
+        reconnect_all_exchanges();
+        result.steps_completed.push_back("Reconnected to exchanges");
+
+        // Step 4: Reconcile positions with exchanges
+        reconcile_all_positions();
+        result.steps_completed.push_back("Reconciled positions");
+
+        // Step 5: Reconcile orders
+        reconcile_all_orders();
+        result.steps_completed.push_back("Reconciled orders");
+
+        // Step 6: Verify risk limits
+        if (!verify_risk_limits()) {
+            logger_.error("Risk limits exceeded after recovery");
+            result.success = false;
+            result.error = "Risk limits exceeded";
+            return result;
+        }
+        result.steps_completed.push_back("Verified risk limits");
+
+        // Step 7: Resume strategies (conservative mode)
+        resume_strategies_conservative();
+        result.steps_completed.push_back("Resumed strategies (conservative)");
+
+        // Step 8: Gradual transition to normal operation
+        schedule_gradual_rampup();
+        result.steps_completed.push_back("Scheduled gradual ramp-up");
+
+        result.success = true;
+        return result;
+    }
+
+private:
+    void load_persistent_state() {
+        // Load from write-ahead log
+        wal_manager_.replay_log();
+
+        // Load from database
+        db_manager_.load_state();
+
+        // Verify checksums
+        if (!state_manager_.verify_checksums()) {
+            throw StateCorruptionException("State checksum verification failed");
+        }
+    }
+
+    bool verify_state_consistency() {
+        // Check position consistency
+        auto positions = position_manager_.get_all_positions();
+        for (const auto& [symbol, position] : positions) {
+            if (!position.is_consistent()) {
+                logger_.error("Inconsistent position", {
+                    {"symbol", symbol},
+                    {"quantity", position.quantity},
+                    {"avg_price", position.avg_price}
+                });
+                return false;
+            }
+        }
+
+        // Check order consistency
+        auto orders = order_manager_.get_all_orders();
+        for (const auto& order : orders) {
+            if (!order.is_valid()) {
+                logger_.error("Invalid order state", {
+                    {"order_id", order.id},
+                    {"state", to_string(order.state)}
+                });
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    void reconnect_all_exchanges() {
+        auto exchanges = config_.get_exchanges();
+
+        for (const auto& exchange : exchanges) {
+            try {
+                exchange_manager_.connect(exchange, {
+                    .timeout_ms = 10000,
+                    .refresh_credentials = true
+                });
+
+                logger_.info("Reconnected to exchange", {
+                    {"exchange", exchange}
+                });
+
+            } catch (const std::exception& e) {
+                logger_.error("Failed to reconnect to exchange", {
+                    {"exchange", exchange},
+                    {"error", e.what()}
+                });
+
+                // Continue with other exchanges
+            }
+        }
+    }
+
+    void reconcile_all_positions() {
+        auto exchanges = exchange_manager_.get_connected_exchanges();
+
+        for (const auto& exchange : exchanges) {
+            auto local_positions = position_manager_.get_positions(exchange);
+            auto exchange_positions = exchange_api_.get_positions(exchange);
+
+            for (const auto& [symbol, local_pos] : local_positions) {
+                auto it = exchange_positions.find(symbol);
+
+                if (it == exchange_positions.end()) {
+                    logger_.error("Position exists locally but not on exchange", {
+                        {"exchange", exchange},
+                        {"symbol", symbol},
+                        {"local_quantity", local_pos.quantity}
+                    });
+
+                    alert_system_.send_alert(
+                        AlertSeverity::P1_CRITICAL,
+                        "Position reconciliation discrepancy",
+                        {{"exchange", exchange}, {"symbol", symbol}},
+                        AlertChannel::PAGERDUTY
+                    );
+
+                } else {
+                    const auto& exchange_pos = it->second;
+
+                    if (local_pos.quantity != exchange_pos.quantity) {
+                        logger_.error("Position quantity mismatch", {
+                            {"exchange", exchange},
+                            {"symbol", symbol},
+                            {"local_quantity", local_pos.quantity},
+                            {"exchange_quantity", exchange_pos.quantity}
+                        });
+
+                        // Use exchange as source of truth
+                        position_manager_.sync_position(
+                            exchange, symbol, exchange_pos
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    void reconcile_all_orders() {
+        auto exchanges = exchange_manager_.get_connected_exchanges();
+
+        for (const auto& exchange : exchanges) {
+            reconcile_orders(exchange);
+        }
+    }
+
+    bool verify_risk_limits() {
+        auto exposure = risk_manager_.calculate_current_exposure();
+
+        if (exposure.position_utilization > 1.0) {
+            logger_.error("Position limits exceeded", {
+                {"utilization", exposure.position_utilization}
+            });
+            return false;
+        }
+
+        if (exposure.pnl < risk_limits_.max_loss) {
+            logger_.error("Maximum loss exceeded", {
+                {"pnl", exposure.pnl},
+                {"max_loss", risk_limits_.max_loss}
+            });
+            return false;
+        }
+
+        return true;
+    }
+
+    void resume_strategies_conservative() {
+        // Resume in conservative mode
+        strategy_manager_.resume_all({
+            .mode = TradingMode::CONSERVATIVE,
+            .max_position_size_multiplier = 0.5,
+            .max_order_size_multiplier = 0.5,
+            .require_approval_for_new_positions = true
+        });
+
+        logger_.info("Strategies resumed in conservative mode");
+    }
+
+    void schedule_gradual_rampup() {
+        // Schedule transition to normal mode over 5 minutes
+        std::thread([this]() {
+            std::this_thread::sleep_for(std::chrono::minutes(1));
+
+            // Increase to 75% capacity
+            strategy_manager_.adjust_capacity(0.75);
+            logger_.info("Increased capacity to 75%");
+
+            std::this_thread::sleep_for(std::chrono::minutes(2));
+
+            // Increase to 100% capacity
+            strategy_manager_.adjust_capacity(1.0);
+            logger_.info("Increased capacity to 100%");
+
+            std::this_thread::sleep_for(std::chrono::minutes(2));
+
+            // Switch to normal mode
+            strategy_manager_.set_mode(TradingMode::NORMAL);
+            logger_.info("Switched to normal trading mode");
+
+        }).detach();
+    }
+};
+
+} // namespace hft::recovery
+
+================================================================================
+                    3. STATE RESTORATION MECHANISMS
+================================================================================
+
+3.1 WRITE-AHEAD LOG (WAL)
+--------------------------
+
+namespace hft::recovery {
+
+class WriteAheadLog {
+private:
+    struct LogEntry {
+        uint64_t sequence_number;
+        std::chrono::system_clock::time_point timestamp;
+        std::string operation_type;
+        std::string data;
+        uint32_t checksum;
+    };
+
+    int log_fd_{-1};
+    std::atomic<uint64_t> next_sequence_{0};
+    mutable std::mutex wal_mutex_;
+
+public:
+    void initialize(const std::string& log_path) {
+        log_fd_ = open(log_path.c_str(),
+                      O_WRONLY | O_CREAT | O_APPEND | O_SYNC,
+                      0644);
+
+        if (log_fd_ < 0) {
+            throw WALException("Failed to open WAL: " +
+                             std::string(strerror(errno)));
+        }
+
+        logger_.info("WAL initialized", {{"path", log_path}});
+    }
+
+    void write_entry(const std::string& operation_type,
+                    const std::string& data) {
+        std::lock_guard<std::mutex> lock(wal_mutex_);
+
+        LogEntry entry{
+            .sequence_number = next_sequence_++,
+            .timestamp = std::chrono::system_clock::now(),
+            .operation_type = operation_type,
+            .data = data,
+            .checksum = calculate_checksum(data)
+        };
+
+        // Serialize entry
+        std::string serialized = serialize_entry(entry);
+
+        // Write to log (O_SYNC ensures durability)
+        ssize_t written = write(log_fd_, serialized.data(), serialized.size());
+
+        if (written != static_cast<ssize_t>(serialized.size())) {
+            throw WALException("Failed to write WAL entry");
+        }
+    }
+
+    void replay_log() {
+        logger_.info("Replaying WAL");
+
+        auto entries = read_all_entries();
+
+        for (const auto& entry : entries) {
+            // Verify checksum
+            if (entry.checksum != calculate_checksum(entry.data)) {
+                logger_.error("WAL entry checksum mismatch", {
+                    {"sequence", entry.sequence_number}
+                });
+                continue;
+            }
+
+            // Replay operation
+            replay_operation(entry.operation_type, entry.data);
+        }
+
+        logger_.info("WAL replay complete", {
+            {"entries_replayed", entries.size()}
+        });
+    }
+
+private:
+    uint32_t calculate_checksum(const std::string& data) {
+        return std::hash<std::string>{}(data);
+    }
+
+    void replay_operation(const std::string& op_type,
+                         const std::string& data) {
+        if (op_type == "order_submitted") {
+            // Restore order state
+            auto order = deserialize_order(data);
+            order_manager_.restore_order(order);
+
+        } else if (op_type == "order_filled") {
+            auto fill = deserialize_fill(data);
+            order_manager_.restore_fill(fill);
+
+        } else if (op_type == "position_updated") {
+            auto position = deserialize_position(data);
+            position_manager_.restore_position(position);
+
+        } else {
+            logger_.warn("Unknown WAL operation type", {
+                {"op_type", op_type}
+            });
+        }
+    }
+};
+
+} // namespace hft::recovery
+
+
+3.2 SNAPSHOT MECHANISM
+----------------------
+
+namespace hft::recovery {
+
+class SnapshotManager {
+public:
+    void create_snapshot() {
+        auto start = std::chrono::steady_clock::now();
+
+        logger_.info("Creating system snapshot");
+
+        Snapshot snapshot{
+            .timestamp = std::chrono::system_clock::now(),
+            .sequence_number = get_current_sequence()
+        };
+
+        // Capture all critical state
+        snapshot.orders = order_manager_.get_all_orders();
+        snapshot.positions = position_manager_.get_all_positions();
+        snapshot.strategies = strategy_manager_.get_all_states();
+        snapshot.risk_state = risk_manager_.get_state();
+        snapshot.market_data = market_data_manager_.get_snapshots();
+
+        // Calculate checksum
+        snapshot.checksum = calculate_checksum(snapshot);
+
+        // Persist to disk
+        persist_snapshot(snapshot);
+
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start
+        );
+
+        logger_.info("Snapshot created", {
+            {"duration_ms", duration.count()},
+            {"size_bytes", snapshot.size()}
+        });
+    }
+
+    void restore_from_snapshot() {
+        logger_.info("Restoring from snapshot");
+
+        // Load latest snapshot
+        auto snapshot = load_latest_snapshot();
+
+        // Verify checksum
+        if (snapshot.checksum != calculate_checksum(snapshot)) {
+            throw SnapshotCorruptionException("Snapshot checksum mismatch");
+        }
+
+        // Restore state
+        order_manager_.restore_state(snapshot.orders);
+        position_manager_.restore_state(snapshot.positions);
+        strategy_manager_.restore_state(snapshot.strategies);
+        risk_manager_.restore_state(snapshot.risk_state);
+        market_data_manager_.restore_snapshots(snapshot.market_data);
+
+        logger_.info("Snapshot restored", {
+            {"timestamp", to_string(snapshot.timestamp)},
+            {"sequence", snapshot.sequence_number}
+        });
+    }
+};
+
+} // namespace hft::recovery
+
+================================================================================
+                              END OF DOCUMENT
+================================================================================

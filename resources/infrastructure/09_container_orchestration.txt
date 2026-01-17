@@ -1,0 +1,414 @@
+================================================================================
+                    CONTAINER ORCHESTRATION FOR HFT
+                    Kubernetes - When and How to Use
+================================================================================
+
+TABLE OF CONTENTS
+================================================================================
+1. Containers in HFT - Pros and Cons
+2. Kubernetes Architecture
+3. When to Use Kubernetes for HFT
+4. Kubernetes Configuration for HFT
+5. Performance Considerations
+6. Alternatives to Kubernetes
+7. Best Practices
+
+================================================================================
+1. CONTAINERS IN HFT - PROS AND CONS
+================================================================================
+
+CONTAINER BENEFITS:
+✓ Consistent deployment environment
+✓ Easy scaling (non-critical services)
+✓ Resource isolation
+✓ Faster deployment
+✓ Portability across environments
+
+CONTAINER DRAWBACKS FOR HFT:
+✗ Added latency (network overlay, NAT)
+✗ Resource overhead (container runtime)
+✗ Less control over CPU/memory
+✗ Difficult to pin CPUs
+✗ Network complexity
+
+LATENCY COMPARISON:
+┌────────────────────┬────────────┬────────────────┐
+│ Deployment         │ Latency    │ Use Case       │
+├────────────────────┼────────────┼────────────────┤
+│ Bare Metal         │ Baseline   │ Critical path  │
+│ VM (KVM)          │ +10-50μs   │ Non-critical   │
+│ Container (Docker) │ +5-20μs    │ Non-critical   │
+│ Kubernetes Pod    │ +20-100μs  │ Support svcs   │
+└────────────────────┴────────────┴────────────────┘
+
+RECOMMENDATION:
+- Critical trading services: Bare metal
+- Supporting services: Containers/K8s OK
+- Development/Testing: Containers encouraged
+
+================================================================================
+2. KUBERNETES ARCHITECTURE
+================================================================================
+
+KUBERNETES COMPONENTS:
+
+┌─────────────────────────────────────────────────────────┐
+│                   Control Plane                         │
+│  ┌──────────┐  ┌──────────┐  ┌────────────────────┐   │
+│  │ API      │  │etcd      │  │ Controller         │   │
+│  │ Server   │  │(State)   │  │ Manager            │   │
+│  └──────────┘  └──────────┘  └────────────────────┘   │
+└─────────────────────────────────────────────────────────┘
+                         │
+        ┌────────────────┼────────────────┐
+        │                │                │
+   ┌────▼─────┐     ┌───▼──────┐    ┌───▼──────┐
+   │ Worker 1 │     │ Worker 2 │    │ Worker 3 │
+   │          │     │          │    │          │
+   │ kubelet  │     │ kubelet  │    │ kubelet  │
+   └────┬─────┘     └────┬─────┘    └────┬─────┘
+        │                │                │
+   ┌────▼────┐      ┌───▼─────┐     ┌───▼──────┐
+   │  Pods   │      │  Pods   │     │  Pods    │
+   └─────────┘      └─────────┘     └──────────┘
+
+KEY CONCEPTS:
+
+Pod: Smallest deployable unit (one or more containers)
+Deployment: Manages pod replicas
+Service: Network endpoint for pods
+ConfigMap: Configuration data
+Secret: Sensitive data
+PersistentVolume: Storage
+
+================================================================================
+3. WHEN TO USE KUBERNETES FOR HFT
+================================================================================
+
+USE KUBERNETES FOR:
+✓ Risk management services (non-critical path)
+✓ Order history/reporting services
+✓ Market data recorders (non-critical)
+✓ Admin/management APIs
+✓ Monitoring and alerting services
+✓ Backtesting systems
+✓ Analytics pipelines
+
+DO NOT USE KUBERNETES FOR:
+✗ Market data gateways (critical latency)
+✗ Trading strategy engines (critical path)
+✗ Order management (critical path)
+✗ Execution gateways
+✗ Services requiring CPU pinning
+✗ Services requiring huge pages
+✗ Services with strict latency < 1ms
+
+HYBRID ARCHITECTURE:
+
+Bare Metal Cluster (Critical Path):
+┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+│Market Data   │  │ Strategy     │  │ Order Mgmt   │
+│Gateway       │──│ Engine       │──│ System       │
+│(Bare Metal)  │  │(Bare Metal)  │  │(Bare Metal)  │
+└──────────────┘  └──────────────┘  └──────────────┘
+
+Kubernetes Cluster (Supporting Services):
+┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+│ Risk Mgmt    │  │ Reporting    │  │ Monitoring   │
+│ (K8s Pod)    │  │ (K8s Pod)    │  │ (K8s Pod)    │
+└──────────────┘  └──────────────┘  └──────────────┘
+
+================================================================================
+4. KUBERNETES CONFIGURATION FOR HFT
+================================================================================
+
+DEPLOYMENT EXAMPLE (Risk Service):
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: risk-service
+  namespace: hft-services
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: risk-service
+  template:
+    metadata:
+      labels:
+        app: risk-service
+    spec:
+      # Node affinity (specific nodes)
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: node-type
+                operator: In
+                values:
+                - hft-worker
+
+      # Anti-affinity (spread across nodes)
+      podAntiAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            labelSelector:
+              matchLabels:
+                app: risk-service
+            topologyKey: kubernetes.io/hostname
+
+      containers:
+      - name: risk-service
+        image: hft/risk-service:v1.0.0
+        
+        # Resource limits
+        resources:
+          requests:
+            memory: "4Gi"
+            cpu: "2000m"
+          limits:
+            memory: "8Gi"
+            cpu: "4000m"
+
+        # Environment variables
+        env:
+        - name: REDIS_HOST
+          value: "redis.hft-services.svc.cluster.local"
+        - name: MAX_POSITION
+          valueFrom:
+            configMapKeyRef:
+              name: risk-config
+              key: max_position
+
+        # Health checks
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+
+        # Ports
+        ports:
+        - containerPort: 8080
+          name: http
+          protocol: TCP
+
+SERVICE DEFINITION:
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: risk-service
+  namespace: hft-services
+spec:
+  type: ClusterIP
+  selector:
+    app: risk-service
+  ports:
+  - port: 8080
+    targetPort: 8080
+    protocol: TCP
+
+CONFIGMAP:
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: risk-config
+  namespace: hft-services
+data:
+  max_position: "10000"
+  max_order_value: "1000000"
+  risk_check_timeout: "100ms"
+
+SECRETS:
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: risk-secrets
+  namespace: hft-services
+type: Opaque
+data:
+  redis_password: cmVkaXNfcGFzc3dvcmQ=  # base64 encoded
+
+STATEFULSET (for stateful services):
+
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: market-data-recorder
+spec:
+  serviceName: "market-data-recorder"
+  replicas: 3
+  selector:
+    matchLabels:
+      app: market-data-recorder
+  template:
+    metadata:
+      labels:
+        app: market-data-recorder
+    spec:
+      containers:
+      - name: recorder
+        image: hft/md-recorder:v1.0.0
+        volumeMounts:
+        - name: data
+          mountPath: /data
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 100Gi
+
+================================================================================
+5. PERFORMANCE CONSIDERATIONS
+================================================================================
+
+NETWORK PERFORMANCE:
+
+Default (kube-proxy iptables): +50-200μs latency
+Calico: +20-100μs latency
+Cilium (eBPF): +10-50μs latency
+Host network: +5-20μs latency
+
+CONFIGURATION FOR LOW LATENCY:
+
+spec:
+  # Use host network (bypass overlay)
+  hostNetwork: true
+  
+  # DNS policy
+  dnsPolicy: ClusterFirstWithHostNet
+
+  # Priority class (high priority pods)
+  priorityClassName: high-priority
+
+PRIORITY CLASS:
+
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: high-priority
+value: 1000000
+globalDefault: false
+description: "High priority for HFT services"
+
+CPU PINNING (LIMITED IN K8S):
+
+spec:
+  containers:
+  - name: risk-service
+    resources:
+      requests:
+        cpu: "4"
+        memory: "8Gi"
+      limits:
+        cpu: "4"  # Guaranteed QoS -> CPU pinning possible
+        memory: "8Gi"
+
+NODE CONFIGURATION FOR LOW LATENCY:
+
+# Kubelet config
+cpuManagerPolicy: static
+topologyManagerPolicy: single-numa-node
+
+# Node labels
+kubectl label nodes worker1 latency=low
+kubectl label nodes worker1 numa=node0
+
+================================================================================
+6. ALTERNATIVES TO KUBERNETES
+================================================================================
+
+DOCKER SWARM:
+- Simpler than Kubernetes
+- Native Docker integration
+- Lower overhead
+- Less features
+
+NOMAD (HashiCorp):
+- Simple orchestrator
+- Lower overhead than K8s
+- Good for batch jobs
+- Less community support
+
+SYSTEMD (for HFT):
+- Bare metal process management
+- Lowest overhead
+- Best performance
+- Manual scaling
+
+COMPARISON:
+
+┌────────────┬──────────┬──────────┬──────────┬────────┐
+│ Feature    │ K8s      │ Swarm    │ Nomad    │Systemd │
+├────────────┼──────────┼──────────┼──────────┼────────┤
+│ Latency    │ High     │ Medium   │ Low      │Lowest  │
+│ Complexity │ High     │ Low      │ Medium   │Low     │
+│ Features   │ Rich     │ Basic    │ Medium   │Basic   │
+│ HFT Fit    │ Support  │ Support  │ Better   │Best    │
+└────────────┴──────────┴──────────┴──────────┴────────┘
+
+RECOMMENDATION FOR HFT:
+Critical services: systemd on bare metal
+Support services: Kubernetes or Nomad
+
+================================================================================
+7. BEST PRACTICES
+================================================================================
+
+DEPLOYMENT:
+
+✓ Use separate clusters for critical and non-critical
+✓ Pin critical pods to specific nodes
+✓ Use host network for low latency
+✓ Set resource limits (guaranteed QoS)
+✓ Use pod disruption budgets
+✓ Implement proper health checks
+✓ Use rolling updates carefully
+✓ Test thoroughly before production
+
+MONITORING:
+
+✓ Monitor pod CPU/memory usage
+✓ Track pod restart rate
+✓ Monitor network latency
+✓ Alert on pod scheduling failures
+✓ Monitor node resource utilization
+✓ Use Prometheus + Grafana
+
+DON'T:
+
+✗ Run critical path services in K8s
+✗ Forget resource limits
+✗ Ignore network latency
+✗ Use default network plugins for low latency
+✗ Over-allocate cluster
+✗ Deploy without testing
+✗ Ignore security (RBAC, network policies)
+
+SAMPLE ARCHITECTURE:
+
+Production HFT System:
+- Bare Metal: Market data, Strategy, OMS (5 servers)
+- Kubernetes: Risk, Reporting, Monitoring (3 nodes)
+- Redis/Consul: Shared services (3 nodes)
+
+================================================================================
+END OF CONTAINER ORCHESTRATION
+================================================================================

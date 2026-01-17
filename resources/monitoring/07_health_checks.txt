@@ -1,0 +1,1010 @@
+HEALTH CHECKS AND HEARTBEAT SYSTEMS FOR HFT
+===========================================
+
+TABLE OF CONTENTS
+-----------------
+1. Overview & Health Check Strategy
+2. Liveness vs Readiness Probes
+3. HTTP Health Check Endpoints
+4. Component Health Monitors
+5. Exchange Connectivity Checks
+6. Market Data Health Verification
+7. Heartbeat Protocol Implementation
+8. Circuit Breaker Pattern
+9. Service Mesh Integration
+10. Production Health Dashboards
+11. Automated Recovery Actions
+
+============================================
+1. OVERVIEW & HEALTH CHECK STRATEGY
+============================================
+
+Health Check Architecture:
+---------------------------
+┌────────────────────────────────────────────────────────────┐
+│                  Trading System Components                  │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐    │
+│  │   Trading    │  │  Market      │  │     Risk     │    │
+│  │   Engine     │  │   Data       │  │   Manager    │    │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘    │
+│         │                  │                  │             │
+│         └──────────────────┼──────────────────┘             │
+│                            │                                │
+│                    ┌───────▼────────┐                      │
+│                    │ Health Manager │                      │
+│                    │   (Periodic    │                      │
+│                    │    Checks)     │                      │
+│                    └───────┬────────┘                      │
+└────────────────────────────┼───────────────────────────────┘
+                             │
+        ┌────────────────────┼────────────────────┐
+        │                    │                    │
+   ┌────▼─────┐      ┌──────▼──────┐     ┌──────▼──────┐
+   │Liveness  │      │  Readiness  │     │  Heartbeat  │
+   │  Check   │      │    Check    │     │   Monitor   │
+   │(Am I OK?)│      │(Can I serve)│     │ (Still alive│
+   └────┬─────┘      └──────┬──────┘     └──────┬──────┘
+        │                   │                    │
+        └───────────────────┼────────────────────┘
+                            │
+                     ┌──────▼──────┐
+                     │ Orchestrator│
+                     │ (K8s, etc)  │
+                     └─────────────┘
+
+Health Check Types:
+-------------------
+1. LIVENESS: Is the service running?
+   - Process alive
+   - Main event loop responsive
+   - Critical threads running
+
+2. READINESS: Can the service handle traffic?
+   - Exchange connections established
+   - Market data flowing
+   - Risk checks operational
+   - Sufficient resources available
+
+3. STARTUP: Is initialization complete?
+   - Configuration loaded
+   - Database connections ready
+   - Cache warmed up
+
+4. DEEP HEALTH: Comprehensive checks
+   - End-to-end latency verification
+   - Component dependency checks
+   - Data quality validation
+
+Health States:
+--------------
+- HEALTHY: All checks passing
+- DEGRADED: Some non-critical issues
+- UNHEALTHY: Critical failures detected
+- UNKNOWN: Unable to determine health
+
+============================================
+2. HTTP HEALTH CHECK ENDPOINTS
+============================================
+
+Health Check Server Implementation:
+------------------------------------
+#include <httplib.h>
+#include <nlohmann/json.hpp>
+#include <atomic>
+#include <chrono>
+
+using json = nlohmann::json;
+
+enum class HealthStatus {
+    HEALTHY,
+    DEGRADED,
+    UNHEALTHY,
+    UNKNOWN
+};
+
+std::string statusToString(HealthStatus status) {
+    switch (status) {
+        case HealthStatus::HEALTHY: return "healthy";
+        case HealthStatus::DEGRADED: return "degraded";
+        case HealthStatus::UNHEALTHY: return "unhealthy";
+        case HealthStatus::UNKNOWN: return "unknown";
+    }
+    return "unknown";
+}
+
+int statusToHTTPCode(HealthStatus status) {
+    switch (status) {
+        case HealthStatus::HEALTHY: return 200;
+        case HealthStatus::DEGRADED: return 200;  // Still accepting traffic
+        case HealthStatus::UNHEALTHY: return 503;
+        case HealthStatus::UNKNOWN: return 503;
+    }
+    return 503;
+}
+
+class HealthCheckEndpoint {
+private:
+    httplib::Server server_;
+    std::thread server_thread_;
+    std::atomic<bool> running_{true};
+
+    std::atomic<HealthStatus> liveness_status_{HealthStatus::UNKNOWN};
+    std::atomic<HealthStatus> readiness_status_{HealthStatus::UNKNOWN};
+
+    std::chrono::steady_clock::time_point startup_time_;
+    std::chrono::steady_clock::time_point last_heartbeat_;
+
+    std::function<HealthStatus()> liveness_check_;
+    std::function<HealthStatus()> readiness_check_;
+    std::function<json()> detailed_health_check_;
+
+public:
+    HealthCheckEndpoint(int port = 8080) {
+        startup_time_ = std::chrono::steady_clock::now();
+        last_heartbeat_ = startup_time_;
+
+        setupEndpoints();
+
+        // Start server in background thread
+        server_thread_ = std::thread([this, port]() {
+            server_.listen("0.0.0.0", port);
+        });
+    }
+
+    ~HealthCheckEndpoint() {
+        running_ = false;
+        server_.stop();
+        if (server_thread_.joinable()) {
+            server_thread_.join();
+        }
+    }
+
+    void setLivenessCheck(std::function<HealthStatus()> check) {
+        liveness_check_ = check;
+    }
+
+    void setReadinessCheck(std::function<HealthStatus()> check) {
+        readiness_check_ = check;
+    }
+
+    void setDetailedHealthCheck(std::function<json()> check) {
+        detailed_health_check_ = check;
+    }
+
+    void updateHeartbeat() {
+        last_heartbeat_ = std::chrono::steady_clock::now();
+    }
+
+private:
+    void setupEndpoints() {
+        // Liveness probe - minimal check
+        server_.Get("/healthz", [this](const httplib::Request&, httplib::Response& res) {
+            auto status = performLivenessCheck();
+            liveness_status_.store(status, std::memory_order_release);
+
+            json response = {
+                {"status", statusToString(status)},
+                {"timestamp", getTimestamp()}
+            };
+
+            res.status = statusToHTTPCode(status);
+            res.set_content(response.dump(), "application/json");
+        });
+
+        // Readiness probe - can serve traffic?
+        server_.Get("/ready", [this](const httplib::Request&, httplib::Response& res) {
+            auto status = performReadinessCheck();
+            readiness_status_.store(status, std::memory_order_release);
+
+            json response = {
+                {"status", statusToString(status)},
+                {"timestamp", getTimestamp()}
+            };
+
+            res.status = statusToHTTPCode(status);
+            res.set_content(response.dump(), "application/json");
+        });
+
+        // Startup probe - is initialization complete?
+        server_.Get("/startup", [this](const httplib::Request&, httplib::Response& res) {
+            auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - startup_time_).count();
+
+            // Consider started after 30 seconds
+            HealthStatus status = uptime > 30 ?
+                HealthStatus::HEALTHY : HealthStatus::UNKNOWN;
+
+            json response = {
+                {"status", statusToString(status)},
+                {"uptime_seconds", uptime},
+                {"timestamp", getTimestamp()}
+            };
+
+            res.status = statusToHTTPCode(status);
+            res.set_content(response.dump(), "application/json");
+        });
+
+        // Detailed health check
+        server_.Get("/health", [this](const httplib::Request&, httplib::Response& res) {
+            json health_data = performDetailedHealthCheck();
+
+            res.status = 200;
+            res.set_content(health_data.dump(2), "application/json");
+        });
+
+        // Heartbeat endpoint
+        server_.Get("/heartbeat", [this](const httplib::Request&, httplib::Response& res) {
+            auto last_heartbeat = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - last_heartbeat_).count();
+
+            json response = {
+                {"alive", last_heartbeat < 5000},  // 5 second threshold
+                {"last_heartbeat_ms", last_heartbeat},
+                {"timestamp", getTimestamp()}
+            };
+
+            res.status = 200;
+            res.set_content(response.dump(), "application/json");
+        });
+
+        // Metrics endpoint (Prometheus format)
+        server_.Get("/metrics", [this](const httplib::Request&, httplib::Response& res) {
+            std::string metrics = generatePrometheusMetrics();
+            res.status = 200;
+            res.set_content(metrics, "text/plain; version=0.0.4");
+        });
+    }
+
+    HealthStatus performLivenessCheck() {
+        if (liveness_check_) {
+            return liveness_check_();
+        }
+
+        // Default: check if main thread is responsive
+        auto last_heartbeat_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - last_heartbeat_).count();
+
+        if (last_heartbeat_ms > 10000) {  // 10 seconds
+            return HealthStatus::UNHEALTHY;
+        }
+
+        return HealthStatus::HEALTHY;
+    }
+
+    HealthStatus performReadinessCheck() {
+        if (readiness_check_) {
+            return readiness_check_();
+        }
+
+        // Default: check liveness
+        return performLivenessCheck();
+    }
+
+    json performDetailedHealthCheck() {
+        if (detailed_health_check_) {
+            return detailed_health_check_();
+        }
+
+        // Default detailed health
+        auto uptime_seconds = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - startup_time_).count();
+
+        return json{
+            {"status", statusToString(liveness_status_.load())},
+            {"uptime_seconds", uptime_seconds},
+            {"timestamp", getTimestamp()}
+        };
+    }
+
+    std::string generatePrometheusMetrics() {
+        std::ostringstream metrics;
+
+        metrics << "# HELP hft_liveness_status Liveness status (1=healthy, 0=unhealthy)\n";
+        metrics << "# TYPE hft_liveness_status gauge\n";
+        metrics << "hft_liveness_status "
+                << (liveness_status_.load() == HealthStatus::HEALTHY ? 1 : 0) << "\n\n";
+
+        metrics << "# HELP hft_readiness_status Readiness status (1=ready, 0=not ready)\n";
+        metrics << "# TYPE hft_readiness_status gauge\n";
+        metrics << "hft_readiness_status "
+                << (readiness_status_.load() == HealthStatus::HEALTHY ? 1 : 0) << "\n\n";
+
+        auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - startup_time_).count();
+
+        metrics << "# HELP hft_uptime_seconds Uptime in seconds\n";
+        metrics << "# TYPE hft_uptime_seconds counter\n";
+        metrics << "hft_uptime_seconds " << uptime << "\n\n";
+
+        return metrics.str();
+    }
+
+    std::string getTimestamp() {
+        auto now = std::chrono::system_clock::now();
+        auto time_t = std::chrono::system_clock::to_time_t(now);
+        std::tm tm = *std::gmtime(&time_t);
+
+        char buf[32];
+        std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
+
+        return std::string(buf);
+    }
+};
+
+============================================
+3. COMPONENT HEALTH MONITORS
+============================================
+
+Component Health Tracker:
+--------------------------
+class ComponentHealth {
+public:
+    struct HealthInfo {
+        HealthStatus status;
+        std::string message;
+        std::chrono::steady_clock::time_point last_check;
+        std::map<std::string, std::string> details;
+    };
+
+private:
+    std::string component_name_;
+    std::atomic<HealthStatus> status_{HealthStatus::UNKNOWN};
+    std::string last_message_;
+    std::chrono::steady_clock::time_point last_check_;
+    std::map<std::string, std::string> details_;
+    mutable std::mutex mutex_;
+
+public:
+    explicit ComponentHealth(const std::string& name)
+        : component_name_(name),
+          last_check_(std::chrono::steady_clock::now()) {}
+
+    void setHealthy(const std::string& message = "") {
+        std::lock_guard<std::mutex> lock(mutex_);
+        status_.store(HealthStatus::HEALTHY, std::memory_order_release);
+        last_message_ = message;
+        last_check_ = std::chrono::steady_clock::now();
+    }
+
+    void setDegraded(const std::string& message) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        status_.store(HealthStatus::DEGRADED, std::memory_order_release);
+        last_message_ = message;
+        last_check_ = std::chrono::steady_clock::now();
+    }
+
+    void setUnhealthy(const std::string& message) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        status_.store(HealthStatus::UNHEALTHY, std::memory_order_release);
+        last_message_ = message;
+        last_check_ = std::chrono::steady_clock::now();
+    }
+
+    void addDetail(const std::string& key, const std::string& value) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        details_[key] = value;
+    }
+
+    HealthInfo getHealth() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return {
+            status_.load(std::memory_order_acquire),
+            last_message_,
+            last_check_,
+            details_
+        };
+    }
+
+    bool isHealthy() const {
+        return status_.load(std::memory_order_acquire) == HealthStatus::HEALTHY;
+    }
+
+    json toJson() const {
+        auto health = getHealth();
+
+        auto time_since_check = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - health.last_check).count();
+
+        json j = {
+            {"component", component_name_},
+            {"status", statusToString(health.status)},
+            {"message", health.message},
+            {"last_check_ms_ago", time_since_check}
+        };
+
+        if (!health.details.empty()) {
+            j["details"] = health.details;
+        }
+
+        return j;
+    }
+};
+
+System Health Manager:
+----------------------
+class SystemHealthManager {
+private:
+    std::map<std::string, std::shared_ptr<ComponentHealth>> components_;
+    mutable std::mutex mutex_;
+
+    std::thread health_monitor_thread_;
+    std::atomic<bool> running_{true};
+
+public:
+    SystemHealthManager() {
+        health_monitor_thread_ = std::thread(&SystemHealthManager::monitorHealth, this);
+    }
+
+    ~SystemHealthManager() {
+        running_ = false;
+        if (health_monitor_thread_.joinable()) {
+            health_monitor_thread_.join();
+        }
+    }
+
+    std::shared_ptr<ComponentHealth> registerComponent(const std::string& name) {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        auto component = std::make_shared<ComponentHealth>(name);
+        components_[name] = component;
+
+        return component;
+    }
+
+    HealthStatus getOverallHealth() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        bool has_unhealthy = false;
+        bool has_degraded = false;
+
+        for (const auto& [name, component] : components_) {
+            auto health = component->getHealth();
+
+            if (health.status == HealthStatus::UNHEALTHY) {
+                has_unhealthy = true;
+            } else if (health.status == HealthStatus::DEGRADED) {
+                has_degraded = true;
+            }
+        }
+
+        if (has_unhealthy) {
+            return HealthStatus::UNHEALTHY;
+        } else if (has_degraded) {
+            return HealthStatus::DEGRADED;
+        } else if (components_.empty()) {
+            return HealthStatus::UNKNOWN;
+        }
+
+        return HealthStatus::HEALTHY;
+    }
+
+    json getDetailedHealth() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        json components_json = json::array();
+
+        for (const auto& [name, component] : components_) {
+            components_json.push_back(component->toJson());
+        }
+
+        return json{
+            {"status", statusToString(getOverallHealth())},
+            {"components", components_json},
+            {"timestamp", getCurrentTimestamp()}
+        };
+    }
+
+private:
+    void monitorHealth() {
+        while (running_) {
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+
+            // Periodic health checks can be performed here
+            checkStaleness();
+        }
+    }
+
+    void checkStaleness() {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        auto now = std::chrono::steady_clock::now();
+
+        for (const auto& [name, component] : components_) {
+            auto health = component->getHealth();
+
+            auto age = std::chrono::duration_cast<std::chrono::seconds>(
+                now - health.last_check).count();
+
+            // If no update in 60 seconds, mark as stale
+            if (age > 60 && health.status == HealthStatus::HEALTHY) {
+                component->setDegraded("No recent health update");
+            }
+        }
+    }
+
+    std::string getCurrentTimestamp() const {
+        auto now = std::chrono::system_clock::now();
+        auto time_t = std::chrono::system_clock::to_time_t(now);
+        std::tm tm = *std::gmtime(&time_t);
+
+        char buf[32];
+        std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
+
+        return std::string(buf);
+    }
+};
+
+============================================
+4. EXCHANGE CONNECTIVITY HEALTH CHECKS
+============================================
+
+Exchange Connection Monitor:
+----------------------------
+class ExchangeHealthMonitor {
+private:
+    std::string exchange_name_;
+    std::shared_ptr<ComponentHealth> health_;
+
+    std::atomic<bool> connected_{false};
+    std::atomic<uint64_t> message_count_{0};
+    std::atomic<uint64_t> last_message_timestamp_{0};
+
+    std::thread monitor_thread_;
+    std::atomic<bool> running_{true};
+
+public:
+    ExchangeHealthMonitor(const std::string& exchange_name,
+                         std::shared_ptr<ComponentHealth> health)
+        : exchange_name_(exchange_name),
+          health_(health) {
+
+        monitor_thread_ = std::thread(&ExchangeHealthMonitor::monitorConnection, this);
+    }
+
+    ~ExchangeHealthMonitor() {
+        running_ = false;
+        if (monitor_thread_.joinable()) {
+            monitor_thread_.join();
+        }
+    }
+
+    void onConnected() {
+        connected_.store(true, std::memory_order_release);
+        health_->setHealthy("Connected to " + exchange_name_);
+        health_->addDetail("connected", "true");
+    }
+
+    void onDisconnected() {
+        connected_.store(false, std::memory_order_release);
+        health_->setUnhealthy("Disconnected from " + exchange_name_);
+        health_->addDetail("connected", "false");
+    }
+
+    void onMessageReceived() {
+        message_count_.fetch_add(1, std::memory_order_relaxed);
+
+        auto now = std::chrono::system_clock::now();
+        auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now.time_since_epoch()).count();
+
+        last_message_timestamp_.store(timestamp, std::memory_order_release);
+    }
+
+    void onError(const std::string& error) {
+        health_->setDegraded("Exchange error: " + error);
+    }
+
+private:
+    void monitorConnection() {
+        while (running_) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+
+            bool is_connected = connected_.load(std::memory_order_acquire);
+
+            if (is_connected) {
+                // Check for data flow
+                auto now = std::chrono::system_clock::now();
+                auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now.time_since_epoch()).count();
+
+                auto last_msg_ms = last_message_timestamp_.load(std::memory_order_acquire);
+                auto time_since_last_msg = now_ms - last_msg_ms;
+
+                if (last_msg_ms > 0 && time_since_last_msg > 5000) {  // 5 seconds
+                    health_->setDegraded(
+                        "No data received for " +
+                        std::to_string(time_since_last_msg / 1000) + " seconds");
+                } else if (last_msg_ms > 0) {
+                    health_->setHealthy("Receiving data");
+                }
+
+                // Update message rate
+                uint64_t msg_count = message_count_.load(std::memory_order_acquire);
+                health_->addDetail("message_count", std::to_string(msg_count));
+            }
+        }
+    }
+};
+
+Market Data Health Monitor:
+---------------------------
+class MarketDataHealthMonitor {
+private:
+    std::string symbol_;
+    std::shared_ptr<ComponentHealth> health_;
+
+    std::atomic<uint64_t> update_count_{0};
+    std::atomic<uint64_t> last_update_timestamp_{0};
+    std::atomic<double> last_bid_{0.0};
+    std::atomic<double> last_ask_{0.0};
+
+public:
+    MarketDataHealthMonitor(const std::string& symbol,
+                           std::shared_ptr<ComponentHealth> health)
+        : symbol_(symbol), health_(health) {}
+
+    void onMarketDataUpdate(double bid, double ask) {
+        update_count_.fetch_add(1, std::memory_order_relaxed);
+
+        auto now = std::chrono::system_clock::now();
+        auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now.time_since_epoch()).count();
+
+        last_update_timestamp_.store(timestamp, std::memory_order_release);
+        last_bid_.store(bid, std::memory_order_release);
+        last_ask_.store(ask, std::memory_order_release);
+
+        // Validate spread
+        double spread = ask - bid;
+        if (spread < 0) {
+            health_->setUnhealthy("Crossed market: bid > ask");
+        } else if (spread > (bid * 0.01)) {  // Spread > 1%
+            health_->setDegraded("Wide spread: " + std::to_string(spread));
+        } else {
+            health_->setHealthy("Market data flowing");
+        }
+
+        health_->addDetail("last_bid", std::to_string(bid));
+        health_->addDetail("last_ask", std::to_string(ask));
+        health_->addDetail("spread", std::to_string(spread));
+    }
+
+    void checkFreshness() {
+        auto now = std::chrono::system_clock::now();
+        auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now.time_since_epoch()).count();
+
+        auto last_update_ms = last_update_timestamp_.load(std::memory_order_acquire);
+        auto age_ms = now_ms - last_update_ms;
+
+        if (age_ms > 1000) {  // Stale data > 1 second
+            health_->setDegraded(
+                "Stale market data: " + std::to_string(age_ms) + "ms old");
+        }
+    }
+};
+
+============================================
+5. HEARTBEAT PROTOCOL IMPLEMENTATION
+============================================
+
+Heartbeat Manager:
+------------------
+class HeartbeatManager {
+private:
+    std::atomic<uint64_t> heartbeat_sequence_{0};
+    std::atomic<uint64_t> last_heartbeat_timestamp_{0};
+
+    std::thread heartbeat_thread_;
+    std::atomic<bool> running_{true};
+
+    std::chrono::milliseconds heartbeat_interval_;
+    std::function<void(uint64_t)> heartbeat_callback_;
+
+public:
+    explicit HeartbeatManager(
+        std::chrono::milliseconds interval = std::chrono::milliseconds(1000))
+        : heartbeat_interval_(interval) {
+
+        heartbeat_thread_ = std::thread(&HeartbeatManager::heartbeatLoop, this);
+    }
+
+    ~HeartbeatManager() {
+        running_ = false;
+        if (heartbeat_thread_.joinable()) {
+            heartbeat_thread_.join();
+        }
+    }
+
+    void setCallback(std::function<void(uint64_t)> callback) {
+        heartbeat_callback_ = callback;
+    }
+
+    uint64_t getLastHeartbeatAge() const {
+        auto now = std::chrono::system_clock::now();
+        auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now.time_since_epoch()).count();
+
+        auto last_hb = last_heartbeat_timestamp_.load(std::memory_order_acquire);
+
+        return now_ms - last_hb;
+    }
+
+    bool isAlive(uint64_t threshold_ms = 5000) const {
+        return getLastHeartbeatAge() < threshold_ms;
+    }
+
+private:
+    void heartbeatLoop() {
+        while (running_) {
+            auto now = std::chrono::system_clock::now();
+            auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now.time_since_epoch()).count();
+
+            uint64_t sequence = heartbeat_sequence_.fetch_add(1,
+                std::memory_order_relaxed);
+
+            last_heartbeat_timestamp_.store(now_ms, std::memory_order_release);
+
+            if (heartbeat_callback_) {
+                heartbeat_callback_(sequence);
+            }
+
+            std::this_thread::sleep_for(heartbeat_interval_);
+        }
+    }
+};
+
+Watchdog Timer:
+---------------
+class Watchdog {
+private:
+    std::string component_name_;
+    std::chrono::milliseconds timeout_;
+    std::atomic<uint64_t> last_kick_timestamp_{0};
+
+    std::thread watchdog_thread_;
+    std::atomic<bool> running_{true};
+
+    std::function<void(const std::string&)> timeout_callback_;
+
+public:
+    Watchdog(const std::string& name, std::chrono::milliseconds timeout)
+        : component_name_(name), timeout_(timeout) {
+
+        kick();  // Initialize
+        watchdog_thread_ = std::thread(&Watchdog::watchdogLoop, this);
+    }
+
+    ~Watchdog() {
+        running_ = false;
+        if (watchdog_thread_.joinable()) {
+            watchdog_thread_.join();
+        }
+    }
+
+    void kick() {
+        auto now = std::chrono::system_clock::now();
+        auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now.time_since_epoch()).count();
+
+        last_kick_timestamp_.store(now_ms, std::memory_order_release);
+    }
+
+    void setTimeoutCallback(std::function<void(const std::string&)> callback) {
+        timeout_callback_ = callback;
+    }
+
+private:
+    void watchdogLoop() {
+        while (running_) {
+            std::this_thread::sleep_for(timeout_ / 2);
+
+            auto now = std::chrono::system_clock::now();
+            auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now.time_since_epoch()).count();
+
+            auto last_kick = last_kick_timestamp_.load(std::memory_order_acquire);
+            auto elapsed = now_ms - last_kick;
+
+            if (elapsed > timeout_.count()) {
+                if (timeout_callback_) {
+                    timeout_callback_(component_name_);
+                }
+            }
+        }
+    }
+};
+
+============================================
+6. PRODUCTION HEALTH CHECK CONFIGURATION
+============================================
+
+Kubernetes Health Probes:
+--------------------------
+# deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hft-trading-engine
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: hft-trading-engine
+  template:
+    metadata:
+      labels:
+        app: hft-trading-engine
+    spec:
+      containers:
+      - name: trading-engine
+        image: hft-trading-engine:latest
+        ports:
+        - containerPort: 8080
+          name: http
+        - containerPort: 9090
+          name: metrics
+
+        # Startup probe - give 2 minutes to start
+        startupProbe:
+          httpGet:
+            path: /startup
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 24  # 2 minutes
+
+        # Liveness probe - restart if unhealthy
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 3
+
+        # Readiness probe - remove from load balancer if not ready
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+
+        resources:
+          requests:
+            memory: "4Gi"
+            cpu: "2000m"
+          limits:
+            memory: "8Gi"
+            cpu: "4000m"
+
+Complete Health Check Implementation:
+--------------------------------------
+class TradingEngineWithHealthChecks {
+private:
+    std::shared_ptr<SystemHealthManager> health_manager_;
+    std::shared_ptr<HealthCheckEndpoint> health_endpoint_;
+    std::shared_ptr<HeartbeatManager> heartbeat_;
+    std::shared_ptr<Watchdog> watchdog_;
+
+    std::shared_ptr<ComponentHealth> engine_health_;
+    std::shared_ptr<ComponentHealth> exchange_health_;
+    std::shared_ptr<ComponentHealth> market_data_health_;
+    std::shared_ptr<ComponentHealth> risk_health_;
+
+public:
+    TradingEngineWithHealthChecks() {
+        // Initialize health management
+        health_manager_ = std::make_shared<SystemHealthManager>();
+
+        // Register components
+        engine_health_ = health_manager_->registerComponent("trading_engine");
+        exchange_health_ = health_manager_->registerComponent("exchange_connection");
+        market_data_health_ = health_manager_->registerComponent("market_data");
+        risk_health_ = health_manager_->registerComponent("risk_manager");
+
+        // Setup health endpoint
+        health_endpoint_ = std::make_shared<HealthCheckEndpoint>(8080);
+
+        health_endpoint_->setLivenessCheck([this]() {
+            return checkLiveness();
+        });
+
+        health_endpoint_->setReadinessCheck([this]() {
+            return checkReadiness();
+        });
+
+        health_endpoint_->setDetailedHealthCheck([this]() {
+            return health_manager_->getDetailedHealth();
+        });
+
+        // Setup heartbeat
+        heartbeat_ = std::make_shared<HeartbeatManager>(
+            std::chrono::milliseconds(1000));
+
+        heartbeat_->setCallback([this](uint64_t sequence) {
+            health_endpoint_->updateHeartbeat();
+            onHeartbeat(sequence);
+        });
+
+        // Setup watchdog
+        watchdog_ = std::make_shared<Watchdog>("main_loop",
+            std::chrono::milliseconds(5000));
+
+        watchdog_->setTimeoutCallback([this](const std::string& name) {
+            engine_health_->setUnhealthy("Watchdog timeout: " + name);
+        });
+
+        engine_health_->setHealthy("Initialized");
+    }
+
+    void run() {
+        while (true) {
+            // Kick watchdog
+            watchdog_->kick();
+
+            // Process orders, market data, etc.
+            processEvents();
+
+            // Update health status
+            updateHealthStatus();
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+
+private:
+    HealthStatus checkLiveness() {
+        // Check if heartbeat is recent
+        if (!heartbeat_->isAlive(5000)) {
+            return HealthStatus::UNHEALTHY;
+        }
+
+        return HealthStatus::HEALTHY;
+    }
+
+    HealthStatus checkReadiness() {
+        // Check all components
+        return health_manager_->getOverallHealth();
+    }
+
+    void onHeartbeat(uint64_t sequence) {
+        // Periodic health updates
+        if (sequence % 10 == 0) {  // Every 10 seconds
+            updateHealthStatus();
+        }
+    }
+
+    void updateHealthStatus() {
+        // Update component health based on metrics
+        engine_health_->setHealthy("Processing orders");
+    }
+
+    void processEvents() {
+        // Event processing logic
+    }
+};
+
+Production Deployment Script:
+------------------------------
+#!/bin/bash
+
+# Deploy with health checks
+
+kubectl apply -f deployment.yaml
+
+# Wait for deployment to be ready
+kubectl wait --for=condition=available --timeout=300s \
+    deployment/hft-trading-engine
+
+# Verify health
+kubectl exec -it deployment/hft-trading-engine -- \
+    curl http://localhost:8080/health
+
+echo "Deployment complete and healthy"

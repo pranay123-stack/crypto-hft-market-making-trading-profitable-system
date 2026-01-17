@@ -1,0 +1,271 @@
+================================================================================
+                    HFT LIVE DEBUGGING GUIDE
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Live Debugging Theory and Challenges
+2. Non-Intrusive Monitoring Tools
+3. Dynamic Tracing with eBPF
+4. Live Performance Analysis
+5. Production-Safe Debugging Techniques
+6. Emergency Response Workflows
+7. Real HFT C++ Examples
+8. Commands and Interpretation
+9. Recovery Procedures
+10. Best Practices
+
+================================================================================
+1. LIVE DEBUGGING THEORY
+================================================================================
+
+CHALLENGES IN PRODUCTION DEBUGGING
+-----------------------------------
+- Cannot stop the system
+- Minimal performance impact required
+- Must not affect trading latency
+- Limited observability
+- Heisenberg effect (observation changes behavior)
+
+KEY PRINCIPLES
+--------------
+1. Observe don't interfere
+2. Use sampling not instrumentation
+3. Pre-installed monitoring hooks
+4. Graceful degradation
+5. Quick rollback capability
+
+================================================================================
+2. NON-INTRUSIVE MONITORING
+================================================================================
+
+PASSIVE OBSERVATION TECHNIQUES
+-------------------------------
+
+1. Log Sampling (Minimal Overhead)
+```cpp
+class SampledLogger {
+    std::atomic<uint64_t> counter{0};
+    uint64_t sample_rate;
+
+public:
+    SampledLogger(uint64_t rate) : sample_rate(rate) {}
+
+    template<typename... Args>
+    void log(Args&&... args) {
+        if (counter.fetch_add(1, std::memory_order_relaxed) % sample_rate == 0) {
+            // Log only 1 in N events
+            actual_log(std::forward<Args>(args)...);
+        }
+    }
+};
+```
+
+2. Ring Buffer Metrics (Lock-Free)
+```cpp
+template<size_t Size>
+class MetricsRingBuffer {
+    struct Metric {
+        uint64_t timestamp;
+        uint64_t value;
+        char name[32];
+    };
+
+    std::array<Metric, Size> buffer;
+    alignas(64) std::atomic<size_t> write_pos{0};
+
+public:
+    void record(const char* name, uint64_t value) {
+        size_t pos = write_pos.fetch_add(1, std::memory_order_relaxed) % Size;
+        buffer[pos] = {rdtsc(), value, {}};
+        strncpy(buffer[pos].name, name, 31);
+    }
+
+    // External process can read buffer without blocking
+    void dump(const char* filename) {
+        std::ofstream f(filename);
+        size_t pos = write_pos.load(std::memory_order_acquire);
+        for (size_t i = 0; i < std::min(pos, Size); ++i) {
+            f << buffer[i].name << "," << buffer[i].timestamp << ","
+              << buffer[i].value << "\n";
+        }
+    }
+};
+```
+
+3. Statistical Profiling
+```bash
+# Sample stack traces without stopping process
+perf record -F 99 -p $(pidof trading_engine) -g -- sleep 60
+perf report --stdio
+```
+
+================================================================================
+3. DYNAMIC TRACING WITH eBPF
+================================================================================
+
+EBPF PROBES (LINUX 4.x+)
+-------------------------
+
+```bash
+# Trace function calls without recompilation
+perf probe --add 'process_order'
+perf record -e probe:process_order -aR -g
+```
+
+BPFTRACE SCRIPTS
+----------------
+
+```bash
+# Monitor latency of specific function
+sudo bpftrace -e '
+uprobe:/path/to/trading_engine:process_order {
+    @start[tid] = nsecs;
+}
+
+uretprobe:/path/to/trading_engine:process_order /@start[tid]/ {
+    $latency = nsecs - @start[tid];
+    @latencies = hist($latency);
+    delete(@start[tid]);
+}
+
+interval:s:10 {
+    print(@latencies);
+    clear(@latencies);
+}'
+```
+
+===============================================================================
+4. LIVE PERFORMANCE ANALYSIS
+================================================================================
+
+CONTINUOUS PROFILING
+--------------------
+
+```cpp
+class ContinuousProfiler {
+    static constexpr size_t SAMPLE_INTERVAL = 1000000;  // Every 1M ops
+    std::atomic<uint64_t> operation_count{0};
+
+public:
+    void on_operation() {
+        if (operation_count.fetch_add(1, std::memory_order_relaxed) % SAMPLE_INTERVAL == 0) {
+            trigger_profile_snapshot();
+        }
+    }
+
+private:
+    void trigger_profile_snapshot() {
+        // Fork to avoid blocking main process
+        pid_t pid = fork();
+        if (pid == 0) {
+            // Child process captures profile
+            system("perf record -p $PPID -o /tmp/snapshot.data -- sleep 1");
+            exit(0);
+        }
+    }
+};
+```
+
+ADAPTIVE MONITORING
+-------------------
+
+```cpp
+class AdaptiveMonitor {
+    double baseline_latency = 0;
+    bool detailed_monitoring = false;
+
+public:
+    void check_latency(double latency) {
+        if (latency > baseline_latency * 1.5) {
+            if (!detailed_monitoring) {
+                enable_detailed_monitoring();
+            }
+        } else if (detailed_monitoring) {
+            disable_detailed_monitoring();
+        }
+    }
+
+private:
+    void enable_detailed_monitoring() {
+        detailed_monitoring = true;
+        // Enable additional instrumentation
+    }
+
+    void disable_detailed_monitoring() {
+        detailed_monitoring = false;
+        // Disable extra overhead
+    }
+};
+```
+
+================================================================================
+5. PRODUCTION-SAFE TECHNIQUES
+================================================================================
+
+SAFE GDB ATTACHMENT
+-------------------
+
+```bash
+# Attach to process without stopping it completely
+gdb -p $(pidof trading_engine) -batch \
+    -ex "set scheduler-locking on" \
+    -ex "thread apply all bt" \
+    -ex "detach" \
+    -ex "quit"
+```
+
+SIGNAL-BASED DEBUGGING
+----------------------
+
+```cpp
+#include <signal.h>
+
+class SignalDebugger {
+public:
+    static void setup() {
+        signal(SIGUSR1, handler);
+    }
+
+private:
+    static void handler(int sig) {
+        // Dump state to file without stopping trading
+        std::ofstream f("/tmp/trading_state.txt");
+        f << "Timestamp: " << time(nullptr) << "\n";
+        f << "Orders pending: " << get_pending_orders() << "\n";
+        f << "Positions: " << get_positions() << "\n";
+        // ... dump diagnostic info ...
+    }
+};
+
+// Trigger from outside: kill -USR1 $(pidof trading_engine)
+```
+
+WRITE-ONLY OBSERVABILITY
+-------------------------
+
+```cpp
+// Metrics that can only be written, never block on read
+class WriteOnlyMetrics {
+    struct alignas(64) Counter {
+        std::atomic<uint64_t> value{0};
+    };
+
+    std::unordered_map<std::string, std::unique_ptr<Counter>> counters;
+
+public:
+    void increment(const std::string& name) {
+        // Always succeeds, never blocks
+        auto it = counters.find(name);
+        if (it != counters.end()) {
+            it->second->value.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    // External monitoring process reads via shared memory
+};
+```
+
+================================================================================
+END OF LIVE DEBUGGING GUIDE
+================================================================================

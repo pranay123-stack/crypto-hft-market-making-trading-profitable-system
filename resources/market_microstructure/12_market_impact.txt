@@ -1,0 +1,280 @@
+================================================================================
+MARKET IMPACT MODELS AND ESTIMATION
+High-Frequency Trading System Documentation
+================================================================================
+
+Market impact is the price movement caused by executing an order.
+
+TYPES OF IMPACT:
+
+1. Temporary Impact:
+   - Price moves during execution
+   - Partially reverts after
+   - Related to liquidity provision cost
+
+2. Permanent Impact:
+   - Information content of order
+   - Does not revert
+   - Reflects new information
+
+3. Total Impact = Temporary + Permanent
+
+MATHEMATICAL MODELS:
+
+1. LINEAR MODEL (Small Orders):
+ΔP = λ × Q
+
+Where:
+- ΔP = Price impact
+- λ = Kyle's lambda (impact coefficient)
+- Q = Order size
+
+class LinearImpactModel {
+private:
+    double lambda_;  // Impact coefficient
+    
+public:
+    explicit LinearImpactModel(double lambda = 0.0001) : lambda_(lambda) {}
+    
+    double estimate_impact(int64_t order_size) const {
+        return lambda_ * order_size;
+    }
+    
+    int64_t max_order_for_impact(double max_impact_dollars) const {
+        return static_cast<int64_t>(max_impact_dollars / lambda_);
+    }
+};
+
+2. SQUARE-ROOT MODEL (Large Orders):
+ΔP = Y × σ × sqrt(Q / V)
+
+Where:
+- Y = Market impact coefficient (~0.5-1.0)
+- σ = Daily volatility
+- Q = Order size
+- V = Daily volume
+
+class SquareRootImpactModel {
+private:
+    double gamma_;  // Impact coefficient
+    double volatility_;
+    double daily_volume_;
+    
+public:
+    SquareRootImpactModel(double gamma, double vol, double daily_vol)
+        : gamma_(gamma), volatility_(vol), daily_volume_(daily_vol) {}
+    
+    double estimate_impact(int64_t order_size) const {
+        double participation = (double)order_size / daily_volume_;
+        return gamma_ * volatility_ * std::sqrt(participation);
+    }
+    
+    double estimate_impact_bps(int64_t order_size, double price) const {
+        double impact_dollars = estimate_impact(order_size);
+        return (impact_dollars / price) * 10000.0;
+    }
+};
+
+3. ALMGREN-CHRISS MODEL:
+Optimal execution with risk-return tradeoff.
+
+Cost Function:
+E[Cost] = Permanent Impact + Temporary Impact + Risk Penalty
+
+Permanent Impact:
+I_perm = γ × Σ(v_i)
+
+Temporary Impact:
+I_temp = ε × Σ(v_i²/Δt_i)
+
+Where:
+- γ = Permanent impact coefficient
+- ε = Temporary impact coefficient
+- v_i = Trading rate at time i
+- Δt_i = Time interval
+
+class AlmgrenChrissModel {
+private:
+    double gamma_;      // Permanent impact
+    double epsilon_;    // Temporary impact
+    double sigma_;      // Volatility
+    double lambda_;     // Risk aversion
+    
+public:
+    AlmgrenChrissModel(double g, double e, double s, double l)
+        : gamma_(g), epsilon_(e), sigma_(s), lambda_(l) {}
+    
+    std::vector<int64_t> optimal_trajectory(
+        int64_t total_size,
+        double total_time_seconds,
+        int num_slices
+    ) const {
+        std::vector<int64_t> trajectory;
+        
+        double kappa = std::sqrt(lambda_ * sigma_ * sigma_ / epsilon_);
+        double T = total_time_seconds;
+        
+        for (int i = 0; i < num_slices; ++i) {
+            double t = (i * T) / num_slices;
+            double remaining_time = T - t;
+            
+            double sinh_term = std::sinh(kappa * remaining_time) / 
+                              std::sinh(kappa * T);
+            
+            int64_t shares_remaining = static_cast<int64_t>(
+                total_size * sinh_term);
+            
+            trajectory.push_back(shares_remaining);
+        }
+        
+        return trajectory;
+    }
+    
+    double expected_cost(int64_t total_size, double total_time) const {
+        double participation = (double)total_size / total_time;
+        
+        double perm_cost = gamma_ * total_size;
+        double temp_cost = epsilon_ * participation;
+        double risk_penalty = lambda_ * sigma_ * sigma_ * total_time / 2.0;
+        
+        return perm_cost + temp_cost + risk_penalty;
+    }
+};
+
+4. VOLUME PARTICIPATION MODEL:
+Limit order size as percentage of market volume.
+
+Target: Execute Q shares over T time
+Market volume rate: v_market
+Participation rate: α (e.g., 10% = 0.1)
+
+Trading rate: v = α × v_market
+
+class VolumeParticipationModel {
+private:
+    double alpha_;  // Target participation rate (0.05 = 5%)
+    
+public:
+    explicit VolumeParticipationModel(double alpha = 0.10) : alpha_(alpha) {}
+    
+    int64_t calculate_slice_size(int64_t market_volume_in_interval) const {
+        return static_cast<int64_t>(market_volume_in_interval * alpha_);
+    }
+    
+    double estimated_time_to_complete(
+        int64_t order_size,
+        double avg_market_volume_per_second
+    ) const {
+        double our_rate = alpha_ * avg_market_volume_per_second;
+        return order_size / our_rate;  // seconds
+    }
+};
+
+EMPIRICAL IMPACT MEASUREMENT:
+
+class ImpactMeasurement {
+private:
+    struct Execution {
+        int64_t volume;
+        double avg_price;
+        double pre_mid_price;
+        double post_mid_price;
+        uint64_t timestamp_us;
+    };
+    
+    std::vector<Execution> history_;
+    
+public:
+    void record_execution(int64_t volume, double avg_price, 
+                         double pre_mid, double post_mid,
+                         uint64_t timestamp) {
+        history_.push_back({volume, avg_price, pre_mid, post_mid, timestamp});
+    }
+    
+    double average_temporary_impact() const {
+        if (history_.empty()) return 0.0;
+        
+        double sum = 0.0;
+        for (const auto& exec : history_) {
+            sum += std::abs(exec.avg_price - exec.pre_mid);
+        }
+        return sum / history_.size();
+    }
+    
+    double average_permanent_impact() const {
+        if (history_.empty()) return 0.0;
+        
+        double sum = 0.0;
+        for (const auto& exec : history_) {
+            sum += std::abs(exec.post_mid - exec.pre_mid);
+        }
+        return sum / history_.size();
+    }
+    
+    // Estimate impact coefficient from historical data
+    double estimate_lambda() const {
+        if (history_.size() < 10) return 0.0;
+        
+        // Linear regression: impact = lambda * size
+        double sum_x = 0.0;    // order size
+        double sum_y = 0.0;    // impact
+        double sum_xy = 0.0;
+        double sum_xx = 0.0;
+        int n = 0;
+        
+        for (const auto& exec : history_) {
+            double impact = exec.avg_price - exec.pre_mid;
+            double size = exec.volume;
+            
+            sum_x += size;
+            sum_y += impact;
+            sum_xy += size * impact;
+            sum_xx += size * size;
+            n++;
+        }
+        
+        // Least squares: lambda = (n*Σxy - Σx*Σy) / (n*Σx² - (Σx)²)
+        double numerator = n * sum_xy - sum_x * sum_y;
+        double denominator = n * sum_xx - sum_x * sum_x;
+        
+        if (denominator == 0) return 0.0;
+        return numerator / denominator;
+    }
+};
+
+ADAPTIVE IMPACT MODELS:
+
+class AdaptiveImpactEstimator {
+private:
+    double lambda_ = 0.0001;  // Default
+    double alpha_ = 0.1;      // EMA smoothing
+    
+public:
+    void update_from_execution(int64_t order_size, double observed_impact) {
+        if (order_size == 0) return;
+        
+        double implied_lambda = observed_impact / order_size;
+        lambda_ = alpha_ * implied_lambda + (1 - alpha_) * lambda_;
+    }
+    
+    double current_lambda() const { return lambda_; }
+    
+    double estimate_impact(int64_t order_size) const {
+        return lambda_ * order_size;
+    }
+};
+
+SLIPPAGE vs. IMPACT:
+
+Slippage = Execution Price - Decision Price
+Impact = Our order's effect on market price
+
+Slippage includes:
+- Market impact
+- Timing risk
+- Adverse selection
+- Market movement
+
+================================================================================
+Version: 1.0 | Size: ~21 KB
+================================================================================

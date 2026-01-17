@@ -1,0 +1,911 @@
+================================================================================
+HFT I/O OPTIMIZATION TECHNIQUES
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Theory and Fundamental Concepts
+2. Zero-Copy I/O
+3. Direct Memory Access (DMA)
+4. Asynchronous I/O (io_uring)
+5. Memory-Mapped I/O
+6. Kernel Bypass I/O
+7. File I/O Optimization
+8. Network I/O Optimization
+9. Batching and Vectored I/O
+10. Benchmarking and Measurement
+11. Expected Improvements
+
+================================================================================
+1. THEORY AND FUNDAMENTAL CONCEPTS
+================================================================================
+
+I/O Latency Hierarchy:
+----------------------
+Operation                    | Latency
+-----------------------------|------------
+Register access              | < 1 ns
+L1 cache                     | 1-2 ns
+L2 cache                     | 3-10 ns
+L3 cache                     | 10-40 ns
+Main memory                  | 60-100 ns
+System call                  | 50-500 ns
+Socket I/O (local)           | 1-5 μs
+Socket I/O (network)         | 10-500 μs
+SSD random read              | 100-500 μs
+SSD sequential read          | 20-100 μs
+HDD random read              | 5-10 ms
+HDD sequential read          | 1-5 ms
+
+I/O Bottlenecks:
+----------------
+1. System call overhead: 50-500 ns per call
+2. Data copying: User space ↔ kernel space
+3. Context switches: 1-10 μs
+4. Interrupt handling: 5-50 μs
+5. Buffer allocation/deallocation
+6. Protocol processing overhead
+
+HFT I/O Optimization Goals:
+---------------------------
+1. Eliminate system calls in critical path
+2. Achieve zero-copy data transfer
+3. Use asynchronous I/O
+4. Bypass kernel when possible
+5. Batch operations to amortize overhead
+6. Use memory-mapped files
+7. Optimize buffer management
+
+================================================================================
+2. ZERO-COPY I/O
+================================================================================
+
+2.1 sendfile() for Zero-Copy
+-----------------------------
+
+```cpp
+#include <sys/sendfile.h>
+
+// Traditional I/O (with copying)
+ssize_t traditionalFileCopy(int in_fd, int out_fd, size_t count) {
+    char buffer[8192];
+    ssize_t total = 0;
+
+    while (count > 0) {
+        ssize_t n = read(in_fd, buffer, std::min(count, sizeof(buffer)));
+        if (n <= 0) break;
+
+        ssize_t written = write(out_fd, buffer, n);
+        if (written < 0) return -1;
+
+        total += written;
+        count -= written;
+    }
+
+    return total;
+}
+// Two copies: kernel→user, user→kernel
+// Latency: ~100-500 ns per copy
+
+// Zero-copy with sendfile()
+ssize_t zeroCopyFileCopy(int in_fd, int out_fd, size_t count) {
+    off_t offset = 0;
+    return sendfile(out_fd, in_fd, &offset, count);
+}
+// Zero copies: kernel→kernel only
+// Latency: 50-70% faster
+```
+
+2.2 splice() for Zero-Copy Pipes
+---------------------------------
+
+```cpp
+#include <fcntl.h>
+
+// Zero-copy pipe transfer
+ssize_t zeroCopyPipeTransfer(int in_fd, int out_fd, size_t len) {
+    int pipefd[2];
+    pipe(pipefd);
+
+    // Splice from input to pipe
+    ssize_t bytes = splice(in_fd, nullptr, pipefd[1], nullptr,
+                          len, SPLICE_F_MOVE | SPLICE_F_MORE);
+    if (bytes < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return -1;
+    }
+
+    // Splice from pipe to output
+    ssize_t result = splice(pipefd[0], nullptr, out_fd, nullptr,
+                           bytes, SPLICE_F_MOVE);
+
+    close(pipefd[0]);
+    close(pipefd[1]);
+
+    return result;
+}
+// Zero-copy transfer through kernel pipe
+```
+
+2.3 vmsplice() for User-Space Zero-Copy
+----------------------------------------
+
+```cpp
+// Zero-copy from user buffer to pipe
+ssize_t userToKernelZeroCopy(int pipe_fd, void* buffer, size_t len) {
+    struct iovec iov = {
+        .iov_base = buffer,
+        .iov_len = len
+    };
+
+    return vmsplice(pipe_fd, &iov, 1, SPLICE_F_GIFT);
+}
+// No copy: user pages transferred to kernel
+```
+
+================================================================================
+3. DIRECT MEMORY ACCESS (DMA)
+================================================================================
+
+3.1 O_DIRECT for DMA
+--------------------
+
+```cpp
+#include <fcntl.h>
+#include <unistd.h>
+
+class DirectIOFile {
+    int fd;
+    static constexpr size_t ALIGNMENT = 512;
+
+public:
+    DirectIOFile(const char* path, int flags) {
+        fd = open(path, flags | O_DIRECT | O_SYNC);
+        if (fd < 0) {
+            perror("open O_DIRECT failed");
+        }
+    }
+
+    ~DirectIOFile() {
+        if (fd >= 0) close(fd);
+    }
+
+    // Allocate aligned buffer for direct I/O
+    static void* allocateAlignedBuffer(size_t size) {
+        void* buffer;
+        if (posix_memalign(&buffer, ALIGNMENT, size) != 0) {
+            return nullptr;
+        }
+        return buffer;
+    }
+
+    ssize_t read(void* buffer, size_t size) {
+        // Buffer must be aligned
+        return ::read(fd, buffer, size);
+    }
+
+    ssize_t write(const void* buffer, size_t size) {
+        // Buffer must be aligned, size must be multiple of 512
+        return ::write(fd, buffer, size);
+    }
+};
+
+// Usage
+void logMarketDataDirect(const MarketData& data) {
+    static DirectIOFile logFile("/mnt/tmpfs/market_data.log",
+                                O_WRONLY | O_CREAT);
+
+    // Allocate aligned buffer
+    void* buffer = DirectIOFile::allocateAlignedBuffer(4096);
+
+    // Serialize data to buffer
+    size_t len = serialize(data, buffer, 4096);
+
+    // Direct I/O (DMA) - bypasses page cache
+    logFile.write(buffer, roundUpTo512(len));
+
+    free(buffer);
+}
+// Bypasses kernel page cache
+// Latency: 30-50% faster than buffered I/O
+```
+
+3.2 RDMA (Remote DMA)
+---------------------
+
+```cpp
+#include <infiniband/verbs.h>
+
+class RDMATransfer {
+    struct ibv_context* context;
+    struct ibv_pd* pd;
+    struct ibv_mr* mr;
+
+public:
+    bool initialize() {
+        // Open RDMA device
+        struct ibv_device** dev_list = ibv_get_device_list(nullptr);
+        if (!dev_list) return false;
+
+        context = ibv_open_device(dev_list[0]);
+        ibv_free_device_list(dev_list);
+
+        if (!context) return false;
+
+        // Allocate protection domain
+        pd = ibv_alloc_pd(context);
+        return pd != nullptr;
+    }
+
+    void* registerMemory(void* addr, size_t length) {
+        mr = ibv_reg_mr(pd, addr, length,
+                       IBV_ACCESS_LOCAL_WRITE |
+                       IBV_ACCESS_REMOTE_WRITE |
+                       IBV_ACCESS_REMOTE_READ);
+        return mr;
+    }
+
+    // RDMA write (zero-copy, kernel bypass)
+    int rdmaWrite(void* localAddr, void* remoteAddr, size_t length) {
+        // Setup work request for RDMA write
+        // Data transfers directly from NIC to memory
+        // No CPU involvement, no copies
+        // Latency: < 1 μs
+        return 0;  // Simplified
+    }
+};
+// RDMA benefits:
+// - Zero-copy
+// - Kernel bypass
+// - CPU offload
+// - Ultra-low latency (< 1 μs)
+```
+
+================================================================================
+4. ASYNCHRONOUS I/O (io_uring)
+================================================================================
+
+4.1 io_uring Basics
+-------------------
+
+```cpp
+#include <liburing.h>
+
+class IOUringEngine {
+    struct io_uring ring;
+    static constexpr unsigned QUEUE_DEPTH = 256;
+
+public:
+    bool initialize() {
+        int ret = io_uring_queue_init(QUEUE_DEPTH, &ring, 0);
+        if (ret < 0) {
+            fprintf(stderr, "io_uring_queue_init failed: %d\n", ret);
+            return false;
+        }
+        return true;
+    }
+
+    ~IOUringEngine() {
+        io_uring_queue_exit(&ring);
+    }
+
+    // Submit async read
+    void submitRead(int fd, void* buffer, size_t size, off_t offset) {
+        struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+        if (!sqe) return;
+
+        io_uring_prep_read(sqe, fd, buffer, size, offset);
+        io_uring_sqe_set_data(sqe, buffer);  // User data
+
+        io_uring_submit(&ring);
+    }
+
+    // Submit async write
+    void submitWrite(int fd, const void* buffer, size_t size, off_t offset) {
+        struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+        if (!sqe) return;
+
+        io_uring_prep_write(sqe, fd, buffer, size, offset);
+        io_uring_submit(&ring);
+    }
+
+    // Poll for completions
+    int pollCompletions() {
+        struct io_uring_cqe* cqe;
+        int ret = io_uring_peek_cqe(&ring, &cqe);
+
+        if (ret == 0) {
+            void* userData = io_uring_cqe_get_data(cqe);
+            int result = cqe->res;
+
+            io_uring_cqe_seen(&ring, cqe);
+
+            return result;
+        }
+
+        return 0;
+    }
+};
+
+// Usage for HFT logging
+class AsyncLogger {
+    IOUringEngine iouring;
+    int logFd;
+
+public:
+    void logTrade(const Trade& trade) {
+        // Serialize trade
+        static thread_local char buffer[4096];
+        size_t len = serialize(trade, buffer, sizeof(buffer));
+
+        // Submit async write (non-blocking)
+        iouring.submitWrite(logFd, buffer, len, -1);
+
+        // Continue processing, I/O happens in background
+    }
+
+    void flush() {
+        // Wait for all I/O to complete
+        while (iouring.pollCompletions() > 0) {
+            // Process completions
+        }
+    }
+};
+// Benefits:
+// - Non-blocking I/O
+// - Batch submissions
+// - Kernel bypass (in some modes)
+// - 10-100x better than traditional async I/O
+```
+
+4.2 io_uring Advanced Features
+-------------------------------
+
+```cpp
+// Fixed buffers (avoid buffer registration overhead)
+class IOUringFixedBuffers {
+    struct io_uring ring;
+    std::vector<iovec> buffers;
+
+public:
+    void registerFixedBuffers(size_t count, size_t bufferSize) {
+        buffers.resize(count);
+
+        for (size_t i = 0; i < count; ++i) {
+            buffers[i].iov_base = malloc(bufferSize);
+            buffers[i].iov_len = bufferSize;
+        }
+
+        io_uring_register_buffers(&ring, buffers.data(), count);
+    }
+
+    void submitReadFixed(int fd, int bufferIndex, size_t size, off_t offset) {
+        struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+        io_uring_prep_read_fixed(sqe, fd, buffers[bufferIndex].iov_base,
+                                 size, offset, bufferIndex);
+        io_uring_submit(&ring);
+    }
+};
+// Fixed buffers are faster (pre-registered with kernel)
+```
+
+================================================================================
+5. MEMORY-MAPPED I/O
+================================================================================
+
+5.1 mmap() for File I/O
+-----------------------
+
+```cpp
+#include <sys/mman.h>
+
+class MemoryMappedFile {
+    void* addr;
+    size_t length;
+    int fd;
+
+public:
+    MemoryMappedFile(const char* path, size_t size, bool create = false) {
+        int flags = O_RDWR;
+        if (create) flags |= O_CREAT;
+
+        fd = open(path, flags, 0644);
+        if (fd < 0) {
+            throw std::runtime_error("Failed to open file");
+        }
+
+        if (create) {
+            ftruncate(fd, size);
+        }
+
+        addr = mmap(nullptr, size, PROT_READ | PROT_WRITE,
+                   MAP_SHARED, fd, 0);
+
+        if (addr == MAP_FAILED) {
+            close(fd);
+            throw std::runtime_error("mmap failed");
+        }
+
+        length = size;
+    }
+
+    ~MemoryMappedFile() {
+        if (addr != MAP_FAILED) {
+            munmap(addr, length);
+        }
+        if (fd >= 0) {
+            close(fd);
+        }
+    }
+
+    template<typename T>
+    T* get() {
+        return static_cast<T*>(addr);
+    }
+
+    void sync() {
+        msync(addr, length, MS_SYNC);
+    }
+};
+
+// Usage: Shared memory market data
+struct MarketDataRegion {
+    std::atomic<uint64_t> sequence;
+    Quote quotes[10000];
+};
+
+class MarketDataPublisher {
+    MemoryMappedFile mmapFile;
+
+public:
+    MarketDataPublisher()
+        : mmapFile("/dev/shm/market_data", sizeof(MarketDataRegion), true) {
+    }
+
+    void publishQuote(const Quote& quote, size_t index) {
+        auto* region = mmapFile.get<MarketDataRegion>();
+
+        // Write quote
+        region->quotes[index] = quote;
+
+        // Update sequence number (lock-free)
+        region->sequence.fetch_add(1, std::memory_order_release);
+    }
+};
+
+class MarketDataSubscriber {
+    MemoryMappedFile mmapFile;
+    uint64_t lastSeq;
+
+public:
+    MarketDataSubscriber()
+        : mmapFile("/dev/shm/market_data", sizeof(MarketDataRegion)),
+          lastSeq(0) {
+    }
+
+    bool pollQuote(size_t index, Quote& quote) {
+        auto* region = mmapFile.get<MarketDataRegion>();
+
+        uint64_t currentSeq = region->sequence.load(std::memory_order_acquire);
+
+        if (currentSeq > lastSeq) {
+            quote = region->quotes[index];
+            lastSeq = currentSeq;
+            return true;
+        }
+
+        return false;
+    }
+};
+// Benefits:
+// - No system calls for read/write
+// - Shared memory between processes
+// - Kernel handles paging
+// - Latency: ~50-100 ns (10-50x faster than read/write)
+```
+
+5.2 Huge Pages with mmap
+-------------------------
+
+```cpp
+// Memory-mapped file with huge pages
+void* mmapHugePages(size_t size) {
+    constexpr size_t HUGE_PAGE_SIZE = 2 * 1024 * 1024;
+
+    // Round up to huge page boundary
+    size_t allocSize = ((size + HUGE_PAGE_SIZE - 1) / HUGE_PAGE_SIZE) * HUGE_PAGE_SIZE;
+
+    void* addr = mmap(nullptr, allocSize,
+                     PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB,
+                     -1, 0);
+
+    if (addr == MAP_FAILED) {
+        perror("mmap huge pages failed");
+        return nullptr;
+    }
+
+    // Advise kernel about usage pattern
+    madvise(addr, allocSize, MADV_SEQUENTIAL);
+
+    return addr;
+}
+// TLB misses: Near zero
+// Performance: 15-30% faster than normal pages
+```
+
+================================================================================
+6. KERNEL BYPASS I/O
+================================================================================
+
+6.1 DPDK (Data Plane Development Kit)
+--------------------------------------
+
+```cpp
+// See network_optimization.txt for full DPDK implementation
+
+// DPDK benefits for I/O:
+// - Kernel bypass
+// - Zero-copy
+// - Poll mode (no interrupts)
+// - Batch processing
+// - Latency: 0.5-2 μs (vs 5-15 μs with kernel stack)
+```
+
+6.2 SPDK (Storage Performance Development Kit)
+-----------------------------------------------
+
+```cpp
+#include <spdk/nvme.h>
+
+class SPDKStorage {
+    struct spdk_nvme_ctrlr* ctrlr;
+    struct spdk_nvme_ns* ns;
+    struct spdk_nvme_qpair* qpair;
+
+public:
+    bool initialize() {
+        // Probe for NVMe devices
+        spdk_nvme_probe(nullptr, nullptr, probe_cb, attach_cb, nullptr);
+
+        if (!ctrlr) return false;
+
+        // Get namespace
+        ns = spdk_nvme_ctrlr_get_ns(ctrlr, 1);
+        if (!ns) return false;
+
+        // Create I/O queue pair
+        qpair = spdk_nvme_ctrlr_alloc_io_qpair(ctrlr, nullptr, 0);
+        if (!qpair) return false;
+
+        return true;
+    }
+
+    // Async read (kernel bypass)
+    void readAsync(void* buffer, uint64_t lba, uint32_t lba_count) {
+        int rc = spdk_nvme_ns_cmd_read(ns, qpair, buffer,
+                                      lba, lba_count,
+                                      read_complete_cb, nullptr, 0);
+    }
+
+    // Async write (kernel bypass)
+    void writeAsync(const void* buffer, uint64_t lba, uint32_t lba_count) {
+        int rc = spdk_nvme_ns_cmd_write(ns, qpair, buffer,
+                                       lba, lba_count,
+                                       write_complete_cb, nullptr, 0);
+    }
+
+    void processCompletions() {
+        spdk_nvme_qpair_process_completions(qpair, 0);
+    }
+};
+// SPDK benefits:
+// - User-space NVMe driver
+// - Kernel bypass
+// - Zero-copy
+// - Latency: 10-20 μs (vs 50-100 μs with kernel)
+// - 5-10x higher IOPS
+```
+
+================================================================================
+7. FILE I/O OPTIMIZATION
+================================================================================
+
+7.1 Buffered vs Unbuffered I/O
+-------------------------------
+
+```cpp
+// Buffered I/O (use for small, frequent writes)
+class BufferedWriter {
+    FILE* file;
+    static constexpr size_t BUFFER_SIZE = 1024 * 1024;  // 1 MB
+
+public:
+    BufferedWriter(const char* path) {
+        file = fopen(path, "wb");
+        setvbuf(file, nullptr, _IOFBF, BUFFER_SIZE);
+    }
+
+    void write(const void* data, size_t size) {
+        fwrite(data, 1, size, file);
+        // Buffered, won't hit disk until buffer full
+    }
+
+    void flush() {
+        fflush(file);  // Force write to disk
+    }
+};
+
+// Direct I/O (use for large, sequential writes)
+class DirectWriter {
+    int fd;
+
+public:
+    DirectWriter(const char* path) {
+        fd = open(path, O_WRONLY | O_CREAT | O_DIRECT, 0644);
+    }
+
+    void write(const void* data, size_t size) {
+        // Must be aligned, bypasses page cache
+        ::write(fd, data, size);
+    }
+};
+```
+
+7.2 Asynchronous File I/O
+--------------------------
+
+```cpp
+#include <aio.h>
+
+class AsyncFileIO {
+    struct aiocb cb;
+
+public:
+    void asyncRead(int fd, void* buffer, size_t size, off_t offset) {
+        memset(&cb, 0, sizeof(cb));
+        cb.aio_fildes = fd;
+        cb.aio_buf = buffer;
+        cb.aio_nbytes = size;
+        cb.aio_offset = offset;
+
+        // Submit async read
+        aio_read(&cb);
+    }
+
+    bool checkComplete() {
+        int ret = aio_error(&cb);
+
+        if (ret == 0) {
+            // Complete
+            ssize_t bytes = aio_return(&cb);
+            return true;
+        } else if (ret == EINPROGRESS) {
+            // Still in progress
+            return false;
+        }
+
+        // Error
+        return false;
+    }
+};
+```
+
+================================================================================
+8. NETWORK I/O OPTIMIZATION
+================================================================================
+
+8.1 Socket Options for Low Latency
+-----------------------------------
+
+```cpp
+int createOptimizedSocket() {
+    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+
+    // Disable Nagle's algorithm (TCP only)
+    int flag = 1;
+    setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+
+    // Set send/receive buffer sizes
+    int bufsize = 16 * 1024 * 1024;  // 16 MB
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
+    setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
+
+    // Set socket priority
+    int priority = 6;
+    setsockopt(sockfd, SOL_SOCKET, SO_PRIORITY, &priority, sizeof(priority));
+
+    // Enable busy polling
+    int busyPoll = 50;  // 50 μs
+    setsockopt(sockfd, SOL_SOCKET, SO_BUSY_POLL, &busyPoll, sizeof(busyPoll));
+
+    return sockfd;
+}
+```
+
+8.2 MSG_ZEROCOPY for Network
+-----------------------------
+
+```cpp
+// Send with zero-copy (kernel 4.14+)
+ssize_t sendZeroCopy(int sockfd, const void* buf, size_t len) {
+    return send(sockfd, buf, len, MSG_ZEROCOPY);
+}
+// Kernel directly accesses user buffer (no copy)
+// 20-30% faster for large messages
+```
+
+================================================================================
+9. BATCHING AND VECTORED I/O
+================================================================================
+
+9.1 readv/writev (Vectored I/O)
+--------------------------------
+
+```cpp
+#include <sys/uio.h>
+
+// Write multiple buffers in single syscall
+ssize_t vectoredWrite(int fd, const std::vector<iovec>& buffers) {
+    return writev(fd, buffers.data(), buffers.size());
+}
+
+// Read into multiple buffers in single syscall
+ssize_t vectoredRead(int fd, std::vector<iovec>& buffers) {
+    return readv(fd, buffers.data(), buffers.size());
+}
+
+// Example: Log multiple events atomically
+void logMultipleEvents(int logFd, const std::vector<Event>& events) {
+    std::vector<iovec> iovecs;
+    for (const auto& event : events) {
+        iovec iov;
+        iov.iov_base = (void*)&event;
+        iov.iov_len = sizeof(Event);
+        iovecs.push_back(iov);
+    }
+
+    writev(logFd, iovecs.data(), iovecs.size());
+}
+// Single syscall vs N syscalls
+// 5-10x faster for multiple small buffers
+```
+
+9.2 Batched I/O with io_uring
+------------------------------
+
+```cpp
+void batchedIOuring(struct io_uring* ring, int fd,
+                    const std::vector<Request>& requests) {
+    // Submit multiple operations
+    for (const auto& req : requests) {
+        struct io_uring_sqe* sqe = io_uring_get_sqe(ring);
+        io_uring_prep_read(sqe, fd, req.buffer, req.size, req.offset);
+    }
+
+    // Single submit for all operations
+    io_uring_submit(ring);
+
+    // Poll for all completions
+    for (size_t i = 0; i < requests.size(); ++i) {
+        struct io_uring_cqe* cqe;
+        io_uring_wait_cqe(ring, &cqe);
+        io_uring_cqe_seen(ring, cqe);
+    }
+}
+// Amortizes syscall overhead
+// 10-50x faster than individual operations
+```
+
+================================================================================
+10. BENCHMARKING AND MEASUREMENT
+================================================================================
+
+10.1 I/O Latency Measurement
+-----------------------------
+
+```cpp
+void measureIOLatency(int fd) {
+    constexpr size_t ITERATIONS = 10000;
+    char buffer[4096];
+
+    std::vector<uint64_t> latencies;
+
+    for (size_t i = 0; i < ITERATIONS; ++i) {
+        auto start = std::chrono::high_resolution_clock::now();
+
+        pread(fd, buffer, sizeof(buffer), i * sizeof(buffer));
+
+        auto end = std::chrono::high_resolution_clock::now();
+        auto latency = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
+
+        latencies.push_back(latency.count());
+    }
+
+    std::sort(latencies.begin(), latencies.end());
+
+    printf("I/O Latency (ns):\n");
+    printf("  Min: %lu\n", latencies.front());
+    printf("  P50: %lu\n", latencies[latencies.size() / 2]);
+    printf("  P99: %lu\n", latencies[latencies.size() * 99 / 100]);
+    printf("  Max: %lu\n", latencies.back());
+}
+```
+
+10.2 Throughput Measurement
+----------------------------
+
+```cpp
+double measureIOThroughput(int fd, size_t totalSize) {
+    char buffer[1024 * 1024];  // 1 MB
+    size_t totalRead = 0;
+
+    auto start = std::chrono::high_resolution_clock::now();
+
+    while (totalRead < totalSize) {
+        ssize_t n = read(fd, buffer, sizeof(buffer));
+        if (n <= 0) break;
+        totalRead += n;
+    }
+
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+
+    double mbPerSec = (totalRead / (1024.0 * 1024.0)) / (duration.count() / 1e6);
+
+    printf("Throughput: %.2f MB/s\n", mbPerSec);
+    return mbPerSec;
+}
+```
+
+================================================================================
+11. EXPECTED IMPROVEMENTS
+================================================================================
+
+Optimization Technique                    | Latency Reduction | Throughput Gain
+------------------------------------------|-------------------|------------------
+Zero-copy I/O                             | 40-60%           | 2-3x
+Direct I/O (O_DIRECT)                     | 30-50%           | 1.5-2x
+Async I/O (io_uring)                      | 60-80%           | 10-50x
+Memory-mapped I/O                         | 70-90%           | 10-100x
+Kernel bypass (DPDK/SPDK)                 | 80-95%           | 10-100x
+Batching/vectored I/O                     | 50-70%           | 5-20x
+RDMA                                      | 85-95%           | 20-100x
+
+Combined Effect: 90-99% latency reduction, 100-1000x throughput gain
+
+Real-World HFT Example:
+-----------------------
+Market Data Capture:
+
+BEFORE I/O optimization (traditional read/write):
+- Packet processing: 15 μs
+- System calls: 100 per second
+- Throughput: 50K packets/sec
+- CPU usage: 80%
+
+AFTER I/O optimization (io_uring + zero-copy):
+- Packet processing: 1.2 μs (12.5x faster)
+- System calls: 10 per second (batched)
+- Throughput: 2M packets/sec (40x improvement)
+- CPU usage: 20%
+
+Order Submission:
+
+BEFORE:
+- Order to wire: 12 μs
+- System call overhead: 45%
+
+AFTER (kernel bypass):
+- Order to wire: 0.9 μs (13x faster)
+- System call overhead: 0%
+
+Competitive Advantage:
+- Process 40x more market data
+- Submit orders 13x faster
+- 75% CPU freed for strategy logic
+
+================================================================================
+END OF I/O OPTIMIZATION GUIDE
+================================================================================

@@ -1,0 +1,519 @@
+================================================================================
+                    MEMCACHED FOR HFT SYSTEMS
+                    Session Data and High-Performance Caching
+================================================================================
+
+TABLE OF CONTENTS
+================================================================================
+1. Introduction to Memcached
+2. Memcached vs Redis Comparison
+3. Architecture and Deployment
+4. C++ Client Implementation
+5. Caching Patterns
+6. Performance Optimization
+7. Best Practices
+
+================================================================================
+1. INTRODUCTION TO MEMCACHED
+================================================================================
+
+Memcached is a high-performance, distributed memory caching system designed
+for simple key-value storage.
+
+KEY CHARACTERISTICS:
+- Ultra-simple protocol
+- Lower latency than Redis (30-100 μs)
+- No persistence
+- No data structures (only strings)
+- Multi-threaded (better CPU utilization)
+- LRU eviction
+
+PERFORMANCE:
+┌───────────────┬──────────┬──────────────┬────────────────┐
+│ Operation     │ Latency  │ Throughput   │ Notes          │
+├───────────────┼──────────┼──────────────┼────────────────┤
+│ GET (local)   │ 30-80 μs │ 200K ops/s   │ Simple lookup  │
+│ SET (local)   │ 40-100μs │ 150K ops/s   │ Simple write   │
+│ Multi-GET     │ 50-150μs │ 500K ops/s   │ Batch ops      │
+└───────────────┴──────────┴──────────────┴────────────────┘
+
+WHEN TO USE MEMCACHED:
+✓ Simple key-value caching
+✓ Session data storage
+✓ Lower latency than Redis needed
+✓ Don't need persistence
+✓ Don't need complex data structures
+
+================================================================================
+2. MEMCACHED VS REDIS COMPARISON
+================================================================================
+
+┌──────────────────┬─────────────┬──────────────────────┐
+│ Feature          │ Memcached   │ Redis                │
+├──────────────────┼─────────────┼──────────────────────┤
+│ Data Structures  │ String only │ String, Hash, List,  │
+│                  │             │ Set, Sorted Set      │
+│ Latency          │ 30-80 μs    │ 50-200 μs            │
+│ Threading        │ Multi       │ Single (event loop)  │
+│ Persistence      │ No          │ Yes (RDB, AOF)       │
+│ Replication      │ No          │ Yes                  │
+│ Pub/Sub          │ No          │ Yes                  │
+│ Lua Scripting    │ No          │ Yes                  │
+│ Memory Overhead  │ Lower       │ Higher               │
+│ Complexity       │ Low         │ Medium-High          │
+└──────────────────┴─────────────┴──────────────────────┘
+
+DECISION MATRIX:
+Use Memcached if:
+- Need lowest latency
+- Simple key-value only
+- No persistence required
+- Higher CPU utilization preferred
+
+Use Redis if:
+- Need data structures
+- Need persistence
+- Need pub/sub
+- Need replication/clustering
+
+================================================================================
+3. ARCHITECTURE AND DEPLOYMENT
+================================================================================
+
+DEPLOYMENT TOPOLOGY:
+
+┌──────────────────────────────────────────────────────────┐
+│                   Client Application                     │
+│  ┌────────────────────────────────────────────────────┐  │
+│  │  libmemcached (Consistent Hashing)                 │  │
+│  └─────┬─────────────┬─────────────┬──────────────────┘  │
+└────────┼─────────────┼─────────────┼─────────────────────┘
+         │             │             │
+    ┌────▼───┐    ┌───▼────┐   ┌────▼───┐
+    │Memcached│    │Memcached│   │Memcached│
+    │Server 1 │    │Server 2 │   │Server 3 │
+    │:11211   │    │:11211   │   │:11211   │
+    └─────────┘    └─────────┘   └─────────┘
+
+CONSISTENT HASHING:
+- Keys distributed across servers using hash function
+- Adding/removing servers only affects ~1/n of keys
+- Client-side logic (no proxy needed)
+
+================================================================================
+4. C++ CLIENT IMPLEMENTATION
+================================================================================
+
+USING LIBMEMCACHED:
+
+#include <libmemcached/memcached.h>
+#include <string>
+#include <vector>
+#include <optional>
+
+class MemcachedClient {
+    memcached_st* memc_;
+
+public:
+    MemcachedClient(const std::vector<std::string>& servers) {
+        memc_ = memcached_create(nullptr);
+
+        // Add servers
+        for (const auto& server : servers) {
+            memcached_server_add(memc_, server.c_str(), 11211);
+        }
+
+        // Configure behavior
+        memcached_behavior_set(memc_, MEMCACHED_BEHAVIOR_BINARY_PROTOCOL, 1);
+        memcached_behavior_set(memc_, MEMCACHED_BEHAVIOR_NO_BLOCK, 1);
+        memcached_behavior_set(memc_, MEMCACHED_BEHAVIOR_TCP_NODELAY, 1);
+    }
+
+    ~MemcachedClient() {
+        memcached_free(memc_);
+    }
+
+    // SET operation
+    bool set(const std::string& key,
+            const std::string& value,
+            time_t expiration = 0) {
+
+        memcached_return_t rc = memcached_set(
+            memc_,
+            key.c_str(), key.length(),
+            value.c_str(), value.length(),
+            expiration,
+            0  // flags
+        );
+
+        return rc == MEMCACHED_SUCCESS;
+    }
+
+    // GET operation
+    std::optional<std::string> get(const std::string& key) {
+        size_t value_length;
+        uint32_t flags;
+        memcached_return_t rc;
+
+        char* value = memcached_get(
+            memc_,
+            key.c_str(), key.length(),
+            &value_length,
+            &flags,
+            &rc
+        );
+
+        if (rc != MEMCACHED_SUCCESS || value == nullptr) {
+            return std::nullopt;
+        }
+
+        std::string result(value, value_length);
+        free(value);
+
+        return result;
+    }
+
+    // DELETE operation
+    bool del(const std::string& key) {
+        memcached_return_t rc = memcached_delete(
+            memc_,
+            key.c_str(), key.length(),
+            0  // expiration
+        );
+
+        return rc == MEMCACHED_SUCCESS;
+    }
+
+    // INCREMENT operation
+    uint64_t increment(const std::string& key, uint64_t offset = 1) {
+        uint64_t value;
+        memcached_return_t rc = memcached_increment(
+            memc_,
+            key.c_str(), key.length(),
+            offset,
+            &value
+        );
+
+        if (rc != MEMCACHED_SUCCESS) {
+            throw std::runtime_error("Increment failed");
+        }
+
+        return value;
+    }
+
+    // MULTI-GET operation
+    std::map<std::string, std::string> multiGet(
+        const std::vector<std::string>& keys) {
+
+        // Prepare key array
+        std::vector<const char*> key_ptrs;
+        std::vector<size_t> key_lengths;
+
+        for (const auto& key : keys) {
+            key_ptrs.push_back(key.c_str());
+            key_lengths.push_back(key.length());
+        }
+
+        // Execute multi-get
+        memcached_return_t rc = memcached_mget(
+            memc_,
+            key_ptrs.data(),
+            key_lengths.data(),
+            keys.size()
+        );
+
+        std::map<std::string, std::string> results;
+
+        if (rc != MEMCACHED_SUCCESS) {
+            return results;
+        }
+
+        // Fetch results
+        char return_key[MEMCACHED_MAX_KEY];
+        size_t return_key_length;
+        char* return_value;
+        size_t return_value_length;
+        uint32_t flags;
+
+        while ((return_value = memcached_fetch(
+                   memc_,
+                   return_key, &return_key_length,
+                   &return_value_length,
+                   &flags, &rc))) {
+
+            if (rc == MEMCACHED_SUCCESS) {
+                std::string key(return_key, return_key_length);
+                std::string value(return_value, return_value_length);
+                results[key] = value;
+            }
+
+            free(return_value);
+        }
+
+        return results;
+    }
+};
+
+// SESSION DATA MANAGEMENT
+class SessionManager {
+    MemcachedClient& cache_;
+
+public:
+    SessionManager(MemcachedClient& cache) : cache_(cache) {}
+
+    // Store session
+    bool storeSession(const std::string& session_id,
+                     const SessionData& data,
+                     time_t ttl = 3600) {  // 1 hour
+
+        std::string serialized = data.SerializeAsString();
+        std::string key = "session:" + session_id;
+
+        return cache_.set(key, serialized, ttl);
+    }
+
+    // Get session
+    std::optional<SessionData> getSession(const std::string& session_id) {
+        std::string key = "session:" + session_id;
+        auto value = cache_.get(key);
+
+        if (!value) {
+            return std::nullopt;
+        }
+
+        SessionData data;
+        data.ParseFromString(*value);
+        return data;
+    }
+
+    // Delete session
+    bool deleteSession(const std::string& session_id) {
+        std::string key = "session:" + session_id;
+        return cache_.del(key);
+    }
+};
+
+================================================================================
+5. CACHING PATTERNS
+================================================================================
+
+CACHE-ASIDE (LAZY LOADING):
+
+class CacheAsidePattern {
+    MemcachedClient& cache_;
+
+public:
+    CacheAsidePattern(MemcachedClient& cache) : cache_(cache) {}
+
+    template<typename T>
+    T getWithCache(const std::string& key,
+                   std::function<T()> fetch_from_source,
+                   time_t ttl = 300) {
+
+        // Try cache first
+        auto cached = cache_.get(key);
+        if (cached) {
+            return deserialize<T>(*cached);
+        }
+
+        // Cache miss - fetch from source
+        T value = fetch_from_source();
+
+        // Store in cache
+        std::string serialized = serialize(value);
+        cache_.set(key, serialized, ttl);
+
+        return value;
+    }
+};
+
+// Usage
+CacheAsidePattern cache_pattern(cache);
+
+auto symbol_info = cache_pattern.getWithCache<SymbolInfo>(
+    "symbol:AAPL",
+    []() { return fetchSymbolFromDatabase("AAPL"); },
+    3600  // 1 hour TTL
+);
+
+WRITE-THROUGH CACHE:
+
+class WriteThroughCache {
+    MemcachedClient& cache_;
+
+public:
+    WriteThroughCache(MemcachedClient& cache) : cache_(cache) {}
+
+    void set(const std::string& key,
+            const std::string& value,
+            std::function<void()> write_to_db,
+            time_t ttl = 300) {
+
+        // Write to database first
+        write_to_db();
+
+        // Then update cache
+        cache_.set(key, value, ttl);
+    }
+};
+
+CACHE PREFETCHING:
+
+class CachePrefetcher {
+    MemcachedClient& cache_;
+
+public:
+    CachePrefetcher(MemcachedClient& cache) : cache_(cache) {}
+
+    // Prefetch symbol data
+    void prefetchSymbols(const std::vector<std::string>& symbols) {
+        // Batch fetch from database
+        auto symbol_data = batchFetchSymbols(symbols);
+
+        // Batch store to cache
+        for (const auto& [symbol, data] : symbol_data) {
+            std::string key = "symbol:" + symbol;
+            std::string value = serialize(data);
+            cache_.set(key, value, 3600);
+        }
+    }
+
+    // Prefetch on startup
+    void warmCache() {
+        auto active_symbols = getActiveSymbols();
+        prefetchSymbols(active_symbols);
+    }
+};
+
+================================================================================
+6. PERFORMANCE OPTIMIZATION
+================================================================================
+
+BATCH OPERATIONS:
+
+class BatchOperations {
+    MemcachedClient& cache_;
+
+public:
+    BatchOperations(MemcachedClient& cache) : cache_(cache) {}
+
+    // Batch get positions
+    std::map<std::string, int64_t> batchGetPositions(
+        const std::vector<std::string>& symbols) {
+
+        std::vector<std::string> keys;
+        for (const auto& symbol : symbols) {
+            keys.push_back("position:" + symbol);
+        }
+
+        auto results = cache_.multiGet(keys);
+
+        std::map<std::string, int64_t> positions;
+        for (const auto& [key, value] : results) {
+            std::string symbol = key.substr(9);  // Remove "position:"
+            positions[symbol] = std::stoll(value);
+        }
+
+        return positions;
+    }
+};
+
+// Performance: 100 individual GETs = ~5ms, Multi-GET = ~0.2ms (25x faster)
+
+CONNECTION POOLING:
+
+class MemcachedPool {
+    std::vector<std::unique_ptr<MemcachedClient>> pool_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::queue<size_t> available_;
+
+public:
+    MemcachedPool(const std::vector<std::string>& servers, size_t size) {
+        for (size_t i = 0; i < size; ++i) {
+            pool_.push_back(std::make_unique<MemcachedClient>(servers));
+            available_.push(i);
+        }
+    }
+
+    MemcachedClient& acquire() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [this] { return !available_.empty(); });
+
+        size_t idx = available_.front();
+        available_.pop();
+
+        return *pool_[idx];
+    }
+
+    void release(MemcachedClient& client) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        // Find index
+        for (size_t i = 0; i < pool_.size(); ++i) {
+            if (pool_[i].get() == &client) {
+                available_.push(i);
+                cv_.notify_one();
+                break;
+            }
+        }
+    }
+};
+
+================================================================================
+7. BEST PRACTICES
+================================================================================
+
+CONFIGURATION:
+
+# memcached.conf
+-m 4096          # Memory limit (4GB)
+-c 1024          # Max connections
+-t 4             # Threads
+-l 127.0.0.1     # Listen address
+-p 11211         # Port
+-U 0             # Disable UDP
+-I 1m            # Max item size (1MB)
+-v               # Verbose
+
+MONITORING:
+
+class MemcachedStats {
+    MemcachedClient& cache_;
+
+public:
+    MemcachedStats(MemcachedClient& cache) : cache_(cache) {}
+
+    void printStats() {
+        // Get stats using memcached_stat()
+        std::cout << "Memcached Statistics:" << std::endl;
+        std::cout << "Hit Rate: " << getHitRate() << "%" << std::endl;
+        std::cout << "Memory Usage: " << getMemoryUsage() << " MB" << std::endl;
+        std::cout << "Connections: " << getConnections() << std::endl;
+    }
+};
+
+BEST PRACTICES:
+
+✓ Use binary protocol for better performance
+✓ Enable TCP_NODELAY for low latency
+✓ Set appropriate memory limits (-m)
+✓ Use consistent hashing for distribution
+✓ Monitor hit rate (target > 80%)
+✓ Use multi-get for batch operations
+✓ Set reasonable TTLs on all keys
+✓ Use connection pooling for concurrent access
+✓ Deploy close to application (same host/rack)
+
+DON'T:
+
+✗ Store large objects (> 1MB)
+✗ Use as primary data store (no persistence)
+✗ Forget to set expiration times
+✗ Use UDP in production
+✗ Store sensitive data without encryption
+✗ Ignore eviction rate
+✗ Create too many connections
+
+================================================================================
+END OF MEMCACHED IMPLEMENTATION
+================================================================================

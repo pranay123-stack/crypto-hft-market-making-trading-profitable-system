@@ -1,0 +1,879 @@
+================================================================================
+SECURITY HARDENING
+High-Frequency Trading System - System Security Best Practices
+================================================================================
+
+VERSION: 2.0
+LAST UPDATED: 2025-11-26
+CLASSIFICATION: CONFIDENTIAL
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+
+1. Overview
+2. Principle of Least Privilege
+3. Network Security
+4. Operating System Hardening
+5. Application Security
+6. Database Security
+7. Container Security
+8. Secrets and Key Management
+9. Security Monitoring
+10. Incident Response Readiness
+
+================================================================================
+1. OVERVIEW
+================================================================================
+
+Security hardening reduces the attack surface of HFT systems by eliminating
+unnecessary services, implementing security controls, and following defense-in-depth principles.
+
+HARDENING OBJECTIVES:
+- Minimize attack surface
+- Enforce least privilege access
+- Implement defense in depth
+- Maintain security compliance
+- Ensure rapid incident detection
+
+THREAT LANDSCAPE FOR HFT:
+1. External attacks (DDoS, malware, exploits)
+2. Insider threats (malicious or negligent)
+3. Supply chain attacks (compromised dependencies)
+4. Zero-day vulnerabilities
+5. Social engineering
+
+================================================================================
+2. PRINCIPLE OF LEAST PRIVILEGE
+================================================================================
+
+2.1 USER ACCESS CONTROL
+------------------------
+
+IMPLEMENTATION CHECKLIST:
+
+✓ Every user has unique account (no shared accounts)
+✓ Default deny all access, explicitly grant necessary permissions
+✓ Time-limited access for temporary needs
+✓ Regular access reviews (quarterly)
+✓ Automatic account deactivation after 90 days inactivity
+✓ Separation of duties (no single person controls end-to-end process)
+
+EXAMPLE: Role Assignments
+
+```bash
+#!/bin/bash
+# User Access Provisioning Script
+
+# Trader (limited access)
+create_user_account() {
+    local username=$1
+    local role=$2
+
+    # Create system user with limited shell
+    useradd -m -s /bin/rbash $username
+
+    # Assign to appropriate group
+    usermod -aG trading_users $username
+
+    # Set file permissions
+    chmod 700 /home/$username
+    chown $username:trading_users /home/$username
+
+    # Configure sudoers (no sudo for traders)
+    # Only specific commands allowed
+
+    # Set password expiry
+    chage -M 90 $username  # 90-day password expiry
+    chage -W 14 $username  # 14-day warning
+
+    echo "User $username created with role $role"
+}
+
+# Admin (elevated but restricted)
+create_admin_account() {
+    local username=$1
+
+    useradd -m -s /bin/bash $username
+    usermod -aG admin_users $username
+
+    # Sudoers with command restrictions
+    echo "$username ALL=(ALL) /usr/bin/systemctl restart trading-service" >> /etc/sudoers.d/$username
+    echo "$username ALL=(ALL) /usr/bin/systemctl status *" >> /etc/sudoers.d/$username
+
+    # No password login, key-based only
+    mkdir -p /home/$username/.ssh
+    chmod 700 /home/$username/.ssh
+    chown $username:admin_users /home/$username/.ssh
+}
+```
+
+2.2 SERVICE ACCOUNT ISOLATION
+------------------------------
+
+```yaml
+# Docker Compose example: Run services with non-root users
+
+version: '3.8'
+services:
+  trading-engine:
+    image: hft/trading-engine:latest
+    user: "1000:1000"  # Non-root UID:GID
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE  # Only if binding to privileged ports
+    security_opt:
+      - no-new-privileges:true
+    read_only: true  # Read-only filesystem
+    tmpfs:
+      - /tmp
+    volumes:
+      - ./config:/config:ro  # Read-only configuration
+```
+
+================================================================================
+3. NETWORK SECURITY
+================================================================================
+
+3.1 FIREWALL CONFIGURATION
+---------------------------
+
+```bash
+#!/bin/bash
+# iptables firewall rules for HFT system
+
+# Flush existing rules
+iptables -F
+iptables -X
+iptables -Z
+
+# Default policies: DROP everything
+iptables -P INPUT DROP
+iptables -P FORWARD DROP
+iptables -P OUTPUT DROP
+
+# Allow loopback
+iptables -A INPUT -i lo -j ACCEPT
+iptables -A OUTPUT -o lo -j ACCEPT
+
+# Allow established connections
+iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+# SSH (from specific IPs only)
+iptables -A INPUT -p tcp --dport 22 -s 203.0.113.0/24 -j ACCEPT
+
+# HTTPS (API Gateway)
+iptables -A INPUT -p tcp --dport 443 -j ACCEPT
+
+# Allow outbound HTTPS (for exchange APIs)
+iptables -A OUTPUT -p tcp --dport 443 -j ACCEPT
+
+# Allow DNS
+iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
+
+# Drop invalid packets
+iptables -A INPUT -m conntrack --ctstate INVALID -j DROP
+
+# Rate limiting: Prevent DDoS
+iptables -A INPUT -p tcp --dport 443 -m limit --limit 100/second --limit-burst 200 -j ACCEPT
+iptables -A INPUT -p tcp --dport 443 -j DROP
+
+# Log dropped packets
+iptables -A INPUT -j LOG --log-prefix "DROPPED INPUT: " --log-level 4
+iptables -A OUTPUT -j LOG --log-prefix "DROPPED OUTPUT: " --log-level 4
+
+# Save rules
+iptables-save > /etc/iptables/rules.v4
+```
+
+3.2 NETWORK SEGMENTATION
+-------------------------
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      INTERNET                                    │
+└────────────────────────────┬────────────────────────────────────┘
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    DMZ (VLAN 10)                                │
+│  - API Gateway (public endpoints)                               │
+│  - WAF (Web Application Firewall)                               │
+│  - DDoS protection                                              │
+└────────────────────────────┬────────────────────────────────────┘
+                             │ Firewall
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│              APPLICATION TIER (VLAN 20)                         │
+│  - Trading Engine                                               │
+│  - Risk Management Service                                      │
+│  - Market Data Service                                          │
+│  NO DIRECT INTERNET ACCESS                                      │
+└────────────────────────────┬────────────────────────────────────┘
+                             │ Firewall
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                   DATA TIER (VLAN 30)                           │
+│  - PostgreSQL Database                                          │
+│  - Redis Cache                                                  │
+│  - Message Queue                                                │
+│  ISOLATED - No external connectivity                            │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+3.3 VPN AND REMOTE ACCESS
+--------------------------
+
+```bash
+#!/bin/bash
+# WireGuard VPN configuration for secure remote access
+
+# Install WireGuard
+apt-get install wireguard
+
+# Generate server keys
+wg genkey | tee /etc/wireguard/server_private.key | wg pubkey > /etc/wireguard/server_public.key
+chmod 600 /etc/wireguard/server_private.key
+
+# Server configuration
+cat > /etc/wireguard/wg0.conf <<EOF
+[Interface]
+PrivateKey = $(cat /etc/wireguard/server_private.key)
+Address = 10.200.200.1/24
+ListenPort = 51820
+SaveConfig = true
+
+# Enable forwarding
+PostUp = sysctl -w net.ipv4.ip_forward=1
+PostUp = iptables -A FORWARD -i wg0 -j ACCEPT
+PostUp = iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+
+PostDown = iptables -D FORWARD -i wg0 -j ACCEPT
+PostDown = iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
+
+# Client configurations (add per user)
+[Peer]
+# Trader 1
+PublicKey = CLIENT1_PUBLIC_KEY
+AllowedIPs = 10.200.200.2/32
+
+[Peer]
+# Admin 1
+PublicKey = CLIENT2_PUBLIC_KEY
+AllowedIPs = 10.200.200.3/32
+EOF
+
+# Start VPN
+systemctl enable wg-quick@wg0
+systemctl start wg-quick@wg0
+```
+
+================================================================================
+4. OPERATING SYSTEM HARDENING
+================================================================================
+
+4.1 UBUNTU/DEBIAN HARDENING
+----------------------------
+
+```bash
+#!/bin/bash
+# OS Hardening Script for Ubuntu 22.04
+
+echo "Starting OS hardening..."
+
+# 1. Update system
+apt-get update && apt-get upgrade -y
+
+# 2. Disable unnecessary services
+systemctl disable cups  # Printing service
+systemctl disable avahi-daemon  # Zeroconf networking
+systemctl disable bluetooth
+
+# 3. Remove unnecessary packages
+apt-get purge -y telnet ftp rsh-client rsh-redone-client
+
+# 4. Configure SSH hardening
+cat >> /etc/ssh/sshd_config <<EOF
+# SSH Hardening
+Protocol 2
+PermitRootLogin no
+PasswordAuthentication no
+PubkeyAuthentication yes
+PermitEmptyPasswords no
+ChallengeResponseAuthentication no
+UsePAM yes
+X11Forwarding no
+PrintMotd no
+TCPKeepAlive yes
+ClientAliveInterval 300
+ClientAliveCountMax 2
+MaxAuthTries 3
+MaxSessions 2
+AllowUsers trader1 admin1  # Whitelist specific users
+AllowGroups trading_users admin_users
+EOF
+
+systemctl restart sshd
+
+# 5. Enable automatic security updates
+apt-get install -y unattended-upgrades
+dpkg-reconfigure -plow unattended-upgrades
+
+# 6. Install and configure fail2ban (brute force protection)
+apt-get install -y fail2ban
+
+cat > /etc/fail2ban/jail.local <<EOF
+[sshd]
+enabled = true
+port = 22
+filter = sshd
+logpath = /var/log/auth.log
+maxretry = 3
+bantime = 3600
+findtime = 600
+EOF
+
+systemctl enable fail2ban
+systemctl start fail2ban
+
+# 7. Configure auditd (system call auditing)
+apt-get install -y auditd audispd-plugins
+
+cat >> /etc/audit/rules.d/audit.rules <<EOF
+# Audit authentication events
+-w /etc/passwd -p wa -k passwd_changes
+-w /etc/shadow -p wa -k shadow_changes
+-w /etc/sudoers -p wa -k sudoers_changes
+
+# Audit file access
+-w /etc/hft/ -p rwxa -k hft_config_changes
+
+# Audit network configuration
+-w /etc/network/ -p wa -k network_changes
+
+# Audit time changes
+-a always,exit -F arch=b64 -S adjtimex -S settimeofday -k time_change
+
+# Audit privileged commands
+-a always,exit -F path=/usr/bin/sudo -F perm=x -F auid>=1000 -F auid!=4294967295 -k privileged
+EOF
+
+systemctl restart auditd
+
+# 8. Set file permissions
+chmod 644 /etc/passwd
+chmod 600 /etc/shadow
+chmod 644 /etc/group
+chmod 600 /etc/gshadow
+
+# 9. Configure kernel parameters (sysctl)
+cat >> /etc/sysctl.conf <<EOF
+# IP forwarding (disable if not router)
+net.ipv4.ip_forward = 0
+
+# Ignore ICMP redirects
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv6.conf.all.accept_redirects = 0
+
+# Ignore send redirects
+net.ipv4.conf.all.send_redirects = 0
+
+# Disable source packet routing
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv6.conf.all.accept_source_route = 0
+
+# Enable SYN cookies (DDoS protection)
+net.ipv4.tcp_syncookies = 1
+
+# Log martian packets
+net.ipv4.conf.all.log_martians = 1
+
+# Ignore ping requests
+net.ipv4.icmp_echo_ignore_all = 1
+
+# Increase TCP backlog
+net.ipv4.tcp_max_syn_backlog = 4096
+net.core.netdev_max_backlog = 5000
+
+# TCP hardening
+net.ipv4.tcp_timestamps = 0
+net.ipv4.tcp_sack = 0
+EOF
+
+sysctl -p
+
+# 10. Configure AppArmor
+systemctl enable apparmor
+systemctl start apparmor
+
+# 11. Disable core dumps (prevent information leakage)
+echo "* hard core 0" >> /etc/security/limits.conf
+echo "fs.suid_dumpable = 0" >> /etc/sysctl.conf
+
+# 12. Set password policies
+apt-get install -y libpam-pwquality
+
+cat > /etc/security/pwquality.conf <<EOF
+minlen = 12
+dcredit = -1
+ucredit = -1
+lcredit = -1
+ocredit = -1
+maxrepeat = 3
+gecoscheck = 1
+EOF
+
+# 13. Configure login banner
+cat > /etc/issue.net <<EOF
+***************************************************************************
+*                      AUTHORIZED ACCESS ONLY                            *
+*                                                                         *
+* This system is for authorized use only. All activity is monitored and  *
+* logged. Unauthorized access is prohibited and will be prosecuted.      *
+***************************************************************************
+EOF
+
+echo "Banner /etc/issue.net" >> /etc/ssh/sshd_config
+
+echo "OS hardening complete!"
+```
+
+================================================================================
+5. APPLICATION SECURITY
+================================================================================
+
+5.1 SECURE CODING PRACTICES
+----------------------------
+
+```cpp
+// Example: Input validation and sanitization
+
+#include <string>
+#include <regex>
+#include <stdexcept>
+
+class InputValidator {
+public:
+    // Validate trading symbol (alphanumeric only, max 10 chars)
+    static bool isValidSymbol(const std::string& symbol) {
+        if (symbol.empty() || symbol.length() > 10) {
+            return false;
+        }
+
+        std::regex pattern("^[A-Z0-9]+$");
+        return std::regex_match(symbol, pattern);
+    }
+
+    // Validate quantity (positive number, max 10 digits)
+    static bool isValidQuantity(double quantity) {
+        return quantity > 0 && quantity < 9999999999.0;
+    }
+
+    // Sanitize SQL input (prevent SQL injection)
+    static std::string sanitizeSQLInput(const std::string& input) {
+        std::string sanitized = input;
+
+        // Escape single quotes
+        size_t pos = 0;
+        while ((pos = sanitized.find("'", pos)) != std::string::npos) {
+            sanitized.replace(pos, 1, "''");
+            pos += 2;
+        }
+
+        return sanitized;
+    }
+
+    // Validate email address
+    static bool isValidEmail(const std::string& email) {
+        std::regex pattern(R"([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})");
+        return std::regex_match(email, pattern);
+    }
+
+    // Prevent path traversal attacks
+    static bool isSafePath(const std::string& path) {
+        // Reject paths containing ".." or absolute paths
+        if (path.find("..") != std::string::npos ||
+            path.find("/") == 0 ||
+            path.find("\\") == 0) {
+            return false;
+        }
+        return true;
+    }
+};
+
+// Example usage in trading API
+class TradingAPI {
+public:
+    void submitOrder(const std::string& symbol, double quantity, double price) {
+        // Input validation
+        if (!InputValidator::isValidSymbol(symbol)) {
+            throw std::invalid_argument("Invalid symbol");
+        }
+
+        if (!InputValidator::isValidQuantity(quantity)) {
+            throw std::invalid_argument("Invalid quantity");
+        }
+
+        if (price <= 0) {
+            throw std::invalid_argument("Invalid price");
+        }
+
+        // Proceed with order submission
+        processOrder(symbol, quantity, price);
+    }
+
+private:
+    void processOrder(const std::string& symbol, double quantity, double price) {
+        // Implementation
+    }
+};
+```
+
+5.2 DEPENDENCY SCANNING
+------------------------
+
+```yaml
+# GitHub Actions: Automated dependency scanning
+
+name: Security Scan
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    - cron: '0 0 * * *'  # Daily
+
+jobs:
+  dependency-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      # C++ dependency scanning with Snyk
+      - name: Run Snyk to check for vulnerabilities
+        uses: snyk/actions/cpp@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+      # Python dependency scanning
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Safety check
+        run: pip install safety && safety check
+
+      # Docker image scanning
+      - name: Build Docker image
+        run: docker build -t trading-engine:latest .
+
+      - name: Scan Docker image with Trivy
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy image trading-engine:latest
+
+  sast-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      # Static Application Security Testing
+      - name: Run CodeQL analysis
+        uses: github/codeql-action/analyze@v2
+        with:
+          languages: cpp, python
+```
+
+================================================================================
+6. DATABASE SECURITY
+================================================================================
+
+6.1 POSTGRESQL HARDENING
+-------------------------
+
+```sql
+-- Database security configuration
+
+-- 1. Create read-only user for reporting
+CREATE ROLE reporting_user WITH LOGIN PASSWORD 'secure_password_here';
+GRANT CONNECT ON DATABASE trading_db TO reporting_user;
+GRANT USAGE ON SCHEMA public TO reporting_user;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO reporting_user;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO reporting_user;
+
+-- 2. Create application user with limited permissions
+CREATE ROLE trading_app WITH LOGIN PASSWORD 'secure_password_here';
+GRANT CONNECT ON DATABASE trading_db TO trading_app;
+GRANT USAGE ON SCHEMA public TO trading_app;
+GRANT SELECT, INSERT, UPDATE ON orders TO trading_app;
+GRANT SELECT ON positions TO trading_app;
+-- NO DELETE permission on critical tables
+
+-- 3. Enable SSL connections only
+ALTER SYSTEM SET ssl = on;
+ALTER SYSTEM SET ssl_cert_file = '/etc/postgresql/ssl/server.crt';
+ALTER SYSTEM SET ssl_key_file = '/etc/postgresql/ssl/server.key';
+
+-- Require SSL for all connections
+ALTER SYSTEM SET ssl_min_protocol_version = 'TLSv1.3';
+
+-- 4. Configure pg_hba.conf for IP restrictions
+-- /etc/postgresql/14/main/pg_hba.conf:
+-- hostssl  all  all  10.0.1.0/24  scram-sha-256
+-- hostssl  all  all  10.0.2.0/24  scram-sha-256
+-- Deny all others
+
+-- 5. Enable audit logging
+CREATE EXTENSION IF NOT EXISTS pgaudit;
+ALTER SYSTEM SET pgaudit.log = 'ddl, write, role';
+ALTER SYSTEM SET log_connections = on;
+ALTER SYSTEM SET log_disconnections = on;
+ALTER SYSTEM SET log_statement = 'mod';  -- Log modifications
+
+-- 6. Encrypt sensitive columns
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+-- Example: Encrypt API keys
+CREATE TABLE exchange_credentials (
+    id SERIAL PRIMARY KEY,
+    exchange_name VARCHAR(50),
+    api_key BYTEA,  -- Encrypted
+    api_secret BYTEA,  -- Encrypted
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Insert with encryption
+INSERT INTO exchange_credentials (exchange_name, api_key, api_secret)
+VALUES ('binance',
+        pgp_sym_encrypt('API_KEY_HERE', 'encryption_key'),
+        pgp_sym_encrypt('API_SECRET_HERE', 'encryption_key'));
+
+-- Query with decryption
+SELECT exchange_name,
+       pgp_sym_decrypt(api_key, 'encryption_key') AS api_key,
+       pgp_sym_decrypt(api_secret, 'encryption_key') AS api_secret
+FROM exchange_credentials
+WHERE exchange_name = 'binance';
+
+-- 7. Set connection limits
+ALTER ROLE trading_app CONNECTION LIMIT 50;
+ALTER ROLE reporting_user CONNECTION LIMIT 10;
+
+-- 8. Regular vacuuming and maintenance
+-- Add to crontab:
+-- 0 2 * * * psql -U postgres -d trading_db -c "VACUUM ANALYZE;"
+```
+
+================================================================================
+7. SECURITY MONITORING
+================================================================================
+
+7.1 INTRUSION DETECTION (AIDE)
+-------------------------------
+
+```bash
+#!/bin/bash
+# AIDE (Advanced Intrusion Detection Environment) setup
+
+# Install AIDE
+apt-get install -y aide aide-common
+
+# Configure AIDE
+cat > /etc/aide/aide.conf <<EOF
+# AIDE configuration
+
+# Database locations
+database=file:/var/lib/aide/aide.db
+database_out=file:/var/lib/aide/aide.db.new
+database_new=file:/var/lib/aide/aide.db.new
+
+# Report settings
+report_url=file:/var/log/aide/aide.log
+report_url=stdout
+
+# Rules
+All=R+b+sha256+sha512
+Norm=s+n+b+md5+sha256
+
+# Directories to monitor
+/etc All
+/bin All
+/sbin All
+/usr/bin All
+/usr/sbin All
+/lib All
+/lib64 All
+/opt/hft All
+
+# Exclude temporary directories
+!/tmp
+!/var/tmp
+!/var/log
+!/var/cache
+EOF
+
+# Initialize AIDE database
+aideinit
+
+# Copy database to active location
+cp /var/lib/aide/aide.db.new /var/lib/aide/aide.db
+
+# Daily AIDE check (add to crontab)
+echo "0 3 * * * /usr/bin/aide --check" >> /etc/crontab
+
+# Email alerts on changes
+cat > /etc/cron.daily/aide-check <<'EOF'
+#!/bin/bash
+/usr/bin/aide --check | mail -s "AIDE Report - $(hostname)" security@trading.com
+EOF
+
+chmod +x /etc/cron.daily/aide-check
+```
+
+7.2 SECURITY MONITORING DASHBOARD
+----------------------------------
+
+```python
+#!/usr/bin/env python3
+"""
+Real-time Security Monitoring Dashboard
+"""
+
+import psutil
+import time
+from datetime import datetime
+import json
+
+class SecurityMonitor:
+    """Monitor system security metrics"""
+
+    def __init__(self):
+        self.alerts = []
+
+    def check_failed_logins(self):
+        """Monitor failed SSH login attempts"""
+        failed_count = 0
+
+        with open('/var/log/auth.log', 'r') as f:
+            for line in f:
+                if 'Failed password' in line:
+                    failed_count += 1
+
+        if failed_count > 10:
+            self.alert('HIGH', f'{failed_count} failed login attempts detected')
+
+    def check_disk_usage(self):
+        """Monitor disk usage"""
+        for partition in psutil.disk_partitions():
+            usage = psutil.disk_usage(partition.mountpoint)
+            if usage.percent > 90:
+                self.alert('CRITICAL', f'Disk usage {usage.percent}% on {partition.mountpoint}')
+
+    def check_cpu_usage(self):
+        """Monitor CPU usage"""
+        cpu_percent = psutil.cpu_percent(interval=1)
+        if cpu_percent > 95:
+            self.alert('WARNING', f'High CPU usage: {cpu_percent}%')
+
+    def check_open_ports(self):
+        """Monitor unexpected open ports"""
+        expected_ports = {22, 443, 8080, 5432}
+        connections = psutil.net_connections(kind='inet')
+
+        listening_ports = set()
+        for conn in connections:
+            if conn.status == 'LISTEN':
+                listening_ports.add(conn.laddr.port)
+
+        unexpected = listening_ports - expected_ports
+        if unexpected:
+            self.alert('WARNING', f'Unexpected open ports: {unexpected}')
+
+    def check_process_anomalies(self):
+        """Monitor for suspicious processes"""
+        suspicious_names = ['nc', 'netcat', 'nmap', 'wireshark']
+
+        for proc in psutil.process_iter(['name', 'username']):
+            if proc.info['name'] in suspicious_names:
+                self.alert('CRITICAL',
+                          f'Suspicious process: {proc.info["name"]} by {proc.info["username"]}')
+
+    def alert(self, severity: str, message: str):
+        """Generate security alert"""
+        alert = {
+            'timestamp': datetime.now().isoformat(),
+            'severity': severity,
+            'message': message
+        }
+
+        self.alerts.append(alert)
+        print(f"[{severity}] {message}")
+
+        # Send to SIEM, Slack, PagerDuty, etc.
+
+    def run(self):
+        """Run monitoring loop"""
+        while True:
+            self.check_failed_logins()
+            self.check_disk_usage()
+            self.check_cpu_usage()
+            self.check_open_ports()
+            self.check_process_anomalies()
+
+            time.sleep(60)  # Check every minute
+
+if __name__ == '__main__':
+    monitor = SecurityMonitor()
+    monitor.run()
+```
+
+================================================================================
+8. BEST PRACTICES SUMMARY
+================================================================================
+
+1. KEEP SYSTEMS UPDATED
+   - Automatic security updates
+   - Regular patching schedule
+   - Test patches in staging first
+
+2. MINIMIZE ATTACK SURFACE
+   - Disable unnecessary services
+   - Remove unused packages
+   - Close unused ports
+
+3. IMPLEMENT DEFENSE IN DEPTH
+   - Multiple security layers
+   - Network segmentation
+   - Application-level security
+
+4. ENFORCE LEAST PRIVILEGE
+   - Minimal permissions for all accounts
+   - Separate admin and regular accounts
+   - Time-limited elevated access
+
+5. MONITOR AND AUDIT
+   - Comprehensive logging
+   - Real-time alerting
+   - Regular security audits
+
+6. ENCRYPT EVERYTHING
+   - Data at rest (disk encryption)
+   - Data in transit (TLS)
+   - Sensitive data in database (column encryption)
+
+7. REGULAR SECURITY TESTING
+   - Vulnerability scanning
+   - Penetration testing
+   - Code security reviews
+
+8. INCIDENT RESPONSE PLAN
+   - Documented procedures
+   - Regular drills
+   - Post-incident reviews
+
+================================================================================
+END OF DOCUMENT
+================================================================================

@@ -1,0 +1,1147 @@
+================================================================================
+SIMULATION ARCHITECTURE - EVENT-DRIVEN DESIGN
+High-Frequency Trading System Simulation Framework
+================================================================================
+
+VERSION: 1.0
+DOCUMENT: Simulation Architecture and Design Patterns
+LAST UPDATED: 2025-11-26
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+
+1. Architecture Overview
+2. Event-Driven Design Pattern
+3. Component Architecture
+4. Time Management System
+5. Memory Management
+6. Threading Model
+7. Performance Optimizations
+8. Complete Implementation Examples
+
+================================================================================
+1. ARCHITECTURE OVERVIEW
+================================================================================
+
+1.1 DESIGN PRINCIPLES
+---------------------
+
+The simulation architecture is built on these core principles:
+
+1. EVENT-DRIVEN: All actions triggered by discrete events
+2. DETERMINISTIC: Same inputs always produce same outputs
+3. MODULAR: Loosely coupled components with well-defined interfaces
+4. SCALABLE: Efficient handling of millions of events per second
+5. EXTENSIBLE: Easy to add new strategies, exchanges, and data sources
+
+1.2 ARCHITECTURAL LAYERS
+------------------------
+
+┌─────────────────────────────────────────────────────────────┐
+│                   APPLICATION LAYER                          │
+│  (Strategies, Risk Management, Portfolio Management)         │
+└────────────────────────────────┬────────────────────────────┘
+                                 │
+┌────────────────────────────────▼────────────────────────────┐
+│                   SIMULATION LAYER                           │
+│  (Event Engine, Time Management, Component Coordination)     │
+└────────────────────────────────┬────────────────────────────┘
+                                 │
+┌────────────────────────────────▼────────────────────────────┐
+│                   SERVICE LAYER                              │
+│  (Exchange Simulation, Data Replay, Latency Modeling)        │
+└────────────────────────────────┬────────────────────────────┘
+                                 │
+┌────────────────────────────────▼────────────────────────────┐
+│                   INFRASTRUCTURE LAYER                       │
+│  (Memory Management, Threading, I/O, Logging)                │
+└─────────────────────────────────────────────────────────────┘
+
+1.3 DATA FLOW DIAGRAM
+----------------------
+
+Market Data     Strategy          Exchange
+  Source         Input             Simulation
+    │              │                   │
+    │              │                   │
+    ▼              ▼                   ▼
+┌───────────────────────────────────────┐
+│       EVENT QUEUE (Priority)          │
+│  Sorted by: Timestamp, Priority       │
+└───────────────┬───────────────────────┘
+                │
+                ▼
+        ┌───────────────┐
+        │  EVENT LOOP   │
+        │  Dispatcher   │
+        └───┬───────────┘
+            │
+    ┌───────┼───────┐
+    ▼       ▼       ▼
+┌───────┐ ┌────┐ ┌──────┐
+│Market │ │Fill│ │Timer │
+│Data   │ │    │ │      │
+│Handler│ │Hndlr│ │Hndlr │
+└───────┘ └────┘ └──────┘
+
+================================================================================
+2. EVENT-DRIVEN DESIGN PATTERN
+================================================================================
+
+2.1 EVENT TYPES AND HIERARCHY
+------------------------------
+
+// Base event interface
+class IEvent {
+public:
+    virtual ~IEvent() = default;
+    virtual EventType getType() const = 0;
+    virtual uint64_t getTimestamp() const = 0;
+    virtual void* getPayload() = 0;
+};
+
+// Market data event
+struct MarketDataEvent : public IEvent {
+    uint64_t timestamp_ns;
+    char symbol[16];
+    double bid_price;
+    double ask_price;
+    uint32_t bid_size;
+    uint32_t ask_size;
+    uint64_t sequence_number;
+
+    EventType getType() const override { return EventType::MARKET_DATA; }
+    uint64_t getTimestamp() const override { return timestamp_ns; }
+    void* getPayload() override { return this; }
+};
+
+// Order event
+struct OrderEvent : public IEvent {
+    enum class Action { NEW, CANCEL, MODIFY };
+
+    uint64_t timestamp_ns;
+    Action action;
+    uint64_t order_id;
+    char symbol[16];
+    double price;
+    uint32_t quantity;
+    char side;  // 'B' or 'S'
+    char order_type;  // 'L' limit, 'M' market, 'S' stop
+
+    EventType getType() const override { return EventType::ORDER_NEW; }
+    uint64_t getTimestamp() const override { return timestamp_ns; }
+    void* getPayload() override { return this; }
+};
+
+// Fill event
+struct FillEvent : public IEvent {
+    uint64_t timestamp_ns;
+    uint64_t order_id;
+    uint64_t fill_id;
+    char symbol[16];
+    double price;
+    uint32_t quantity;
+    char side;
+    double commission;
+
+    EventType getType() const override { return EventType::FILL; }
+    uint64_t getTimestamp() const override { return timestamp_ns; }
+    void* getPayload() override { return this; }
+};
+
+2.2 EVENT QUEUE IMPLEMENTATION
+-------------------------------
+
+// High-performance lock-free event queue
+template<typename T>
+class LockFreeEventQueue {
+public:
+    LockFreeEventQueue(size_t capacity)
+        : capacity_(capacity), head_(0), tail_(0) {
+        buffer_ = new std::atomic<T*>[capacity];
+        for (size_t i = 0; i < capacity; ++i) {
+            buffer_[i].store(nullptr, std::memory_order_relaxed);
+        }
+    }
+
+    ~LockFreeEventQueue() {
+        delete[] buffer_;
+    }
+
+    bool push(T* item) {
+        size_t tail = tail_.load(std::memory_order_relaxed);
+        size_t next_tail = (tail + 1) % capacity_;
+
+        if (next_tail == head_.load(std::memory_order_acquire)) {
+            return false;  // Queue full
+        }
+
+        buffer_[tail].store(item, std::memory_order_release);
+        tail_.store(next_tail, std::memory_order_release);
+        return true;
+    }
+
+    T* pop() {
+        size_t head = head_.load(std::memory_order_relaxed);
+
+        if (head == tail_.load(std::memory_order_acquire)) {
+            return nullptr;  // Queue empty
+        }
+
+        T* item = buffer_[head].load(std::memory_order_acquire);
+        head_.store((head + 1) % capacity_, std::memory_order_release);
+        return item;
+    }
+
+    size_t size() const {
+        size_t head = head_.load(std::memory_order_acquire);
+        size_t tail = tail_.load(std::memory_order_acquire);
+        if (tail >= head) {
+            return tail - head;
+        }
+        return capacity_ - head + tail;
+    }
+
+    bool empty() const {
+        return head_.load(std::memory_order_acquire) ==
+               tail_.load(std::memory_order_acquire);
+    }
+
+private:
+    size_t capacity_;
+    std::atomic<T*>* buffer_;
+    std::atomic<size_t> head_;
+    std::atomic<size_t> tail_;
+
+    // Prevent false sharing
+    char padding_[64 - sizeof(std::atomic<size_t>) * 2];
+};
+
+2.3 EVENT DISPATCHER
+--------------------
+
+class EventDispatcher {
+public:
+    using HandlerFunc = std::function<void(const IEvent&)>;
+
+    void registerHandler(EventType type, HandlerFunc handler) {
+        handlers_[type].push_back(std::move(handler));
+    }
+
+    void dispatch(const IEvent& event) {
+        auto it = handlers_.find(event.getType());
+        if (it != handlers_.end()) {
+            for (auto& handler : it->second) {
+                handler(event);
+            }
+        }
+    }
+
+    void dispatch(const IEvent& event, EventType type) {
+        auto it = handlers_.find(type);
+        if (it != handlers_.end()) {
+            for (auto& handler : it->second) {
+                handler(event);
+            }
+        }
+    }
+
+private:
+    std::unordered_map<EventType, std::vector<HandlerFunc>> handlers_;
+};
+
+================================================================================
+3. COMPONENT ARCHITECTURE
+================================================================================
+
+3.1 COMPONENT INTERFACE
+------------------------
+
+class ISimulationComponent {
+public:
+    virtual ~ISimulationComponent() = default;
+
+    // Lifecycle methods
+    virtual void initialize(SimulationContext& ctx) = 0;
+    virtual void start() = 0;
+    virtual void stop() = 0;
+    virtual void shutdown() = 0;
+
+    // Event handling
+    virtual void onEvent(const IEvent& event) = 0;
+
+    // Time callbacks
+    virtual void onTimerTick(uint64_t timestamp_ns) = 0;
+
+    // State management
+    virtual ComponentState getState() const = 0;
+    virtual std::string getName() const = 0;
+};
+
+3.2 SIMULATION CONTEXT
+----------------------
+
+struct SimulationContext {
+    // Time management
+    uint64_t current_time_ns;
+    uint64_t start_time_ns;
+    uint64_t end_time_ns;
+
+    // Component registry
+    std::unordered_map<std::string, ISimulationComponent*> components;
+
+    // Event scheduling
+    std::function<void(SimulationEvent&&)> scheduleEvent;
+    std::function<void(uint64_t, std::function<void()>)> scheduleTimer;
+
+    // Market data access
+    std::function<MarketData(const std::string&)> getMarketData;
+
+    // Order management
+    std::function<uint64_t(const Order&)> submitOrder;
+    std::function<bool(uint64_t)> cancelOrder;
+
+    // Configuration
+    std::unordered_map<std::string, std::string> config;
+
+    // Statistics
+    SimulationStats* stats;
+
+    // Helper methods
+    template<typename T>
+    T* getComponent(const std::string& name) {
+        auto it = components.find(name);
+        if (it != components.end()) {
+            return dynamic_cast<T*>(it->second);
+        }
+        return nullptr;
+    }
+
+    void registerComponent(const std::string& name, ISimulationComponent* comp) {
+        components[name] = comp;
+    }
+};
+
+3.3 COMPONENT MANAGER
+----------------------
+
+class ComponentManager {
+public:
+    void addComponent(std::shared_ptr<ISimulationComponent> component) {
+        components_[component->getName()] = component;
+    }
+
+    void removeComponent(const std::string& name) {
+        components_.erase(name);
+    }
+
+    void initializeAll(SimulationContext& ctx) {
+        for (auto& [name, component] : components_) {
+            component->initialize(ctx);
+        }
+    }
+
+    void startAll() {
+        for (auto& [name, component] : components_) {
+            component->start();
+        }
+    }
+
+    void stopAll() {
+        for (auto& [name, component] : components_) {
+            component->stop();
+        }
+    }
+
+    void shutdownAll() {
+        for (auto& [name, component] : components_) {
+            component->shutdown();
+        }
+    }
+
+    void broadcastEvent(const IEvent& event) {
+        for (auto& [name, component] : components_) {
+            component->onEvent(event);
+        }
+    }
+
+    template<typename T>
+    std::shared_ptr<T> getComponent(const std::string& name) {
+        auto it = components_.find(name);
+        if (it != components_.end()) {
+            return std::dynamic_pointer_cast<T>(it->second);
+        }
+        return nullptr;
+    }
+
+private:
+    std::unordered_map<std::string, std::shared_ptr<ISimulationComponent>> components_;
+};
+
+================================================================================
+4. TIME MANAGEMENT SYSTEM
+================================================================================
+
+4.1 VIRTUAL TIME CONTROLLER
+----------------------------
+
+class VirtualTimeController {
+public:
+    enum class Mode {
+        REAL_TIME,      // 1:1 with wall clock
+        FAST_FORWARD,   // As fast as possible
+        FIXED_RATE      // Fixed multiplier
+    };
+
+    VirtualTimeController(Mode mode = Mode::FAST_FORWARD)
+        : mode_(mode), speed_multiplier_(1.0),
+          current_virtual_time_(0), wall_clock_reference_(0) {}
+
+    void setMode(Mode mode) { mode_ = mode; }
+    void setSpeedMultiplier(double multiplier) { speed_multiplier_ = multiplier; }
+
+    uint64_t getCurrentTime() const {
+        return current_virtual_time_.load(std::memory_order_acquire);
+    }
+
+    void advanceTo(uint64_t target_time_ns) {
+        if (mode_ == Mode::REAL_TIME) {
+            // Wait for real time to catch up
+            uint64_t wall_clock_now = getWallClockTime();
+            uint64_t wall_clock_target = wall_clock_reference_ +
+                (target_time_ns - current_virtual_time_) / speed_multiplier_;
+
+            if (wall_clock_target > wall_clock_now) {
+                uint64_t sleep_ns = wall_clock_target - wall_clock_now;
+                std::this_thread::sleep_for(std::chrono::nanoseconds(sleep_ns));
+            }
+        } else if (mode_ == Mode::FIXED_RATE) {
+            // Sleep proportionally to virtual time advance
+            uint64_t virtual_advance = target_time_ns - current_virtual_time_;
+            uint64_t sleep_ns = virtual_advance / speed_multiplier_;
+            if (sleep_ns > 0) {
+                std::this_thread::sleep_for(std::chrono::nanoseconds(sleep_ns));
+            }
+        }
+        // FAST_FORWARD mode: no waiting
+
+        current_virtual_time_.store(target_time_ns, std::memory_order_release);
+    }
+
+    void reset(uint64_t start_time_ns) {
+        current_virtual_time_ = start_time_ns;
+        wall_clock_reference_ = getWallClockTime();
+    }
+
+private:
+    Mode mode_;
+    double speed_multiplier_;
+    std::atomic<uint64_t> current_virtual_time_;
+    uint64_t wall_clock_reference_;
+
+    uint64_t getWallClockTime() const {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()
+        ).count();
+    }
+};
+
+4.2 TIMER MANAGEMENT
+--------------------
+
+class TimerManager {
+public:
+    using TimerCallback = std::function<void()>;
+
+    struct Timer {
+        uint64_t id;
+        uint64_t next_trigger_time_ns;
+        uint64_t interval_ns;  // 0 for one-shot
+        TimerCallback callback;
+        bool active;
+
+        bool operator>(const Timer& other) const {
+            return next_trigger_time_ns > other.next_trigger_time_ns;
+        }
+    };
+
+    uint64_t addTimer(uint64_t trigger_time_ns, TimerCallback callback) {
+        return addTimer(trigger_time_ns, 0, std::move(callback));
+    }
+
+    uint64_t addTimer(uint64_t trigger_time_ns, uint64_t interval_ns,
+                     TimerCallback callback) {
+        Timer timer;
+        timer.id = next_timer_id_++;
+        timer.next_trigger_time_ns = trigger_time_ns;
+        timer.interval_ns = interval_ns;
+        timer.callback = std::move(callback);
+        timer.active = true;
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        timers_.push(timer);
+        return timer.id;
+    }
+
+    void cancelTimer(uint64_t timer_id) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        cancelled_timers_.insert(timer_id);
+    }
+
+    void processTimers(uint64_t current_time_ns) {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        while (!timers_.empty() &&
+               timers_.top().next_trigger_time_ns <= current_time_ns) {
+            Timer timer = timers_.top();
+            timers_.pop();
+
+            // Skip cancelled timers
+            if (cancelled_timers_.count(timer.id)) {
+                cancelled_timers_.erase(timer.id);
+                continue;
+            }
+
+            // Execute callback
+            timer.callback();
+
+            // Reschedule if periodic
+            if (timer.interval_ns > 0) {
+                timer.next_trigger_time_ns += timer.interval_ns;
+                timers_.push(timer);
+            }
+        }
+    }
+
+    uint64_t getNextTimerTime() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (timers_.empty()) {
+            return UINT64_MAX;
+        }
+        return timers_.top().next_trigger_time_ns;
+    }
+
+private:
+    std::priority_queue<Timer, std::vector<Timer>, std::greater<Timer>> timers_;
+    std::unordered_set<uint64_t> cancelled_timers_;
+    std::atomic<uint64_t> next_timer_id_{1};
+    mutable std::mutex mutex_;
+};
+
+================================================================================
+5. MEMORY MANAGEMENT
+================================================================================
+
+5.1 MEMORY POOL ALLOCATOR
+--------------------------
+
+template<typename T, size_t PoolSize = 10000>
+class MemoryPool {
+public:
+    MemoryPool() : next_free_(0) {
+        pool_.reserve(PoolSize);
+        for (size_t i = 0; i < PoolSize; ++i) {
+            pool_.emplace_back();
+            free_list_.push_back(i);
+        }
+    }
+
+    T* allocate() {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        if (free_list_.empty()) {
+            // Expand pool
+            size_t old_size = pool_.size();
+            pool_.resize(old_size + PoolSize);
+            for (size_t i = old_size; i < pool_.size(); ++i) {
+                free_list_.push_back(i);
+            }
+        }
+
+        size_t idx = free_list_.back();
+        free_list_.pop_back();
+        return &pool_[idx];
+    }
+
+    void deallocate(T* ptr) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        size_t idx = ptr - &pool_[0];
+        if (idx < pool_.size()) {
+            free_list_.push_back(idx);
+        }
+    }
+
+    // Batch allocation for better performance
+    std::vector<T*> allocateBatch(size_t count) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<T*> result;
+        result.reserve(count);
+
+        for (size_t i = 0; i < count; ++i) {
+            if (free_list_.empty()) {
+                size_t old_size = pool_.size();
+                pool_.resize(old_size + PoolSize);
+                for (size_t j = old_size; j < pool_.size(); ++j) {
+                    free_list_.push_back(j);
+                }
+            }
+
+            size_t idx = free_list_.back();
+            free_list_.pop_back();
+            result.push_back(&pool_[idx]);
+        }
+
+        return result;
+    }
+
+private:
+    std::vector<T> pool_;
+    std::vector<size_t> free_list_;
+    size_t next_free_;
+    std::mutex mutex_;
+};
+
+5.2 ZERO-COPY MESSAGE PASSING
+------------------------------
+
+template<typename T>
+class ZeroCopyChannel {
+public:
+    ZeroCopyChannel(size_t capacity) : buffer_(capacity) {}
+
+    // Producer side - get pointer to write location
+    T* getWriteSlot() {
+        size_t write_idx = write_index_.load(std::memory_order_relaxed);
+        size_t next_write = (write_idx + 1) % buffer_.size();
+
+        // Check if buffer is full
+        if (next_write == read_index_.load(std::memory_order_acquire)) {
+            return nullptr;
+        }
+
+        return &buffer_[write_idx];
+    }
+
+    // Producer commits write
+    void commitWrite() {
+        size_t write_idx = write_index_.load(std::memory_order_relaxed);
+        write_index_.store((write_idx + 1) % buffer_.size(),
+                          std::memory_order_release);
+    }
+
+    // Consumer side - get pointer to read location
+    const T* getReadSlot() {
+        size_t read_idx = read_index_.load(std::memory_order_relaxed);
+
+        // Check if buffer is empty
+        if (read_idx == write_index_.load(std::memory_order_acquire)) {
+            return nullptr;
+        }
+
+        return &buffer_[read_idx];
+    }
+
+    // Consumer commits read
+    void commitRead() {
+        size_t read_idx = read_index_.load(std::memory_order_relaxed);
+        read_index_.store((read_idx + 1) % buffer_.size(),
+                         std::memory_order_release);
+    }
+
+private:
+    std::vector<T> buffer_;
+    std::atomic<size_t> write_index_{0};
+    std::atomic<size_t> read_index_{0};
+};
+
+================================================================================
+6. THREADING MODEL
+================================================================================
+
+6.1 SINGLE-THREADED EVENT LOOP
+-------------------------------
+
+class SingleThreadedSimulation {
+public:
+    void run() {
+        is_running_ = true;
+
+        while (is_running_ && !event_queue_.empty()) {
+            // Get next event
+            SimulationEvent event = event_queue_.top();
+            event_queue_.pop();
+
+            // Advance virtual time
+            time_controller_.advanceTo(event.timestamp_ns);
+
+            // Process timers
+            timer_manager_.processTimers(event.timestamp_ns);
+
+            // Dispatch event
+            dispatchEvent(event);
+
+            // Update statistics
+            updateStats(event);
+        }
+    }
+
+private:
+    VirtualTimeController time_controller_;
+    TimerManager timer_manager_;
+    std::priority_queue<SimulationEvent,
+                       std::vector<SimulationEvent>,
+                       std::greater<SimulationEvent>> event_queue_;
+    bool is_running_;
+};
+
+6.2 MULTI-THREADED SIMULATION
+------------------------------
+
+class MultiThreadedSimulation {
+public:
+    MultiThreadedSimulation(size_t num_worker_threads = 4)
+        : num_workers_(num_worker_threads), stop_flag_(false) {
+        // Start worker threads
+        for (size_t i = 0; i < num_workers_; ++i) {
+            workers_.emplace_back(&MultiThreadedSimulation::workerThread, this);
+        }
+    }
+
+    ~MultiThreadedSimulation() {
+        stop_flag_ = true;
+        cv_.notify_all();
+        for (auto& worker : workers_) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+    }
+
+    void submitEvent(SimulationEvent&& event) {
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            event_queue_.push(std::move(event));
+        }
+        cv_.notify_one();
+    }
+
+private:
+    void workerThread() {
+        while (!stop_flag_) {
+            SimulationEvent event;
+
+            {
+                std::unique_lock<std::mutex> lock(queue_mutex_);
+                cv_.wait(lock, [this] {
+                    return !event_queue_.empty() || stop_flag_;
+                });
+
+                if (stop_flag_) break;
+
+                event = std::move(const_cast<SimulationEvent&>(event_queue_.top()));
+                event_queue_.pop();
+            }
+
+            // Process event
+            processEvent(event);
+        }
+    }
+
+    void processEvent(const SimulationEvent& event) {
+        // Event processing logic
+        dispatcher_.dispatch(event);
+    }
+
+    size_t num_workers_;
+    std::vector<std::thread> workers_;
+    std::atomic<bool> stop_flag_;
+
+    std::priority_queue<SimulationEvent,
+                       std::vector<SimulationEvent>,
+                       std::greater<SimulationEvent>> event_queue_;
+    std::mutex queue_mutex_;
+    std::condition_variable cv_;
+
+    EventDispatcher dispatcher_;
+};
+
+================================================================================
+7. PERFORMANCE OPTIMIZATIONS
+================================================================================
+
+7.1 CACHE-ALIGNED STRUCTURES
+-----------------------------
+
+// Ensure critical structures fit in cache lines
+struct alignas(64) CacheAlignedEvent {
+    uint64_t timestamp_ns;
+    uint32_t event_type;
+    uint32_t payload_size;
+    void* payload_ptr;
+    uint32_t sequence_number;
+    uint32_t padding;  // Align to 64 bytes
+};
+
+7.2 SIMD-OPTIMIZED CALCULATIONS
+--------------------------------
+
+#include <immintrin.h>
+
+// Vectorized price calculation
+void calculatePnL_SIMD(const double* prices, const double* positions,
+                      double* pnl, size_t count) {
+    size_t i = 0;
+
+    // Process 4 doubles at a time using AVX
+    for (; i + 4 <= count; i += 4) {
+        __m256d price_vec = _mm256_loadu_pd(&prices[i]);
+        __m256d pos_vec = _mm256_loadu_pd(&positions[i]);
+        __m256d result = _mm256_mul_pd(price_vec, pos_vec);
+        _mm256_storeu_pd(&pnl[i], result);
+    }
+
+    // Handle remaining elements
+    for (; i < count; ++i) {
+        pnl[i] = prices[i] * positions[i];
+    }
+}
+
+7.3 BRANCH PREDICTION HINTS
+----------------------------
+
+// Hot path optimization
+inline void processMarketData(const MarketDataEvent& event) {
+    // Likely to have valid data
+    if (__builtin_expect(event.bid_price > 0, 1)) {
+        // Fast path
+        updateOrderBook(event);
+    } else {
+        // Unlikely error path
+        handleInvalidData(event);
+    }
+}
+
+7.4 PREFETCHING
+---------------
+
+// Prefetch next events during processing
+void processEventBatch(const std::vector<SimulationEvent*>& events) {
+    for (size_t i = 0; i < events.size(); ++i) {
+        // Prefetch next event while processing current
+        if (i + 1 < events.size()) {
+            __builtin_prefetch(events[i + 1], 0, 3);
+        }
+
+        processEvent(*events[i]);
+    }
+}
+
+================================================================================
+8. COMPLETE IMPLEMENTATION EXAMPLE
+================================================================================
+
+File: src/simulation_engine.cpp
+
+#include "simulation_engine.hpp"
+#include <algorithm>
+#include <stdexcept>
+
+namespace hft {
+namespace simulation {
+
+SimulationEngine::SimulationEngine(const SimulationConfig& config)
+    : config_(config) {
+    if (config_.deterministic) {
+        srand(config_.random_seed);
+    }
+}
+
+SimulationEngine::~SimulationEngine() {
+    if (is_running_) {
+        stop();
+    }
+}
+
+void SimulationEngine::setConfig(const SimulationConfig& config) {
+    if (is_running_) {
+        throw std::runtime_error("Cannot change config while simulation is running");
+    }
+    config_ = config;
+}
+
+void SimulationEngine::setTimeRange(uint64_t start_ns, uint64_t end_ns) {
+    config_.start_time_ns = start_ns;
+    config_.end_time_ns = end_ns;
+    current_time_ns_ = start_ns;
+}
+
+void SimulationEngine::scheduleEvent(SimulationEvent&& event) {
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+
+    if (event_queue_.size() >= config_.max_event_queue_size) {
+        throw std::runtime_error("Event queue full");
+    }
+
+    event_queue_.push(std::move(event));
+    cv_.notify_one();
+}
+
+void SimulationEngine::scheduleTimer(uint64_t timestamp_ns,
+                                    std::function<void()> callback) {
+    SimulationEvent event;
+    event.timestamp_ns = timestamp_ns;
+    event.type = EventType::TIMER;
+    event.priority = EventPriority::NORMAL;
+    event.deleter = std::move(callback);
+
+    scheduleEvent(std::move(event));
+}
+
+void SimulationEngine::addEventHandler(EventType type,
+                                       std::function<void(const SimulationEvent&)> handler) {
+    handlers_[type].push_back(std::move(handler));
+}
+
+void SimulationEngine::run() {
+    if (is_running_) {
+        return;
+    }
+
+    is_running_ = true;
+    current_time_ns_ = config_.start_time_ns;
+    stats_.wall_clock_start_ns = getWallClockTime();
+    stats_.simulation_start_time_ns = current_time_ns_;
+
+    while (is_running_ && !event_queue_.empty()) {
+        // Check pause state
+        while (is_paused_ && is_running_) {
+            std::unique_lock<std::mutex> lock(queue_mutex_);
+            cv_.wait_for(lock, std::chrono::milliseconds(100));
+        }
+
+        if (!is_running_) break;
+
+        // Get next event
+        SimulationEvent event;
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            if (event_queue_.empty()) break;
+
+            event = std::move(const_cast<SimulationEvent&>(event_queue_.top()));
+            event_queue_.pop();
+        }
+
+        // Check time bounds
+        if (event.timestamp_ns > config_.end_time_ns) {
+            break;
+        }
+
+        // Time management
+        if (config_.time_mode == SimulationConfig::TimeMode::REAL_TIME) {
+            waitForRealTime(event.timestamp_ns);
+        } else if (config_.time_mode == SimulationConfig::TimeMode::FIXED_SPEED) {
+            // TODO: Implement fixed speed timing
+        }
+
+        // Update current time
+        current_time_ns_ = event.timestamp_ns;
+
+        // Process event
+        uint64_t start_processing = getWallClockTime();
+        processEvent(event);
+        uint64_t processing_time = getWallClockTime() - start_processing;
+
+        // Update statistics
+        updateStats(event, processing_time);
+    }
+
+    stats_.wall_clock_end_ns = getWallClockTime();
+    stats_.simulation_end_time_ns = current_time_ns_;
+    is_running_ = false;
+}
+
+void SimulationEngine::stop() {
+    is_running_ = false;
+    cv_.notify_all();
+}
+
+void SimulationEngine::pause() {
+    is_paused_ = true;
+}
+
+void SimulationEngine::resume() {
+    is_paused_ = false;
+    cv_.notify_all();
+}
+
+void SimulationEngine::reset() {
+    if (is_running_) {
+        stop();
+    }
+
+    // Clear event queue
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+    while (!event_queue_.empty()) {
+        event_queue_.pop();
+    }
+
+    // Reset state
+    current_time_ns_ = config_.start_time_ns;
+    resetStats();
+}
+
+void SimulationEngine::processEvent(const SimulationEvent& event) {
+    // Find and execute handlers for this event type
+    auto it = handlers_.find(event.type);
+    if (it != handlers_.end()) {
+        for (auto& handler : it->second) {
+            handler(event);
+        }
+    }
+
+    // Execute timer callback if present
+    if (event.type == EventType::TIMER && event.deleter) {
+        event.deleter();
+    }
+}
+
+void SimulationEngine::updateStats(const SimulationEvent& event,
+                                   uint64_t processing_time_ns) {
+    stats_.total_events_processed++;
+
+    switch (event.type) {
+        case EventType::MARKET_DATA:
+            stats_.market_data_events++;
+            break;
+        case EventType::ORDER_NEW:
+        case EventType::ORDER_CANCEL:
+        case EventType::ORDER_MODIFY:
+            stats_.order_events++;
+            break;
+        case EventType::FILL:
+            stats_.fill_events++;
+            break;
+        case EventType::TIMER:
+            stats_.timer_events++;
+            break;
+        default:
+            break;
+    }
+
+    // Update average processing time
+    double total_time = stats_.avg_event_processing_ns *
+                       (stats_.total_events_processed - 1);
+    stats_.avg_event_processing_ns =
+        (total_time + processing_time_ns) / stats_.total_events_processed;
+
+    // Update max processing time
+    if (processing_time_ns > stats_.max_event_processing_ns) {
+        stats_.max_event_processing_ns = processing_time_ns;
+    }
+}
+
+uint64_t SimulationEngine::getWallClockTime() const {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()
+    ).count();
+}
+
+void SimulationEngine::waitForRealTime(uint64_t target_time_ns) {
+    // Calculate wall clock time for target virtual time
+    uint64_t elapsed_virtual = target_time_ns - config_.start_time_ns;
+    uint64_t target_wall_clock = stats_.wall_clock_start_ns + elapsed_virtual;
+    uint64_t current_wall_clock = getWallClockTime();
+
+    if (target_wall_clock > current_wall_clock) {
+        uint64_t sleep_ns = target_wall_clock - current_wall_clock;
+        std::this_thread::sleep_for(std::chrono::nanoseconds(sleep_ns));
+    }
+}
+
+void SimulationEngine::resetStats() {
+    stats_ = SimulationStats();
+}
+
+size_t SimulationEngine::getEventQueueSize() const {
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+    return event_queue_.size();
+}
+
+} // namespace simulation
+} // namespace hft
+
+================================================================================
+USAGE EXAMPLE
+================================================================================
+
+#include "simulation_engine.hpp"
+#include <iostream>
+
+int main() {
+    using namespace hft::simulation;
+
+    // Configure simulation
+    SimulationConfig config;
+    config.time_mode = SimulationConfig::TimeMode::FAST_FORWARD;
+    config.start_time_ns = 1640000000000000000ULL;  // Example timestamp
+    config.end_time_ns = config.start_time_ns + 3600000000000ULL;  // 1 hour
+
+    // Create engine
+    SimulationEngine engine(config);
+
+    // Register event handlers
+    engine.addEventHandler(EventType::MARKET_DATA,
+        [](const SimulationEvent& event) {
+            auto* md = static_cast<MarketDataEvent*>(event.payload);
+            std::cout << "Market Data: " << md->symbol
+                     << " Bid: " << md->bid_price
+                     << " Ask: " << md->ask_price << std::endl;
+        });
+
+    engine.addEventHandler(EventType::FILL,
+        [](const SimulationEvent& event) {
+            auto* fill = static_cast<FillEvent*>(event.payload);
+            std::cout << "Fill: " << fill->symbol
+                     << " Price: " << fill->price
+                     << " Qty: " << fill->quantity << std::endl;
+        });
+
+    // Schedule some test events
+    MarketDataEvent md_event;
+    md_event.timestamp_ns = config.start_time_ns + 1000000;
+    strcpy(md_event.symbol, "AAPL");
+    md_event.bid_price = 150.00;
+    md_event.ask_price = 150.01;
+    md_event.bid_size = 100;
+    md_event.ask_size = 200;
+
+    SimulationEvent sim_event;
+    sim_event.timestamp_ns = md_event.timestamp_ns;
+    sim_event.type = EventType::MARKET_DATA;
+    sim_event.payload = &md_event;
+
+    engine.scheduleEvent(std::move(sim_event));
+
+    // Run simulation
+    std::cout << "Starting simulation..." << std::endl;
+    engine.run();
+    std::cout << "Simulation complete." << std::endl;
+
+    // Print statistics
+    const auto& stats = engine.getStats();
+    std::cout << "\nSimulation Statistics:" << std::endl;
+    std::cout << "Total events: " << stats.total_events_processed << std::endl;
+    std::cout << "Market data events: " << stats.market_data_events << std::endl;
+    std::cout << "Order events: " << stats.order_events << std::endl;
+    std::cout << "Fill events: " << stats.fill_events << std::endl;
+    std::cout << "Avg processing time: " << stats.avg_event_processing_ns << "ns" << std::endl;
+    std::cout << "Max processing time: " << stats.max_event_processing_ns << "ns" << std::endl;
+    std::cout << "Speed multiplier: " << stats.getSimulationSpeedMultiplier() << "x" << std::endl;
+
+    return 0;
+}
+
+================================================================================
+END OF DOCUMENT
+================================================================================

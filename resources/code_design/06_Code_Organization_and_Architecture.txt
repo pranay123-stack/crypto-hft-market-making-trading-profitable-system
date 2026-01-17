@@ -1,0 +1,765 @@
+================================================================================
+CODE ORGANIZATION AND ARCHITECTURE FOR HFT SYSTEMS
+================================================================================
+
+This document covers how to structure HFT C++ codebases for maintainability,
+performance, and scalability while maintaining ultra-low latency requirements.
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+1. Layer Architecture for HFT Systems
+2. Component Separation and Boundaries
+3. Header Organization and Compilation
+4. Namespace Design
+5. Build System Organization
+6. Testing Architecture
+7. Configuration Management
+8. Logging and Monitoring Structure
+9. Third-Party Library Integration
+10. Multi-Strategy Architecture
+
+================================================================================
+1. LAYER ARCHITECTURE FOR HFT SYSTEMS
+================================================================================
+
+THEORY:
+-------
+HFT systems benefit from a layered architecture that separates concerns while
+maintaining performance. Key layers:
+- Hardware/OS layer (kernel bypass, DPDK, etc.)
+- Transport layer (TCP, UDP, shared memory)
+- Protocol layer (FIX, OUCH, ITCH, etc.)
+- Business logic layer (strategies, risk, OMS)
+- API/Configuration layer
+
+PRINCIPLES:
+-----------
+1. Lower layers have no dependencies on upper layers
+2. Critical path bypasses unnecessary layers
+3. Each layer has clear performance contracts
+4. Minimize cross-layer communication overhead
+5. Use zero-copy techniques across layers
+
+COMPLETE HFT ARCHITECTURE EXAMPLE:
+----------------------------------
+
+/*
+Directory Structure:
+====================
+
+hft-system/
+├── src/
+│   ├── hardware/           # Layer 0: Hardware abstraction
+│   │   ├── cpu_affinity.hpp
+│   │   ├── memory.hpp
+│   │   ├── rdtsc.hpp
+│   │   └── numa.hpp
+│   │
+│   ├── network/            # Layer 1: Network transport
+│   │   ├── tcp_socket.hpp
+│   │   ├── udp_socket.hpp
+│   │   ├── multicast.hpp
+│   │   ├── kernel_bypass.hpp
+│   │   └── shared_memory.hpp
+│   │
+│   ├── protocols/          # Layer 2: Exchange protocols
+│   │   ├── fix/
+│   │   │   ├── fix_encoder.hpp
+│   │   │   ├── fix_decoder.hpp
+│   │   │   └── fix_session.hpp
+│   │   ├── ouch/
+│   │   │   ├── ouch_encoder.hpp
+│   │   │   └── ouch_decoder.hpp
+│   │   └── itch/
+│   │       └── itch_decoder.hpp
+│   │
+│   ├── market_data/        # Layer 3: Market data processing
+│   │   ├── order_book.hpp
+│   │   ├── market_data_handler.hpp
+│   │   ├── symbol_manager.hpp
+│   │   └── feed_handler.hpp
+│   │
+│   ├── orders/             # Layer 3: Order management
+│   │   ├── order.hpp
+│   │   ├── order_manager.hpp
+│   │   ├── execution_tracker.hpp
+│   │   └── order_router.hpp
+│   │
+│   ├── risk/               # Layer 3: Risk management
+│   │   ├── risk_checker.hpp
+│   │   ├── position_tracker.hpp
+│   │   └── limit_manager.hpp
+│   │
+│   ├── strategies/         # Layer 4: Trading strategies
+│   │   ├── strategy_interface.hpp
+│   │   ├── market_making.hpp
+│   │   ├── arbitrage.hpp
+│   │   └── momentum.hpp
+│   │
+│   ├── engine/             # Layer 5: Trading engine
+│   │   ├── trading_engine.hpp
+│   │   ├── event_loop.hpp
+│   │   └── strategy_runner.hpp
+│   │
+│   └── utils/              # Cross-cutting utilities
+│       ├── lock_free_queue.hpp
+│       ├── object_pool.hpp
+│       ├── logger.hpp
+│       └── config.hpp
+│
+├── include/                # Public headers
+├── tests/                  # Unit tests
+├── benchmarks/             # Performance benchmarks
+└── docs/                   # Documentation
+*/
+
+namespace hft {
+
+// ============================================================================
+// LAYER 0: Hardware Abstraction
+// ============================================================================
+
+namespace hardware {
+
+// cpu_affinity.hpp
+class CPUAffinity {
+public:
+    static bool pinToCPU(int cpu_id) noexcept;
+    static bool pinToCore(int core_id, int thread_id) noexcept;
+    static int getCurrentCPU() noexcept;
+};
+
+// memory.hpp
+template<typename T, size_t Alignment = 64>
+class AlignedAllocator {
+public:
+    using value_type = T;
+    T* allocate(size_t n);
+    void deallocate(T* p, size_t n) noexcept;
+};
+
+// rdtsc.hpp
+class Timestamp {
+public:
+    static inline uint64_t now() noexcept {
+        return __builtin_ia32_rdtsc();
+    }
+
+    static inline uint64_t nowNanoseconds() noexcept {
+        // Assumes TSC calibration done at startup
+        return __builtin_ia32_rdtsc() * ns_per_tick_;
+    }
+
+private:
+    static double ns_per_tick_;
+};
+
+} // namespace hardware
+
+// ============================================================================
+// LAYER 1: Network Transport
+// ============================================================================
+
+namespace network {
+
+// Base socket interface
+class ISocket {
+public:
+    virtual ~ISocket() = default;
+    virtual ssize_t send(const void* data, size_t len) noexcept = 0;
+    virtual ssize_t receive(void* buffer, size_t len) noexcept = 0;
+    virtual bool isConnected() const noexcept = 0;
+};
+
+// tcp_socket.hpp
+class TCPSocket : public ISocket {
+    int fd_;
+    bool connected_;
+
+public:
+    explicit TCPSocket(const char* host, uint16_t port);
+    ~TCPSocket() override;
+
+    ssize_t send(const void* data, size_t len) noexcept override;
+    ssize_t receive(void* buffer, size_t len) noexcept override;
+    bool isConnected() const noexcept override { return connected_; }
+
+    // Low-latency optimizations
+    void setNoDelay(bool enable) noexcept;
+    void setQuickAck(bool enable) noexcept;
+    void setNonBlocking(bool enable) noexcept;
+};
+
+// udp_socket.hpp
+class UDPSocket : public ISocket {
+    int fd_;
+    struct sockaddr_in addr_;
+
+public:
+    explicit UDPSocket(uint16_t port);
+    ~UDPSocket() override;
+
+    ssize_t send(const void* data, size_t len) noexcept override;
+    ssize_t receive(void* buffer, size_t len) noexcept override;
+    bool isConnected() const noexcept override { return true; }
+
+    // Multicast support
+    bool joinMulticastGroup(const char* group_ip) noexcept;
+};
+
+// kernel_bypass.hpp (using DPDK or similar)
+class KernelBypassSocket {
+    // Direct access to NIC, bypassing kernel
+    void* dpdk_port_;
+    uint16_t queue_id_;
+
+public:
+    explicit KernelBypassSocket(uint16_t port_id, uint16_t queue_id);
+
+    // Zero-copy send
+    bool sendZeroCopy(const void* data, size_t len) noexcept;
+
+    // Batch receive for efficiency
+    size_t receiveBatch(void** buffers, size_t max_packets) noexcept;
+};
+
+} // namespace network
+
+// ============================================================================
+// LAYER 2: Protocol Layer
+// ============================================================================
+
+namespace protocol {
+
+// Protocol interface
+class IProtocolEncoder {
+public:
+    virtual ~IProtocolEncoder() = default;
+    virtual size_t encode(const void* message, char* buffer,
+                         size_t buffer_size) const noexcept = 0;
+};
+
+class IProtocolDecoder {
+public:
+    virtual ~IProtocolDecoder() = default;
+    virtual bool decode(const char* buffer, size_t length) noexcept = 0;
+};
+
+// FIX protocol
+namespace fix {
+
+class FIXEncoder : public IProtocolEncoder {
+public:
+    size_t encode(const void* message, char* buffer,
+                 size_t buffer_size) const noexcept override;
+
+    // Specialized encode methods for performance
+    size_t encodeNewOrder(uint64_t order_id, const char* symbol,
+                         char side, int64_t quantity, double price,
+                         char* buffer, size_t buffer_size) const noexcept;
+
+    size_t encodeCancelRequest(uint64_t order_id, const char* orig_cl_ord_id,
+                              char* buffer, size_t buffer_size) const noexcept;
+};
+
+class FIXDecoder : public IProtocolDecoder {
+    // Parsed message data
+    struct ParsedMessage {
+        char msg_type[2];
+        char sender_comp_id[32];
+        char target_comp_id[32];
+        uint64_t msg_seq_num;
+        // ... other fields
+    };
+
+    ParsedMessage current_message_;
+
+public:
+    bool decode(const char* buffer, size_t length) noexcept override;
+
+    const ParsedMessage& getCurrentMessage() const noexcept {
+        return current_message_;
+    }
+};
+
+} // namespace fix
+
+// Binary protocol (OUCH, ITCH, etc.)
+namespace binary {
+
+template<typename MessageType>
+class BinaryEncoder : public IProtocolEncoder {
+public:
+    size_t encode(const void* message, char* buffer,
+                 size_t buffer_size) const noexcept override {
+        if (buffer_size < sizeof(MessageType)) return 0;
+        std::memcpy(buffer, message, sizeof(MessageType));
+        return sizeof(MessageType);
+    }
+};
+
+template<typename MessageType>
+class BinaryDecoder : public IProtocolDecoder {
+    MessageType current_message_;
+
+public:
+    bool decode(const char* buffer, size_t length) noexcept override {
+        if (length < sizeof(MessageType)) return false;
+        std::memcpy(&current_message_, buffer, sizeof(MessageType));
+        return true;
+    }
+
+    const MessageType& getCurrentMessage() const noexcept {
+        return current_message_;
+    }
+};
+
+} // namespace binary
+
+} // namespace protocol
+
+// ============================================================================
+// LAYER 3: Business Logic Components
+// ============================================================================
+
+namespace business {
+
+// Market data component
+class OrderBook {
+    // Order book implementation
+};
+
+class MarketDataHandler {
+    network::ISocket* socket_;
+    protocol::IProtocolDecoder* decoder_;
+    OrderBook* order_book_;
+
+public:
+    MarketDataHandler(network::ISocket* sock,
+                     protocol::IProtocolDecoder* dec,
+                     OrderBook* book)
+        : socket_(sock), decoder_(dec), order_book_(book) {}
+
+    void processIncomingData() noexcept;
+};
+
+// Order management component
+class OrderManager {
+    network::ISocket* socket_;
+    protocol::IProtocolEncoder* encoder_;
+
+public:
+    OrderManager(network::ISocket* sock, protocol::IProtocolEncoder* enc)
+        : socket_(sock), encoder_(enc) {}
+
+    bool submitOrder(uint64_t order_id, const char* symbol,
+                    char side, int64_t quantity, double price) noexcept;
+};
+
+// Risk component
+class RiskChecker {
+public:
+    bool checkPreTradeRisk(const Order& order) const noexcept;
+    bool checkPositionRisk(int64_t current_position,
+                          int64_t delta) const noexcept;
+};
+
+} // namespace business
+
+// ============================================================================
+// LAYER 4: Strategy Layer
+// ============================================================================
+
+namespace strategy {
+
+class IStrategy {
+public:
+    virtual ~IStrategy() = default;
+    virtual void onMarketData(const MarketData& data) noexcept = 0;
+    virtual void onOrderUpdate(const OrderUpdate& update) noexcept = 0;
+    virtual void onTimer(uint64_t timestamp_ns) noexcept = 0;
+};
+
+class MarketMakingStrategy : public IStrategy {
+    business::OrderBook* order_book_;
+    business::OrderManager* order_manager_;
+    business::RiskChecker* risk_checker_;
+
+public:
+    MarketMakingStrategy(business::OrderBook* ob,
+                        business::OrderManager* om,
+                        business::RiskChecker* rc)
+        : order_book_(ob), order_manager_(om), risk_checker_(rc) {}
+
+    void onMarketData(const MarketData& data) noexcept override;
+    void onOrderUpdate(const OrderUpdate& update) noexcept override;
+    void onTimer(uint64_t timestamp_ns) noexcept override;
+};
+
+} // namespace strategy
+
+// ============================================================================
+// LAYER 5: Engine/Application Layer
+// ============================================================================
+
+namespace engine {
+
+class TradingEngine {
+    // Hardware layer
+    hardware::CPUAffinity cpu_affinity_;
+
+    // Network layer
+    std::unique_ptr<network::ISocket> market_data_socket_;
+    std::unique_ptr<network::ISocket> order_socket_;
+
+    // Protocol layer
+    std::unique_ptr<protocol::IProtocolDecoder> md_decoder_;
+    std::unique_ptr<protocol::IProtocolEncoder> order_encoder_;
+
+    // Business layer
+    std::unique_ptr<business::OrderBook> order_book_;
+    std::unique_ptr<business::OrderManager> order_manager_;
+    std::unique_ptr<business::RiskChecker> risk_checker_;
+
+    // Strategy layer
+    std::unique_ptr<strategy::IStrategy> strategy_;
+
+    // Event loop
+    std::atomic<bool> running_{false};
+
+public:
+    TradingEngine();
+
+    void initialize();
+    void run();
+    void shutdown();
+
+private:
+    void eventLoop();
+    void processMarketData();
+    void processOrderUpdates();
+};
+
+} // namespace engine
+
+} // namespace hft
+
+// ============================================================================
+// USAGE EXAMPLE
+// ============================================================================
+
+/*
+int main() {
+    hft::engine::TradingEngine engine;
+
+    // Initialize all layers
+    engine.initialize();
+
+    // Run trading engine
+    engine.run();
+
+    // Shutdown gracefully
+    engine.shutdown();
+
+    return 0;
+}
+*/
+
+================================================================================
+2. COMPONENT SEPARATION AND BOUNDARIES
+================================================================================
+
+PRINCIPLES:
+-----------
+1. Single Responsibility: Each component does one thing
+2. Dependency Inversion: Depend on interfaces, not implementations
+3. Interface Segregation: Small, focused interfaces
+4. Explicit Dependencies: Constructor injection, no globals
+5. Clear Ownership: Use RAII and smart pointers
+
+EXAMPLE: Order Flow Component Separation
+-----------------------------------------
+
+namespace hft::components {
+
+// ============================================================================
+// Component 1: Order Validation
+// ============================================================================
+
+class IOrderValidator {
+public:
+    virtual ~IOrderValidator() = default;
+    virtual bool validate(const Order& order) const noexcept = 0;
+};
+
+class OrderValidator : public IOrderValidator {
+    double min_price_;
+    double max_price_;
+    int64_t max_quantity_;
+
+public:
+    OrderValidator(double min_p, double max_p, int64_t max_q)
+        : min_price_(min_p), max_price_(max_p), max_quantity_(max_q) {}
+
+    bool validate(const Order& order) const noexcept override {
+        return order.price >= min_price_ &&
+               order.price <= max_price_ &&
+               order.quantity > 0 &&
+               order.quantity <= max_quantity_;
+    }
+};
+
+// ============================================================================
+// Component 2: Risk Checking
+// ============================================================================
+
+class IRiskChecker {
+public:
+    virtual ~IRiskChecker() = default;
+    virtual bool checkRisk(const Order& order) const noexcept = 0;
+};
+
+class RiskChecker : public IRiskChecker {
+    int64_t position_limit_;
+    double value_limit_;
+    std::atomic<int64_t> current_position_{0};
+
+public:
+    explicit RiskChecker(int64_t pos_limit, double val_limit)
+        : position_limit_(pos_limit), value_limit_(val_limit) {}
+
+    bool checkRisk(const Order& order) const noexcept override {
+        int64_t new_position = current_position_.load(std::memory_order_acquire);
+        new_position += (order.side == 'B' ? order.quantity : -order.quantity);
+
+        if (std::abs(new_position) > position_limit_) {
+            return false;
+        }
+
+        double order_value = order.quantity * order.price;
+        return order_value <= value_limit_;
+    }
+
+    void updatePosition(int64_t delta) noexcept {
+        current_position_.fetch_add(delta, std::memory_order_acq_rel);
+    }
+};
+
+// ============================================================================
+// Component 3: Order Encoding
+// ============================================================================
+
+class IOrderEncoder {
+public:
+    virtual ~IOrderEncoder() = default;
+    virtual size_t encodeOrder(const Order& order, char* buffer,
+                              size_t size) const noexcept = 0;
+};
+
+class FIXOrderEncoder : public IOrderEncoder {
+public:
+    size_t encodeOrder(const Order& order, char* buffer,
+                      size_t size) const noexcept override {
+        return snprintf(buffer, size,
+            "35=D|55=%s|54=%c|38=%ld|40=2|44=%.2f|",
+            order.symbol, order.side, order.quantity, order.price);
+    }
+};
+
+// ============================================================================
+// Component 4: Network Sender
+// ============================================================================
+
+class INetworkSender {
+public:
+    virtual ~INetworkSender() = default;
+    virtual bool send(const char* data, size_t len) noexcept = 0;
+};
+
+class TCPSender : public INetworkSender {
+    int socket_fd_;
+
+public:
+    explicit TCPSender(int fd) : socket_fd_(fd) {}
+
+    bool send(const char* data, size_t len) noexcept override {
+        ssize_t sent = ::send(socket_fd_, data, len, MSG_DONTWAIT);
+        return sent == static_cast<ssize_t>(len);
+    }
+};
+
+// ============================================================================
+// Coordinator: Order Submission Pipeline
+// ============================================================================
+
+class OrderSubmissionPipeline {
+    IOrderValidator* validator_;
+    IRiskChecker* risk_checker_;
+    IOrderEncoder* encoder_;
+    INetworkSender* sender_;
+
+public:
+    // Explicit dependency injection
+    OrderSubmissionPipeline(IOrderValidator* validator,
+                           IRiskChecker* risk_checker,
+                           IOrderEncoder* encoder,
+                           INetworkSender* sender)
+        : validator_(validator)
+        , risk_checker_(risk_checker)
+        , encoder_(encoder)
+        , sender_(sender) {}
+
+    // Clear, linear pipeline
+    bool submitOrder(const Order& order) noexcept {
+        // Step 1: Validate
+        if (!validator_->validate(order)) {
+            return false;
+        }
+
+        // Step 2: Risk check
+        if (!risk_checker_->checkRisk(order)) {
+            return false;
+        }
+
+        // Step 3: Encode
+        char buffer[512];
+        size_t len = encoder_->encodeOrder(order, buffer, sizeof(buffer));
+        if (len == 0) {
+            return false;
+        }
+
+        // Step 4: Send
+        return sender_->send(buffer, len);
+    }
+};
+
+// ============================================================================
+// Component Assembly (Dependency Injection)
+// ============================================================================
+
+class OrderSubmissionFactory {
+public:
+    static std::unique_ptr<OrderSubmissionPipeline>
+    create(int socket_fd) {
+        // Create components
+        auto validator = std::make_unique<OrderValidator>(0.01, 100000.0, 1000000);
+        auto risk_checker = std::make_unique<RiskChecker>(10000, 1000000.0);
+        auto encoder = std::make_unique<FIXOrderEncoder>();
+        auto sender = std::make_unique<TCPSender>(socket_fd);
+
+        // Assemble pipeline
+        return std::make_unique<OrderSubmissionPipeline>(
+            validator.get(),
+            risk_checker.get(),
+            encoder.get(),
+            sender.get()
+        );
+    }
+};
+
+} // namespace hft::components
+
+BENEFITS:
+---------
+1. Easy to test each component in isolation
+2. Easy to swap implementations (e.g., FIX -> Binary)
+3. Clear performance boundaries
+4. Enables parallel development
+5. Easier to optimize individual components
+
+PERFORMANCE IMPACT:
+------------------
+- Interface overhead: Eliminated by compiler inlining
+- Virtual calls: ~5ns each (use CRTP to eliminate)
+- Component assembly: Zero runtime cost (done at startup)
+
+================================================================================
+3. HEADER ORGANIZATION AND COMPILATION
+================================================================================
+
+PRINCIPLES:
+-----------
+1. Minimize header dependencies
+2. Use forward declarations
+3. Separate interface from implementation
+4. Use include guards and #pragma once
+5. Organize headers by layer
+
+EXAMPLE HEADER STRUCTURE:
+--------------------------
+
+// order.hpp - Interface header (minimal dependencies)
+#pragma once
+
+#include <cstdint>  // Only include what's needed
+
+namespace hft {
+
+// Forward declarations
+class OrderManager;
+struct ExecutionReport;
+
+// Order structure (POD for cache friendliness)
+struct Order {
+    uint64_t order_id;
+    uint32_t symbol_id;
+    double price;
+    int64_t quantity;
+    char side;  // 'B' or 'S'
+    uint8_t status;
+
+    // Inline methods in header for inlining
+    constexpr bool isBuy() const noexcept { return side == 'B'; }
+    constexpr bool isSell() const noexcept { return side == 'S'; }
+};
+
+} // namespace hft
+
+// order_manager.hpp - Implementation header
+#pragma once
+
+#include "order.hpp"  // Include interface header
+#include <array>
+#include <atomic>
+
+namespace hft {
+
+class OrderManager {
+    static constexpr size_t MAX_ORDERS = 10000;
+    std::array<Order, MAX_ORDERS> orders_;
+    std::atomic<size_t> count_{0};
+
+public:
+    bool addOrder(const Order& order) noexcept;
+    Order* findOrder(uint64_t order_id) noexcept;
+
+    // Implementation in .cpp file
+    bool submitOrder(uint64_t order_id, uint32_t symbol_id,
+                    double price, int64_t quantity, char side);
+};
+
+} // namespace hft
+
+COMPILATION SPEED OPTIMIZATION:
+-------------------------------
+
+1. Precompiled Headers (PCH):
+   - Create pch.hpp with stable headers
+   - Include STL, boost, etc.
+   - Compile once, reuse across TUs
+
+2. Forward Declarations:
+   - Reduce header dependencies
+   - Faster incremental builds
+
+3. Template Separation:
+   - Explicit template instantiation
+   - Reduce template bloat
+
+4. Unity Builds:
+   - Combine .cpp files for release builds
+   - Better optimization across TUs
+
+This document continues with remaining sections on namespaces, build systems,
+testing, configuration, logging, and multi-strategy architecture...

@@ -1,0 +1,73 @@
+//! Binance client for multi-exchange system
+
+use super::{ExchangeClient, ExchangeError};
+use crate::core::types::*;
+use async_trait::async_trait;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+pub struct BinanceClient {
+    connected: AtomicBool,
+    latency_ns: AtomicU64,
+    testnet: bool,
+}
+
+impl BinanceClient {
+    pub fn new(testnet: bool) -> Self {
+        BinanceClient {
+            connected: AtomicBool::new(false),
+            latency_ns: AtomicU64::new(0),
+            testnet,
+        }
+    }
+}
+
+#[async_trait]
+impl ExchangeClient for BinanceClient {
+    fn id(&self) -> ExchangeId {
+        ExchangeId::Binance
+    }
+
+    fn name(&self) -> &str {
+        "Binance"
+    }
+
+    async fn connect(&mut self) -> Result<(), ExchangeError> {
+        tracing::info!("Connecting to Binance (testnet={})", self.testnet);
+        self.connected.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn disconnect(&mut self) -> Result<(), ExchangeError> {
+        self.connected.store(false, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::Relaxed)
+    }
+
+    async fn subscribe(&mut self, symbol: &Symbol) -> Result<(), ExchangeError> {
+        tracing::info!("Subscribing to {} on Binance", symbol);
+        Ok(())
+    }
+
+    async fn send_order(&self, order: &Order) -> Result<OrderId, ExchangeError> {
+        if !self.is_connected() {
+            return Err(ExchangeError::NotConnected);
+        }
+        // Simulated order send
+        Ok(order.id)
+    }
+
+    async fn cancel_order(&self, order_id: OrderId) -> Result<(), ExchangeError> {
+        if !self.is_connected() {
+            return Err(ExchangeError::NotConnected);
+        }
+        tracing::debug!("Canceling order {} on Binance", order_id);
+        Ok(())
+    }
+
+    fn get_latency(&self) -> Timestamp {
+        self.latency_ns.load(Ordering::Relaxed)
+    }
+}

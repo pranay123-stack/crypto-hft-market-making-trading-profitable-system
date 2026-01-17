@@ -1,0 +1,1157 @@
+================================================================================
+PERFORMANCE TESTING FOR HFT SYSTEMS
+Latency, Throughput, and Performance Benchmarking
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Performance Testing Overview
+2. Latency Benchmarking
+3. Throughput Testing
+4. Memory Performance
+5. CPU Profiling
+6. Lock Contention Analysis
+7. Cache Performance
+8. Network Performance
+9. End-to-End Performance Tests
+10. Performance Regression Testing
+
+================================================================================
+1. PERFORMANCE TESTING OVERVIEW
+================================================================================
+
+1.1 Performance Requirements for HFT
+-------------------------------------
+Order Processing Latency:
+- P50: < 10 microseconds
+- P99: < 50 microseconds
+- P99.9: < 100 microseconds
+
+Market Data Processing:
+- Tick-to-trade: < 5 microseconds
+- Order book update: < 1 microsecond
+
+Throughput:
+- Orders per second: > 100,000
+- Market data updates: > 1,000,000/sec
+- Memory allocations: Zero in hot path
+
+
+1.2 Performance Test Framework
+-------------------------------
+// include/performance/perf_test_framework.h
+#ifndef PERF_TEST_FRAMEWORK_H
+#define PERF_TEST_FRAMEWORK_H
+
+#include <chrono>
+#include <vector>
+#include <string>
+#include <functional>
+
+using namespace std::chrono;
+
+struct PerformanceResult {
+    std::string test_name;
+    size_t iterations;
+
+    long long min_ns;
+    long long p50_ns;
+    long long p95_ns;
+    long long p99_ns;
+    long long p999_ns;
+    long long max_ns;
+
+    double mean_ns;
+    double stddev_ns;
+
+    double operations_per_second;
+};
+
+class PerformanceTest {
+public:
+    PerformanceTest(const std::string& name, size_t warmup_iterations = 1000);
+
+    template<typename Func>
+    PerformanceResult benchmark(Func&& func, size_t iterations = 100000);
+
+    void printResults(const PerformanceResult& result);
+    void exportResults(const std::string& filename);
+
+private:
+    std::string name_;
+    size_t warmup_iterations_;
+    std::vector<PerformanceResult> results_;
+
+    void calculateStatistics(std::vector<long long>& timings, PerformanceResult& result);
+};
+
+#endif // PERF_TEST_FRAMEWORK_H
+
+
+1.3 Performance Test Implementation
+------------------------------------
+// src/performance/perf_test_framework.cpp
+#include "perf_test_framework.h"
+#include <algorithm>
+#include <numeric>
+#include <cmath>
+#include <iostream>
+#include <iomanip>
+
+PerformanceTest::PerformanceTest(const std::string& name, size_t warmup_iterations)
+    : name_(name), warmup_iterations_(warmup_iterations) {
+}
+
+template<typename Func>
+PerformanceResult PerformanceTest::benchmark(Func&& func, size_t iterations) {
+    PerformanceResult result;
+    result.test_name = name_;
+    result.iterations = iterations;
+
+    std::vector<long long> timings;
+    timings.reserve(iterations);
+
+    // Warmup phase
+    for (size_t i = 0; i < warmup_iterations_; ++i) {
+        func();
+    }
+
+    // Actual benchmarking
+    for (size_t i = 0; i < iterations; ++i) {
+        auto start = high_resolution_clock::now();
+        func();
+        auto end = high_resolution_clock::now();
+
+        auto duration = duration_cast<nanoseconds>(end - start).count();
+        timings.push_back(duration);
+    }
+
+    calculateStatistics(timings, result);
+    results_.push_back(result);
+
+    return result;
+}
+
+void PerformanceTest::calculateStatistics(
+    std::vector<long long>& timings,
+    PerformanceResult& result
+) {
+    std::sort(timings.begin(), timings.end());
+
+    result.min_ns = timings.front();
+    result.max_ns = timings.back();
+    result.p50_ns = timings[timings.size() / 2];
+    result.p95_ns = timings[timings.size() * 95 / 100];
+    result.p99_ns = timings[timings.size() * 99 / 100];
+    result.p999_ns = timings[timings.size() * 999 / 1000];
+
+    // Calculate mean
+    double sum = std::accumulate(timings.begin(), timings.end(), 0.0);
+    result.mean_ns = sum / timings.size();
+
+    // Calculate standard deviation
+    double sq_sum = 0.0;
+    for (auto timing : timings) {
+        sq_sum += (timing - result.mean_ns) * (timing - result.mean_ns);
+    }
+    result.stddev_ns = std::sqrt(sq_sum / timings.size());
+
+    // Operations per second
+    result.operations_per_second = 1e9 / result.mean_ns;
+}
+
+void PerformanceTest::printResults(const PerformanceResult& result) {
+    std::cout << "\n=== Performance Test: " << result.test_name << " ===" << std::endl;
+    std::cout << "Iterations: " << result.iterations << std::endl;
+    std::cout << std::fixed << std::setprecision(2);
+    std::cout << "Latency (nanoseconds):" << std::endl;
+    std::cout << "  Min:  " << result.min_ns << " ns" << std::endl;
+    std::cout << "  P50:  " << result.p50_ns << " ns" << std::endl;
+    std::cout << "  P95:  " << result.p95_ns << " ns" << std::endl;
+    std::cout << "  P99:  " << result.p99_ns << " ns" << std::endl;
+    std::cout << "  P99.9:" << result.p999_ns << " ns" << std::endl;
+    std::cout << "  Max:  " << result.max_ns << " ns" << std::endl;
+    std::cout << "  Mean: " << result.mean_ns << " ns (σ=" << result.stddev_ns << ")" << std::endl;
+    std::cout << "Throughput: " << result.operations_per_second << " ops/sec" << std::endl;
+}
+
+
+================================================================================
+2. LATENCY BENCHMARKING
+================================================================================
+
+2.1 Order Processing Latency Tests
+-----------------------------------
+// tests/performance/order_latency_test.cpp
+#include <gtest/gtest.h>
+#include "perf_test_framework.h"
+#include "order_manager.h"
+
+class OrderLatencyTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        order_manager_ = std::make_unique<OrderManager>();
+
+        // Prepare test order
+        test_order_.order_id = 1;
+        test_order_.symbol = "AAPL";
+        test_order_.side = OrderSide::BUY;
+        test_order_.price = 150.00;
+        test_order_.quantity = 100;
+        test_order_.order_type = OrderType::LIMIT;
+    }
+
+    std::unique_ptr<OrderManager> order_manager_;
+    Order test_order_;
+};
+
+TEST_F(OrderLatencyTest, OrderCreationLatency) {
+    PerformanceTest perf("Order Creation");
+
+    auto result = perf.benchmark([this]() {
+        Order order = test_order_;
+        order.order_id++;  // Unique ID
+    }, 1000000);
+
+    perf.printResults(result);
+
+    // Assertions for HFT requirements
+    EXPECT_LT(result.p99_ns, 100) << "Order creation P99 exceeds 100ns";
+}
+
+TEST_F(OrderLatencyTest, OrderValidationLatency) {
+    PerformanceTest perf("Order Validation");
+
+    auto result = perf.benchmark([this]() {
+        order_manager_->validateOrder(test_order_);
+    }, 1000000);
+
+    perf.printResults(result);
+
+    EXPECT_LT(result.p99_ns, 1000) << "Order validation P99 exceeds 1us";
+}
+
+TEST_F(OrderLatencyTest, OrderSubmissionLatency) {
+    PerformanceTest perf("Order Submission");
+
+    auto result = perf.benchmark([this]() {
+        Order order = test_order_;
+        order.order_id = rand();
+        order_manager_->submitOrder(order);
+    }, 100000);
+
+    perf.printResults(result);
+
+    EXPECT_LT(result.p50_ns, 10000) << "Order submission P50 exceeds 10us";
+    EXPECT_LT(result.p99_ns, 50000) << "Order submission P99 exceeds 50us";
+}
+
+TEST_F(OrderLatencyTest, CancelOrderLatency) {
+    PerformanceTest perf("Order Cancellation");
+
+    // Submit orders first
+    std::vector<uint64_t> order_ids;
+    for (int i = 0; i < 10000; ++i) {
+        Order order = test_order_;
+        order.order_id = i;
+        order_manager_->submitOrder(order);
+        order_ids.push_back(order.order_id);
+    }
+
+    size_t idx = 0;
+    auto result = perf.benchmark([&]() {
+        order_manager_->cancelOrder(order_ids[idx++ % order_ids.size()]);
+    }, 100000);
+
+    perf.printResults(result);
+
+    EXPECT_LT(result.p99_ns, 5000) << "Order cancel P99 exceeds 5us";
+}
+
+
+2.2 Market Data Processing Latency
+-----------------------------------
+// tests/performance/market_data_latency_test.cpp
+#include <gtest/gtest.h>
+#include "perf_test_framework.h"
+#include "market_data_handler.h"
+
+TEST(MarketDataLatency, QuoteProcessingLatency) {
+    MarketDataHandler handler;
+
+    Quote test_quote;
+    test_quote.symbol = "AAPL";
+    test_quote.bid_price = 150.00;
+    test_quote.ask_price = 150.05;
+    test_quote.bid_size = 1000;
+    test_quote.ask_size = 1000;
+
+    PerformanceTest perf("Quote Processing");
+
+    auto result = perf.benchmark([&]() {
+        test_quote.timestamp = high_resolution_clock::now();
+        handler.onQuoteUpdate(test_quote);
+    }, 1000000);
+
+    perf.printResults(result);
+
+    EXPECT_LT(result.p99_ns, 1000) << "Quote processing P99 exceeds 1us";
+}
+
+TEST(MarketDataLatency, OrderBookUpdateLatency) {
+    OrderBook book("AAPL");
+
+    PerformanceTest perf("Order Book Update");
+
+    int level = 0;
+    auto result = perf.benchmark([&]() {
+        double price = 150.00 + (level++ % 100) * 0.01;
+        book.addBid(price, 100);
+    }, 1000000);
+
+    perf.printResults(result);
+
+    EXPECT_LT(result.p99_ns, 500) << "Order book update P99 exceeds 500ns";
+}
+
+TEST(MarketDataLatency, TickToTradeLatency) {
+    MarketDataHandler md_handler;
+    OrderManager order_manager;
+    Strategy* strategy = createTestStrategy();
+
+    Quote quote;
+    quote.symbol = "AAPL";
+    quote.bid_price = 150.00;
+    quote.ask_price = 150.05;
+
+    PerformanceTest perf("Tick-to-Trade");
+
+    auto result = perf.benchmark([&]() {
+        // Simulate full pipeline: quote -> strategy -> order
+        auto start = high_resolution_clock::now();
+
+        quote.timestamp = start;
+        md_handler.onQuoteUpdate(quote);
+
+        auto signal = strategy->processQuote(quote);
+        if (signal.has_value()) {
+            Order order = createOrderFromSignal(*signal);
+            order_manager.submitOrder(order);
+        }
+
+        // Measure end-to-end latency
+    }, 100000);
+
+    perf.printResults(result);
+
+    EXPECT_LT(result.p99_ns, 5000) << "Tick-to-trade P99 exceeds 5us";
+}
+
+
+2.3 Jitter Analysis
+-------------------
+TEST(LatencyTest, JitterAnalysis) {
+    OrderManager order_manager;
+    Order test_order;
+    test_order.symbol = "AAPL";
+    test_order.side = OrderSide::BUY;
+    test_order.quantity = 100;
+
+    std::vector<long long> latencies;
+
+    for (int i = 0; i < 100000; ++i) {
+        auto start = high_resolution_clock::now();
+        order_manager.submitOrder(test_order);
+        auto end = high_resolution_clock::now();
+
+        latencies.push_back(duration_cast<nanoseconds>(end - start).count());
+    }
+
+    // Calculate jitter (stddev of latencies)
+    double mean = std::accumulate(latencies.begin(), latencies.end(), 0.0) / latencies.size();
+    double sq_sum = 0.0;
+    for (auto lat : latencies) {
+        sq_sum += (lat - mean) * (lat - mean);
+    }
+    double jitter = std::sqrt(sq_sum / latencies.size());
+
+    std::cout << "Latency Jitter: " << jitter << " ns" << std::endl;
+    std::cout << "Coefficient of Variation: " << (jitter / mean) * 100 << "%" << std::endl;
+
+    // Jitter should be low for predictable performance
+    EXPECT_LT(jitter / mean, 0.5) << "High jitter detected (>50% CV)";
+}
+
+
+================================================================================
+3. THROUGHPUT TESTING
+================================================================================
+
+3.1 Order Throughput Tests
+---------------------------
+// tests/performance/throughput_test.cpp
+#include <gtest/gtest.h>
+#include <atomic>
+#include <thread>
+
+TEST(ThroughputTest, OrderSubmissionThroughput) {
+    OrderManager order_manager;
+    std::atomic<uint64_t> orders_processed{0};
+
+    const int duration_seconds = 10;
+    const int num_threads = 4;
+
+    auto worker = [&]() {
+        Order order;
+        order.symbol = "AAPL";
+        order.side = OrderSide::BUY;
+        order.price = 150.00;
+        order.quantity = 100;
+
+        auto start = high_resolution_clock::now();
+        auto end = start + seconds(duration_seconds);
+
+        while (high_resolution_clock::now() < end) {
+            order.order_id = orders_processed.fetch_add(1);
+            order_manager.submitOrder(order);
+        }
+    };
+
+    std::vector<std::thread> threads;
+    auto test_start = high_resolution_clock::now();
+
+    for (int i = 0; i < num_threads; ++i) {
+        threads.emplace_back(worker);
+    }
+
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    auto test_end = high_resolution_clock::now();
+    double elapsed = duration_cast<milliseconds>(test_end - test_start).count() / 1000.0;
+
+    uint64_t total_orders = orders_processed.load();
+    double throughput = total_orders / elapsed;
+
+    std::cout << "Order Throughput Test Results:" << std::endl;
+    std::cout << "  Total Orders: " << total_orders << std::endl;
+    std::cout << "  Duration: " << elapsed << " seconds" << std::endl;
+    std::cout << "  Throughput: " << throughput << " orders/sec" << std::endl;
+
+    EXPECT_GT(throughput, 100000) << "Throughput below 100k orders/sec";
+}
+
+TEST(ThroughputTest, MarketDataThroughput) {
+    MarketDataHandler handler;
+    std::atomic<uint64_t> quotes_processed{0};
+
+    Quote test_quote;
+    test_quote.symbol = "AAPL";
+    test_quote.bid_price = 150.00;
+    test_quote.ask_price = 150.05;
+
+    const int duration_seconds = 5;
+
+    auto start = high_resolution_clock::now();
+    auto end = start + seconds(duration_seconds);
+
+    while (high_resolution_clock::now() < end) {
+        test_quote.timestamp = high_resolution_clock::now();
+        handler.onQuoteUpdate(test_quote);
+        quotes_processed++;
+    }
+
+    double elapsed = duration_seconds;
+    double throughput = quotes_processed.load() / elapsed;
+
+    std::cout << "Market Data Throughput: " << throughput << " quotes/sec" << std::endl;
+
+    EXPECT_GT(throughput, 1000000) << "Market data throughput below 1M quotes/sec";
+}
+
+
+3.2 Concurrent Processing Throughput
+-------------------------------------
+TEST(ThroughputTest, ConcurrentOrderProcessing) {
+    OrderManager order_manager;
+    const int num_producers = 4;
+    const int orders_per_producer = 100000;
+
+    std::atomic<int> orders_submitted{0};
+    std::atomic<int> orders_completed{0};
+
+    auto producer = [&](int id) {
+        for (int i = 0; i < orders_per_producer; ++i) {
+            Order order;
+            order.order_id = id * orders_per_producer + i;
+            order.symbol = "AAPL";
+            order.side = (i % 2 == 0) ? OrderSide::BUY : OrderSide::SELL;
+            order.price = 150.00 + (i % 100) * 0.01;
+            order.quantity = 100;
+
+            if (order_manager.submitOrder(order)) {
+                orders_submitted++;
+            }
+        }
+    };
+
+    auto start = high_resolution_clock::now();
+
+    std::vector<std::thread> threads;
+    for (int i = 0; i < num_producers; ++i) {
+        threads.emplace_back(producer, i);
+    }
+
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    auto end = high_resolution_clock::now();
+    double elapsed = duration_cast<milliseconds>(end - start).count() / 1000.0;
+
+    int total_orders = orders_submitted.load();
+    double throughput = total_orders / elapsed;
+
+    std::cout << "Concurrent Processing Results:" << std::endl;
+    std::cout << "  Orders Submitted: " << total_orders << std::endl;
+    std::cout << "  Time: " << elapsed << " seconds" << std::endl;
+    std::cout << "  Throughput: " << throughput << " orders/sec" << std::endl;
+
+    EXPECT_EQ(total_orders, num_producers * orders_per_producer);
+    EXPECT_GT(throughput, 50000);
+}
+
+
+================================================================================
+4. MEMORY PERFORMANCE
+================================================================================
+
+4.1 Memory Allocation Tests
+----------------------------
+// tests/performance/memory_perf_test.cpp
+#include <gtest/gtest.h>
+
+TEST(MemoryPerformance, ZeroAllocationInHotPath) {
+    // Use custom allocator that tracks allocations
+    AllocationTracker tracker;
+
+    OrderManager order_manager;
+    Order test_order;
+    test_order.symbol = "AAPL";
+    test_order.side = OrderSide::BUY;
+    test_order.quantity = 100;
+
+    // Reset allocation counter
+    tracker.reset();
+
+    // Execute hot path operations
+    for (int i = 0; i < 10000; ++i) {
+        test_order.order_id = i;
+        order_manager.submitOrder(test_order);
+    }
+
+    // Check allocations
+    size_t allocs = tracker.getAllocationCount();
+    size_t bytes = tracker.getBytesAllocated();
+
+    std::cout << "Allocations in hot path: " << allocs << std::endl;
+    std::cout << "Bytes allocated: " << bytes << std::endl;
+
+    EXPECT_EQ(allocs, 0) << "Memory allocations detected in hot path";
+}
+
+TEST(MemoryPerformance, ObjectPoolPerformance) {
+    // Test object pool vs standard allocation
+    const int iterations = 100000;
+
+    // Standard allocation
+    {
+        PerformanceTest perf("Standard Allocation");
+        auto result = perf.benchmark([&]() {
+            auto* order = new Order();
+            order->symbol = "AAPL";
+            delete order;
+        }, iterations);
+
+        perf.printResults(result);
+    }
+
+    // Object pool
+    {
+        ObjectPool<Order> pool(1000);
+        PerformanceTest perf("Object Pool");
+
+        auto result = perf.benchmark([&]() {
+            auto* order = pool.acquire();
+            order->symbol = "AAPL";
+            pool.release(order);
+        }, iterations);
+
+        perf.printResults(result);
+    }
+}
+
+TEST(MemoryPerformance, MemoryBandwidth) {
+    const size_t data_size = 1024 * 1024 * 100;  // 100 MB
+    std::vector<char> data(data_size);
+
+    PerformanceTest perf("Memory Bandwidth");
+
+    auto result = perf.benchmark([&]() {
+        // Sequential write
+        for (size_t i = 0; i < data_size; ++i) {
+            data[i] = static_cast<char>(i);
+        }
+    }, 100);
+
+    double bandwidth_mb = (data_size / (result.mean_ns / 1e9)) / (1024 * 1024);
+
+    std::cout << "Memory Bandwidth: " << bandwidth_mb << " MB/s" << std::endl;
+
+    EXPECT_GT(bandwidth_mb, 1000) << "Memory bandwidth below 1 GB/s";
+}
+
+
+================================================================================
+5. CPU PROFILING
+================================================================================
+
+5.1 CPU Profiling Integration
+------------------------------
+// include/performance/cpu_profiler.h
+#ifndef CPU_PROFILER_H
+#define CPU_PROFILER_H
+
+#include <string>
+#include <map>
+
+class CPUProfiler {
+public:
+    static CPUProfiler& getInstance();
+
+    void startProfiling(const std::string& name);
+    void stopProfiling(const std::string& name);
+
+    void printProfile();
+    void exportProfile(const std::string& filename);
+
+private:
+    CPUProfiler() = default;
+
+    struct ProfileData {
+        long long total_time_ns;
+        size_t call_count;
+    };
+
+    std::map<std::string, ProfileData> profiles_;
+};
+
+// RAII helper for profiling
+class ScopedProfile {
+public:
+    explicit ScopedProfile(const std::string& name)
+        : name_(name) {
+        CPUProfiler::getInstance().startProfiling(name_);
+    }
+
+    ~ScopedProfile() {
+        CPUProfiler::getInstance().stopProfiling(name_);
+    }
+
+private:
+    std::string name_;
+};
+
+#define PROFILE_SCOPE(name) ScopedProfile _profile_##__LINE__(name)
+
+#endif // CPU_PROFILER_H
+
+
+5.2 Using CPU Profiler
+-----------------------
+// Example usage in code
+void OrderManager::submitOrder(const Order& order) {
+    PROFILE_SCOPE("OrderManager::submitOrder");
+
+    // Validation
+    {
+        PROFILE_SCOPE("OrderValidation");
+        if (!validateOrder(order)) {
+            return;
+        }
+    }
+
+    // Risk check
+    {
+        PROFILE_SCOPE("RiskCheck");
+        if (!risk_manager_->checkOrder(order)) {
+            return;
+        }
+    }
+
+    // Send to exchange
+    {
+        PROFILE_SCOPE("ExchangeSend");
+        exchange_->sendOrder(order);
+    }
+}
+
+
+5.3 Performance Profiling Test
+-------------------------------
+TEST(CPUProfiling, ProfileOrderProcessing) {
+    OrderManager order_manager;
+
+    Order order;
+    order.symbol = "AAPL";
+    order.side = OrderSide::BUY;
+    order.quantity = 100;
+
+    // Run with profiling
+    for (int i = 0; i < 100000; ++i) {
+        order.order_id = i;
+        order_manager.submitOrder(order);
+    }
+
+    // Print profile
+    CPUProfiler::getInstance().printProfile();
+
+    // Example output:
+    // Function                          Calls    Total Time    Avg Time
+    // ----------------------------------------------------------------
+    // OrderManager::submitOrder         100000   450ms         4.5us
+    //   OrderValidation                 100000   50ms          0.5us
+    //   RiskCheck                       100000   100ms         1.0us
+    //   ExchangeSend                    100000   300ms         3.0us
+}
+
+
+================================================================================
+6. LOCK CONTENTION ANALYSIS
+================================================================================
+
+6.1 Lock-Free vs Locked Performance
+------------------------------------
+TEST(LockContention, CompareLockedVsLockFree) {
+    const int iterations = 1000000;
+    const int num_threads = 8;
+
+    // Test with mutex
+    {
+        std::mutex mtx;
+        int counter = 0;
+
+        auto worker = [&]() {
+            for (int i = 0; i < iterations / num_threads; ++i) {
+                std::lock_guard<std::mutex> lock(mtx);
+                counter++;
+            }
+        };
+
+        auto start = high_resolution_clock::now();
+
+        std::vector<std::thread> threads;
+        for (int i = 0; i < num_threads; ++i) {
+            threads.emplace_back(worker);
+        }
+        for (auto& t : threads) {
+            t.join();
+        }
+
+        auto end = high_resolution_clock::now();
+        auto duration = duration_cast<microseconds>(end - start).count();
+
+        std::cout << "Mutex-based: " << duration << " us" << std::endl;
+        std::cout << "  Throughput: " << (iterations * 1000000.0 / duration) << " ops/sec" << std::endl;
+    }
+
+    // Test with atomic (lock-free)
+    {
+        std::atomic<int> counter{0};
+
+        auto worker = [&]() {
+            for (int i = 0; i < iterations / num_threads; ++i) {
+                counter.fetch_add(1, std::memory_order_relaxed);
+            }
+        };
+
+        auto start = high_resolution_clock::now();
+
+        std::vector<std::thread> threads;
+        for (int i = 0; i < num_threads; ++i) {
+            threads.emplace_back(worker);
+        }
+        for (auto& t : threads) {
+            t.join();
+        }
+
+        auto end = high_resolution_clock::now();
+        auto duration = duration_cast<microseconds>(end - start).count();
+
+        std::cout << "Atomic (lock-free): " << duration << " us" << std::endl;
+        std::cout << "  Throughput: " << (iterations * 1000000.0 / duration) << " ops/sec" << std::endl;
+    }
+}
+
+
+6.2 Lock Contention Detector
+-----------------------------
+// include/performance/lock_detector.h
+#ifndef LOCK_DETECTOR_H
+#define LOCK_DETECTOR_H
+
+#include <mutex>
+#include <chrono>
+#include <map>
+
+class LockDetector {
+public:
+    static LockDetector& getInstance();
+
+    void recordLockAttempt(const std::string& lock_name);
+    void recordLockAcquired(const std::string& lock_name, long long wait_time_ns);
+    void recordLockReleased(const std::string& lock_name, long long hold_time_ns);
+
+    void printStatistics();
+
+private:
+    struct LockStats {
+        size_t attempts;
+        size_t acquisitions;
+        long long total_wait_time_ns;
+        long long total_hold_time_ns;
+        long long max_wait_time_ns;
+    };
+
+    std::map<std::string, LockStats> stats_;
+    std::mutex stats_mutex_;
+};
+
+// Instrumented mutex
+class InstrumentedMutex {
+public:
+    explicit InstrumentedMutex(const std::string& name) : name_(name) {}
+
+    void lock() {
+        auto start = std::chrono::high_resolution_clock::now();
+        LockDetector::getInstance().recordLockAttempt(name_);
+
+        mtx_.lock();
+
+        auto end = std::chrono::high_resolution_clock::now();
+        auto wait_time = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+        LockDetector::getInstance().recordLockAcquired(name_, wait_time);
+
+        lock_time_ = end;
+    }
+
+    void unlock() {
+        auto now = std::chrono::high_resolution_clock::now();
+        auto hold_time = std::chrono::duration_cast<std::chrono::nanoseconds>(now - lock_time_).count();
+        LockDetector::getInstance().recordLockReleased(name_, hold_time);
+
+        mtx_.unlock();
+    }
+
+private:
+    std::string name_;
+    std::mutex mtx_;
+    std::chrono::high_resolution_clock::time_point lock_time_;
+};
+
+#endif // LOCK_DETECTOR_H
+
+
+================================================================================
+7. CACHE PERFORMANCE
+================================================================================
+
+7.1 Cache-Friendly Data Structures
+-----------------------------------
+TEST(CachePerformance, ArrayOfStructsVsStructOfArrays) {
+    const size_t count = 1000000;
+
+    // Array of Structs (AoS)
+    struct Order_AoS {
+        uint64_t id;
+        double price;
+        int quantity;
+        char symbol[16];
+    };
+    std::vector<Order_AoS> aos(count);
+
+    // Struct of Arrays (SoA)
+    struct Orders_SoA {
+        std::vector<uint64_t> ids;
+        std::vector<double> prices;
+        std::vector<int> quantities;
+
+        Orders_SoA(size_t n) : ids(n), prices(n), quantities(n) {}
+    };
+    Orders_SoA soa(count);
+
+    // Test AoS performance (accessing only prices)
+    {
+        PerformanceTest perf("AoS Price Sum");
+        auto result = perf.benchmark([&]() {
+            double sum = 0.0;
+            for (const auto& order : aos) {
+                sum += order.price;
+            }
+            return sum;
+        }, 100);
+
+        perf.printResults(result);
+    }
+
+    // Test SoA performance
+    {
+        PerformanceTest perf("SoA Price Sum");
+        auto result = perf.benchmark([&]() {
+            double sum = 0.0;
+            for (auto price : soa.prices) {
+                sum += price;
+            }
+            return sum;
+        }, 100);
+
+        perf.printResults(result);
+    }
+}
+
+TEST(CachePerformance, CacheLinePadding) {
+    // Without padding (false sharing)
+    struct UnpaddedCounter {
+        alignas(64) std::atomic<int> count1{0};
+        std::atomic<int> count2{0};  // Likely same cache line
+    };
+
+    // With padding (no false sharing)
+    struct PaddedCounter {
+        alignas(64) std::atomic<int> count1{0};
+        char padding[64 - sizeof(std::atomic<int>)];
+        alignas(64) std::atomic<int> count2{0};
+    };
+
+    const int iterations = 10000000;
+
+    // Test unpadded
+    {
+        UnpaddedCounter counter;
+
+        auto start = high_resolution_clock::now();
+
+        std::thread t1([&]() {
+            for (int i = 0; i < iterations; ++i) {
+                counter.count1.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+
+        std::thread t2([&]() {
+            for (int i = 0; i < iterations; ++i) {
+                counter.count2.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+
+        t1.join();
+        t2.join();
+
+        auto end = high_resolution_clock::now();
+        auto duration = duration_cast<milliseconds>(end - start).count();
+
+        std::cout << "Unpadded (false sharing): " << duration << " ms" << std::endl;
+    }
+
+    // Test padded
+    {
+        PaddedCounter counter;
+
+        auto start = high_resolution_clock::now();
+
+        std::thread t1([&]() {
+            for (int i = 0; i < iterations; ++i) {
+                counter.count1.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+
+        std::thread t2([&]() {
+            for (int i = 0; i < iterations; ++i) {
+                counter.count2.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+
+        t1.join();
+        t2.join();
+
+        auto end = high_resolution_clock::now();
+        auto duration = duration_cast<milliseconds>(end - start).count();
+
+        std::cout << "Padded (no false sharing): " << duration << " ms" << std::endl;
+    }
+}
+
+
+================================================================================
+8. NETWORK PERFORMANCE
+================================================================================
+
+8.1 Network Latency Tests
+--------------------------
+TEST(NetworkPerformance, TCPLatency) {
+    // Measure TCP round-trip time
+    TCPClient client("localhost", 9999);
+
+    std::vector<long long> latencies;
+
+    for (int i = 0; i < 1000; ++i) {
+        auto start = high_resolution_clock::now();
+
+        client.send("PING");
+        std::string response = client.receive();
+
+        auto end = high_resolution_clock::now();
+        latencies.push_back(duration_cast<microseconds>(end - start).count());
+    }
+
+    std::sort(latencies.begin(), latencies.end());
+
+    std::cout << "TCP Latency:" << std::endl;
+    std::cout << "  P50: " << latencies[500] << " us" << std::endl;
+    std::cout << "  P99: " << latencies[990] << " us" << std::endl;
+}
+
+
+================================================================================
+9. END-TO-END PERFORMANCE TESTS
+================================================================================
+
+9.1 Complete Order Flow Performance
+------------------------------------
+TEST(EndToEnd, CompleteOrderFlowPerformance) {
+    // Set up complete trading system
+    auto market_data = std::make_shared<MarketDataHandler>();
+    auto order_manager = std::make_shared<OrderManager>();
+    auto risk_manager = std::make_shared<RiskManager>();
+    auto strategy = std::make_shared<TestStrategy>();
+
+    std::vector<long long> e2e_latencies;
+
+    for (int i = 0; i < 10000; ++i) {
+        // Simulate quote arrival
+        Quote quote;
+        quote.symbol = "AAPL";
+        quote.bid_price = 150.00;
+        quote.ask_price = 150.05;
+        quote.timestamp = high_resolution_clock::now();
+
+        auto start = quote.timestamp;
+
+        // Process through pipeline
+        market_data->onQuoteUpdate(quote);
+        auto signal = strategy->generateSignal(quote);
+
+        if (signal.has_value()) {
+            if (risk_manager->checkSignal(*signal)) {
+                Order order = createOrderFromSignal(*signal);
+                order_manager->submitOrder(order);
+
+                auto end = high_resolution_clock::now();
+                e2e_latencies.push_back(
+                    duration_cast<nanoseconds>(end - start).count()
+                );
+            }
+        }
+    }
+
+    if (!e2e_latencies.empty()) {
+        std::sort(e2e_latencies.begin(), e2e_latencies.end());
+
+        std::cout << "End-to-End Latency:" << std::endl;
+        std::cout << "  P50:  " << e2e_latencies[e2e_latencies.size()/2] << " ns" << std::endl;
+        std::cout << "  P99:  " << e2e_latencies[e2e_latencies.size()*99/100] << " ns" << std::endl;
+        std::cout << "  P99.9:" << e2e_latencies[e2e_latencies.size()*999/1000] << " ns" << std::endl;
+
+        EXPECT_LT(e2e_latencies[e2e_latencies.size()*99/100], 10000)
+            << "E2E P99 latency exceeds 10us";
+    }
+}
+
+
+================================================================================
+10. PERFORMANCE REGRESSION TESTING
+================================================================================
+
+10.1 Automated Performance Regression
+--------------------------------------
+# .github/workflows/perf_regression.yml
+name: Performance Regression Tests
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+jobs:
+  perf-test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Build with optimizations
+      run: |
+        mkdir build && cd build
+        cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_PERF_TESTS=ON ..
+        make -j$(nproc)
+
+    - name: Run performance tests
+      run: |
+        cd build
+        ./hft_perf_tests --gtest_output=json:perf_results.json
+
+    - name: Compare with baseline
+      run: |
+        python scripts/compare_perf.py \
+          perf_results.json \
+          baseline_perf.json \
+          --threshold 0.05  # 5% regression threshold
+
+    - name: Upload results
+      uses: actions/upload-artifact@v3
+      with:
+        name: perf-results
+        path: build/perf_results.json
+
+
+10.2 Performance Dashboard
+---------------------------
+// Generate performance report
+void generatePerformanceReport(const std::vector<PerformanceResult>& results) {
+    std::ofstream html("performance_report.html");
+
+    html << "<html><head><title>Performance Report</title></head><body>";
+    html << "<h1>HFT System Performance Report</h1>";
+    html << "<table border='1'>";
+    html << "<tr><th>Test</th><th>P50</th><th>P99</th><th>P99.9</th><th>Status</th></tr>";
+
+    for (const auto& result : results) {
+        bool pass = result.p99_ns < 50000;  // P99 < 50us
+
+        html << "<tr>";
+        html << "<td>" << result.test_name << "</td>";
+        html << "<td>" << result.p50_ns << " ns</td>";
+        html << "<td>" << result.p99_ns << " ns</td>";
+        html << "<td>" << result.p999_ns << " ns</td>";
+        html << "<td style='color:" << (pass ? "green" : "red") << "'>";
+        html << (pass ? "PASS" : "FAIL") << "</td>";
+        html << "</tr>";
+    }
+
+    html << "</table></body></html>";
+}
+
+
+================================================================================
+END OF PERFORMANCE TESTING
+================================================================================

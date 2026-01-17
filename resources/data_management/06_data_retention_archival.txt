@@ -1,0 +1,729 @@
+================================================================================
+DATA RETENTION AND ARCHIVAL FOR HFT SYSTEMS
+Lifecycle Management and Compliance
+================================================================================
+
+OVERVIEW
+--------
+This document covers comprehensive data retention and archival strategies for
+high-frequency trading systems, including regulatory compliance, storage
+optimization, and data lifecycle management.
+
+================================================================================
+1. DATA RETENTION POLICY
+================================================================================
+
+1.1 REGULATORY REQUIREMENTS
+----------------------------
+
+SEC Rule 17a-4 Requirements:
+- Order and execution records: 6 years
+- Trade confirmations: 3 years
+- Account statements: 6 years
+- Communications: 3 years
+- First 2 years: readily accessible
+
+MiFID II Requirements:
+- Order records: 5 years
+- Transaction reports: 5 years
+- Recording of telephone conversations: 5-7 years
+
+FINRA Requirements:
+- Order tickets: 3 years
+- Trade blotters: 6 years
+- Customer account records: 6 years after account closure
+
+1.2 DATA RETENTION TIERS
+-------------------------
+
+┌────────────────┬──────────────┬────────────────┬───────────────┐
+│  Data Type     │ Hot Storage  │ Warm Storage   │ Cold Storage  │
+├────────────────┼──────────────┼────────────────┼───────────────┤
+│ Tick Data      │ 7 days       │ 90 days        │ 2+ years      │
+│ Order Book     │ 7 days       │ 30 days        │ 1+ year       │
+│ Orders         │ 30 days      │ 1 year         │ 6+ years      │
+│ Executions     │ 30 days      │ 1 year         │ 6+ years      │
+│ Positions      │ 90 days      │ 2 years        │ 6+ years      │
+│ Performance    │ 90 days      │ 2 years        │ 10+ years     │
+│ Logs           │ 30 days      │ 90 days        │ 1+ year       │
+│ Audit Trail    │ 90 days      │ 1 year         │ 7+ years      │
+└────────────────┴──────────────┴────────────────┴───────────────┘
+
+Storage Characteristics:
+- Hot: NVMe SSD, < 1ms latency, immediate access
+- Warm: SSD/HDD, < 100ms latency, hourly access
+- Cold: Object storage (S3, Glacier), minutes latency, rare access
+
+================================================================================
+2. POSTGRESQL ARCHIVAL IMPLEMENTATION
+================================================================================
+
+2.1 PARTITION-BASED ARCHIVAL
+-----------------------------
+
+-- Create archive schema
+CREATE SCHEMA archive;
+
+-- Archive table for old orders
+CREATE TABLE archive.orders (LIKE orders INCLUDING ALL);
+
+-- Partition orders by month for easy archival
+CREATE TABLE orders_partitioned (
+    LIKE orders INCLUDING ALL
+) PARTITION BY RANGE (created_at);
+
+-- Archival function
+CREATE OR REPLACE FUNCTION archive_old_orders(p_cutoff_date DATE)
+RETURNS INTEGER AS $$
+DECLARE
+    v_rows_archived INTEGER;
+    v_partition_name TEXT;
+BEGIN
+    -- Find partitions to archive
+    FOR v_partition_name IN
+        SELECT tablename
+        FROM pg_tables
+        WHERE schemaname = 'public'
+          AND tablename LIKE 'orders_%'
+          AND tablename <= 'orders_' || TO_CHAR(p_cutoff_date, 'YYYY_MM')
+    LOOP
+        RAISE NOTICE 'Archiving partition: %', v_partition_name;
+
+        -- Move data to archive
+        EXECUTE format('
+            WITH archived AS (
+                DELETE FROM %I
+                RETURNING *
+            )
+            INSERT INTO archive.orders
+            SELECT * FROM archived
+        ', v_partition_name);
+
+        GET DIAGNOSTICS v_rows_archived = ROW_COUNT;
+
+        RAISE NOTICE 'Archived % rows from %', v_rows_archived, v_partition_name;
+
+        -- Detach and drop partition
+        EXECUTE format('ALTER TABLE orders_partitioned DETACH PARTITION %I', v_partition_name);
+        EXECUTE format('DROP TABLE %I', v_partition_name);
+    END LOOP;
+
+    RETURN v_rows_archived;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Compress archived data
+CREATE TABLE archive.orders_compressed (
+    LIKE archive.orders INCLUDING ALL
+) WITH (
+    autovacuum_enabled = false,
+    fillfactor = 100
+);
+
+-- Add compression
+ALTER TABLE archive.orders_compressed
+ALTER COLUMN order_data SET COMPRESSION lz4;
+
+2.2 EXPORT TO PARQUET FILES
+----------------------------
+
+-- Python script for exporting to Parquet
+import psycopg2
+import pyarrow as pa
+import pyarrow.parquet as pq
+from datetime import datetime, timedelta
+import os
+
+class OrderArchiver:
+    def __init__(self, db_conn_string, archive_path):
+        self.conn = psycopg2.connect(db_conn_string)
+        self.archive_path = archive_path
+
+    def archive_orders_to_parquet(self, start_date, end_date):
+        """Archive orders to Parquet files"""
+        
+        query = """
+            SELECT
+                order_id,
+                client_order_id,
+                account_id,
+                instrument_id,
+                strategy_id,
+                order_type,
+                side,
+                quantity,
+                price,
+                stop_price,
+                time_in_force,
+                filled_quantity,
+                avg_fill_price,
+                commission,
+                fees,
+                order_status,
+                exchange_order_id,
+                created_at,
+                submitted_at,
+                acknowledged_at,
+                filled_at,
+                cancelled_at
+            FROM orders
+            WHERE created_at >= %s AND created_at < %s
+            ORDER BY created_at
+        """
+
+        cursor = self.conn.cursor()
+        cursor.execute(query, (start_date, end_date))
+
+        # Fetch in chunks
+        chunk_size = 100000
+        chunk_num = 0
+
+        while True:
+            rows = cursor.fetchmany(chunk_size)
+            if not rows:
+                break
+
+            # Convert to PyArrow table
+            columns = [desc[0] for desc in cursor.description]
+            arrays = [pa.array([row[i] for row in rows]) 
+                     for i in range(len(columns))]
+
+            table = pa.Table.from_arrays(arrays, names=columns)
+
+            # Write to Parquet with compression
+            filename = f"orders_{start_date.strftime('%Y%m%d')}_chunk{chunk_num}.parquet"
+            filepath = os.path.join(self.archive_path, filename)
+
+            pq.write_table(
+                table,
+                filepath,
+                compression='snappy',
+                use_dictionary=True,
+                row_group_size=10000
+            )
+
+            print(f"Archived {len(rows)} orders to {filename}")
+            chunk_num += 1
+
+        cursor.close()
+
+    def archive_monthly_data(self, year, month):
+        """Archive full month of data"""
+        start_date = datetime(year, month, 1)
+        
+        if month == 12:
+            end_date = datetime(year + 1, 1, 1)
+        else:
+            end_date = datetime(year, month + 1, 1)
+
+        month_path = os.path.join(
+            self.archive_path,
+            f"{year}",
+            f"{month:02d}"
+        )
+        os.makedirs(month_path, exist_ok=True)
+
+        # Archive orders
+        self.archive_orders_to_parquet(start_date, end_date)
+
+        # Archive executions
+        self.archive_executions_to_parquet(start_date, end_date)
+
+        # Archive market data
+        self.archive_market_data_to_parquet(start_date, end_date)
+
+        print(f"Completed archival for {year}-{month:02d}")
+
+    def verify_archive(self, start_date, end_date):
+        """Verify archived data integrity"""
+        
+        # Count records in database
+        query = "SELECT COUNT(*) FROM orders WHERE created_at >= %s AND created_at < %s"
+        cursor = self.conn.cursor()
+        cursor.execute(query, (start_date, end_date))
+        db_count = cursor.fetchone()[0]
+
+        # Count records in Parquet files
+        parquet_count = 0
+        for filename in os.listdir(self.archive_path):
+            if filename.endswith('.parquet'):
+                filepath = os.path.join(self.archive_path, filename)
+                table = pq.read_table(filepath)
+                parquet_count += len(table)
+
+        if db_count == parquet_count:
+            print(f"Verification passed: {db_count} records")
+            return True
+        else:
+            print(f"Verification failed: DB={db_count}, Parquet={parquet_count}")
+            return False
+
+================================================================================
+3. TIMESCALEDB COMPRESSION AND RETENTION
+================================================================================
+
+3.1 NATIVE COMPRESSION
+-----------------------
+
+-- Enable compression on hypertables
+ALTER TABLE market_ohlcv SET (
+    timescaledb.compress,
+    timescaledb.compress_orderby = 'time DESC',
+    timescaledb.compress_segmentby = 'instrument_id'
+);
+
+-- Add compression policy (compress chunks older than 7 days)
+SELECT add_compression_policy('market_ohlcv', INTERVAL '7 days');
+
+-- Manual compression of specific chunks
+SELECT compress_chunk(chunk_schema => '_timescaledb_internal',
+                     chunk_name => '_hyper_1_1_chunk');
+
+-- Check compression status
+SELECT
+    hypertable_name,
+    chunk_name,
+    before_compression_total_bytes,
+    after_compression_total_bytes,
+    before_compression_total_bytes::FLOAT / 
+        after_compression_total_bytes::FLOAT AS compression_ratio
+FROM timescaledb_information.compressed_chunk_stats
+ORDER BY hypertable_name, chunk_name;
+
+3.2 DATA RETENTION POLICIES
+----------------------------
+
+-- Add retention policy (drop chunks older than 90 days)
+SELECT add_retention_policy('market_trades', INTERVAL '90 days');
+
+-- Different retention for different data types
+SELECT add_retention_policy('market_ohlcv', INTERVAL '2 years');
+SELECT add_retention_policy('market_order_book', INTERVAL '30 days');
+SELECT add_retention_policy('market_quotes', INTERVAL '90 days');
+
+-- Remove retention policy
+SELECT remove_retention_policy('market_trades');
+
+-- View active policies
+SELECT * FROM timescaledb_information.jobs
+WHERE proc_name IN ('policy_compression', 'policy_retention');
+
+3.3 CONTINUOUS AGGREGATES FOR HISTORICAL DATA
+----------------------------------------------
+
+-- Create continuous aggregate for monthly statistics
+CREATE MATERIALIZED VIEW market_ohlcv_monthly
+WITH (timescaledb.continuous) AS
+SELECT
+    time_bucket('1 month', time) AS month,
+    instrument_id,
+    first(open, time) AS open,
+    max(high) AS high,
+    min(low) AS low,
+    last(close, time) AS close,
+    sum(volume) AS volume,
+    sum(volume * vwap) / sum(volume) AS vwap
+FROM market_ohlcv
+GROUP BY month, instrument_id;
+
+-- Add refresh policy
+SELECT add_continuous_aggregate_policy('market_ohlcv_monthly',
+    start_offset => INTERVAL '3 months',
+    end_offset => INTERVAL '1 day',
+    schedule_interval => INTERVAL '1 day');
+
+-- Query historical data from aggregates
+SELECT * FROM market_ohlcv_monthly
+WHERE month >= '2023-01-01' AND instrument_id = 123
+ORDER BY month;
+
+================================================================================
+4. CLICKHOUSE TIERED STORAGE
+================================================================================
+
+4.1 TTL-BASED ARCHIVAL
+-----------------------
+
+-- Orders with TTL and tiered storage
+CREATE TABLE orders_tiered
+(
+    order_id UInt64,
+    account_id UInt32,
+    created_at DateTime,
+    order_data String
+)
+ENGINE = MergeTree()
+ORDER BY (account_id, created_at)
+TTL created_at + INTERVAL 30 DAY TO DISK 'warm',
+    created_at + INTERVAL 365 DAY TO DISK 'cold',
+    created_at + INTERVAL 2190 DAY DELETE;  -- 6 years
+
+-- Storage policy configuration (config.xml)
+<storage_configuration>
+    <disks>
+        <hot>
+            <path>/mnt/nvme/clickhouse/</path>
+        </hot>
+        <warm>
+            <path>/mnt/ssd/clickhouse/</path>
+        </warm>
+        <cold>
+            <type>s3</type>
+            <endpoint>https://s3.amazonaws.com/bucket/</endpoint>
+            <access_key_id>...</access_key_id>
+            <secret_access_key>...</secret_access_key>
+        </cold>
+    </disks>
+    <policies>
+        <tiered_storage>
+            <volumes>
+                <hot>
+                    <disk>hot</disk>
+                </hot>
+                <warm>
+                    <disk>warm</disk>
+                </warm>
+                <cold>
+                    <disk>cold</disk>
+                </cold>
+            </volumes>
+        </tiered_storage>
+    </policies>
+</storage_configuration>
+
+4.2 PARTITION MANAGEMENT
+-------------------------
+
+-- Partition by month
+CREATE TABLE market_trades_partitioned
+(
+    event_date Date,
+    event_time DateTime,
+    symbol String,
+    price Decimal64(8),
+    quantity Decimal64(8)
+)
+ENGINE = MergeTree()
+PARTITION BY toYYYYMM(event_date)
+ORDER BY (symbol, event_time);
+
+-- Drop old partitions
+ALTER TABLE market_trades_partitioned DROP PARTITION '202301';
+
+-- Detach partition (for archival)
+ALTER TABLE market_trades_partitioned DETACH PARTITION '202302';
+
+-- Attach partition (restore from archive)
+ALTER TABLE market_trades_partitioned ATTACH PARTITION '202302';
+
+-- Export partition to file
+SELECT * FROM market_trades_partitioned
+WHERE toYYYYMM(event_date) = 202303
+INTO OUTFILE '/archive/trades_202303.csv'
+FORMAT CSVWithNames;
+
+================================================================================
+5. OBJECT STORAGE INTEGRATION
+================================================================================
+
+5.1 AWS S3 ARCHIVAL
+-------------------
+
+import boto3
+import gzip
+import io
+from datetime import datetime
+
+class S3Archiver:
+    def __init__(self, bucket_name, region='us-east-1'):
+        self.s3_client = boto3.client('s3', region_name=region)
+        self.bucket_name = bucket_name
+
+    def upload_parquet(self, local_path, s3_key):
+        """Upload Parquet file to S3"""
+        
+        # Use Glacier Instant Retrieval for cold storage
+        self.s3_client.upload_file(
+            local_path,
+            self.bucket_name,
+            s3_key,
+            ExtraArgs={
+                'StorageClass': 'GLACIER_IR',
+                'ServerSideEncryption': 'AES256'
+            }
+        )
+
+        print(f"Uploaded {local_path} to s3://{self.bucket_name}/{s3_key}")
+
+    def upload_compressed_csv(self, data, s3_key):
+        """Upload compressed CSV to S3"""
+        
+        # Compress data
+        compressed = io.BytesIO()
+        with gzip.GzipFile(fileobj=compressed, mode='wb') as gz:
+            gz.write(data.encode('utf-8'))
+
+        compressed.seek(0)
+
+        # Upload
+        self.s3_client.put_object(
+            Bucket=self.bucket_name,
+            Key=s3_key,
+            Body=compressed.read(),
+            StorageClass='GLACIER_IR',
+            ServerSideEncryption='AES256',
+            ContentType='application/gzip',
+            ContentEncoding='gzip'
+        )
+
+    def archive_database_table(self, db_conn, table_name, date):
+        """Archive database table to S3"""
+        
+        query = f"""
+            COPY (
+                SELECT * FROM {table_name}
+                WHERE created_at::DATE = '{date}'
+            ) TO STDOUT WITH CSV HEADER
+        """
+
+        cursor = db_conn.cursor()
+        csv_buffer = io.StringIO()
+        cursor.copy_expert(query, csv_buffer)
+        csv_buffer.seek(0)
+
+        s3_key = f"archive/{table_name}/{date.year}/{date.month:02d}/{table_name}_{date}.csv.gz"
+        self.upload_compressed_csv(csv_buffer.read(), s3_key)
+
+    def set_lifecycle_policy(self):
+        """Configure S3 lifecycle policy"""
+        
+        lifecycle_config = {
+            'Rules': [
+                {
+                    'Id': 'Archive-to-Glacier-Deep',
+                    'Status': 'Enabled',
+                    'Transitions': [
+                        {
+                            'Days': 90,
+                            'StorageClass': 'GLACIER'
+                        },
+                        {
+                            'Days': 365,
+                            'StorageClass': 'DEEP_ARCHIVE'
+                        }
+                    ],
+                    'Expiration': {
+                        'Days': 2555  # 7 years
+                    }
+                }
+            ]
+        }
+
+        self.s3_client.put_bucket_lifecycle_configuration(
+            Bucket=self.bucket_name,
+            LifecycleConfiguration=lifecycle_config
+        )
+
+    def restore_from_glacier(self, s3_key, days=1):
+        """Restore object from Glacier"""
+        
+        self.s3_client.restore_object(
+            Bucket=self.bucket_name,
+            Key=s3_key,
+            RestoreRequest={
+                'Days': days,
+                'GlacierJobParameters': {
+                    'Tier': 'Standard'  # or 'Expedited' for faster retrieval
+                }
+            }
+        )
+
+        print(f"Restore initiated for {s3_key}")
+
+================================================================================
+6. COMPLIANCE AND AUDIT TRAIL
+================================================================================
+
+6.1 IMMUTABLE AUDIT LOG
+------------------------
+
+-- Create append-only audit table
+CREATE TABLE audit_trail (
+    audit_id BIGSERIAL PRIMARY KEY,
+    event_timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    event_type VARCHAR(50) NOT NULL,
+    user_id INTEGER,
+    account_id INTEGER,
+    entity_type VARCHAR(50),
+    entity_id BIGINT,
+    action VARCHAR(50) NOT NULL,
+    old_values JSONB,
+    new_values JSONB,
+    ip_address INET,
+    user_agent TEXT,
+    request_id UUID
+) PARTITION BY RANGE (event_timestamp);
+
+-- Prevent updates and deletes
+CREATE RULE no_update AS ON UPDATE TO audit_trail DO INSTEAD NOTHING;
+CREATE RULE no_delete AS ON DELETE TO audit_trail DO INSTEAD NOTHING;
+
+-- Trigger to log all order changes
+CREATE OR REPLACE FUNCTION log_order_changes()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF (TG_OP = 'INSERT') THEN
+        INSERT INTO audit_trail (
+            event_type, user_id, account_id, entity_type,
+            entity_id, action, new_values
+        ) VALUES (
+            'order', NEW.user_id, NEW.account_id, 'order',
+            NEW.order_id, 'INSERT', to_jsonb(NEW)
+        );
+        RETURN NEW;
+    ELSIF (TG_OP = 'UPDATE') THEN
+        INSERT INTO audit_trail (
+            event_type, user_id, account_id, entity_type,
+            entity_id, action, old_values, new_values
+        ) VALUES (
+            'order', NEW.user_id, NEW.account_id, 'order',
+            NEW.order_id, 'UPDATE', to_jsonb(OLD), to_jsonb(NEW)
+        );
+        RETURN NEW;
+    END IF;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER order_audit_trigger
+AFTER INSERT OR UPDATE ON orders
+FOR EACH ROW EXECUTE FUNCTION log_order_changes();
+
+6.2 WRITE-ONCE-READ-MANY (WORM) STORAGE
+----------------------------------------
+
+-- Use S3 Object Lock for WORM compliance
+import boto3
+
+def enable_s3_object_lock(bucket_name):
+    s3_client = boto3.client('s3')
+    
+    # Enable versioning (required for Object Lock)
+    s3_client.put_bucket_versioning(
+        Bucket=bucket_name,
+        VersioningConfiguration={'Status': 'Enabled'}
+    )
+    
+    # Enable Object Lock
+    s3_client.put_object_lock_configuration(
+        Bucket=bucket_name,
+        ObjectLockConfiguration={
+            'ObjectLockEnabled': 'Enabled',
+            'Rule': {
+                'DefaultRetention': {
+                    'Mode': 'COMPLIANCE',  # Cannot be deleted even by root
+                    'Years': 7
+                }
+            }
+        }
+    )
+
+def upload_with_retention(bucket_name, key, data):
+    s3_client = boto3.client('s3')
+    
+    from datetime import datetime, timedelta
+    retention_date = datetime.utcnow() + timedelta(days=2555)  # 7 years
+    
+    s3_client.put_object(
+        Bucket=bucket_name,
+        Key=key,
+        Body=data,
+        ObjectLockMode='COMPLIANCE',
+        ObjectLockRetainUntilDate=retention_date
+    )
+
+================================================================================
+7. AUTOMATED ARCHIVAL WORKFLOWS
+================================================================================
+
+7.1 CRON JOBS FOR ARCHIVAL
+---------------------------
+
+#!/bin/bash
+# /etc/cron.d/hft-archival
+
+# Daily archival of previous day's data (2 AM)
+0 2 * * * postgres /opt/hft/scripts/archive_daily.sh
+
+# Weekly compression of old chunks (Sunday 3 AM)
+0 3 * * 0 postgres /opt/hft/scripts/compress_chunks.sh
+
+# Monthly export to S3 (1st of month, 4 AM)
+0 4 1 * * postgres /opt/hft/scripts/export_to_s3.sh
+
+# Quarterly verification (1st day of quarter, 5 AM)
+0 5 1 1,4,7,10 * postgres /opt/hft/scripts/verify_archives.sh
+
+7.2 ARCHIVAL ORCHESTRATION
+---------------------------
+
+import schedule
+import time
+from datetime import datetime, timedelta
+
+class ArchivalOrchestrator:
+    def __init__(self):
+        self.db_archiver = DatabaseArchiver()
+        self.s3_archiver = S3Archiver('hft-archives')
+
+    def daily_archival(self):
+        """Archive yesterday's data"""
+        yesterday = datetime.now().date() - timedelta(days=1)
+        
+        print(f"Starting daily archival for {yesterday}")
+        
+        # Archive to local Parquet
+        self.db_archiver.archive_daily_data(yesterday)
+        
+        # Upload to S3
+        parquet_files = self.db_archiver.get_parquet_files(yesterday)
+        for file_path in parquet_files:
+            s3_key = f"daily/{yesterday.year}/{yesterday.month:02d}/{os.path.basename(file_path)}"
+            self.s3_archiver.upload_parquet(file_path, s3_key)
+        
+        # Verify and cleanup
+        if self.verify_archival(yesterday):
+            self.db_archiver.delete_archived_data(yesterday)
+            print(f"Completed archival for {yesterday}")
+        else:
+            print(f"Archival verification failed for {yesterday}")
+
+    def monthly_aggregation(self):
+        """Create monthly aggregates"""
+        last_month = datetime.now().replace(day=1) - timedelta(days=1)
+        
+        print(f"Creating monthly aggregates for {last_month.strftime('%Y-%m')}")
+        
+        # Generate aggregates
+        self.db_archiver.create_monthly_aggregates(
+            last_month.year, last_month.month
+        )
+
+    def run(self):
+        """Run archival orchestrator"""
+        
+        # Schedule jobs
+        schedule.every().day.at("02:00").do(self.daily_archival)
+        schedule.every().month.at("04:00").do(self.monthly_aggregation)
+        
+        while True:
+            schedule.run_pending()
+            time.sleep(60)
+
+if __name__ == "__main__":
+    orchestrator = ArchivalOrchestrator()
+    orchestrator.run()
+
+================================================================================
+END OF DATA RETENTION AND ARCHIVAL DOCUMENT
+================================================================================

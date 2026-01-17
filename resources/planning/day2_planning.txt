@@ -1,0 +1,1356 @@
+================================================================================
+DAY 2 PLANNING - SYSTEM OPTIMIZATION AND KERNEL-BYPASS SETUP
+================================================================================
+
+Date: Week 1, Day 2
+Phase: Foundation (Week 1-8)
+Status: Ready to Execute
+Critical Path: YES
+Dependencies: Day 1 completion (timing infrastructure)
+
+================================================================================
+DAILY OBJECTIVES
+================================================================================
+
+PRIMARY GOALS:
+--------------
+1. Optimize system for ultra-low latency operation
+2. Implement kernel-bypass networking (DPDK or OpenOnload)
+3. Configure CPU pinning and NUMA awareness
+4. Disable unnecessary system services and interrupts
+5. Create basic UDP echo server for network latency testing
+6. Establish network performance baseline
+
+SUCCESS CRITERIA:
+-----------------
+✓ CPU frequency scaling disabled, CPU in performance mode
+✓ Isolated CPU cores allocated for trading application
+✓ Kernel-bypass networking operational (DPDK or OpenOnload)
+✓ UDP echo test shows <5μs RTT on localhost
+✓ Network packet processing measured <500ns
+✓ IRQ affinity configured to non-trading cores
+✓ System tuning parameters documented
+
+DELIVERABLES:
+-------------
+- System tuning scripts (CPU, NUMA, IRQ)
+- Kernel-bypass installation and configuration
+- UDP echo server and client (kernel-bypass)
+- Network performance benchmark results
+- System configuration documentation
+- Tuning parameter reference guide
+
+================================================================================
+HOUR-BY-HOUR SCHEDULE
+================================================================================
+
+08:00 - 08:15 | DAILY STANDUP
+------------------------------
+Attendees: All Team Members
+Location: Team area / Video call
+
+Agenda:
+1. Review Day 1 accomplishments (5 min)
+   - Confirm all environment setups complete
+   - Verify timing infrastructure working
+   - Address any outstanding issues
+
+2. Day 2 objectives overview (5 min)
+   - System optimization tasks
+   - Kernel-bypass setup
+   - Network testing goals
+
+3. Task assignments (3 min)
+   - Confirm who is doing what
+   - Identify any skill gaps or concerns
+
+4. Questions and blockers (2 min)
+
+Action Items:
+- [ ] Confirm Day 1 completion status
+- [ ] Verify sudo/root access for system changes
+- [ ] Review backup plan if kernel-bypass fails
+
+08:15 - 10:00 | SYSTEM OPTIMIZATION SETUP
+------------------------------------------
+Responsible: DevOps Engineer, Senior Developers
+Support: Technical Lead
+
+Tasks:
+
+1. Disable CPU Frequency Scaling (20 min)
+
+   Modern CPUs dynamically adjust frequency for power saving, which introduces
+   latency jitter. We need constant, maximum performance.
+
+   ```bash
+   #!/bin/bash
+   # File: scripts/setup_cpu_performance.sh
+
+   # Check current CPU governor
+   echo "Current CPU governor:"
+   cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor | sort -u
+
+   # Install CPU power management tools
+   sudo apt install -y linux-tools-common linux-tools-generic cpufrequtils
+
+   # Set all CPUs to performance mode
+   echo "Setting performance mode..."
+   for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+       echo performance | sudo tee $cpu
+   done
+
+   # Disable turbo boost (reduces jitter)
+   echo "Disabling turbo boost..."
+   echo 1 | sudo tee /sys/devices/system/cpu/intel_pmu/freeze_on_smi
+   echo 0 | sudo tee /sys/devices/system/cpu/cpufreq/boost  # AMD
+   echo 1 | sudo tee /sys/devices/system/cpu/intel_pstate/no_turbo  # Intel
+
+   # Set minimum and maximum frequency to same value
+   sudo cpupower frequency-set -g performance
+
+   # Verify settings
+   echo "Verification:"
+   cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor | sort -u
+   cpupower frequency-info
+
+   # Make persistent across reboots
+   echo 'GOVERNOR="performance"' | sudo tee /etc/default/cpufrequtils
+   sudo systemctl disable ondemand
+   ```
+
+2. CPU Isolation and Pinning Configuration (30 min)
+
+   Isolate specific CPU cores for the trading application to eliminate
+   interference from other processes.
+
+   ```bash
+   #!/bin/bash
+   # File: scripts/setup_cpu_isolation.sh
+
+   # Identify CPU topology
+   echo "=== CPU Topology ==="
+   lscpu
+   echo ""
+   echo "=== NUMA Nodes ==="
+   numactl --hardware
+   echo ""
+   echo "=== Core Layout ==="
+   lstopo-no-graphics
+
+   # Example: 24-core system (0-23)
+   # Reserve cores 0-3 for OS, 4-23 for trading
+   # Cores 4-13 on NUMA node 0
+   # Cores 14-23 on NUMA node 1
+
+   # Edit GRUB configuration
+   sudo cp /etc/default/grub /etc/default/grub.backup
+
+   # Add isolcpus parameter
+   GRUB_CMDLINE="isolcpus=4-23 nohz_full=4-23 rcu_nocbs=4-23"
+   GRUB_CMDLINE="$GRUB_CMDLINE intel_pstate=disable intel_idle.max_cstate=0"
+   GRUB_CMDLINE="$GRUB_CMDLINE processor.max_cstate=0 idle=poll"
+   GRUB_CMDLINE="$GRUB_CMDLINE nosoftlockup tsc=reliable"
+
+   echo "Add this to GRUB_CMDLINE_LINUX in /etc/default/grub:"
+   echo "$GRUB_CMDLINE"
+
+   # Update GRUB (manual step - requires reboot)
+   echo "After editing /etc/default/grub, run:"
+   echo "  sudo update-grub"
+   echo "  sudo reboot"
+
+   # Note: System will require reboot for isolation to take effect
+   ```
+
+   File: scripts/verify_cpu_isolation.sh
+
+   ```bash
+   #!/bin/bash
+   # Verify CPU isolation after reboot
+
+   echo "=== Isolated CPUs ==="
+   cat /sys/devices/system/cpu/isolated
+
+   echo -e "\n=== Process Affinity on Isolated CPUs ==="
+   for cpu in {4..23}; do
+       count=$(ps -eLo psr | grep -c "^$cpu$")
+       echo "CPU $cpu: $count processes"
+   done
+
+   echo -e "\n=== IRQ Affinity ==="
+   for irq in /proc/irq/*/smp_affinity_list; do
+       echo "$irq: $(cat $irq)"
+   done
+   ```
+
+3. IRQ Affinity Configuration (25 min)
+
+   Move interrupt handling to non-trading cores to prevent interruptions.
+
+   ```bash
+   #!/bin/bash
+   # File: scripts/setup_irq_affinity.sh
+
+   # Find all IRQs
+   echo "=== Current IRQ Distribution ==="
+   cat /proc/interrupts | grep -E "CPU0|eth"
+
+   # Install irqbalance and stop it (we'll manually configure)
+   sudo apt install -y irqbalance
+   sudo systemctl stop irqbalance
+   sudo systemctl disable irqbalance
+
+   # Function to set IRQ affinity
+   set_irq_affinity() {
+       local irq=$1
+       local cpus=$2  # e.g., "0-3" for cores 0,1,2,3
+
+       if [ -f "/proc/irq/$irq/smp_affinity_list" ]; then
+           echo $cpus | sudo tee /proc/irq/$irq/smp_affinity_list
+           echo "Set IRQ $irq to CPUs $cpus"
+       fi
+   }
+
+   # Get network interface name
+   IFACE=$(ip route | grep default | awk '{print $5}' | head -n1)
+   echo "Primary network interface: $IFACE"
+
+   # Find IRQs for network interface
+   NET_IRQS=$(grep $IFACE /proc/interrupts | cut -d: -f1 | tr -d ' ')
+
+   # Set network IRQs to OS cores (0-3)
+   for irq in $NET_IRQS; do
+       set_irq_affinity $irq "0-3"
+   done
+
+   # Set all other IRQs to OS cores
+   for irq in $(ls /proc/irq/ | grep -E '^[0-9]+$'); do
+       # Skip special IRQs (0, 2)
+       if [ $irq -gt 2 ]; then
+           set_irq_affinity $irq "0-3"
+       fi
+   done
+
+   echo "=== IRQ Affinity Configuration Complete ==="
+   ```
+
+4. NUMA Configuration (20 min)
+
+   ```bash
+   #!/bin/bash
+   # File: scripts/setup_numa.sh
+
+   # Install NUMA tools
+   sudo apt install -y numactl libnuma-dev
+
+   # Check NUMA configuration
+   echo "=== NUMA Configuration ==="
+   numactl --hardware
+
+   echo -e "\n=== Memory per NUMA Node ==="
+   numastat -m
+
+   echo -e "\n=== Process NUMA Policy ==="
+   numactl --show
+
+   # Create wrapper script for running applications with NUMA awareness
+   cat > scripts/run_with_numa.sh << 'EOF'
+#!/bin/bash
+# Run application on specific NUMA node
+
+NODE=${1:-0}  # Default to node 0
+shift
+APP="$@"
+
+echo "Running on NUMA node $NODE: $APP"
+numactl --cpunodebind=$NODE --membind=$NODE $APP
+EOF
+
+   chmod +x scripts/run_with_numa.sh
+
+   echo "Use: ./scripts/run_with_numa.sh 0 ./your_application"
+   ```
+
+5. Disable Unnecessary Services (15 min)
+
+   ```bash
+   #!/bin/bash
+   # File: scripts/disable_unnecessary_services.sh
+
+   # Services that can introduce latency
+   SERVICES_TO_DISABLE=(
+       "bluetooth"
+       "cups"
+       "avahi-daemon"
+       "ModemManager"
+       "apport"
+       "whoopsie"
+       "snapd"
+   )
+
+   echo "Disabling unnecessary services..."
+   for service in "${SERVICES_TO_DISABLE[@]}"; do
+       if systemctl is-enabled $service 2>/dev/null; then
+           echo "Disabling $service"
+           sudo systemctl stop $service
+           sudo systemctl disable $service
+       fi
+   done
+
+   # Disable swap (introduces latency)
+   echo "Disabling swap..."
+   sudo swapoff -a
+   sudo sed -i '/swap/d' /etc/fstab
+
+   echo "Services disabled. System optimization complete."
+   ```
+
+Checkpoint #1 (10:00):
+- [ ] All tuning scripts created and tested
+- [ ] CPU governor set to performance
+- [ ] IRQ affinity configured
+- [ ] System ready for reboot (if isolation needed)
+
+10:00 - 10:15 | BREAK
+----------------------
+
+10:15 - 12:30 | KERNEL-BYPASS NETWORKING SETUP
+-----------------------------------------------
+Responsible: Networking Specialist, Senior Developer
+Support: Technical Lead, DevOps Engineer
+
+Decision Point: DPDK vs OpenOnload
+-----------------------------------
+
+DPDK (Data Plane Development Kit):
+Pros:
++ Open source, no licensing costs
++ Supports wide range of NICs
++ Excellent documentation and community
++ Used by many HFT firms
++ Complete control over packet processing
+
+Cons:
+- Requires binding NIC to userspace driver
+- More complex initial setup
+- Requires dedicated CPU cores for polling
+
+OpenOnload (Solarflare):
+Pros:
++ Minimal code changes (uses standard sockets)
++ Very low latency with Solarflare NICs
++ Simpler integration
++ Excellent support from vendor
+
+Cons:
+- Requires Solarflare NIC hardware
+- Proprietary (free but not open source)
+- Vendor lock-in
+
+DECISION: Start with DPDK (hardware agnostic)
+We'll provide both paths below.
+
+OPTION A: DPDK Installation (Follow this if using standard NICs)
+-----------------------------------------------------------------
+
+1. Install DPDK Dependencies (20 min)
+
+   ```bash
+   #!/bin/bash
+   # File: scripts/install_dpdk.sh
+
+   # Install build dependencies
+   sudo apt install -y build-essential meson python3-pip python3-pyelftools
+   sudo apt install -y libnuma-dev libpcap-dev pkg-config
+   sudo pip3 install meson ninja
+
+   # Install hugepages support
+   sudo apt install -y libhugetlbfs-dev
+
+   # Download DPDK (LTS version 22.11)
+   cd /tmp
+   wget http://fast.dpdk.org/rel/dpdk-22.11.3.tar.xz
+   tar xf dpdk-22.11.3.tar.xz
+   cd dpdk-22.11.3
+
+   # Build DPDK
+   meson build
+   cd build
+   ninja
+   sudo ninja install
+   sudo ldconfig
+
+   echo "DPDK installed successfully"
+   dpdk-devbind --status
+   ```
+
+2. Configure Hugepages (20 min)
+
+   DPDK requires hugepages for efficient memory allocation.
+
+   ```bash
+   #!/bin/bash
+   # File: scripts/setup_hugepages.sh
+
+   # Calculate number of hugepages needed
+   # 2048 pages of 2MB = 4GB total
+   NR_HUGEPAGES=2048
+
+   echo "Configuring $NR_HUGEPAGES hugepages..."
+
+   # Set for current session
+   echo $NR_HUGEPAGES | sudo tee /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+
+   # Make persistent
+   echo "vm.nr_hugepages = $NR_HUGEPAGES" | sudo tee -a /etc/sysctl.conf
+   sudo sysctl -p
+
+   # Mount hugepages
+   sudo mkdir -p /mnt/huge
+   sudo mount -t hugetlbfs nodev /mnt/huge
+
+   # Make mount persistent
+   echo "nodev /mnt/huge hugetlbfs defaults 0 0" | sudo tee -a /etc/fstab
+
+   # Verify
+   echo "=== Hugepage Status ==="
+   cat /proc/meminfo | grep Huge
+   ```
+
+3. Bind Network Interface to DPDK (25 min)
+
+   ```bash
+   #!/bin/bash
+   # File: scripts/bind_nic_to_dpdk.sh
+
+   # Show current NIC binding
+   echo "=== Current NIC Status ==="
+   dpdk-devbind --status
+
+   # Find your trading NIC (example: eth1)
+   # Get PCI address
+   NIC="eth1"  # Change to your NIC
+   PCI_ADDR=$(ethtool -i $NIC | grep bus-info | awk '{print $2}')
+
+   echo "Binding $NIC (PCI: $PCI_ADDR) to DPDK..."
+
+   # Load required kernel modules
+   sudo modprobe uio
+   sudo modprobe uio_pci_generic
+
+   # Bind NIC to DPDK driver
+   sudo dpdk-devbind --bind=uio_pci_generic $PCI_ADDR
+
+   # Verify binding
+   echo "=== Updated NIC Status ==="
+   dpdk-devbind --status
+
+   echo "NIC bound to DPDK successfully"
+   echo "WARNING: $NIC is no longer accessible via standard networking"
+   ```
+
+4. Create DPDK UDP Echo Server (45 min)
+
+   File: src/network/dpdk_echo_server.cpp
+
+   ```cpp
+   #include <rte_eal.h>
+   #include <rte_ethdev.h>
+   #include <rte_mbuf.h>
+   #include <rte_udp.h>
+   #include <rte_ip.h>
+   #include <iostream>
+   #include "core/timing.hpp"
+
+   using namespace hft::core;
+
+   constexpr uint16_t RX_RING_SIZE = 1024;
+   constexpr uint16_t TX_RING_SIZE = 1024;
+   constexpr uint16_t NUM_MBUFS = 8191;
+   constexpr uint16_t MBUF_CACHE_SIZE = 250;
+   constexpr uint16_t BURST_SIZE = 32;
+   constexpr uint16_t UDP_ECHO_PORT = 12345;
+
+   struct rte_mempool *mbuf_pool = nullptr;
+
+   static int init_port(uint16_t port) {
+       struct rte_eth_conf port_conf = {};
+       const uint16_t rx_rings = 1, tx_rings = 1;
+       uint16_t nb_rxd = RX_RING_SIZE;
+       uint16_t nb_txd = TX_RING_SIZE;
+
+       // Configure port
+       int ret = rte_eth_dev_configure(port, rx_rings, tx_rings, &port_conf);
+       if (ret != 0) {
+           return ret;
+       }
+
+       // Allocate RX queue
+       ret = rte_eth_rx_queue_setup(port, 0, nb_rxd,
+                                      rte_eth_dev_socket_id(port),
+                                      nullptr, mbuf_pool);
+       if (ret < 0) {
+           return ret;
+       }
+
+       // Allocate TX queue
+       ret = rte_eth_tx_queue_setup(port, 0, nb_txd,
+                                      rte_eth_dev_socket_id(port),
+                                      nullptr);
+       if (ret < 0) {
+           return ret;
+       }
+
+       // Start device
+       ret = rte_eth_dev_start(port);
+       if (ret < 0) {
+           return ret;
+       }
+
+       // Enable promiscuous mode
+       rte_eth_promiscuous_enable(port);
+
+       return 0;
+   }
+
+   static void process_packets(uint16_t port) {
+       struct rte_mbuf *bufs[BURST_SIZE];
+       uint64_t total_packets = 0;
+       uint64_t start_tsc = rdtscp();
+
+       std::cout << "Echo server listening on port " << UDP_ECHO_PORT << "...\n";
+
+       while (true) {
+           // Receive packets
+           const uint16_t nb_rx = rte_eth_rx_burst(port, 0, bufs, BURST_SIZE);
+
+           if (nb_rx == 0) {
+               continue;
+           }
+
+           for (uint16_t i = 0; i < nb_rx; i++) {
+               uint64_t pkt_start = rdtscp();
+
+               struct rte_mbuf *pkt = bufs[i];
+
+               // Simply echo back the packet
+               // In production: parse headers, swap src/dst, etc.
+
+               uint64_t pkt_end = rdtscp();
+
+               total_packets++;
+
+               if (total_packets % 10000 == 0) {
+                   uint64_t current_tsc = rdtscp();
+                   double elapsed_sec = static_cast<double>(current_tsc - start_tsc) / 3.0e9;  // Assume 3GHz
+                   double pps = total_packets / elapsed_sec;
+                   std::cout << "Processed " << total_packets
+                             << " packets, Rate: " << pps << " pps"
+                             << ", Processing time: " << (pkt_end - pkt_start) << " cycles\n";
+               }
+           }
+
+           // Send packets back
+           const uint16_t nb_tx = rte_eth_tx_burst(port, 0, bufs, nb_rx);
+
+           // Free unsent packets
+           for (uint16_t i = nb_tx; i < nb_rx; i++) {
+               rte_pktmbuf_free(bufs[i]);
+           }
+       }
+   }
+
+   int main(int argc, char *argv[]) {
+       // Initialize EAL
+       int ret = rte_eal_init(argc, argv);
+       if (ret < 0) {
+           std::cerr << "Error initializing EAL\n";
+           return -1;
+       }
+
+       argc -= ret;
+       argv += ret;
+
+       // Create mbuf pool
+       mbuf_pool = rte_pktmbuf_pool_create("MBUF_POOL", NUM_MBUFS,
+                                            MBUF_CACHE_SIZE, 0,
+                                            RTE_MBUF_DEFAULT_BUF_SIZE,
+                                            rte_socket_id());
+       if (mbuf_pool == nullptr) {
+           std::cerr << "Cannot create mbuf pool\n";
+           return -1;
+       }
+
+       // Initialize port 0
+       uint16_t port = 0;
+       if (init_port(port) != 0) {
+           std::cerr << "Cannot init port " << port << "\n";
+           return -1;
+       }
+
+       std::cout << "DPDK UDP Echo Server started successfully\n";
+       std::cout << "Port " << port << " initialized\n";
+
+       // Process packets
+       process_packets(port);
+
+       return 0;
+   }
+   ```
+
+5. Create CMake for DPDK (20 min)
+
+   File: src/network/CMakeLists.txt
+
+   ```cmake
+   # Find DPDK
+   find_package(PkgConfig REQUIRED)
+   pkg_check_modules(DPDK REQUIRED libdpdk)
+
+   # DPDK Echo Server
+   add_executable(dpdk_echo_server dpdk_echo_server.cpp)
+   target_include_directories(dpdk_echo_server PRIVATE
+       ${CMAKE_SOURCE_DIR}/include
+       ${DPDK_INCLUDE_DIRS}
+   )
+   target_link_libraries(dpdk_echo_server PRIVATE
+       ${DPDK_LIBRARIES}
+       Threads::Threads
+   )
+   target_compile_options(dpdk_echo_server PRIVATE ${DPDK_CFLAGS_OTHER})
+   ```
+
+OPTION B: OpenOnload Installation (If using Solarflare NICs)
+-------------------------------------------------------------
+
+1. Install OpenOnload (20 min)
+
+   ```bash
+   #!/bin/bash
+   # File: scripts/install_openonload.sh
+
+   # Download OpenOnload from Solarflare/AMD website
+   # (Requires registration)
+   cd /tmp
+   # wget <URL-from-Solarflare>  # Get from vendor
+
+   # Extract
+   tar xf openonload-*.tgz
+   cd openonload-*
+
+   # Build and install
+   scripts/onload_build
+   scripts/onload_install
+
+   # Load kernel module
+   sudo modprobe sfc
+   sudo onload_tool reload
+
+   echo "OpenOnload installed"
+   onload --version
+   ```
+
+2. Create OpenOnload UDP Echo (simpler) (30 min)
+
+   With OpenOnload, we can use standard socket API:
+
+   File: src/network/openonload_echo_server.cpp
+
+   ```cpp
+   #include <sys/socket.h>
+   #include <netinet/in.h>
+   #include <arpa/inet.h>
+   #include <unistd.h>
+   #include <cstring>
+   #include <iostream>
+   #include "core/timing.hpp"
+
+   using namespace hft::core;
+
+   constexpr int PORT = 12345;
+   constexpr int BUFFER_SIZE = 1500;
+
+   int main() {
+       // Create UDP socket
+       int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+       if (sockfd < 0) {
+           std::cerr << "Socket creation failed\n";
+           return -1;
+       }
+
+       // Bind to port
+       struct sockaddr_in addr = {};
+       addr.sin_family = AF_INET;
+       addr.sin_addr.s_addr = INADDR_ANY;
+       addr.sin_port = htons(PORT);
+
+       if (bind(sockfd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+           std::cerr << "Bind failed\n";
+           return -1;
+       }
+
+       std::cout << "OpenOnload UDP Echo Server listening on port " << PORT << "\n";
+
+       char buffer[BUFFER_SIZE];
+       struct sockaddr_in client_addr;
+       socklen_t client_len = sizeof(client_addr);
+
+       uint64_t packet_count = 0;
+
+       while (true) {
+           uint64_t recv_start = rdtscp();
+
+           // Receive
+           ssize_t n = recvfrom(sockfd, buffer, BUFFER_SIZE, 0,
+                                (struct sockaddr*)&client_addr, &client_len);
+
+           uint64_t recv_end = rdtscp();
+
+           if (n > 0) {
+               uint64_t send_start = rdtscp();
+
+               // Echo back
+               sendto(sockfd, buffer, n, 0,
+                      (struct sockaddr*)&client_addr, client_len);
+
+               uint64_t send_end = rdtscp();
+
+               packet_count++;
+
+               if (packet_count % 10000 == 0) {
+                   std::cout << "Packets: " << packet_count
+                             << ", Recv latency: " << (recv_end - recv_start)
+                             << ", Send latency: " << (send_end - send_start)
+                             << " cycles\n";
+               }
+           }
+       }
+
+       close(sockfd);
+       return 0;
+   }
+   ```
+
+   Run with OpenOnload:
+   ```bash
+   onload --profile=latency ./dpdk_echo_server
+   ```
+
+Checkpoint #2 (12:30):
+- [ ] Kernel-bypass (DPDK or OpenOnload) installed
+- [ ] Echo server compiled successfully
+- [ ] Ready for network testing after lunch
+
+12:30 - 13:30 | LUNCH BREAK
+----------------------------
+
+13:30 - 15:30 | NETWORK PERFORMANCE TESTING
+--------------------------------------------
+Responsible: All Developers
+
+Tasks:
+
+1. Create UDP Client for Testing (40 min)
+
+   File: benchmarks/udp_latency_test.cpp
+
+   ```cpp
+   #include <sys/socket.h>
+   #include <netinet/in.h>
+   #include <arpa/inet.h>
+   #include <unistd.h>
+   #include <cstring>
+   #include <iostream>
+   #include <vector>
+   #include <algorithm>
+   #include <numeric>
+   #include "core/timing.hpp"
+
+   using namespace hft::core;
+
+   constexpr int PORT = 12345;
+   constexpr int ITERATIONS = 100000;
+   constexpr int WARMUP = 1000;
+
+   int main(int argc, char *argv[]) {
+       const char* server_ip = (argc > 1) ? argv[1] : "127.0.0.1";
+
+       // Create socket
+       int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+       if (sockfd < 0) {
+           std::cerr << "Socket creation failed\n";
+           return -1;
+       }
+
+       struct sockaddr_in server_addr = {};
+       server_addr.sin_family = AF_INET;
+       server_addr.sin_port = htons(PORT);
+       inet_pton(AF_INET, server_ip, &server_addr.sin_addr);
+
+       std::cout << "Testing latency to " << server_ip << ":" << PORT << "\n";
+
+       char send_buf[64] = "PING";
+       char recv_buf[64];
+       std::vector<uint64_t> latencies;
+       latencies.reserve(ITERATIONS);
+
+       // Warmup
+       for (int i = 0; i < WARMUP; i++) {
+           sendto(sockfd, send_buf, sizeof(send_buf), 0,
+                  (struct sockaddr*)&server_addr, sizeof(server_addr));
+           recvfrom(sockfd, recv_buf, sizeof(recv_buf), 0, nullptr, nullptr);
+       }
+
+       // Measurement
+       for (int i = 0; i < ITERATIONS; i++) {
+           uint64_t start = rdtscp();
+
+           sendto(sockfd, send_buf, sizeof(send_buf), 0,
+                  (struct sockaddr*)&server_addr, sizeof(server_addr));
+
+           recvfrom(sockfd, recv_buf, sizeof(recv_buf), 0, nullptr, nullptr);
+
+           uint64_t end = rdtscp();
+
+           latencies.push_back(end - start);
+       }
+
+       close(sockfd);
+
+       // Calculate statistics
+       std::sort(latencies.begin(), latencies.end());
+
+       uint64_t min = latencies.front();
+       uint64_t max = latencies.back();
+       uint64_t median = latencies[ITERATIONS / 2];
+       uint64_t p99 = latencies[static_cast<size_t>(ITERATIONS * 0.99)];
+       uint64_t p999 = latencies[static_cast<size_t>(ITERATIONS * 0.999)];
+       uint64_t p9999 = latencies[static_cast<size_t>(ITERATIONS * 0.9999)];
+
+       double mean = std::accumulate(latencies.begin(), latencies.end(), 0.0) / ITERATIONS;
+
+       // Assume 3GHz CPU for ns conversion
+       const double cycles_per_ns = 3.0;
+
+       std::cout << "\n=== UDP Round-Trip Latency ===\n";
+       std::cout << "Iterations: " << ITERATIONS << "\n";
+       std::cout << "Min:     " << min << " cycles (" << min / cycles_per_ns << " ns)\n";
+       std::cout << "Median:  " << median << " cycles (" << median / cycles_per_ns << " ns)\n";
+       std::cout << "Mean:    " << mean << " cycles (" << mean / cycles_per_ns << " ns)\n";
+       std::cout << "P99:     " << p99 << " cycles (" << p99 / cycles_per_ns << " ns)\n";
+       std::cout << "P99.9:   " << p999 << " cycles (" << p999 / cycles_per_ns << " ns)\n";
+       std::cout << "P99.99:  " << p9999 << " cycles (" << p9999 / cycles_per_ns << " ns)\n";
+       std::cout << "Max:     " << max << " cycles (" << max / cycles_per_ns << " ns)\n";
+
+       return 0;
+   }
+   ```
+
+2. Run Network Latency Tests (40 min)
+
+   ```bash
+   # Terminal 1: Start echo server
+   cd build
+   ./bin/dpdk_echo_server  # or with OpenOnload
+
+   # Terminal 2: Run latency test
+   ./bin/udp_latency_test 127.0.0.1
+
+   # Document results in day2_network_baseline.txt
+   ```
+
+   Expected results:
+   - Loopback (127.0.0.1): <5 microseconds RTT
+   - LAN (same switch): <50 microseconds RTT
+   - With kernel-bypass: 50-80% improvement
+
+3. Network Throughput Test (40 min)
+
+   File: benchmarks/udp_throughput_test.cpp
+
+   ```cpp
+   // Test maximum packets per second
+   #include <sys/socket.h>
+   #include <netinet/in.h>
+   #include <unistd.h>
+   #include <iostream>
+   #include "core/timing.hpp"
+
+   using namespace hft::core;
+
+   constexpr int PORT = 12345;
+   constexpr int DURATION_SEC = 10;
+   constexpr int PACKET_SIZE = 64;
+
+   int main() {
+       int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+
+       struct sockaddr_in server_addr = {};
+       server_addr.sin_family = AF_INET;
+       server_addr.sin_port = htons(PORT);
+       server_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+
+       char buffer[PACKET_SIZE];
+       uint64_t packet_count = 0;
+
+       uint64_t start = rdtscp();
+       uint64_t end_time = start + (DURATION_SEC * 3000000000ULL);  // Assume 3GHz
+
+       while (rdtscp() < end_time) {
+           sendto(sockfd, buffer, PACKET_SIZE, 0,
+                  (struct sockaddr*)&server_addr, sizeof(server_addr));
+           packet_count++;
+       }
+
+       uint64_t end = rdtscp();
+       double elapsed_sec = (end - start) / 3.0e9;
+
+       double pps = packet_count / elapsed_sec;
+       double mbps = (pps * PACKET_SIZE * 8) / 1e6;
+
+       std::cout << "\n=== Throughput Test Results ===\n";
+       std::cout << "Duration: " << elapsed_sec << " seconds\n";
+       std::cout << "Packets sent: " << packet_count << "\n";
+       std::cout << "Packets/sec: " << pps << "\n";
+       std::cout << "Throughput: " << mbps << " Mbps\n";
+
+       close(sockfd);
+       return 0;
+   }
+   ```
+
+Checkpoint #3 (15:30):
+- [ ] Latency test shows <5μs RTT on loopback
+- [ ] Throughput test shows >1M packets/sec
+- [ ] Results documented
+- [ ] Baseline established for future comparison
+
+15:30 - 15:45 | BREAK
+----------------------
+
+15:45 - 17:15 | DOCUMENTATION AND SYSTEM VALIDATION
+----------------------------------------------------
+Responsible: All Team Members
+
+Tasks:
+
+1. Document System Configuration (30 min)
+
+   File: docs/system_tuning_guide.md
+
+   Contents:
+   - CPU configuration and isolation
+   - NUMA configuration
+   - IRQ affinity settings
+   - Hugepage configuration
+   - Kernel-bypass setup
+   - Verification procedures
+
+2. Create System Health Check Script (30 min)
+
+   File: scripts/check_system_health.sh
+
+   ```bash
+   #!/bin/bash
+   # Verify all optimizations are active
+
+   echo "=== SYSTEM HEALTH CHECK ==="
+   echo ""
+
+   # Check CPU governor
+   echo "1. CPU Governor:"
+   GOVERNOR=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)
+   if [ "$GOVERNOR" == "performance" ]; then
+       echo "   ✓ Performance mode active"
+   else
+       echo "   ✗ WARNING: Not in performance mode (current: $GOVERNOR)"
+   fi
+
+   # Check CPU isolation
+   echo ""
+   echo "2. CPU Isolation:"
+   ISOLATED=$(cat /sys/devices/system/cpu/isolated)
+   if [ -n "$ISOLATED" ]; then
+       echo "   ✓ Isolated CPUs: $ISOLATED"
+   else
+       echo "   ✗ WARNING: No CPUs isolated"
+   fi
+
+   # Check hugepages
+   echo ""
+   echo "3. Hugepages:"
+   HUGE=$(cat /proc/meminfo | grep HugePages_Total | awk '{print $2}')
+   if [ "$HUGE" -gt 0 ]; then
+       echo "   ✓ Hugepages configured: $HUGE pages"
+   else
+       echo "   ✗ WARNING: Hugepages not configured"
+   fi
+
+   # Check swap
+   echo ""
+   echo "4. Swap:"
+   SWAP=$(cat /proc/swaps | wc -l)
+   if [ "$SWAP" -eq 1 ]; then
+       echo "   ✓ Swap disabled"
+   else
+       echo "   ✗ WARNING: Swap is enabled"
+   fi
+
+   # Check DPDK
+   echo ""
+   echo "5. DPDK Status:"
+   if command -v dpdk-devbind &> /dev/null; then
+       echo "   ✓ DPDK installed"
+       dpdk-devbind --status | head -20
+   else
+       echo "   - DPDK not found (may be using OpenOnload)"
+   fi
+
+   echo ""
+   echo "=== Health Check Complete ==="
+   ```
+
+3. Performance Baseline Document (30 min)
+
+   File: docs/day2_performance_baseline.txt
+
+   Record:
+   - System specifications
+   - Tuning parameters applied
+   - Network latency measurements
+   - Network throughput measurements
+   - Comparison with Day 1 baseline
+   - Any issues or anomalies
+
+4. Commit Day 2 Work (15 min)
+
+   ```bash
+   cd /home/pranay-hft/Desktop/1.AI_LLM_c++_optimization/HFT_system
+
+   git add .
+   git commit -m "Day 2: System optimization and kernel-bypass networking
+
+   System Optimization:
+   - CPU frequency scaling disabled (performance mode)
+   - CPU isolation configured (cores 4-23)
+   - IRQ affinity set to OS cores (0-3)
+   - NUMA awareness configured
+   - Unnecessary services disabled
+   - Swap disabled
+
+   Kernel-Bypass Networking:
+   - DPDK 22.11.3 installed and configured
+   - Hugepages configured (4GB allocated)
+   - Network interface bound to DPDK
+   - UDP echo server implemented
+   - Network latency baseline established
+
+   Benchmarks:
+   - UDP RTT (loopback): <5μs achieved
+   - Throughput: >1M packets/sec demonstrated
+   - System health check script created
+
+   Documentation:
+   - System tuning guide created
+   - Performance baseline documented
+   - Verification procedures established
+   "
+
+   git tag -a v0.1.0-day2 -m "Day 2 milestone: Ultra-low latency foundation"
+   ```
+
+Checkpoint #4 (17:15):
+- [ ] All documentation complete
+- [ ] Code committed with detailed message
+- [ ] Performance baseline documented
+- [ ] System health check passes
+
+17:15 - 17:30 | DAILY RETROSPECTIVE
+------------------------------------
+Attendees: All Team Members
+
+Agenda:
+1. Review Day 2 accomplishments (5 min)
+2. Discuss challenges faced (5 min)
+3. Preview Day 3 objectives (3 min)
+4. Identify blockers (2 min)
+
+Day 3 Preview:
+- Implement basic FIX protocol parser
+- Create market data feed handler skeleton
+- Design order book data structure
+- Begin integration with Day 2 network layer
+
+================================================================================
+TEAM RESPONSIBILITIES
+================================================================================
+
+TECHNICAL LEAD:
+---------------
+- [ ] Approve CPU isolation configuration
+- [ ] Review kernel-bypass implementation choice
+- [ ] Code review for network components
+- [ ] Validate performance measurements
+- [ ] Sign off on Day 2 completion
+
+SENIOR C++ DEVELOPER 1:
+-----------------------
+- [ ] Implement DPDK echo server
+- [ ] Optimize packet processing loop
+- [ ] Create network latency benchmark
+- [ ] Document DPDK integration
+
+SENIOR C++ DEVELOPER 2:
+-----------------------
+- [ ] Create UDP client test harness
+- [ ] Implement throughput testing
+- [ ] Statistical analysis of latency results
+- [ ] Performance baseline documentation
+
+NETWORKING SPECIALIST:
+----------------------
+- [ ] Install and configure DPDK/OpenOnload
+- [ ] Configure hugepages and NIC binding
+- [ ] IRQ affinity optimization
+- [ ] Network performance validation
+- [ ] Troubleshoot any network issues
+
+DEVOPS ENGINEER:
+----------------
+- [ ] CPU isolation and governor setup
+- [ ] NUMA configuration
+- [ ] Create system tuning scripts
+- [ ] System health check automation
+- [ ] Document all configuration changes
+- [ ] Ensure changes persist across reboot
+
+OTHERS:
+-------
+- [ ] Review network infrastructure
+- [ ] Familiarize with DPDK concepts
+- [ ] Prepare for Day 3 tasks
+- [ ] No coding tasks today
+
+================================================================================
+SUCCESS CRITERIA VALIDATION
+================================================================================
+
+SYSTEM OPTIMIZATION:
+--------------------
+✓ CPU governor shows "performance" on all cores
+✓ Isolated CPUs verified in /sys/devices/system/cpu/isolated
+✓ IRQs confirmed on OS cores only (0-3)
+✓ Swap completely disabled (swappiness = 0)
+✓ Unnecessary services stopped and disabled
+✓ System health check script passes all tests
+
+KERNEL-BYPASS:
+--------------
+✓ DPDK installed without errors (or OpenOnload)
+✓ Hugepages configured: 2048 x 2MB = 4GB
+✓ NIC successfully bound to DPDK driver
+✓ Echo server compiles and runs
+✓ Can send/receive packets via kernel-bypass
+
+NETWORK PERFORMANCE:
+--------------------
+✓ UDP RTT <5 microseconds on localhost
+✓ Packet processing <500ns per packet
+✓ Throughput >1M packets/second
+✓ Latency jitter <100ns (p99.9 - p50)
+✓ Results match or exceed expectations
+
+DOCUMENTATION:
+--------------
+✓ System tuning guide complete
+✓ Performance baseline documented
+✓ All scripts have comments
+✓ README updated with Day 2 progress
+✓ Git commit with detailed message
+
+================================================================================
+DELIVERABLES CHECKLIST
+================================================================================
+
+SCRIPTS:
+--------
+[ ] scripts/setup_cpu_performance.sh
+[ ] scripts/setup_cpu_isolation.sh
+[ ] scripts/setup_irq_affinity.sh
+[ ] scripts/setup_numa.sh
+[ ] scripts/disable_unnecessary_services.sh
+[ ] scripts/install_dpdk.sh (or install_openonload.sh)
+[ ] scripts/setup_hugepages.sh
+[ ] scripts/bind_nic_to_dpdk.sh
+[ ] scripts/check_system_health.sh
+[ ] scripts/verify_cpu_isolation.sh
+
+CODE:
+-----
+[ ] src/network/dpdk_echo_server.cpp (or openonload_echo_server.cpp)
+[ ] src/network/CMakeLists.txt
+[ ] benchmarks/udp_latency_test.cpp
+[ ] benchmarks/udp_throughput_test.cpp
+[ ] benchmarks/CMakeLists.txt (updated)
+
+DOCUMENTATION:
+--------------
+[ ] docs/system_tuning_guide.md
+[ ] docs/day2_performance_baseline.txt
+[ ] docs/kernel_bypass_setup.md
+[ ] planning/day2_completion_report.txt
+
+CONFIGURATION:
+--------------
+[ ] /etc/default/grub (modified for CPU isolation)
+[ ] /etc/fstab (hugepages mount, swap removed)
+[ ] /etc/sysctl.conf (hugepages configuration)
+
+================================================================================
+RISKS AND MITIGATION
+================================================================================
+
+RISK #1: NIC incompatible with DPDK
+------------------------------------
+Probability: Low
+Impact: High
+
+Mitigation:
+- Pre-verify NIC compatibility with DPDK driver matrix
+- Have backup NIC available (Intel X710 or X520 recommended)
+- Fall back to OpenOnload if Solarflare NIC available
+- Standard sockets as last resort (higher latency)
+
+Action if occurs:
+- Check DPDK compatibility list immediately
+- Order compatible NIC if needed (Priority shipping)
+- Use standard UDP with SO_BUSY_POLL as temporary solution
+
+RISK #2: System becomes unstable after CPU isolation
+-----------------------------------------------------
+Probability: Medium
+Impact: Medium
+
+Mitigation:
+- Test CPU isolation on non-critical machine first
+- Document exact GRUB configuration for rollback
+- Keep backup of /etc/default/grub
+- Have recovery USB ready
+
+Action if occurs:
+- Boot into recovery mode
+- Restore original GRUB configuration
+- Update grub and reboot
+- Reassess isolation parameters (isolate fewer cores)
+
+RISK #3: Performance targets not met
+-------------------------------------
+Probability: Low
+Impact: High
+
+Mitigation:
+- Set realistic expectations based on hardware
+- Compare with industry benchmarks
+- Ensure proper measurement methodology
+- Get second opinion from networking specialist
+
+Action if occurs:
+- Analyze performance bottlenecks systematically
+- Check for system misconfigurations
+- Verify NIC firmware is latest version
+- Consider hardware upgrade if necessary
+
+RISK #4: Hugepage allocation fails
+-----------------------------------
+Probability: Low
+Impact: Medium
+
+Mitigation:
+- Allocate hugepages at boot time
+- Ensure sufficient free memory
+- Use 2MB pages (not 1GB) for better flexibility
+
+Action if occurs:
+- Reduce number of hugepages
+- Free up memory by stopping services
+- Check kernel hugepage support: `grep Huge /proc/meminfo`
+- Reboot and allocate at boot time
+
+================================================================================
+DEPENDENCIES
+================================================================================
+
+PREREQUISITES (Must be complete):
+----------------------------------
+✓ Day 1 completion (timing infrastructure working)
+✓ Root/sudo access available
+✓ Network hardware identified
+✓ Backup of system configuration
+
+BLOCKING DEPENDENCIES FOR DAY 3:
+---------------------------------
+⚠ Must complete these today:
+- Kernel-bypass networking operational
+- Can send/receive packets with <5μs latency
+- System tuning scripts created and tested
+- Performance baseline documented
+
+EXTERNAL DEPENDENCIES:
+----------------------
+- DPDK packages available in repository
+- Internet access for package downloads
+- Hardware compatible with kernel-bypass
+- Sufficient memory for hugepages (4GB+)
+
+================================================================================
+LESSONS LEARNED
+================================================================================
+
+WHAT WENT WELL:
+---------------
++
++
++
+
+WHAT COULD BE IMPROVED:
+-----------------------
+-
+-
+-
+
+TECHNICAL CHALLENGES:
+---------------------
+!
+!
+!
+
+PROCESS IMPROVEMENTS:
+---------------------
+→
+→
+→
+
+================================================================================
+SIGN-OFF
+================================================================================
+
+Technical Lead: _________________ Date: _______ Time: _______
+
+Networking Specialist: __________ Date: _______ Time: _______
+
+DevOps Engineer: ________________ Date: _______ Time: _______
+
+COMPLETION STATUS:
+------------------
+[ ] All optimizations applied
+[ ] Kernel-bypass operational
+[ ] Performance targets achieved
+[ ] Documentation complete
+[ ] Day 3 ready to begin
+
+DAY 2 STATUS: [ ] SUCCESS  [ ] PARTIAL  [ ] BLOCKED
+
+================================================================================
+END OF DAY 2 PLANNING
+================================================================================

@@ -1,0 +1,1425 @@
+================================================================================
+SYSTEM ARCHITECTURE - HIGH-LEVEL DESIGN
+================================================================================
+
+FILE: 01_system_architecture.txt
+PURPOSE: Defines the high-level architecture, design patterns, and system topology
+AUDIENCE: System architects, senior developers, technical leads
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+
+1. ARCHITECTURAL OVERVIEW
+2. DESIGN PATTERNS AND PRINCIPLES
+3. LAYERED ARCHITECTURE
+4. COMPONENT TOPOLOGY
+5. CONCURRENCY MODEL
+6. NETWORK ARCHITECTURE
+7. DATA ARCHITECTURE
+8. SECURITY ARCHITECTURE
+9. DEPLOYMENT ARCHITECTURE
+10. SCALABILITY DESIGN
+11. RELIABILITY DESIGN
+
+================================================================================
+1. ARCHITECTURAL OVERVIEW
+================================================================================
+
+1.1 ARCHITECTURE STYLE
+----------------------
+
+The system employs a hybrid architecture combining:
+
+A) EVENT-DRIVEN ARCHITECTURE (Primary)
+   - Asynchronous event processing
+   - Publish-subscribe patterns
+   - Event sourcing for audit trail
+   - CQRS (Command Query Responsibility Segregation)
+
+B) MICROKERNEL ARCHITECTURE
+   - Core system with pluggable components
+   - Exchange connectors as plugins
+   - Strategies as plugins
+   - Hot-swappable components
+
+C) LAYERED ARCHITECTURE
+   - Clear separation of concerns
+   - Well-defined interfaces between layers
+   - Dependency inversion
+   - Testable layers
+
+D) SERVICE-ORIENTED (for scaling)
+   - Market data service
+   - Execution service
+   - Risk service
+   - Can be deployed as separate processes
+
+1.2 ARCHITECTURE DIAGRAM (HIGH-LEVEL)
+-------------------------------------
+
+                         ┌─────────────────────────────┐
+                         │   Trading Strategies        │
+                         │  (Market Making, Arbitrage) │
+                         └──────────────┬──────────────┘
+                                        │
+                                        ▼
+                         ┌─────────────────────────────┐
+                         │   Trading Engine Core       │
+                         │  ┌──────────────────────┐   │
+                         │  │ Order Management     │   │
+                         │  │ Risk Management      │   │
+                         │  │ Position Management  │   │
+                         │  │ Execution Engine     │   │
+                         │  └──────────────────────┘   │
+                         └──────────┬──────────┬───────┘
+                                    │          │
+                    ┌───────────────┘          └───────────────┐
+                    ▼                                           ▼
+         ┌─────────────────────┐                     ┌─────────────────────┐
+         │  Market Data Layer  │                     │   Order Execution   │
+         │  ┌───────────────┐  │                     │   Layer             │
+         │  │ Data Handler  │  │                     │  ┌───────────────┐  │
+         │  │ Order Book    │  │                     │  │ Order Router  │  │
+         │  │ Normalizer    │  │                     │  │ Fill Handler  │  │
+         │  └───────────────┘  │                     │  └───────────────┘  │
+         └──────────┬──────────┘                     └──────────┬──────────┘
+                    │                                           │
+                    └───────────────┬───────────────────────────┘
+                                    ▼
+                         ┌─────────────────────────────┐
+                         │  Exchange Connector Layer   │
+                         │  ┌──────────────────────┐   │
+                         │  │ Generic Framework    │   │
+                         │  │ WebSocket Clients    │   │
+                         │  │ REST Clients         │   │
+                         │  │ 10 Exchange Adapters │   │
+                         │  └──────────────────────┘   │
+                         └──────────┬──────────────────┘
+                                    │
+                    ┌───────────────┴───────────────┐
+                    ▼                               ▼
+         ┌─────────────────┐           ┌─────────────────────┐
+         │  Binance        │           │  Coinbase, Kraken,  │
+         │  OKX            │    ...    │  Bybit, Huobi, etc. │
+         │  (10 exchanges) │           │  (10 total)         │
+         └─────────────────┘           └─────────────────────┘
+
+1.3 KEY ARCHITECTURAL CHARACTERISTICS
+-------------------------------------
+
+PERFORMANCE:
+  - Ultra-low latency: < 1ms tick-to-trade
+  - High throughput: 1M+ events/second
+  - Lockfree algorithms in critical paths
+  - Zero-copy where possible
+  - Cache-optimized data structures
+
+RELIABILITY:
+  - No single point of failure
+  - Automatic failover
+  - Graceful degradation
+  - Data integrity guarantees
+  - Idempotent operations
+
+SCALABILITY:
+  - Horizontal scaling for market data
+  - Vertical scaling for strategies
+  - Independent component scaling
+  - Linear performance scaling
+
+MAINTAINABILITY:
+  - Modular design
+  - Clear interfaces
+  - Comprehensive logging
+  - Self-documenting code
+  - Automated testing
+
+================================================================================
+2. DESIGN PATTERNS AND PRINCIPLES
+================================================================================
+
+2.1 CORE DESIGN PATTERNS
+-------------------------
+
+PATTERN 1: REACTOR PATTERN (Event Loop)
+----------------------------------------
+
+Used for: Handling multiple concurrent connections efficiently
+
+class EventLoop {
+public:
+    void run() {
+        while (running_) {
+            // Wait for events with timeout
+            auto events = poller_.poll(timeout_);
+
+            for (auto& event : events) {
+                // Dispatch to handler
+                handlers_[event.fd]->handle(event);
+            }
+
+            // Process timer callbacks
+            process_timers();
+        }
+    }
+
+    void register_handler(int fd, EventHandler* handler) {
+        handlers_[fd] = handler;
+        poller_.add(fd, POLLIN | POLLOUT);
+    }
+
+private:
+    Poller poller_;  // epoll on Linux, kqueue on BSD
+    std::map<int, EventHandler*> handlers_;
+    bool running_ = true;
+    std::chrono::milliseconds timeout_{10};
+};
+
+// WebSocket handler uses reactor
+class WebSocketHandler : public EventHandler {
+public:
+    void handle(const Event& event) override {
+        if (event.type & READABLE) {
+            auto data = socket_.read();
+            on_message(data);
+        }
+        if (event.type & WRITABLE) {
+            flush_send_buffer();
+        }
+    }
+};
+
+
+PATTERN 2: STRATEGY PATTERN (Trading Strategies)
+------------------------------------------------
+
+Used for: Pluggable trading algorithms
+
+class TradingStrategy {
+public:
+    virtual ~TradingStrategy() = default;
+
+    // Called on market data update
+    virtual void on_market_data(const MarketData& data) = 0;
+
+    // Called on order update
+    virtual void on_order_update(const OrderUpdate& update) = 0;
+
+    // Called on timer
+    virtual void on_timer(std::chrono::nanoseconds now) = 0;
+
+    // Strategy configuration
+    virtual void configure(const Config& config) = 0;
+};
+
+class MarketMakingStrategy : public TradingStrategy {
+public:
+    void on_market_data(const MarketData& data) override {
+        // Update internal state
+        auto& book = order_books_[data.symbol];
+        book.update(data);
+
+        // Calculate fair price
+        auto fair_price = calculate_fair_price(book);
+
+        // Generate quotes
+        if (should_quote(book)) {
+            auto [bid, ask] = generate_quotes(fair_price);
+            send_orders(bid, ask);
+        }
+    }
+
+private:
+    Price calculate_fair_price(const OrderBook& book) {
+        // Mid-price with volume-weighted adjustment
+        auto mid = (book.best_bid() + book.best_ask()) / 2.0;
+        auto imbalance = book.bid_volume() - book.ask_volume();
+        return mid + imbalance * skew_factor_;
+    }
+
+    double skew_factor_ = 0.0001;
+};
+
+
+PATTERN 3: OBSERVER PATTERN (Event Notification)
+------------------------------------------------
+
+Used for: Notifying components of state changes
+
+class OrderObserver {
+public:
+    virtual ~OrderObserver() = default;
+    virtual void on_order_placed(const Order& order) = 0;
+    virtual void on_order_filled(const Order& order, const Fill& fill) = 0;
+    virtual void on_order_cancelled(const Order& order) = 0;
+};
+
+class OrderManagementSystem {
+public:
+    void add_observer(OrderObserver* observer) {
+        observers_.push_back(observer);
+    }
+
+    void place_order(Order order) {
+        // Validate and store
+        orders_[order.id] = order;
+
+        // Notify observers
+        for (auto* obs : observers_) {
+            obs->on_order_placed(order);
+        }
+
+        // Send to exchange
+        execution_engine_->submit(order);
+    }
+
+private:
+    std::vector<OrderObserver*> observers_;
+    std::unordered_map<OrderId, Order> orders_;
+    ExecutionEngine* execution_engine_;
+};
+
+// Risk manager observes orders
+class RiskManager : public OrderObserver {
+public:
+    void on_order_placed(const Order& order) override {
+        // Update risk metrics
+        exposure_[order.symbol] += order.quantity * order.price;
+
+        // Check limits
+        if (exposure_[order.symbol] > max_exposure_) {
+            // Cancel order or alert
+            alert("Exposure limit exceeded for " + order.symbol);
+        }
+    }
+};
+
+
+PATTERN 4: FACTORY PATTERN (Exchange Connectors)
+------------------------------------------------
+
+Used for: Creating exchange-specific connectors
+
+class ExchangeConnectorFactory {
+public:
+    static std::unique_ptr<ExchangeConnector> create(
+        const std::string& exchange_name,
+        const Config& config)
+    {
+        if (exchange_name == "binance") {
+            return std::make_unique<BinanceConnector>(config);
+        } else if (exchange_name == "coinbase") {
+            return std::make_unique<CoinbaseConnector>(config);
+        } else if (exchange_name == "kraken") {
+            return std::make_unique<KrakenConnector>(config);
+        }
+        // ... other exchanges
+
+        throw std::invalid_argument("Unknown exchange: " + exchange_name);
+    }
+
+    // Register custom connector
+    static void register_connector(
+        const std::string& name,
+        std::function<std::unique_ptr<ExchangeConnector>(const Config&)> factory)
+    {
+        factories_[name] = factory;
+    }
+
+private:
+    static std::map<std::string,
+        std::function<std::unique_ptr<ExchangeConnector>(const Config&)>> factories_;
+};
+
+
+PATTERN 5: OBJECT POOL PATTERN (Memory Management)
+--------------------------------------------------
+
+Used for: Reusing frequently allocated objects
+
+template<typename T>
+class ObjectPool {
+public:
+    ObjectPool(size_t initial_size = 1000) {
+        for (size_t i = 0; i < initial_size; ++i) {
+            free_objects_.push(new T());
+        }
+    }
+
+    ~ObjectPool() {
+        while (!free_objects_.empty()) {
+            delete free_objects_.top();
+            free_objects_.pop();
+        }
+    }
+
+    T* acquire() {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        if (free_objects_.empty()) {
+            // Allocate new object
+            return new T();
+        }
+
+        T* obj = free_objects_.top();
+        free_objects_.pop();
+        return obj;
+    }
+
+    void release(T* obj) {
+        // Reset object state
+        obj->reset();
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        free_objects_.push(obj);
+    }
+
+private:
+    std::stack<T*> free_objects_;
+    std::mutex mutex_;
+};
+
+// Usage
+ObjectPool<Order> order_pool(10000);
+
+Order* create_order() {
+    return order_pool.acquire();
+}
+
+void delete_order(Order* order) {
+    order_pool.release(order);
+}
+
+
+PATTERN 6: DISRUPTOR PATTERN (High-Throughput Queue)
+----------------------------------------------------
+
+Used for: Inter-thread communication with minimal contention
+
+template<typename T, size_t Size>
+class RingBuffer {
+    static_assert((Size & (Size - 1)) == 0, "Size must be power of 2");
+
+public:
+    bool try_publish(const T& item) {
+        const auto current_tail = tail_.load(std::memory_order_relaxed);
+        const auto next_tail = current_tail + 1;
+
+        // Check if buffer is full
+        if (next_tail == head_.load(std::memory_order_acquire) + Size) {
+            return false;  // Buffer full
+        }
+
+        // Write data
+        buffer_[current_tail & (Size - 1)] = item;
+
+        // Publish
+        tail_.store(next_tail, std::memory_order_release);
+        return true;
+    }
+
+    bool try_consume(T& item) {
+        const auto current_head = head_.load(std::memory_order_relaxed);
+
+        // Check if buffer is empty
+        if (current_head == tail_.load(std::memory_order_acquire)) {
+            return false;  // Buffer empty
+        }
+
+        // Read data
+        item = buffer_[current_head & (Size - 1)];
+
+        // Consume
+        head_.store(current_head + 1, std::memory_order_release);
+        return true;
+    }
+
+private:
+    alignas(64) std::atomic<size_t> head_{0};
+    alignas(64) std::atomic<size_t> tail_{0};
+    std::array<T, Size> buffer_;
+};
+
+2.2 SOLID PRINCIPLES APPLICATION
+---------------------------------
+
+SINGLE RESPONSIBILITY:
+  - Each class has one reason to change
+  - ExchangeConnector: only handles exchange communication
+  - OrderBook: only manages order book state
+  - RiskManager: only enforces risk rules
+
+OPEN/CLOSED:
+  - Open for extension (new strategies, exchanges)
+  - Closed for modification (core interfaces stable)
+  - Plugin architecture for strategies
+
+LISKOV SUBSTITUTION:
+  - All exchange connectors implement same interface
+  - Can swap exchanges without changing client code
+  - Strategies are interchangeable
+
+INTERFACE SEGREGATION:
+  - Small, focused interfaces
+  - MarketDataListener vs OrderUpdateListener
+  - Clients depend only on what they use
+
+DEPENDENCY INVERSION:
+  - Depend on abstractions, not concretions
+  - Strategy depends on IOrderManager, not concrete OMS
+  - Connectors depend on IWebSocket, not specific implementation
+
+2.3 ADDITIONAL DESIGN PRINCIPLES
+---------------------------------
+
+DRY (Don't Repeat Yourself):
+  - Generic connector framework
+  - Shared utilities (logging, metrics, config)
+  - Template code for type-safe operations
+
+YAGNI (You Aren't Gonna Need It):
+  - Build what's needed now
+  - Avoid speculative features
+  - Iterate based on real requirements
+
+KISS (Keep It Simple, Stupid):
+  - Simple solutions over clever ones
+  - Clear code over optimized obscurity
+  - Optimize only when profiling shows need
+
+Fail Fast:
+  - Validate inputs at boundaries
+  - Assert preconditions
+  - Throw on unrecoverable errors
+  - Return error codes for expected failures
+
+================================================================================
+3. LAYERED ARCHITECTURE
+================================================================================
+
+3.1 LAYER DEFINITIONS
+---------------------
+
+LAYER 1: INFRASTRUCTURE (Bottom)
+--------------------------------
+Responsibilities:
+  - Thread management
+  - Memory management
+  - Network I/O
+  - Logging
+  - Configuration
+  - Metrics collection
+
+Dependencies: None (only system libraries)
+
+Key Components:
+  - ThreadPool
+  - MemoryPool
+  - Logger
+  - ConfigManager
+  - MetricsCollector
+  - NetworkStack
+
+LAYER 2: EXCHANGE CONNECTIVITY
+-------------------------------
+Responsibilities:
+  - WebSocket connections
+  - REST API calls
+  - Protocol handling
+  - Connection management
+  - Reconnection logic
+
+Dependencies: Infrastructure layer
+
+Key Components:
+  - ExchangeConnectorBase
+  - WebSocketClient
+  - RESTClient
+  - ConnectionManager
+  - 10 Exchange-specific adapters
+
+LAYER 3: MARKET DATA
+---------------------
+Responsibilities:
+  - Market data parsing
+  - Data normalization
+  - Order book reconstruction
+  - Trade aggregation
+  - Data distribution
+
+Dependencies: Exchange connectivity, Infrastructure
+
+Key Components:
+  - MarketDataHandler
+  - OrderBookManager
+  - TickerProcessor
+  - TradeProcessor
+  - DataNormalizer
+
+LAYER 4: TRADING CORE
+----------------------
+Responsibilities:
+  - Order management
+  - Risk management
+  - Position tracking
+  - Execution logic
+
+Dependencies: Market data, Exchange connectivity, Infrastructure
+
+Key Components:
+  - OrderManagementSystem
+  - RiskManager
+  - PositionManager
+  - ExecutionEngine
+
+LAYER 5: STRATEGY (Top)
+------------------------
+Responsibilities:
+  - Trading logic
+  - Signal generation
+  - Strategy state management
+  - PnL calculation
+
+Dependencies: Trading core, Market data
+
+Key Components:
+  - StrategyEngine
+  - MarketMakingStrategy
+  - ArbitrageStrategy
+  - StatArbStrategy
+
+3.2 LAYER INTERACTION RULES
+----------------------------
+
+1. Dependencies flow DOWNWARD only
+   - Upper layers depend on lower layers
+   - Lower layers NEVER depend on upper layers
+   - Use callbacks/observers for upward communication
+
+2. Each layer exposes a clean interface
+   - Well-defined API
+   - Versioned interfaces
+   - Documentation for all public methods
+
+3. Layers are independently testable
+   - Mock lower layers for unit tests
+   - Integration tests for layer boundaries
+
+4. Data transformations at layer boundaries
+   - Exchange-specific data -> Normalized data
+   - External events -> Internal events
+   - Domain objects within layers
+
+3.3 CROSS-CUTTING CONCERNS
+---------------------------
+
+Handled consistently across all layers:
+
+LOGGING:
+  - Structured logging with context
+  - Consistent log levels
+  - Performance-aware (async logging)
+
+ERROR HANDLING:
+  - Exceptions for exceptional conditions
+  - Result types for expected errors
+  - Error propagation rules
+
+SECURITY:
+  - Input validation at boundaries
+  - Encryption for sensitive data
+  - Audit trail for critical operations
+
+OBSERVABILITY:
+  - Metrics at layer boundaries
+  - Distributed tracing
+  - Health checks
+
+================================================================================
+4. COMPONENT TOPOLOGY
+================================================================================
+
+4.1 COMPONENT DIAGRAM (DETAILED)
+---------------------------------
+
+┌────────────────────────────────────────────────────────────────────┐
+│                         STRATEGY LAYER                             │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐            │
+│  │ Market Making│  │  Arbitrage   │  │  Stat Arb    │  ...       │
+│  └───────┬──────┘  └───────┬──────┘  └───────┬──────┘            │
+│          └─────────────────┼─────────────────┘                    │
+└────────────────────────────┼──────────────────────────────────────┘
+                             │
+                             ▼
+┌────────────────────────────────────────────────────────────────────┐
+│                       TRADING CORE LAYER                           │
+│  ┌─────────────────────────────────────────────────────────────┐  │
+│  │                  Order Management System                    │  │
+│  │  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐        │  │
+│  │  │ Orders  │  │ Fills   │  │ Cancels │  │ Amends  │        │  │
+│  │  └─────────┘  └─────────┘  └─────────┘  └─────────┘        │  │
+│  └────────┬────────────────────────────────────────────────────┘  │
+│           │                                                        │
+│  ┌────────┴─────────────┐  ┌─────────────────┐  ┌──────────────┐ │
+│  │   Risk Manager       │  │ Position Manager│  │ Exec Engine  │ │
+│  │  ┌───────────────┐   │  │  ┌───────────┐  │  │ ┌──────────┐ │ │
+│  │  │ Pre-trade     │   │  │  │ Positions │  │  │ │ Routing  │ │ │
+│  │  │ Post-trade    │   │  │  │ PnL       │  │  │ │ Throttle │ │ │
+│  │  │ Limits        │   │  │  └───────────┘  │  │ └──────────┘ │ │
+│  │  └───────────────┘   │  └─────────────────┘  └──────────────┘ │
+│  └──────────────────────┘                                         │
+└────────────────────────────┬───────────────────────────────────────┘
+                             │
+         ┌───────────────────┼───────────────────┐
+         ▼                   ▼                   ▼
+┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐
+│  Market Data    │ │  Order Flow     │ │  Reference Data │
+│     Layer       │ │     Layer       │ │     Layer       │
+│  ┌───────────┐  │ │  ┌───────────┐  │ │  ┌───────────┐  │
+│  │OrderBooks │  │ │  │Order Msgs │  │ │  │ Symbols   │  │
+│  │Trades     │  │ │  │Fill Msgs  │  │ │  │ Specs     │  │
+│  │Tickers    │  │ │  │Status Msgs│  │ │  │ Calendars │  │
+│  └───────────┘  │ │  └───────────┘  │ │  └───────────┘  │
+└────────┬────────┘ └────────┬────────┘ └────────┬────────┘
+         │                   │                   │
+         └───────────────────┼───────────────────┘
+                             ▼
+┌────────────────────────────────────────────────────────────────────┐
+│                   EXCHANGE CONNECTOR LAYER                         │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐             │
+│  │ Binance  │ │ Coinbase │ │  Kraken  │ │   OKX    │    (x10)    │
+│  │ ┌──────┐ │ │ ┌──────┐ │ │ ┌──────┐ │ │ ┌──────┐ │             │
+│  │ │  WS  │ │ │ │  WS  │ │ │ │  WS  │ │ │ │  WS  │ │             │
+│  │ │ REST │ │ │ │ REST │ │ │ │ REST │ │ │ │ REST │ │             │
+│  │ └──────┘ │ │ └──────┘ │ │ └──────┘ │ │ └──────┘ │             │
+│  └──────────┘ └──────────┘ └──────────┘ └──────────┘             │
+└────────────────────────────┬───────────────────────────────────────┘
+                             │
+                             ▼
+┌────────────────────────────────────────────────────────────────────┐
+│                     INFRASTRUCTURE LAYER                           │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐             │
+│  │ Network  │ │ Threading│ │  Memory  │ │ Logging  │             │
+│  └──────────┘ └──────────┘ └──────────┘ └──────────┘             │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐             │
+│  │  Config  │ │ Metrics  │ │   DB     │ │ Recovery │             │
+│  └──────────┘ └──────────┘ └──────────┘ └──────────┘             │
+└────────────────────────────────────────────────────────────────────┘
+
+4.2 COMPONENT INTERACTIONS
+---------------------------
+
+Market Data Flow:
+  Exchange -> Connector -> MarketData -> OrderBook -> Strategy
+
+Order Flow:
+  Strategy -> OMS -> Risk -> Execution -> Connector -> Exchange
+
+Position Update:
+  Connector -> OMS -> Position -> Risk -> Strategy
+
+Configuration Update:
+  ConfigManager -> All Components (via observers)
+
+Metric Collection:
+  All Components -> MetricsCollector -> Prometheus
+
+4.3 INTERFACE DEFINITIONS
+--------------------------
+
+Core interfaces that define component contracts:
+
+// Market data listener interface
+class IMarketDataListener {
+public:
+    virtual ~IMarketDataListener() = default;
+
+    virtual void on_order_book_update(
+        const std::string& symbol,
+        const OrderBookSnapshot& snapshot) = 0;
+
+    virtual void on_trade(
+        const std::string& symbol,
+        const Trade& trade) = 0;
+
+    virtual void on_ticker(
+        const std::string& symbol,
+        const Ticker& ticker) = 0;
+};
+
+// Order manager interface
+class IOrderManager {
+public:
+    virtual ~IOrderManager() = default;
+
+    virtual OrderId place_order(const Order& order) = 0;
+    virtual bool cancel_order(OrderId id) = 0;
+    virtual bool modify_order(OrderId id, const OrderUpdate& update) = 0;
+    virtual std::optional<Order> get_order(OrderId id) const = 0;
+    virtual std::vector<Order> get_active_orders() const = 0;
+};
+
+// Risk manager interface
+class IRiskManager {
+public:
+    virtual ~IRiskManager() = default;
+
+    virtual bool check_order(const Order& order, std::string& reason) = 0;
+    virtual void on_fill(const Fill& fill) = 0;
+    virtual RiskMetrics get_metrics() const = 0;
+    virtual void set_limit(const std::string& name, double value) = 0;
+};
+
+// Exchange connector interface
+class IExchangeConnector {
+public:
+    virtual ~IExchangeConnector() = default;
+
+    virtual void connect() = 0;
+    virtual void disconnect() = 0;
+    virtual bool is_connected() const = 0;
+
+    virtual void subscribe_market_data(const std::vector<std::string>& symbols) = 0;
+    virtual void subscribe_order_updates() = 0;
+
+    virtual void send_order(const Order& order) = 0;
+    virtual void cancel_order(OrderId id) = 0;
+
+    virtual void set_market_data_callback(std::function<void(MarketData)> cb) = 0;
+    virtual void set_order_update_callback(std::function<void(OrderUpdate)> cb) = 0;
+};
+
+================================================================================
+5. CONCURRENCY MODEL
+================================================================================
+
+5.1 THREAD ARCHITECTURE
+------------------------
+
+The system uses a fixed thread pool architecture with dedicated threads
+for specific tasks:
+
+THREAD GROUPS:
+
+1. Market Data Threads (10 threads, 1 per exchange)
+   - Pin to isolated CPU cores (0-9)
+   - Highest priority (real-time scheduling)
+   - Minimal work: parse and forward to queues
+   - No blocking operations
+   - No locks in critical path
+
+2. Strategy Threads (4-8 threads)
+   - Pin to isolated CPU cores (10-17)
+   - High priority
+   - Process market data events
+   - Generate trading signals
+   - Submit orders
+
+3. Execution Threads (10 threads, 1 per exchange)
+   - Pin to cores (20-29)
+   - Handle order submissions
+   - Process order updates
+   - Update OMS state
+
+4. I/O Thread Pool (8 threads)
+   - Standard priority
+   - REST API calls
+   - Database operations
+   - File I/O
+   - Non-critical tasks
+
+5. Admin Thread (1 thread)
+   - Low priority
+   - Configuration reload
+   - Health monitoring
+   - Metric aggregation
+   - Housekeeping tasks
+
+THREAD PINNING STRATEGY:
+
+// Pin thread to specific CPU core
+void pin_thread_to_core(int core_id) {
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(core_id, &cpuset);
+
+    pthread_t thread = pthread_self();
+    int result = pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset);
+
+    if (result != 0) {
+        throw std::runtime_error("Failed to pin thread to core " +
+                                 std::to_string(core_id));
+    }
+}
+
+// Set real-time priority
+void set_realtime_priority(int priority = 99) {
+    struct sched_param param;
+    param.sched_priority = priority;
+
+    if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &param) != 0) {
+        throw std::runtime_error("Failed to set real-time priority");
+    }
+}
+
+// Market data thread initialization
+void market_data_thread_main(int exchange_id) {
+    // Pin to dedicated core
+    pin_thread_to_core(exchange_id);
+
+    // Set real-time priority
+    set_realtime_priority(99);
+
+    // Disable interrupts
+    disable_thread_interruption();
+
+    // Run event loop
+    run_event_loop();
+}
+
+5.2 SYNCHRONIZATION STRATEGY
+-----------------------------
+
+LOCKFREE QUEUES:
+  - SPSC queues between market data and strategy threads
+  - MPSC queues for order submissions
+  - Boost.Lockfree for implementation
+
+ATOMIC OPERATIONS:
+  - Position updates
+  - Order counts
+  - Metric counters
+
+RCU (Read-Copy-Update):
+  - Configuration data
+  - Symbol specifications
+  - Read-heavy data structures
+
+SEQLOCKS:
+  - Timestamps
+  - Snapshot-consistent reads
+
+NO LOCKS IN HOT PATH:
+  - Critical path avoids all locks
+  - Use message passing instead
+  - Pre-allocated buffers
+
+5.3 MEMORY ORDERING
+-------------------
+
+Careful use of memory ordering for lockfree algorithms:
+
+// Example: Publishing to lockfree queue
+bool publish(const MarketData& data) {
+    auto tail = tail_.load(std::memory_order_relaxed);
+    auto next_tail = increment(tail);
+
+    // Check if full
+    if (next_tail == head_.load(std::memory_order_acquire)) {
+        return false;  // Queue full
+    }
+
+    // Write data
+    buffer_[tail] = data;
+
+    // Publish with release semantics
+    tail_.store(next_tail, std::memory_order_release);
+    return true;
+}
+
+// Example: Consuming from lockfree queue
+bool consume(MarketData& data) {
+    auto head = head_.load(std::memory_order_relaxed);
+
+    // Check if empty
+    if (head == tail_.load(std::memory_order_acquire)) {
+        return false;  // Queue empty
+    }
+
+    // Read data
+    data = buffer_[head];
+
+    // Consume with release semantics
+    head_.store(increment(head), std::memory_order_release);
+    return true;
+}
+
+================================================================================
+6. NETWORK ARCHITECTURE
+================================================================================
+
+6.1 CONNECTION TOPOLOGY
+------------------------
+
+Each exchange connector maintains:
+  - 1 WebSocket connection for market data
+  - 1 WebSocket connection for order updates
+  - 1 REST connection pool (5-10 connections)
+
+Total connections: 10 exchanges × 3 = 30 primary connections
+
+6.2 NETWORK OPTIMIZATION
+-------------------------
+
+TCP SETTINGS:
+  - TCP_NODELAY: Disable Nagle's algorithm
+  - TCP_QUICKACK: Enable quick ACK
+  - SO_REUSEPORT: Load balance across threads
+  - SO_RCVBUF/SO_SNDBUF: Optimal buffer sizes (256KB)
+
+WEBSOCKET SETTINGS:
+  - No compression (latency vs bandwidth tradeoff)
+  - Binary frames where supported
+  - Heartbeat every 30 seconds
+  - Auto-reconnect with exponential backoff
+
+KERNEL BYPASS (Optional):
+  - DPDK for ultra-low latency
+  - Requires dedicated NIC
+  - Complex setup but <10us latency
+
+6.3 CONNECTION MANAGEMENT
+--------------------------
+
+class ConnectionManager {
+public:
+    void maintain_connections() {
+        for (auto& [exchange, connector] : connectors_) {
+            if (!connector->is_connected()) {
+                // Reconnect with backoff
+                auto delay = calculate_backoff(connector->failure_count());
+                schedule_reconnect(connector, delay);
+            } else {
+                // Send heartbeat
+                connector->send_heartbeat();
+            }
+        }
+    }
+
+private:
+    std::chrono::milliseconds calculate_backoff(int failures) {
+        // Exponential backoff: 1s, 2s, 4s, 8s, max 30s
+        return std::chrono::milliseconds(
+            std::min(1000 * (1 << failures), 30000));
+    }
+};
+
+================================================================================
+7. DATA ARCHITECTURE
+================================================================================
+
+7.1 DATA MODELS
+---------------
+
+// Core domain objects with value semantics
+
+struct Price {
+    int64_t value;  // Fixed-point: value / 100000000
+
+    static constexpr int64_t SCALE = 100000000;
+
+    Price(double d) : value(static_cast<int64_t>(d * SCALE)) {}
+    double to_double() const { return static_cast<double>(value) / SCALE; }
+
+    bool operator<(Price rhs) const { return value < rhs.value; }
+    bool operator>(Price rhs) const { return value > rhs.value; }
+};
+
+struct Quantity {
+    int64_t value;  // Fixed-point
+    static constexpr int64_t SCALE = 100000000;
+
+    // Similar to Price
+};
+
+struct Order {
+    OrderId id;
+    std::string symbol;
+    Side side;  // BUY or SELL
+    OrderType type;  // LIMIT, MARKET, etc.
+    Price price;
+    Quantity quantity;
+    Quantity filled;
+    OrderStatus status;
+    Timestamp created_time;
+    Timestamp updated_time;
+    std::string exchange;
+    std::string client_order_id;
+};
+
+struct Trade {
+    std::string symbol;
+    Price price;
+    Quantity quantity;
+    Side side;
+    Timestamp timestamp;
+    std::string trade_id;
+};
+
+struct OrderBookLevel {
+    Price price;
+    Quantity quantity;
+    int num_orders;  // If provided by exchange
+};
+
+struct OrderBookSnapshot {
+    std::string symbol;
+    std::vector<OrderBookLevel> bids;
+    std::vector<OrderBookLevel> asks;
+    Timestamp timestamp;
+    uint64_t sequence_number;
+};
+
+7.2 DATA NORMALIZATION
+----------------------
+
+Exchange data varies significantly. Normalization layer converts
+exchange-specific formats to common internal format.
+
+class DataNormalizer {
+public:
+    OrderBookSnapshot normalize_binance_book(const json& data) {
+        OrderBookSnapshot snapshot;
+        snapshot.symbol = data["s"];
+        snapshot.timestamp = Timestamp::now();
+
+        for (const auto& bid : data["bids"]) {
+            OrderBookLevel level;
+            level.price = Price(std::stod(bid[0].get<std::string>()));
+            level.quantity = Quantity(std::stod(bid[1].get<std::string>()));
+            snapshot.bids.push_back(level);
+        }
+
+        // Similar for asks
+        return snapshot;
+    }
+
+    // Similar methods for other exchanges
+};
+
+7.3 DATA STORAGE STRATEGY
+--------------------------
+
+HOT DATA (in-memory):
+  - Current positions (Redis)
+  - Active orders (Redis)
+  - Recent market data (ring buffers)
+  - Configuration (memory + Redis)
+
+WARM DATA (SSD):
+  - Today's market data (ClickHouse)
+  - Today's orders (PostgreSQL)
+  - Recent metrics (Prometheus)
+
+COLD DATA (HDD/Cloud):
+  - Historical market data (ClickHouse + S3)
+  - Historical orders (PostgreSQL)
+  - Archived logs (S3)
+
+================================================================================
+8. SECURITY ARCHITECTURE
+================================================================================
+
+8.1 API KEY MANAGEMENT
+-----------------------
+
+// Encrypted key storage
+class SecureKeyStore {
+public:
+    void store_key(const std::string& exchange,
+                   const std::string& api_key,
+                   const std::string& secret_key) {
+        // Encrypt with master key
+        auto encrypted_api = encrypt(api_key, master_key_);
+        auto encrypted_secret = encrypt(secret_key, master_key_);
+
+        // Store in database
+        db_->execute("INSERT INTO api_keys VALUES (?, ?, ?)",
+                     exchange, encrypted_api, encrypted_secret);
+    }
+
+    std::pair<std::string, std::string> get_keys(const std::string& exchange) {
+        auto result = db_->query("SELECT api_key, secret FROM api_keys WHERE exchange = ?",
+                                  exchange);
+
+        return {
+            decrypt(result["api_key"], master_key_),
+            decrypt(result["secret"], master_key_)
+        };
+    }
+
+private:
+    std::string master_key_;  // From environment or HSM
+    Database* db_;
+
+    std::string encrypt(const std::string& plaintext, const std::string& key);
+    std::string decrypt(const std::string& ciphertext, const std::string& key);
+};
+
+8.2 SIGNATURE GENERATION
+-------------------------
+
+// HMAC-SHA256 for exchange API authentication
+class SignatureGenerator {
+public:
+    std::string generate_signature(const std::string& message,
+                                    const std::string& secret) {
+        unsigned char digest[EVP_MAX_MD_SIZE];
+        unsigned int digest_len;
+
+        HMAC(EVP_sha256(),
+             secret.c_str(), secret.length(),
+             reinterpret_cast<const unsigned char*>(message.c_str()),
+             message.length(),
+             digest,
+             &digest_len);
+
+        return hex_encode(digest, digest_len);
+    }
+};
+
+8.3 AUDIT TRAIL
+---------------
+
+All trading actions logged immutably:
+
+class AuditLogger {
+public:
+    void log_order_placed(const Order& order, const std::string& user) {
+        AuditEntry entry;
+        entry.timestamp = Timestamp::now();
+        entry.action = "ORDER_PLACED";
+        entry.user = user;
+        entry.details = serialize(order);
+
+        // Write to append-only log
+        audit_log_->append(entry);
+
+        // Also to database
+        db_->execute("INSERT INTO audit_log VALUES (?, ?, ?, ?)",
+                     entry.timestamp, entry.action, entry.user, entry.details);
+    }
+};
+
+================================================================================
+9. DEPLOYMENT ARCHITECTURE
+================================================================================
+
+9.1 SINGLE-SERVER DEPLOYMENT
+-----------------------------
+
+Suitable for: Development, testing, small-scale trading
+
+Hardware Requirements:
+  - CPU: 32+ cores (AMD EPYC or Intel Xeon)
+  - RAM: 64GB+
+  - Storage: 1TB NVMe SSD
+  - Network: 10Gbps+
+
+Software Stack:
+  - OS: Ubuntu 22.04 LTS (kernel 5.15+)
+  - Runtime: Trading system binary
+  - Database: PostgreSQL 15, Redis 7, ClickHouse 23
+  - Monitoring: Prometheus, Grafana
+
+9.2 MULTI-SERVER DEPLOYMENT
+----------------------------
+
+Suitable for: Production, high-volume trading
+
+Architecture:
+  - Market Data Servers (2+): WebSocket connections, data processing
+  - Strategy Servers (2+): Trading logic, signal generation
+  - Execution Servers (2+): Order submission, fill handling
+  - Database Cluster: PostgreSQL (primary + replica), Redis (cluster), ClickHouse (cluster)
+  - Monitoring: Dedicated Prometheus + Grafana servers
+
+Load Balancing:
+  - Market data: ECMP for WebSocket connections
+  - Strategy: Round-robin for different symbols
+  - Execution: Sticky sessions per exchange
+
+9.3 HIGH-AVAILABILITY SETUP
+----------------------------
+
+Requirements:
+  - 99.99% uptime target
+  - Automatic failover
+  - Data consistency
+
+Design:
+  - Primary + Secondary servers in different data centers
+  - Real-time replication of critical state
+  - Health checks every second
+  - Automatic failover in <5 seconds
+  - Manual fallback option
+
+class FailoverManager {
+public:
+    void monitor_health() {
+        if (!is_primary_healthy()) {
+            if (should_failover()) {
+                initiate_failover();
+            }
+        }
+    }
+
+private:
+    bool is_primary_healthy() {
+        // Check heartbeat, latency, error rate
+        return heartbeat_received_recently() &&
+               latency_acceptable() &&
+               error_rate_acceptable();
+    }
+
+    void initiate_failover() {
+        // 1. Stop accepting new orders
+        // 2. Cancel all active orders
+        // 3. Save state to database
+        // 4. Promote secondary to primary
+        // 5. Resume trading
+    }
+};
+
+================================================================================
+10. SCALABILITY DESIGN
+================================================================================
+
+10.1 HORIZONTAL SCALING
+------------------------
+
+Market Data Processing:
+  - Scale by adding more market data servers
+  - Partition by exchange or symbol
+  - Each server handles subset of data
+
+Strategy Execution:
+  - Scale by adding more strategy servers
+  - Partition by symbol or strategy type
+  - Independent processing
+
+Database:
+  - PostgreSQL: Read replicas
+  - Redis: Cluster mode
+  - ClickHouse: Distributed tables
+
+10.2 VERTICAL SCALING
+----------------------
+
+CPU:
+  - More cores for more parallel processing
+  - Higher clock speed for lower latency
+
+Memory:
+  - Larger order book cache
+  - More historical data in memory
+  - Bigger message buffers
+
+Network:
+  - Higher bandwidth for more exchanges
+  - Lower latency NICs
+
+10.3 PERFORMANCE SCALING
+-------------------------
+
+Target: Linear scaling up to 10 exchanges
+
+Performance vs. Exchange Count:
+  - 1 exchange: 1ms avg latency
+  - 5 exchanges: 1.2ms avg latency
+  - 10 exchanges: 1.5ms avg latency
+
+Achieved through:
+  - Dedicated threads per exchange
+  - No shared bottlenecks
+  - Independent processing
+
+================================================================================
+11. RELIABILITY DESIGN
+================================================================================
+
+11.1 FAILURE MODES
+------------------
+
+Network Failure:
+  - Automatic reconnection
+  - Exponential backoff
+  - Continue with available exchanges
+
+Exchange Downtime:
+  - Graceful degradation
+  - Redirect orders to alternative exchanges
+  - Alert operators
+
+Software Crash:
+  - Automatic restart
+  - State recovery from database
+  - Resume from last known position
+
+Hardware Failure:
+  - Failover to secondary server
+  - Alert operators
+  - Order new hardware
+
+11.2 RECOVERY MECHANISMS
+-------------------------
+
+State Persistence:
+  - Critical state saved to Redis
+  - Periodic snapshots to PostgreSQL
+  - Write-ahead log for orders
+
+Recovery Process:
+  1. Load last snapshot
+  2. Replay write-ahead log
+  3. Reconcile with exchange state
+  4. Resume trading
+
+Recovery Time Objective (RTO): < 5 minutes
+Recovery Point Objective (RPO): < 1 second
+
+11.3 CIRCUIT BREAKERS
+----------------------
+
+class CircuitBreaker {
+public:
+    bool should_trade() {
+        // Check volatility
+        if (volatility_ > max_volatility_) {
+            return false;
+        }
+
+        // Check loss limit
+        if (daily_pnl_ < -max_daily_loss_) {
+            return false;
+        }
+
+        // Check error rate
+        if (error_rate_ > max_error_rate_) {
+            return false;
+        }
+
+        return true;
+    }
+
+private:
+    double volatility_;
+    double daily_pnl_;
+    double error_rate_;
+    double max_volatility_ = 0.1;  // 10%
+    double max_daily_loss_ = 10000;  // $10k
+    double max_error_rate_ = 0.05;  // 5%
+};
+
+================================================================================
+DOCUMENT END
+================================================================================
+
+This architecture provides:
+  - Clear layering and separation of concerns
+  - Scalable, reliable foundation
+  - Low-latency, high-throughput design
+  - Production-ready patterns and practices
+
+Next: See 02_component_architecture.txt for detailed component design

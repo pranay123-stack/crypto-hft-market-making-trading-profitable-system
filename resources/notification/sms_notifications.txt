@@ -1,0 +1,965 @@
+================================================================================
+                      SMS NOTIFICATIONS - COMPLETE GUIDE
+================================================================================
+
+VERSION: 2.1.0
+LAST UPDATED: 2025-11-25
+STATUS: PRODUCTION
+MAINTAINER: Infrastructure Team
+
+================================================================================
+                              TABLE OF CONTENTS
+================================================================================
+
+1. SMS Channel Overview
+2. Provider Selection & Configuration
+3. Twilio Integration (Recommended)
+4. AWS SNS Integration
+5. C++ SMS Implementation
+6. Message Formatting & Length Limits
+7. International Number Support
+8. Cost Management & Optimization
+9. Delivery Status Tracking
+10. SMS Testing & Debugging
+11. Production Best Practices
+12. Emergency Fallback
+
+================================================================================
+                        1. SMS CHANNEL OVERVIEW
+================================================================================
+
+SMS is a critical notification channel for:
+- P1 and P2 critical alerts
+- On-call engineer notifications
+- Escalation when other channels fail
+- Time-sensitive alerts requiring immediate attention
+
+CHARACTERISTICS:
+
+Latency: 1-5 seconds
+Reliability: 99.95%
+Cost: $0.0075 - $0.02 per message
+Character Limit: 160 characters (GSM-7) or 70 characters (Unicode)
+Global Coverage: 99% of countries
+Delivery Rate: 98%+
+
+WHY USE SMS:
+
+1. Universally accessible (no internet required)
+2. Guaranteed delivery to mobile devices
+3. High open rate (98% within 3 minutes)
+4. Works during internet outages
+5. Immediate notification sound/vibration
+6. No app installation required
+
+WHEN TO USE SMS:
+
+P1 Critical Alerts:
+- System outages
+- Trading halted
+- Security breaches
+- Data corruption
+- Critical infrastructure failure
+
+P2 High Priority:
+- Degraded performance
+- High error rates
+- Risk limit breaches
+- Market anomalies
+
+WHEN NOT TO USE SMS:
+
+- Detailed reports (use email)
+- Non-urgent notifications (use Slack)
+- Frequent updates (alert fatigue)
+- Logs or debug information
+
+================================================================================
+                  2. PROVIDER SELECTION & CONFIGURATION
+================================================================================
+
+PROVIDER COMPARISON:
+
+Provider      Cost/SMS   Reliability   Latency   Global   API Quality
+--------------------------------------------------------------------------
+Twilio        $0.0075    99.95%        1-3s      Yes      Excellent
+AWS SNS       $0.0075    99.9%         2-5s      Yes      Good
+Nexmo/Vonage  $0.0080    99.9%         2-4s      Yes      Good
+MessageBird   $0.0070    99.8%         2-5s      Yes      Good
+Plivo         $0.0085    99.8%         2-4s      Yes      Good
+
+RECOMMENDED: Twilio
+- Best reliability and API
+- Excellent documentation
+- Real-time delivery tracking
+- Great support
+- Used by major financial institutions
+
+TWILIO CONFIGURATION:
+
+Account Setup:
+1. Sign up at https://www.twilio.com
+2. Verify your business identity
+3. Purchase a phone number (+1-XXX-XXX-XXXX)
+4. Generate API credentials
+
+Configuration File: /etc/hft/channels/sms.conf
+
+# Twilio Configuration
+sms.provider = twilio
+sms.account_sid = YOUR_TWILIO_ACCOUNT_SID_HERE
+sms.auth_token = ${TWILIO_AUTH_TOKEN}
+sms.from_number = +15551234567
+
+# Alternative: Use Messaging Service SID for better deliverability
+sms.messaging_service_sid = MG1234567890abcdef1234567890abcdef
+
+# API Configuration
+sms.api_endpoint = https://api.twilio.com/2010-04-01
+sms.timeout_seconds = 10
+sms.verify_ssl = true
+
+# Message Configuration
+sms.max_length = 160
+sms.allow_unicode = false
+sms.truncate_long_messages = true
+sms.split_long_messages = false    # Don't send multiple SMS
+
+# Rate Limiting (per recipient)
+sms.max_per_hour = 10
+sms.max_per_day = 50
+sms.cooldown_seconds = 300         # Min 5 minutes between messages
+
+# Retry Configuration
+sms.retry_attempts = 3
+sms.retry_delay_ms = 2000
+sms.retry_backoff_multiplier = 2.0
+
+# Status Callback
+sms.status_callback_url = https://hft-notifications.company.com/sms/status
+sms.track_delivery = true
+
+# Cost Control
+sms.max_daily_spend = 100.00       # USD
+sms.alert_on_high_usage = true
+sms.high_usage_threshold = 50.00   # USD per day
+
+# Emergency Numbers (bypass rate limits)
+sms.emergency_numbers = +15551111111,+15552222222,+15553333333
+
+Environment Variables:
+
+export TWILIO_ACCOUNT_SID=YOUR_TWILIO_ACCOUNT_SID_HERE
+export TWILIO_AUTH_TOKEN=your_auth_token_here
+export TWILIO_FROM_NUMBER=+15551234567
+
+AWS SNS CONFIGURATION (Alternative):
+
+# AWS SNS Configuration
+sms.provider = aws_sns
+sms.aws_region = us-east-1
+sms.aws_access_key_id = ${AWS_ACCESS_KEY_ID}
+sms.aws_secret_access_key = ${AWS_SECRET_ACCESS_KEY}
+
+# SNS Settings
+sms.sns_sender_id = HFTALERT      # Shown as sender name
+sms.sns_message_type = Transactional
+sms.sns_default_country = US
+
+================================================================================
+                    3. TWILIO INTEGRATION (RECOMMENDED)
+================================================================================
+
+HEADER FILE: sms_channel.hpp
+
+#ifndef HFT_SMS_CHANNEL_HPP
+#define HFT_SMS_CHANNEL_HPP
+
+#include "channel_interface.hpp"
+#include <curl/curl.h>
+#include <string>
+#include <vector>
+#include <memory>
+#include <atomic>
+#include <unordered_map>
+#include <mutex>
+
+namespace hft {
+namespace notification {
+
+struct SMSConfig {
+    std::string provider{"twilio"};
+
+    // Twilio settings
+    std::string account_sid;
+    std::string auth_token;
+    std::string from_number;
+    std::string messaging_service_sid;
+
+    // API settings
+    std::string api_endpoint{"https://api.twilio.com/2010-04-01"};
+    std::chrono::seconds timeout{10};
+    bool verify_ssl{true};
+
+    // Message settings
+    size_t max_length{160};
+    bool allow_unicode{false};
+    bool truncate_long_messages{true};
+
+    // Rate limiting
+    uint32_t max_per_hour{10};
+    uint32_t max_per_day{50};
+    std::chrono::seconds cooldown{300};
+
+    // Retry settings
+    uint32_t retry_attempts{3};
+    std::chrono::milliseconds retry_delay{2000};
+    double retry_backoff{2.0};
+
+    // Cost control
+    double max_daily_spend{100.0};
+    bool alert_on_high_usage{true};
+    double high_usage_threshold{50.0};
+
+    // Emergency bypass
+    std::vector<std::string> emergency_numbers;
+
+    // Status tracking
+    std::string status_callback_url;
+    bool track_delivery{true};
+};
+
+struct SMSMessage {
+    std::string to;
+    std::string from;
+    std::string body;
+    std::string message_id;
+    std::chrono::system_clock::time_point sent_time;
+    bool is_emergency{false};
+};
+
+struct SMSDeliveryStatus {
+    std::string message_id;
+    std::string status;  // queued, sent, delivered, failed
+    std::string error_code;
+    std::string error_message;
+    std::chrono::system_clock::time_point status_time;
+};
+
+class TwilioClient {
+public:
+    explicit TwilioClient(const SMSConfig& config);
+    ~TwilioClient();
+
+    struct SendResult {
+        bool success;
+        std::string message_sid;
+        std::string error_message;
+        double cost_usd;
+    };
+
+    SendResult send_sms(const SMSMessage& message);
+    SMSDeliveryStatus get_delivery_status(const std::string& message_sid);
+    double get_account_balance();
+
+private:
+    SMSConfig config_;
+    CURL* curl_{nullptr};
+    std::atomic<double> daily_spend_{0.0};
+    std::chrono::system_clock::time_point spend_reset_time_;
+
+    std::string build_request_body(const SMSMessage& message);
+    std::string parse_message_sid(const std::string& response);
+    std::string generate_auth_header();
+    bool check_spending_limit();
+    void update_spending(double cost);
+};
+
+class SMSChannel : public INotificationChannel {
+public:
+    explicit SMSChannel(const SMSConfig& config);
+    ~SMSChannel() override;
+
+    // INotificationChannel interface
+    DispatchResult send(const Alert& alert,
+                       const std::vector<std::string>& recipients) override;
+
+    bool health_check() override;
+    ChannelMetrics get_metrics() const override;
+    void set_config(const ChannelConfig& config) override;
+    ChannelConfig get_config() const override;
+
+    bool start() override;
+    void stop() override;
+    bool is_running() const override;
+
+    ChannelType get_type() const override { return ChannelType::SMS; }
+    std::string get_name() const override { return "SMS"; }
+
+private:
+    SMSConfig config_;
+    std::unique_ptr<TwilioClient> twilio_client_;
+    std::atomic<bool> running_{false};
+
+    // Rate limiting per phone number
+    struct RateLimitBucket {
+        std::atomic<uint32_t> hourly_count{0};
+        std::atomic<uint32_t> daily_count{0};
+        std::chrono::steady_clock::time_point last_sent;
+        std::chrono::steady_clock::time_point hour_reset;
+        std::chrono::steady_clock::time_point day_reset;
+        std::mutex mutex;
+    };
+    std::unordered_map<std::string, RateLimitBucket> rate_limits_;
+    mutable std::shared_mutex rate_limits_mutex_;
+
+    // Metrics
+    mutable ChannelMetrics metrics_;
+    std::atomic<double> total_cost_{0.0};
+
+    // Helper methods
+    SMSMessage create_sms_message(const Alert& alert,
+                                 const std::string& phone_number);
+    std::string format_message_body(const Alert& alert);
+    std::string truncate_message(const std::string& message, size_t max_length);
+    bool is_valid_phone_number(const std::string& number);
+    std::string normalize_phone_number(const std::string& number);
+    bool check_rate_limit(const std::string& phone_number, bool is_emergency);
+    void update_rate_limit(const std::string& phone_number);
+    bool is_emergency_number(const std::string& number);
+};
+
+} // namespace notification
+} // namespace hft
+
+#endif // HFT_SMS_CHANNEL_HPP
+
+IMPLEMENTATION FILE: sms_channel.cpp
+
+#include "sms_channel.hpp"
+#include <spdlog/spdlog.h>
+#include <curl/curl.h>
+#include <openssl/bio.h>
+#include <openssl/evp.h>
+#include <regex>
+#include <sstream>
+#include <iomanip>
+
+namespace hft {
+namespace notification {
+
+// ============================================================================
+// TwilioClient Implementation
+// ============================================================================
+
+TwilioClient::TwilioClient(const SMSConfig& config)
+    : config_(config) {
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+    curl_ = curl_easy_init();
+
+    if (!curl_) {
+        throw std::runtime_error("Failed to initialize CURL for SMS");
+    }
+
+    // Initialize spending tracking
+    spend_reset_time_ = std::chrono::system_clock::now() +
+                       std::chrono::hours(24);
+}
+
+TwilioClient::~TwilioClient() {
+    if (curl_) {
+        curl_easy_cleanup(curl_);
+    }
+}
+
+TwilioClient::SendResult TwilioClient::send_sms(const SMSMessage& message) {
+    SendResult result;
+    result.success = false;
+    result.cost_usd = 0.0075; // Typical Twilio cost
+
+    // Check spending limit
+    if (!check_spending_limit()) {
+        result.error_message = "Daily spending limit exceeded";
+        spdlog::error("SMS daily spending limit exceeded");
+        return result;
+    }
+
+    // Build API endpoint
+    std::string url = config_.api_endpoint + "/Accounts/" +
+                      config_.account_sid + "/Messages.json";
+
+    curl_easy_setopt(curl_, CURLOPT_URL, url.c_str());
+
+    // Set authentication
+    std::string auth = config_.account_sid + ":" + config_.auth_token;
+    curl_easy_setopt(curl_, CURLOPT_USERPWD, auth.c_str());
+
+    // Build request body
+    std::string body = build_request_body(message);
+    curl_easy_setopt(curl_, CURLOPT_POSTFIELDS, body.c_str());
+
+    // Set headers
+    struct curl_slist* headers = nullptr;
+    headers = curl_slist_append(headers, "Content-Type: application/x-www-form-urlencoded");
+    curl_easy_setopt(curl_, CURLOPT_HTTPHEADER, headers);
+
+    // SSL verification
+    if (config_.verify_ssl) {
+        curl_easy_setopt(curl_, CURLOPT_SSL_VERIFYPEER, 1L);
+        curl_easy_setopt(curl_, CURLOPT_SSL_VERIFYHOST, 2L);
+    }
+
+    // Timeout
+    curl_easy_setopt(curl_, CURLOPT_TIMEOUT, config_.timeout.count());
+
+    // Response handling
+    std::string response_data;
+    curl_easy_setopt(curl_, CURLOPT_WRITEFUNCTION,
+        [](void* ptr, size_t size, size_t nmemb, void* userdata) -> size_t {
+            std::string* response = static_cast<std::string*>(userdata);
+            response->append(static_cast<char*>(ptr), size * nmemb);
+            return size * nmemb;
+        });
+    curl_easy_setopt(curl_, CURLOPT_WRITEDATA, &response_data);
+
+    // Perform request
+    CURLcode res = curl_easy_perform(curl_);
+
+    curl_slist_free_all(headers);
+
+    if (res != CURLE_OK) {
+        result.error_message = curl_easy_strerror(res);
+        spdlog::error("SMS send failed: {}", result.error_message);
+        return result;
+    }
+
+    // Check HTTP status code
+    long http_code = 0;
+    curl_easy_getinfo(curl_, CURLINFO_RESPONSE_CODE, &http_code);
+
+    if (http_code == 201) {
+        // Success
+        result.success = true;
+        result.message_sid = parse_message_sid(response_data);
+        update_spending(result.cost_usd);
+
+        spdlog::info("SMS sent successfully to {} (SID: {})",
+                    message.to, result.message_sid);
+    } else {
+        result.error_message = "HTTP " + std::to_string(http_code) +
+                              ": " + response_data;
+        spdlog::error("SMS failed with HTTP {}: {}",
+                     http_code, response_data);
+    }
+
+    return result;
+}
+
+std::string TwilioClient::build_request_body(const SMSMessage& message) {
+    CURL* curl = curl_easy_init();
+
+    std::ostringstream body;
+
+    // Encode parameters
+    char* encoded_to = curl_easy_escape(curl, message.to.c_str(), message.to.length());
+    char* encoded_body = curl_easy_escape(curl, message.body.c_str(), message.body.length());
+
+    body << "To=" << encoded_to;
+    body << "&Body=" << encoded_body;
+
+    // Use messaging service SID or from number
+    if (!config_.messaging_service_sid.empty()) {
+        char* encoded_sid = curl_easy_escape(curl,
+            config_.messaging_service_sid.c_str(),
+            config_.messaging_service_sid.length());
+        body << "&MessagingServiceSid=" << encoded_sid;
+        curl_free(encoded_sid);
+    } else {
+        char* encoded_from = curl_easy_escape(curl,
+            message.from.c_str(), message.from.length());
+        body << "&From=" << encoded_from;
+        curl_free(encoded_from);
+    }
+
+    // Status callback for delivery tracking
+    if (config_.track_delivery && !config_.status_callback_url.empty()) {
+        char* encoded_callback = curl_easy_escape(curl,
+            config_.status_callback_url.c_str(),
+            config_.status_callback_url.length());
+        body << "&StatusCallback=" << encoded_callback;
+        curl_free(encoded_callback);
+    }
+
+    curl_free(encoded_to);
+    curl_free(encoded_body);
+    curl_easy_cleanup(curl);
+
+    return body.str();
+}
+
+std::string TwilioClient::parse_message_sid(const std::string& response) {
+    // Simple JSON parsing for message SID
+    // In production, use a JSON library like RapidJSON
+
+    std::regex sid_regex(R"("sid"\s*:\s*"([^"]+)")");
+    std::smatch matches;
+
+    if (std::regex_search(response, matches, sid_regex)) {
+        return matches[1].str();
+    }
+
+    return "";
+}
+
+bool TwilioClient::check_spending_limit() {
+    auto now = std::chrono::system_clock::now();
+
+    // Reset daily counter if needed
+    if (now >= spend_reset_time_) {
+        daily_spend_.store(0.0, std::memory_order_relaxed);
+        spend_reset_time_ = now + std::chrono::hours(24);
+    }
+
+    double current_spend = daily_spend_.load(std::memory_order_relaxed);
+    return current_spend < config_.max_daily_spend;
+}
+
+void TwilioClient::update_spending(double cost) {
+    daily_spend_.fetch_add(cost, std::memory_order_relaxed);
+
+    double current_spend = daily_spend_.load(std::memory_order_relaxed);
+
+    if (config_.alert_on_high_usage &&
+        current_spend >= config_.high_usage_threshold) {
+        spdlog::warn("SMS spending reached ${:.2f} (threshold: ${:.2f})",
+                    current_spend, config_.high_usage_threshold);
+    }
+}
+
+double TwilioClient::get_account_balance() {
+    // Query Twilio API for account balance
+    std::string url = config_.api_endpoint + "/Accounts/" +
+                      config_.account_sid + ".json";
+
+    curl_easy_setopt(curl_, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl_, CURLOPT_HTTPGET, 1L);
+
+    std::string response_data;
+    curl_easy_setopt(curl_, CURLOPT_WRITEFUNCTION,
+        [](void* ptr, size_t size, size_t nmemb, void* userdata) -> size_t {
+            std::string* response = static_cast<std::string*>(userdata);
+            response->append(static_cast<char*>(ptr), size * nmemb);
+            return size * nmemb;
+        });
+    curl_easy_setopt(curl_, CURLOPT_WRITEDATA, &response_data);
+
+    CURLcode res = curl_easy_perform(curl_);
+
+    if (res == CURLE_OK) {
+        // Parse balance from JSON response
+        std::regex balance_regex(R"("balance"\s*:\s*"([^"]+)")");
+        std::smatch matches;
+        if (std::regex_search(response_data, matches, balance_regex)) {
+            return std::stod(matches[1].str());
+        }
+    }
+
+    return -1.0; // Error
+}
+
+// ============================================================================
+// SMSChannel Implementation
+// ============================================================================
+
+SMSChannel::SMSChannel(const SMSConfig& config)
+    : config_(config) {
+}
+
+SMSChannel::~SMSChannel() {
+    stop();
+}
+
+bool SMSChannel::start() {
+    if (running_.load(std::memory_order_acquire)) {
+        return true;
+    }
+
+    // Initialize Twilio client
+    try {
+        twilio_client_ = std::make_unique<TwilioClient>(config_);
+    } catch (const std::exception& e) {
+        spdlog::error("Failed to initialize Twilio client: {}", e.what());
+        return false;
+    }
+
+    running_.store(true, std::memory_order_release);
+
+    spdlog::info("SMS channel started");
+    return true;
+}
+
+void SMSChannel::stop() {
+    if (!running_.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    running_.store(false, std::memory_order_release);
+
+    twilio_client_.reset();
+
+    spdlog::info("SMS channel stopped (total cost: ${:.2f})",
+                total_cost_.load(std::memory_order_relaxed));
+}
+
+bool SMSChannel::is_running() const {
+    return running_.load(std::memory_order_acquire);
+}
+
+DispatchResult SMSChannel::send(const Alert& alert,
+                                const std::vector<std::string>& recipients) {
+    auto start_time = std::chrono::steady_clock::now();
+
+    DispatchResult result;
+    result.channel = ChannelType::SMS;
+
+    if (!is_running()) {
+        result.success = false;
+        result.error_message = "SMS channel not running";
+        return result;
+    }
+
+    bool all_success = true;
+    std::string combined_errors;
+
+    for (const auto& recipient : recipients) {
+        // Normalize phone number
+        std::string phone_number = normalize_phone_number(recipient);
+
+        // Validate phone number
+        if (!is_valid_phone_number(phone_number)) {
+            spdlog::error("Invalid phone number: {}", recipient);
+            all_success = false;
+            combined_errors += "Invalid number: " + recipient + "; ";
+            continue;
+        }
+
+        // Check if emergency number (bypasses rate limits)
+        bool is_emergency = is_emergency_number(phone_number) ||
+                           (alert.severity == AlertSeverity::P1);
+
+        // Check rate limit
+        if (!check_rate_limit(phone_number, is_emergency)) {
+            spdlog::warn("SMS rate limit exceeded for {}", phone_number);
+            all_success = false;
+            combined_errors += "Rate limited: " + phone_number + "; ";
+            metrics_.rate_limited_count++;
+            continue;
+        }
+
+        // Create SMS message
+        SMSMessage msg = create_sms_message(alert, phone_number);
+        msg.is_emergency = is_emergency;
+
+        // Send SMS
+        auto send_result = twilio_client_->send_sms(msg);
+
+        if (send_result.success) {
+            update_rate_limit(phone_number);
+            total_cost_.fetch_add(send_result.cost_usd, std::memory_order_relaxed);
+            metrics_.sent_count++;
+            result.external_id = send_result.message_sid;
+        } else {
+            all_success = false;
+            combined_errors += send_result.error_message + "; ";
+            metrics_.failed_count++;
+        }
+    }
+
+    auto end_time = std::chrono::steady_clock::now();
+    result.latency = std::chrono::duration_cast<std::chrono::milliseconds>(
+        end_time - start_time);
+
+    result.success = all_success;
+    if (!all_success) {
+        result.error_message = combined_errors;
+    }
+
+    return result;
+}
+
+SMSMessage SMSChannel::create_sms_message(const Alert& alert,
+                                         const std::string& phone_number) {
+    SMSMessage msg;
+    msg.to = phone_number;
+    msg.from = config_.from_number;
+    msg.body = format_message_body(alert);
+    msg.sent_time = std::chrono::system_clock::now();
+
+    // Truncate if needed
+    if (msg.body.length() > config_.max_length) {
+        if (config_.truncate_long_messages) {
+            msg.body = truncate_message(msg.body, config_.max_length);
+        }
+    }
+
+    return msg;
+}
+
+std::string SMSChannel::format_message_body(const Alert& alert) {
+    std::ostringstream body;
+
+    // Severity prefix
+    std::string severity_prefix;
+    switch (alert.severity) {
+    case AlertSeverity::P1: severity_prefix = "[P1-CRITICAL]"; break;
+    case AlertSeverity::P2: severity_prefix = "[P2-HIGH]"; break;
+    case AlertSeverity::P3: severity_prefix = "[P3-MED]"; break;
+    case AlertSeverity::P4: severity_prefix = "[P4-LOW]"; break;
+    }
+
+    body << severity_prefix << " ";
+    body << alert.title;
+
+    // Add most critical context (if space allows)
+    if (!alert.context.empty()) {
+        for (const auto& [key, value] : alert.context) {
+            std::string addition = " " + key + ":" + value;
+            if (body.str().length() + addition.length() <= config_.max_length - 10) {
+                body << addition;
+            } else {
+                break;
+            }
+        }
+    }
+
+    return body.str();
+}
+
+std::string SMSChannel::truncate_message(const std::string& message,
+                                        size_t max_length) {
+    if (message.length() <= max_length) {
+        return message;
+    }
+
+    // Reserve 3 characters for "..."
+    size_t truncate_length = max_length - 3;
+    return message.substr(0, truncate_length) + "...";
+}
+
+bool SMSChannel::is_valid_phone_number(const std::string& number) {
+    // E.164 format: +[country code][number]
+    std::regex e164_regex(R"(\+[1-9]\d{1,14})");
+    return std::regex_match(number, e164_regex);
+}
+
+std::string SMSChannel::normalize_phone_number(const std::string& number) {
+    // Remove all non-digit characters except leading +
+    std::string normalized;
+
+    for (char c : number) {
+        if (std::isdigit(c) || (c == '+' && normalized.empty())) {
+            normalized += c;
+        }
+    }
+
+    // Add + prefix if missing (assume US +1)
+    if (normalized.empty() || normalized[0] != '+') {
+        if (normalized.length() == 10) {
+            normalized = "+1" + normalized; // US number
+        } else if (normalized.length() == 11 && normalized[0] == '1') {
+            normalized = "+" + normalized;
+        } else {
+            normalized = "+" + normalized;
+        }
+    }
+
+    return normalized;
+}
+
+bool SMSChannel::check_rate_limit(const std::string& phone_number,
+                                  bool is_emergency) {
+    if (is_emergency) {
+        return true; // Emergency bypasses rate limits
+    }
+
+    std::shared_lock lock(rate_limits_mutex_);
+
+    auto it = rate_limits_.find(phone_number);
+    if (it == rate_limits_.end()) {
+        return true; // No limit set yet
+    }
+
+    std::lock_guard<std::mutex> bucket_lock(it->second.mutex);
+
+    auto now = std::chrono::steady_clock::now();
+
+    // Check cooldown period
+    if (now - it->second.last_sent < config_.cooldown) {
+        return false;
+    }
+
+    // Reset hourly counter if needed
+    if (now - it->second.hour_reset >= std::chrono::hours(1)) {
+        it->second.hourly_count.store(0, std::memory_order_relaxed);
+        it->second.hour_reset = now;
+    }
+
+    // Reset daily counter if needed
+    if (now - it->second.day_reset >= std::chrono::hours(24)) {
+        it->second.daily_count.store(0, std::memory_order_relaxed);
+        it->second.day_reset = now;
+    }
+
+    uint32_t hourly = it->second.hourly_count.load(std::memory_order_relaxed);
+    uint32_t daily = it->second.daily_count.load(std::memory_order_relaxed);
+
+    return (hourly < config_.max_per_hour) && (daily < config_.max_per_day);
+}
+
+void SMSChannel::update_rate_limit(const std::string& phone_number) {
+    std::unique_lock lock(rate_limits_mutex_);
+
+    auto& bucket = rate_limits_[phone_number];
+    std::lock_guard<std::mutex> bucket_lock(bucket.mutex);
+
+    auto now = std::chrono::steady_clock::now();
+
+    bucket.hourly_count.fetch_add(1, std::memory_order_relaxed);
+    bucket.daily_count.fetch_add(1, std::memory_order_relaxed);
+    bucket.last_sent = now;
+
+    if (bucket.hour_reset == std::chrono::steady_clock::time_point{}) {
+        bucket.hour_reset = now;
+    }
+    if (bucket.day_reset == std::chrono::steady_clock::time_point{}) {
+        bucket.day_reset = now;
+    }
+}
+
+bool SMSChannel::is_emergency_number(const std::string& number) {
+    return std::find(config_.emergency_numbers.begin(),
+                    config_.emergency_numbers.end(),
+                    number) != config_.emergency_numbers.end();
+}
+
+bool SMSChannel::health_check() {
+    if (!is_running()) {
+        return false;
+    }
+
+    // Check Twilio account balance
+    double balance = twilio_client_->get_account_balance();
+
+    if (balance < 0) {
+        spdlog::error("Failed to query Twilio account balance");
+        return false;
+    }
+
+    if (balance < 10.0) {
+        spdlog::warn("Low Twilio account balance: ${:.2f}", balance);
+    }
+
+    return true;
+}
+
+ChannelMetrics SMSChannel::get_metrics() const {
+    auto metrics = metrics_;
+    metrics.cost_usd = total_cost_.load(std::memory_order_relaxed);
+    return metrics;
+}
+
+} // namespace notification
+} // namespace hft
+
+================================================================================
+                    4. MESSAGE FORMATTING & LENGTH LIMITS
+================================================================================
+
+SMS CHARACTER LIMITS:
+
+GSM-7 Encoding (Standard):
+- Single message: 160 characters
+- Multi-part (2 messages): 306 characters (153 each)
+- Multi-part (3 messages): 459 characters (153 each)
+
+Unicode (UCS-2):
+- Single message: 70 characters
+- Multi-part (2 messages): 134 characters (67 each)
+- Multi-part (3 messages): 201 characters (67 each)
+
+BEST PRACTICES:
+
+1. Keep messages under 160 characters
+2. Use abbreviations for common terms
+3. Avoid emojis (uses Unicode encoding)
+4. Include only essential information
+5. Use severity prefix: [P1], [P2], etc.
+
+MESSAGE TEMPLATES:
+
+P1 Critical (Ultra-concise):
+[P1-CRITICAL] {title} {key_metric}:{value}
+
+Example:
+[P1-CRITICAL] Trading Halted latency:250ms system:OMS
+
+P2 High Priority:
+[P2-HIGH] {title} {detail}
+
+Example:
+[P2-HIGH] High Error Rate 15% failures in execution_engine
+
+P3/P4 (Should use email/Slack instead):
+Not recommended for SMS
+
+FORMATTING FUNCTIONS:
+
+std::string format_p1_sms(const Alert& alert) {
+    std::ostringstream msg;
+    msg << "[P1-CRITICAL] " << alert.title;
+
+    // Add top 2 context items
+    int count = 0;
+    for (const auto& [key, value] : alert.context) {
+        if (count++ >= 2) break;
+        msg << " " << key << ":" << value;
+    }
+
+    return truncate_to_160(msg.str());
+}
+
+std::string abbreviate_terms(const std::string& text) {
+    static const std::map<std::string, std::string> abbreviations = {
+        {"execution", "exec"},
+        {"latency", "lat"},
+        {"milliseconds", "ms"},
+        {"microseconds", "us"},
+        {"trading", "trd"},
+        {"system", "sys"},
+        {"algorithm", "algo"},
+        {"position", "pos"},
+        {"order", "ord"},
+        {"market", "mkt"},
+        {"error", "err"},
+        {"warning", "warn"},
+        {"critical", "crit"},
+        {"database", "db"},
+        {"server", "srv"},
+        {"connection", "conn"},
+    };
+
+    std::string result = text;
+    for (const auto& [full, abbrev] : abbreviations) {
+        size_t pos = 0;
+        while ((pos = result.find(full, pos)) != std::string::npos) {
+            result.replace(pos, full.length(), abbrev);
+            pos += abbrev.length();
+        }
+    }
+
+    return result;
+}
+
+================================================================================
+                        END OF SMS NOTIFICATIONS GUIDE
+================================================================================

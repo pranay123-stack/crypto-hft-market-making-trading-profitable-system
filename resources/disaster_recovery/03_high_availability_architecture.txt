@@ -1,0 +1,1290 @@
+================================================================================
+DISASTER RECOVERY - HIGH AVAILABILITY ARCHITECTURE
+High-Frequency Trading System
+Target: 99.99% Uptime (52.56 minutes downtime/year)
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. High Availability Overview
+2. Active-Passive Architecture
+3. Active-Active Architecture
+4. Load Balancing & Traffic Management
+5. Database High Availability
+6. State Management & Synchronization
+7. Geographic Distribution
+8. Network Redundancy
+9. Monitoring & Health Checks
+10. Capacity Planning
+
+================================================================================
+1. HIGH AVAILABILITY OVERVIEW
+================================================================================
+
+1.1 HA ARCHITECTURE PRINCIPLES
+-------------------------------
+
+Core Principles:
+1. No Single Point of Failure (SPOF)
+2. Automatic Failover
+3. Data Consistency
+4. Minimal Latency Impact
+5. Graceful Degradation
+6. Self-Healing Systems
+
+┌─────────────────────────────────────────────────────────────────────┐
+│                 HIGH AVAILABILITY STACK                             │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  Layer 7: Application                                              │
+│  ┌──────────────────────────────────────────────────────────┐     │
+│  │  Trading Engine Cluster (Active-Active)                  │     │
+│  │  - Load Balanced                                         │     │
+│  │  - Session Affinity                                      │     │
+│  │  - Auto-scaling                                          │     │
+│  └──────────────────────────────────────────────────────────┘     │
+│                          │                                         │
+│  Layer 6: Service Mesh                                             │
+│  ┌──────────────────────────────────────────────────────────┐     │
+│  │  Service Discovery (Consul)                              │     │
+│  │  - Health Checks                                         │     │
+│  │  - Circuit Breakers                                      │     │
+│  │  - Retry Logic                                           │     │
+│  └──────────────────────────────────────────────────────────┘     │
+│                          │                                         │
+│  Layer 5: Data                                                     │
+│  ┌──────────────────────────────────────────────────────────┐     │
+│  │  Database Cluster (PostgreSQL)                           │     │
+│  │  Primary + Synchronous Standby + Async Replicas          │     │
+│  │                                                           │     │
+│  │  Cache Layer (Redis Sentinel)                            │     │
+│  │  Master + Replicas with Auto-Failover                    │     │
+│  └──────────────────────────────────────────────────────────┘     │
+│                          │                                         │
+│  Layer 4: Network                                                  │
+│  ┌──────────────────────────────────────────────────────────┐     │
+│  │  Load Balancers (HAProxy/NGINX)                          │     │
+│  │  - Active-Passive Pair                                   │     │
+│  │  - VRRP/Keepalived                                       │     │
+│  │  - Multiple Network Paths                                │     │
+│  └──────────────────────────────────────────────────────────┘     │
+│                          │                                         │
+│  Layer 3: Infrastructure                                           │
+│  ┌──────────────────────────────────────────────────────────┐     │
+│  │  Multi-AZ Deployment                                     │     │
+│  │  - Primary DC (AZ-1)                                     │     │
+│  │  - DR DC (AZ-2)                                          │     │
+│  │  - Backup DC (AZ-3)                                      │     │
+│  └──────────────────────────────────────────────────────────┘     │
+└─────────────────────────────────────────────────────────────────────┘
+
+1.2 AVAILABILITY TARGETS
+------------------------
+
+Component-Level SLAs:
+
+┌──────────────────────┬────────────┬─────────────┬──────────────┐
+│ Component            │ Uptime %   │ Downtime/Yr │ Architecture │
+├──────────────────────┼────────────┼─────────────┼──────────────┤
+│ Trading Engine       │ 99.995%    │ 26.28 min   │ Active-Active│
+│ Order Management     │ 99.99%     │ 52.56 min   │ Active-Pass  │
+│ Risk Engine          │ 99.99%     │ 52.56 min   │ Active-Pass  │
+│ Market Data Gateway  │ 99.999%    │ 5.26 min    │ Active-Active│
+│ Database (Primary)   │ 99.99%     │ 52.56 min   │ Primary+Sync │
+│ Cache Layer          │ 99.99%     │ 52.56 min   │ Sentinel     │
+│ Load Balancer        │ 99.995%    │ 26.28 min   │ VRRP Pair    │
+│ Network              │ 99.999%    │ 5.26 min    │ Redundant    │
+└──────────────────────┴────────────┴─────────────┴──────────────┘
+
+System-Level SLA: 99.99% (accounting for all components)
+
+1.3 FAILURE MODES & MITIGATION
+-------------------------------
+
+Common Failure Scenarios:
+
+1. Server Hardware Failure
+   - Detection: Health checks (every 1s)
+   - Mitigation: Automatic failover to standby
+   - Recovery Time: 30-60 seconds
+
+2. Network Partition
+   - Detection: Split-brain detection
+   - Mitigation: Quorum-based decision
+   - Recovery Time: 5-10 seconds
+
+3. Software Crash
+   - Detection: Process monitoring (systemd)
+   - Mitigation: Automatic restart + state recovery
+   - Recovery Time: 10-30 seconds
+
+4. Database Failure
+   - Detection: Connection pool monitoring
+   - Mitigation: Promote synchronous standby
+   - Recovery Time: 60-120 seconds
+
+5. Data Center Outage
+   - Detection: Cross-DC health monitoring
+   - Mitigation: Geographic failover
+   - Recovery Time: 2-5 minutes
+
+================================================================================
+2. ACTIVE-PASSIVE ARCHITECTURE
+================================================================================
+
+2.1 ACTIVE-PASSIVE DESIGN
+--------------------------
+
+Configuration: One active node serving traffic, passive node on standby
+
+┌─────────────────────────────────────────────────────────────────┐
+│              ACTIVE-PASSIVE ARCHITECTURE                        │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│                     Virtual IP: 10.0.1.100                      │
+│                              │                                  │
+│                    ┌─────────┴─────────┐                       │
+│                    │   Keepalived      │                       │
+│                    │   (VRRP)          │                       │
+│                    └─────────┬─────────┘                       │
+│                              │                                  │
+│              ┌───────────────┴───────────────┐                 │
+│              │                               │                 │
+│       ┌──────▼──────┐               ┌───────▼──────┐          │
+│       │   ACTIVE    │               │   PASSIVE    │          │
+│       │   PRIMARY   │═══════════════│   STANDBY    │          │
+│       │             │  Replication  │              │          │
+│       │  State:     │               │  State:      │          │
+│       │  MASTER     │               │  BACKUP      │          │
+│       │  Priority:  │               │  Priority:   │          │
+│       │  100        │               │  50          │          │
+│       └─────────────┘               └──────────────┘          │
+│            │                              │                    │
+│            │                              │                    │
+│     Serves Traffic                  Ready to Take Over         │
+│     All Writes                      Synchronized State         │
+│     Heartbeat: 1s                   Monitors Active            │
+└─────────────────────────────────────────────────────────────────┘
+
+Advantages:
++ Simple configuration
++ Clear state ownership
++ No split-brain issues
++ Easier to manage
+
+Disadvantages:
+- 50% resource utilization
+- Failover time (30-60s)
+- Passive node underutilized
+
+2.2 KEEPALIVED CONFIGURATION
+-----------------------------
+
+Primary Node Configuration: /etc/keepalived/keepalived.conf
+
+```conf
+# Keepalived Configuration - Primary Node
+global_defs {
+    router_id HFT_PRIMARY
+    enable_script_security
+    script_user root
+}
+
+# Health check script
+vrrp_script check_trading_engine {
+    script "/opt/hft/scripts/check_trading_health.sh"
+    interval 2
+    timeout 3
+    rise 2
+    fall 3
+    weight -20
+}
+
+vrrp_instance VI_TRADING {
+    state MASTER
+    interface eth0
+    virtual_router_id 51
+    priority 100
+    advert_int 1
+
+    authentication {
+        auth_type PASS
+        auth_pass hft_secret_key_2025
+    }
+
+    virtual_ipaddress {
+        10.0.1.100/24 dev eth0 label eth0:1
+    }
+
+    track_script {
+        check_trading_engine
+    }
+
+    notify_master /opt/hft/scripts/become_master.sh
+    notify_backup /opt/hft/scripts/become_backup.sh
+    notify_fault /opt/hft/scripts/fault_handler.sh
+
+    # Preempt settings
+    preempt_delay 30
+}
+
+# Database VIP
+vrrp_instance VI_DATABASE {
+    state MASTER
+    interface eth0
+    virtual_router_id 52
+    priority 100
+    advert_int 1
+
+    authentication {
+        auth_type PASS
+        auth_pass db_secret_key_2025
+    }
+
+    virtual_ipaddress {
+        10.0.1.101/24 dev eth0 label eth0:2
+    }
+
+    track_script {
+        check_database
+    }
+}
+```
+
+Standby Node Configuration: /etc/keepalived/keepalived.conf
+
+```conf
+# Keepalived Configuration - Standby Node
+global_defs {
+    router_id HFT_STANDBY
+}
+
+vrrp_script check_trading_engine {
+    script "/opt/hft/scripts/check_trading_health.sh"
+    interval 2
+    timeout 3
+    rise 2
+    fall 3
+    weight -20
+}
+
+vrrp_instance VI_TRADING {
+    state BACKUP
+    interface eth0
+    virtual_router_id 51
+    priority 50  # Lower priority than primary
+    advert_int 1
+
+    authentication {
+        auth_type PASS
+        auth_pass hft_secret_key_2025
+    }
+
+    virtual_ipaddress {
+        10.0.1.100/24 dev eth0 label eth0:1
+    }
+
+    track_script {
+        check_trading_engine
+    }
+
+    notify_master /opt/hft/scripts/become_master.sh
+    notify_backup /opt/hft/scripts/become_backup.sh
+    notify_fault /opt/hft/scripts/fault_handler.sh
+
+    preempt_delay 30
+}
+```
+
+Health Check Script: /opt/hft/scripts/check_trading_health.sh
+
+```bash
+#!/bin/bash
+# Trading Engine Health Check for VRRP
+
+# Check if trading engine is running
+if ! systemctl is-active --quiet hft-trading-engine; then
+    exit 1
+fi
+
+# Check HTTP health endpoint
+if ! curl -sf --max-time 2 http://localhost:8080/health > /dev/null; then
+    exit 1
+fi
+
+# Check database connectivity
+if ! psql -h localhost -U hft -d trading -c "SELECT 1;" > /dev/null 2>&1; then
+    exit 1
+fi
+
+# Check Redis connectivity
+if ! redis-cli ping > /dev/null 2>&1; then
+    exit 1
+fi
+
+# Check market data freshness
+LAST_UPDATE=$(redis-cli GET last_market_update)
+NOW=$(date +%s)
+AGE=$((NOW - LAST_UPDATE))
+
+if [ $AGE -gt 5 ]; then
+    # Market data stale (>5 seconds)
+    exit 1
+fi
+
+# All checks passed
+exit 0
+```
+
+Transition Scripts:
+
+Script: /opt/hft/scripts/become_master.sh
+
+```bash
+#!/bin/bash
+# Actions when becoming MASTER
+
+echo "$(date): Transitioning to MASTER role" >> /var/log/hft/vrrp.log
+
+# 1. Update service discovery
+consul kv put service/trading/role "master"
+consul kv put service/trading/host "$(hostname)"
+
+# 2. Enable trading
+redis-cli SET trading:enabled true
+
+# 3. Start accepting connections
+iptables -I INPUT -p tcp --dport 5555 -j ACCEPT
+
+# 4. Promote database if needed
+if [ "$(psql -t -c 'SELECT pg_is_in_recovery();')" = " t" ]; then
+    pg_ctl promote -D /var/lib/pgsql/data
+fi
+
+# 5. Send notification
+/opt/hft/scripts/send_alert.sh "INFO" "$(hostname) is now MASTER"
+
+# 6. Log event
+echo "{\"timestamp\":\"$(date -Iseconds)\",\"event\":\"become_master\",\"host\":\"$(hostname)\"}" >> /var/log/hft/events.json
+```
+
+Script: /opt/hft/scripts/become_backup.sh
+
+```bash
+#!/bin/bash
+# Actions when transitioning to BACKUP
+
+echo "$(date): Transitioning to BACKUP role" >> /var/log/hft/vrrp.log
+
+# 1. Update service discovery
+consul kv put service/trading/role "backup"
+
+# 2. Disable trading (if was active)
+redis-cli SET trading:enabled false
+
+# 3. Stop accepting new connections
+iptables -D INPUT -p tcp --dport 5555 -j ACCEPT 2>/dev/null || true
+
+# 4. Ensure database is in standby mode
+if [ "$(psql -t -c 'SELECT pg_is_in_recovery();')" = " f" ]; then
+    # Was primary, need to demote
+    echo "WARNING: Was primary, manual intervention required" >> /var/log/hft/vrrp.log
+fi
+
+# 5. Send notification
+/opt/hft/scripts/send_alert.sh "INFO" "$(hostname) is now BACKUP"
+
+# 6. Log event
+echo "{\"timestamp\":\"$(date -Iseconds)\",\"event\":\"become_backup\",\"host\":\"$(hostname)\"}" >> /var/log/hft/events.json
+```
+
+2.3 ACTIVE-PASSIVE POSTGRESQL
+------------------------------
+
+Primary Configuration: postgresql.conf
+
+```conf
+# Replication Settings
+wal_level = replica
+max_wal_senders = 10
+max_replication_slots = 10
+hot_standby = on
+
+# Synchronous Replication
+synchronous_commit = remote_apply
+synchronous_standby_names = 'FIRST 1 (standby1, standby2)'
+
+# Performance
+shared_buffers = 16GB
+effective_cache_size = 48GB
+maintenance_work_mem = 2GB
+checkpoint_completion_target = 0.9
+wal_buffers = 16MB
+default_statistics_target = 100
+random_page_cost = 1.1
+effective_io_concurrency = 200
+work_mem = 104857kB
+min_wal_size = 2GB
+max_wal_size = 8GB
+max_worker_processes = 8
+max_parallel_workers_per_gather = 4
+max_parallel_workers = 8
+
+# Logging
+logging_collector = on
+log_directory = 'pg_log'
+log_filename = 'postgresql-%Y-%m-%d_%H%M%S.log'
+log_line_prefix = '%t [%p]: [%l-1] user=%u,db=%d,app=%a,client=%h '
+log_checkpoints = on
+log_connections = on
+log_disconnections = on
+log_duration = off
+log_lock_waits = on
+log_statement = 'ddl'
+log_temp_files = 0
+```
+
+Standby Configuration: recovery.conf (PostgreSQL < 12) or postgresql.auto.conf
+
+```conf
+# Standby Configuration
+standby_mode = on
+primary_conninfo = 'host=primary.hft.local port=5432 user=replicator password=XXX application_name=standby1'
+primary_slot_name = 'standby1_slot'
+restore_command = 'cp /var/lib/pgsql/wal_archive/%f %p'
+archive_cleanup_command = 'pg_archivecleanup /var/lib/pgsql/wal_archive %r'
+
+# Standby Settings
+hot_standby = on
+hot_standby_feedback = on
+max_standby_streaming_delay = 30s
+wal_receiver_status_interval = 10s
+wal_retrieve_retry_interval = 5s
+```
+
+Replication Monitoring Script: /opt/hft/scripts/monitor_replication.sh
+
+```bash
+#!/bin/bash
+# PostgreSQL Replication Monitoring
+
+# On Primary
+check_primary_replication() {
+    echo "=== Primary Replication Status ==="
+
+    psql -d postgres -c "
+        SELECT application_name,
+               client_addr,
+               state,
+               sync_state,
+               pg_wal_lsn_diff(pg_current_wal_lsn(), sent_lsn) AS send_lag,
+               pg_wal_lsn_diff(pg_current_wal_lsn(), write_lsn) AS write_lag,
+               pg_wal_lsn_diff(pg_current_wal_lsn(), flush_lsn) AS flush_lag,
+               pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn) AS replay_lag
+        FROM pg_stat_replication;
+    "
+}
+
+# On Standby
+check_standby_lag() {
+    echo "=== Standby Replication Lag ==="
+
+    LAG_SECONDS=$(psql -d postgres -t -c "
+        SELECT EXTRACT(EPOCH FROM (NOW() - pg_last_xact_replay_timestamp())) AS lag_seconds;
+    " | tr -d ' ')
+
+    echo "Replication lag: ${LAG_SECONDS} seconds"
+
+    if (( $(echo "$LAG_SECONDS > 5" | bc -l) )); then
+        echo "WARNING: Replication lag exceeds 5 seconds"
+        return 1
+    fi
+
+    return 0
+}
+
+# Check if running on primary or standby
+IS_IN_RECOVERY=$(psql -t -c "SELECT pg_is_in_recovery();" | tr -d ' ')
+
+if [ "$IS_IN_RECOVERY" = "f" ]; then
+    check_primary_replication
+else
+    check_standby_lag
+fi
+```
+
+================================================================================
+3. ACTIVE-ACTIVE ARCHITECTURE
+================================================================================
+
+3.1 ACTIVE-ACTIVE DESIGN
+-------------------------
+
+Configuration: Multiple active nodes serving traffic simultaneously
+
+┌─────────────────────────────────────────────────────────────────────┐
+│                ACTIVE-ACTIVE ARCHITECTURE                           │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│                        Load Balancer                                │
+│                    (Round-Robin / Least Conn)                       │
+│                              │                                      │
+│                  ┌───────────┼───────────┐                         │
+│                  │           │           │                         │
+│           ┌──────▼──────┐ ┌─▼───────┐ ┌─▼─────────┐              │
+│           │   NODE 1    │ │  NODE 2 │ │  NODE 3   │              │
+│           │   ACTIVE    │ │  ACTIVE │ │  ACTIVE   │              │
+│           │             │ │         │ │           │              │
+│           │  Handles    │ │ Handles │ │ Handles   │              │
+│           │  Requests   │ │Requests │ │ Requests  │              │
+│           └──────┬──────┘ └─┬───────┘ └─┬─────────┘              │
+│                  │           │           │                         │
+│                  └───────────┼───────────┘                         │
+│                              │                                      │
+│                    ┌─────────▼─────────┐                          │
+│                    │  Shared State     │                          │
+│                    │  (Redis Cluster)  │                          │
+│                    │  + Database       │                          │
+│                    └───────────────────┘                          │
+│                                                                     │
+│  Advantages:                                                        │
+│  + 100% resource utilization                                       │
+│  + Better performance (distributed load)                           │
+│  + No failover delay                                               │
+│  + Horizontal scalability                                          │
+│                                                                     │
+│  Challenges:                                                        │
+│  - State synchronization complexity                                │
+│  - Potential for conflicts                                         │
+│  - Requires distributed consensus                                  │
+│  - More complex configuration                                      │
+└─────────────────────────────────────────────────────────────────────┘
+
+3.2 LOAD BALANCER CONFIGURATION
+--------------------------------
+
+HAProxy Configuration: /etc/haproxy/haproxy.cfg
+
+```conf
+#---------------------------------------------------------------------
+# Global settings
+#---------------------------------------------------------------------
+global
+    log         127.0.0.1 local2
+    chroot      /var/lib/haproxy
+    pidfile     /var/run/haproxy.pid
+    maxconn     100000
+    user        haproxy
+    group       haproxy
+    daemon
+    stats socket /var/lib/haproxy/stats level admin
+
+    # SSL/TLS settings
+    ssl-default-bind-ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256
+    ssl-default-bind-options ssl-min-ver TLSv1.2 no-tls-tickets
+
+defaults
+    mode                    http
+    log                     global
+    option                  httplog
+    option                  dontlognull
+    option http-server-close
+    option forwardfor       except 127.0.0.0/8
+    option                  redispatch
+    retries                 3
+    timeout http-request    10s
+    timeout queue           1m
+    timeout connect         10s
+    timeout client          30s
+    timeout server          30s
+    timeout http-keep-alive 10s
+    timeout check           10s
+    maxconn                 50000
+
+#---------------------------------------------------------------------
+# Stats interface
+#---------------------------------------------------------------------
+listen stats
+    bind *:8404
+    mode http
+    stats enable
+    stats uri /stats
+    stats refresh 30s
+    stats show-legends
+    stats auth admin:hft_stats_2025
+
+#---------------------------------------------------------------------
+# Trading Engine Frontend (TCP mode for low latency)
+#---------------------------------------------------------------------
+frontend trading_frontend
+    bind *:5555
+    mode tcp
+    option tcplog
+    default_backend trading_backend
+
+    # Connection limits
+    maxconn 10000
+
+    # TCP keep-alive
+    option clitcpka
+
+#---------------------------------------------------------------------
+# Trading Engine Backend
+#---------------------------------------------------------------------
+backend trading_backend
+    mode tcp
+    balance leastconn  # Use least connections for even distribution
+
+    # Health check
+    option tcp-check
+    tcp-check connect
+    tcp-check send "PING\r\n"
+    tcp-check expect string "PONG"
+
+    # Stick-table for session persistence (if needed)
+    stick-table type ip size 100k expire 30m
+    stick on src
+
+    # Server definitions
+    server trading1 10.0.1.10:5555 check inter 2s rise 2 fall 3 weight 100
+    server trading2 10.0.1.11:5555 check inter 2s rise 2 fall 3 weight 100
+    server trading3 10.0.1.12:5555 check inter 2s rise 2 fall 3 weight 100
+    server trading4 10.0.1.13:5555 check inter 2s rise 2 fall 3 weight 100 backup
+
+    # Advanced options for HFT
+    option prefer-last-server  # Minimize server switching
+    no option checkcache
+    no option httpclose
+
+#---------------------------------------------------------------------
+# Market Data Frontend
+#---------------------------------------------------------------------
+frontend market_data_frontend
+    bind *:5556
+    mode tcp
+    option tcplog
+    default_backend market_data_backend
+
+backend market_data_backend
+    mode tcp
+    balance roundrobin
+
+    option tcp-check
+    tcp-check connect port 5556
+
+    server md1 10.0.1.20:5556 check inter 1s rise 2 fall 2
+    server md2 10.0.1.21:5556 check inter 1s rise 2 fall 2
+    server md3 10.0.1.22:5556 check inter 1s rise 2 fall 2
+
+#---------------------------------------------------------------------
+# REST API Frontend
+#---------------------------------------------------------------------
+frontend api_frontend
+    bind *:8080
+    mode http
+
+    # Rate limiting
+    stick-table type ip size 100k expire 30s store http_req_rate(10s)
+    http-request track-sc0 src
+    http-request deny if { sc_http_req_rate(0) gt 1000 }
+
+    # ACLs for routing
+    acl is_health_check path /health
+    acl is_orders path_beg /api/orders
+    acl is_positions path_beg /api/positions
+    acl is_risk path_beg /api/risk
+
+    # Route to backends
+    use_backend health_backend if is_health_check
+    use_backend orders_backend if is_orders
+    use_backend positions_backend if is_positions
+    use_backend risk_backend if is_risk
+    default_backend api_backend
+
+#---------------------------------------------------------------------
+# API Backend
+#---------------------------------------------------------------------
+backend api_backend
+    mode http
+    balance roundrobin
+
+    option httpchk GET /health
+    http-check expect status 200
+
+    server api1 10.0.1.30:8080 check inter 5s rise 2 fall 3
+    server api2 10.0.1.31:8080 check inter 5s rise 2 fall 3
+    server api3 10.0.1.32:8080 check inter 5s rise 2 fall 3
+
+    # Compression
+    compression algo gzip
+    compression type text/html text/plain text/css application/json
+
+#---------------------------------------------------------------------
+# Database Frontend (Read Replicas)
+#---------------------------------------------------------------------
+frontend db_read_frontend
+    bind *:5432
+    mode tcp
+    default_backend db_read_backend
+
+backend db_read_backend
+    mode tcp
+    balance leastconn
+
+    option pgsql-check user haproxy
+
+    server db_read1 10.0.1.40:5432 check inter 5s
+    server db_read2 10.0.1.41:5432 check inter 5s
+    server db_read3 10.0.1.42:5432 check inter 5s
+```
+
+3.3 DISTRIBUTED STATE MANAGEMENT
+---------------------------------
+
+Redis Cluster Configuration: /etc/redis/redis-cluster.conf
+
+```conf
+# Redis Cluster Configuration
+port 7000
+cluster-enabled yes
+cluster-config-file nodes-7000.conf
+cluster-node-timeout 5000
+cluster-slave-validity-factor 10
+cluster-migration-barrier 1
+cluster-require-full-coverage yes
+
+# Persistence
+appendonly yes
+appendfilename "appendonly-7000.aof"
+appendfsync everysec
+
+# Memory
+maxmemory 8gb
+maxmemory-policy allkeys-lru
+
+# Performance
+tcp-backlog 511
+timeout 0
+tcp-keepalive 300
+```
+
+Redis Cluster Setup Script: /opt/hft/scripts/setup_redis_cluster.sh
+
+```bash
+#!/bin/bash
+# Redis Cluster Setup
+
+NODES=(
+    "10.0.1.50:7000"
+    "10.0.1.51:7000"
+    "10.0.1.52:7000"
+    "10.0.1.53:7000"
+    "10.0.1.54:7000"
+    "10.0.1.55:7000"
+)
+
+# Create cluster with 3 masters and 3 replicas
+redis-cli --cluster create "${NODES[@]}" \
+    --cluster-replicas 1 \
+    --cluster-yes
+
+# Wait for cluster to stabilize
+sleep 10
+
+# Verify cluster
+redis-cli --cluster check 10.0.1.50:7000
+
+# Test cluster
+for node in "${NODES[@]}"; do
+    echo "Testing $node"
+    redis-cli -c -h ${node%:*} -p ${node#*:} PING
+done
+
+echo "Redis Cluster setup complete"
+```
+
+Distributed Lock Implementation: /opt/hft/scripts/distributed_lock.py
+
+```python
+#!/usr/bin/env python3
+"""
+Distributed Lock using Redis
+Ensures only one node processes critical operations
+"""
+
+import redis
+import time
+import uuid
+
+class DistributedLock:
+    def __init__(self, redis_client, lock_name, timeout=10):
+        self.redis = redis_client
+        self.lock_name = f"lock:{lock_name}"
+        self.timeout = timeout
+        self.identifier = str(uuid.uuid4())
+
+    def acquire(self):
+        """Acquire distributed lock"""
+        end_time = time.time() + self.timeout
+
+        while time.time() < end_time:
+            # Try to set lock with NX (only if not exists) and EX (expiry)
+            if self.redis.set(
+                self.lock_name,
+                self.identifier,
+                nx=True,
+                ex=self.timeout
+            ):
+                return True
+
+            time.sleep(0.001)  # 1ms retry interval
+
+        return False
+
+    def release(self):
+        """Release distributed lock"""
+        # Lua script for atomic check-and-delete
+        lua_script = """
+        if redis.call("get", KEYS[1]) == ARGV[1] then
+            return redis.call("del", KEYS[1])
+        else
+            return 0
+        end
+        """
+
+        script = self.redis.register_script(lua_script)
+        return script(keys=[self.lock_name], args=[self.identifier])
+
+    def __enter__(self):
+        if not self.acquire():
+            raise Exception(f"Could not acquire lock: {self.lock_name}")
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.release()
+
+# Usage example
+if __name__ == '__main__':
+    r = redis.StrictRedis(host='localhost', port=6379, db=0)
+
+    with DistributedLock(r, 'order_processing', timeout=5):
+        print("Lock acquired, processing orders...")
+        # Critical section - only one node executes this
+        time.sleep(2)
+        print("Processing complete")
+```
+
+3.4 SESSION AFFINITY & STICKY SESSIONS
+---------------------------------------
+
+When required (e.g., WebSocket connections), implement sticky sessions:
+
+NGINX Configuration: /etc/nginx/nginx.conf
+
+```nginx
+upstream trading_cluster {
+    # IP Hash for sticky sessions
+    ip_hash;
+
+    server 10.0.1.10:5555 max_fails=3 fail_timeout=30s;
+    server 10.0.1.11:5555 max_fails=3 fail_timeout=30s;
+    server 10.0.1.12:5555 max_fails=3 fail_timeout=30s;
+
+    # Health check
+    check interval=2000 rise=2 fall=3 timeout=1000 type=tcp;
+}
+
+upstream trading_cluster_least_conn {
+    # Least connections (better for HFT)
+    least_conn;
+
+    server 10.0.1.10:5555 weight=100;
+    server 10.0.1.11:5555 weight=100;
+    server 10.0.1.12:5555 weight=100;
+    server 10.0.1.13:5555 weight=50 backup;
+}
+
+server {
+    listen 5555;
+
+    location / {
+        proxy_pass http://trading_cluster_least_conn;
+
+        # Connection settings for low latency
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+
+        # Timeouts
+        proxy_connect_timeout 5s;
+        proxy_send_timeout 30s;
+        proxy_read_timeout 30s;
+
+        # Buffering (disable for lower latency)
+        proxy_buffering off;
+        proxy_request_buffering off;
+
+        # Keep-alive
+        proxy_socket_keepalive on;
+
+        # Headers
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header Host $host;
+    }
+}
+```
+
+================================================================================
+4. DATABASE HIGH AVAILABILITY
+================================================================================
+
+4.1 POSTGRESQL HA WITH PATRONI
+-------------------------------
+
+Patroni provides automatic failover for PostgreSQL clusters.
+
+Patroni Configuration: /etc/patroni/patroni.yml
+
+```yaml
+scope: hft_trading
+namespace: /db/
+name: postgres1
+
+restapi:
+  listen: 0.0.0.0:8008
+  connect_address: 10.0.1.40:8008
+
+etcd:
+  hosts: 10.0.1.100:2379,10.0.1.101:2379,10.0.1.102:2379
+
+bootstrap:
+  dcs:
+    ttl: 30
+    loop_wait: 10
+    retry_timeout: 10
+    maximum_lag_on_failover: 1048576
+    master_start_timeout: 300
+    synchronous_mode: true
+    synchronous_mode_strict: true
+    postgresql:
+      use_pg_rewind: true
+      use_slots: true
+      parameters:
+        max_connections: 1000
+        shared_buffers: 16GB
+        effective_cache_size: 48GB
+        maintenance_work_mem: 2GB
+        checkpoint_completion_target: 0.9
+        wal_buffers: 16MB
+        default_statistics_target: 100
+        random_page_cost: 1.1
+        effective_io_concurrency: 200
+        work_mem: 10MB
+        min_wal_size: 2GB
+        max_wal_size: 8GB
+        max_worker_processes: 8
+        max_parallel_workers_per_gather: 4
+        max_parallel_workers: 8
+        wal_level: replica
+        hot_standby: on
+        wal_log_hints: on
+        max_wal_senders: 10
+        max_replication_slots: 10
+        hot_standby_feedback: on
+
+  initdb:
+  - encoding: UTF8
+  - data-checksums
+
+  pg_hba:
+  - host replication replicator 10.0.1.0/24 md5
+  - host all all 0.0.0.0/0 md5
+
+  users:
+    admin:
+      password: admin_password
+      options:
+        - createrole
+        - createdb
+    replicator:
+      password: repl_password
+      options:
+        - replication
+
+postgresql:
+  listen: 0.0.0.0:5432
+  connect_address: 10.0.1.40:5432
+  data_dir: /var/lib/postgresql/14/main
+  bin_dir: /usr/lib/postgresql/14/bin
+  pgpass: /tmp/pgpass
+  authentication:
+    replication:
+      username: replicator
+      password: repl_password
+    superuser:
+      username: postgres
+      password: postgres_password
+  parameters:
+    unix_socket_directories: '/var/run/postgresql'
+
+tags:
+    nofailover: false
+    noloadbalance: false
+    clonefrom: false
+    nosync: false
+```
+
+4.2 AUTOMATIC FAILOVER TESTING
+-------------------------------
+
+Script: /opt/hft/scripts/test_db_failover.sh
+
+```bash
+#!/bin/bash
+# Test PostgreSQL Automatic Failover
+
+echo "=== DATABASE FAILOVER TEST ==="
+
+# 1. Check current primary
+echo "Checking current primary..."
+PRIMARY=$(patronictl -c /etc/patroni/patroni.yml list | grep Leader | awk '{print $2}')
+echo "Current primary: $PRIMARY"
+
+# 2. Check replication lag
+echo "Checking replication lag..."
+patronictl -c /etc/patroni/patroni.yml list
+
+# 3. Perform failover
+read -p "Proceed with failover? (yes/no) " CONFIRM
+if [[ $CONFIRM != "yes" ]]; then
+    echo "Failover cancelled"
+    exit 0
+fi
+
+START_TIME=$(date +%s)
+
+echo "Initiating failover..."
+patronictl -c /etc/patroni/patroni.yml failover --force
+
+# 4. Wait for new primary
+echo "Waiting for new primary..."
+sleep 10
+
+# 5. Verify new primary
+NEW_PRIMARY=$(patronictl -c /etc/patroni/patroni.yml list | grep Leader | awk '{print $2}')
+echo "New primary: $NEW_PRIMARY"
+
+END_TIME=$(date +%s)
+DURATION=$((END_TIME - START_TIME))
+
+echo "=== FAILOVER COMPLETE ==="
+echo "Duration: ${DURATION} seconds"
+echo "Old primary: $PRIMARY"
+echo "New primary: $NEW_PRIMARY"
+
+# 6. Test connectivity
+echo "Testing database connectivity..."
+psql -h 10.0.1.100 -U postgres -d trading -c "SELECT NOW();"
+
+if [ $? -eq 0 ]; then
+    echo "Database accessible after failover"
+else
+    echo "ERROR: Database not accessible"
+    exit 1
+fi
+```
+
+================================================================================
+5. MONITORING & HEALTH CHECKS
+================================================================================
+
+5.1 COMPREHENSIVE HEALTH CHECK SYSTEM
+--------------------------------------
+
+Script: /opt/hft/scripts/comprehensive_healthcheck.py
+
+```python
+#!/usr/bin/env python3
+"""
+Comprehensive Health Check System
+Monitors all components and reports status
+"""
+
+import requests
+import psycopg2
+import redis
+import time
+from datetime import datetime
+import json
+
+class HealthChecker:
+    def __init__(self):
+        self.results = {}
+        self.overall_status = "HEALTHY"
+
+    def check_trading_engine(self):
+        """Check trading engine health"""
+        try:
+            response = requests.get(
+                'http://localhost:8080/health',
+                timeout=2
+            )
+            if response.status_code == 200:
+                self.results['trading_engine'] = {
+                    'status': 'UP',
+                    'latency_ms': response.elapsed.total_seconds() * 1000
+                }
+            else:
+                self.results['trading_engine'] = {
+                    'status': 'DOWN',
+                    'error': f'HTTP {response.status_code}'
+                }
+                self.overall_status = "DEGRADED"
+        except Exception as e:
+            self.results['trading_engine'] = {
+                'status': 'DOWN',
+                'error': str(e)
+            }
+            self.overall_status = "CRITICAL"
+
+    def check_database(self):
+        """Check database connectivity and replication"""
+        try:
+            conn = psycopg2.connect(
+                host='localhost',
+                database='trading',
+                user='hft',
+                password='password',
+                connect_timeout=3
+            )
+            cursor = conn.cursor()
+
+            # Check if database is accepting connections
+            cursor.execute("SELECT 1;")
+
+            # Check replication lag (if standby)
+            cursor.execute("SELECT pg_is_in_recovery();")
+            is_standby = cursor.fetchone()[0]
+
+            if is_standby:
+                cursor.execute("""
+                    SELECT EXTRACT(EPOCH FROM (NOW() - pg_last_xact_replay_timestamp())) AS lag;
+                """)
+                lag = cursor.fetchone()[0]
+
+                self.results['database'] = {
+                    'status': 'UP',
+                    'role': 'standby',
+                    'replication_lag_seconds': lag
+                }
+
+                if lag and lag > 5:
+                    self.overall_status = "DEGRADED"
+            else:
+                self.results['database'] = {
+                    'status': 'UP',
+                    'role': 'primary'
+                }
+
+            conn.close()
+
+        except Exception as e:
+            self.results['database'] = {
+                'status': 'DOWN',
+                'error': str(e)
+            }
+            self.overall_status = "CRITICAL"
+
+    def check_redis(self):
+        """Check Redis connectivity and memory usage"""
+        try:
+            r = redis.StrictRedis(host='localhost', port=6379, db=0)
+
+            # Ping test
+            start = time.time()
+            r.ping()
+            latency = (time.time() - start) * 1000
+
+            # Memory usage
+            info = r.info('memory')
+            used_memory_mb = info['used_memory'] / (1024 * 1024)
+            maxmemory_mb = info.get('maxmemory', 0) / (1024 * 1024)
+
+            self.results['redis'] = {
+                'status': 'UP',
+                'latency_ms': latency,
+                'used_memory_mb': used_memory_mb,
+                'maxmemory_mb': maxmemory_mb
+            }
+
+            # Check if memory usage is high
+            if maxmemory_mb > 0 and (used_memory_mb / maxmemory_mb) > 0.9:
+                self.overall_status = "DEGRADED"
+
+        except Exception as e:
+            self.results['redis'] = {
+                'status': 'DOWN',
+                'error': str(e)
+            }
+            self.overall_status = "CRITICAL"
+
+    def check_market_data(self):
+        """Check market data freshness"""
+        try:
+            r = redis.StrictRedis(host='localhost', port=6379, db=0)
+
+            last_update = r.get('last_market_update')
+            if last_update:
+                last_update = int(last_update)
+                age = time.time() - last_update
+
+                self.results['market_data'] = {
+                    'status': 'UP' if age < 5 else 'STALE',
+                    'last_update_seconds_ago': age
+                }
+
+                if age > 5:
+                    self.overall_status = "DEGRADED"
+            else:
+                self.results['market_data'] = {
+                    'status': 'NO_DATA'
+                }
+                self.overall_status = "DEGRADED"
+
+        except Exception as e:
+            self.results['market_data'] = {
+                'status': 'DOWN',
+                'error': str(e)
+            }
+
+    def run_all_checks(self):
+        """Run all health checks"""
+        self.check_trading_engine()
+        self.check_database()
+        self.check_redis()
+        self.check_market_data()
+
+        return {
+            'timestamp': datetime.now().isoformat(),
+            'overall_status': self.overall_status,
+            'components': self.results
+        }
+
+if __name__ == '__main__':
+    checker = HealthChecker()
+    result = checker.run_all_checks()
+
+    print(json.dumps(result, indent=2))
+
+    # Exit with appropriate code
+    if result['overall_status'] == 'HEALTHY':
+        exit(0)
+    elif result['overall_status'] == 'DEGRADED':
+        exit(1)
+    else:  # CRITICAL
+        exit(2)
+```
+
+================================================================================
+END OF DOCUMENT
+================================================================================

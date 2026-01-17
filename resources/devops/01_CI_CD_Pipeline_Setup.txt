@@ -1,0 +1,1024 @@
+================================================================================
+CI/CD PIPELINE SETUP FOR HFT SYSTEMS
+================================================================================
+Complete CI/CD configuration for high-frequency trading systems with focus on
+speed, reliability, and zero-downtime deployments.
+
+Last Updated: 2025-11-25
+================================================================================
+
+TABLE OF CONTENTS
+================================================================================
+1. GitHub Actions Configuration
+2. Jenkins Pipeline Setup
+3. GitLab CI Configuration
+4. Pipeline Best Practices for HFT
+5. Testing Strategies
+6. Artifact Management
+7. Performance Benchmarking in CI
+8. Deployment Gates and Approvals
+
+================================================================================
+1. GITHUB ACTIONS CONFIGURATION
+================================================================================
+
+# .github/workflows/hft-main-pipeline.yml
+# Complete CI/CD pipeline for HFT trading system
+---
+name: HFT Trading System CI/CD
+
+on:
+  push:
+    branches: [main, develop, release/*]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment Environment'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - production
+
+env:
+  BUILD_TYPE: Release
+  CONAN_VERSION: 2.0.13
+  CMAKE_VERSION: 3.27.0
+  DOCKER_REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/hft-trading-engine
+
+jobs:
+  # Static Analysis and Code Quality
+  code-quality:
+    name: Code Quality Checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Setup C++ Environment
+        uses: aminya/setup-cpp@v1
+        with:
+          compiler: gcc-13
+          cmake: ${{ env.CMAKE_VERSION }}
+          cppcheck: true
+          clang-tidy: true
+          clang-format: true
+
+      - name: Run Clang-Format Check
+        run: |
+          find src include -name '*.cpp' -o -name '*.hpp' | \
+          xargs clang-format --dry-run --Werror
+
+      - name: Run Clang-Tidy
+        run: |
+          cmake -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+          clang-tidy --config-file=.clang-tidy \
+            -p build src/*.cpp --warnings-as-errors='*'
+
+      - name: Run Cppcheck
+        run: |
+          cppcheck --enable=all --error-exitcode=1 \
+            --suppress=missingInclude --inline-suppr \
+            --std=c++20 src/ include/
+
+      - name: Static Security Analysis
+        uses: github/codeql-action/analyze@v2
+
+  # Unit and Integration Tests
+  test:
+    name: Build and Test
+    needs: code-quality
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+        compiler: [gcc-12, gcc-13, clang-16, clang-17]
+        build-type: [Release, RelWithDebInfo]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Compiler
+        uses: aminya/setup-cpp@v1
+        with:
+          compiler: ${{ matrix.compiler }}
+          cmake: ${{ env.CMAKE_VERSION }}
+          conan: ${{ env.CONAN_VERSION }}
+          ccache: true
+
+      - name: Cache Conan Packages
+        uses: actions/cache@v3
+        with:
+          path: ~/.conan2
+          key: conan-${{ matrix.os }}-${{ matrix.compiler }}-${{ hashFiles('conanfile.py') }}
+          restore-keys: |
+            conan-${{ matrix.os }}-${{ matrix.compiler }}-
+            conan-${{ matrix.os }}-
+
+      - name: Cache Build Artifacts
+        uses: actions/cache@v3
+        with:
+          path: |
+            build
+            ~/.ccache
+          key: build-${{ matrix.os }}-${{ matrix.compiler }}-${{ github.sha }}
+          restore-keys: |
+            build-${{ matrix.os }}-${{ matrix.compiler }}-
+
+      - name: Install Dependencies
+        run: |
+          conan profile detect --force
+          conan install . --build=missing \
+            -s build_type=${{ matrix.build-type }} \
+            -s compiler.cppstd=20
+
+      - name: Configure CMake
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.build-type }} \
+            -DCMAKE_TOOLCHAIN_FILE=build/conan_toolchain.cmake \
+            -DENABLE_TESTING=ON \
+            -DENABLE_BENCHMARKS=ON \
+            -DENABLE_COVERAGE=${{ matrix.build-type == 'RelWithDebInfo' && 'ON' || 'OFF' }}
+
+      - name: Build
+        run: |
+          cmake --build build --config ${{ matrix.build-type }} -j $(nproc)
+
+      - name: Run Unit Tests
+        run: |
+          cd build
+          ctest --output-on-failure --timeout 300 -j $(nproc) \
+            --label-regex "unit"
+
+      - name: Run Integration Tests
+        run: |
+          cd build
+          ctest --output-on-failure --timeout 600 -j $(nproc) \
+            --label-regex "integration"
+
+      - name: Generate Coverage Report
+        if: matrix.build-type == 'RelWithDebInfo'
+        run: |
+          sudo apt-get install -y lcov
+          lcov --capture --directory build --output-file coverage.info
+          lcov --remove coverage.info '/usr/*' '*/test/*' --output-file coverage.info
+          lcov --list coverage.info
+
+      - name: Upload Coverage to Codecov
+        if: matrix.build-type == 'RelWithDebInfo'
+        uses: codecov/codecov-action@v3
+        with:
+          files: ./coverage.info
+          flags: unittests
+          name: codecov-${{ matrix.os }}-${{ matrix.compiler }}
+
+  # Performance Benchmarking
+  benchmark:
+    name: Performance Benchmarks
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Environment
+        uses: aminya/setup-cpp@v1
+        with:
+          compiler: gcc-13
+          cmake: ${{ env.CMAKE_VERSION }}
+
+      - name: Build Benchmarks
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_BENCHMARKS=ON
+          cmake --build build --target benchmarks -j $(nproc)
+
+      - name: Run Latency Benchmarks
+        run: |
+          cd build
+          ./benchmarks/latency_benchmark --benchmark_format=json \
+            > ../benchmark_results.json
+
+      - name: Run Throughput Benchmarks
+        run: |
+          cd build
+          ./benchmarks/throughput_benchmark --benchmark_format=json \
+            >> ../benchmark_results.json
+
+      - name: Compare with Baseline
+        run: |
+          python3 scripts/compare_benchmarks.py \
+            benchmark_results.json \
+            baseline_benchmarks.json
+
+      - name: Upload Benchmark Results
+        uses: actions/upload-artifact@v3
+        with:
+          name: benchmark-results
+          path: benchmark_results.json
+
+      - name: Comment PR with Results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const fs = require('fs');
+            const results = JSON.parse(fs.readFileSync('benchmark_results.json', 'utf8'));
+            const comment = `### Benchmark Results\n\n${JSON.stringify(results, null, 2)}`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+
+  # Docker Build and Push
+  docker-build:
+    name: Build and Push Docker Image
+    needs: [test, benchmark]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.DOCKER_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix={{branch}}-
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.production
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILD_TYPE=Release
+            VERSION=${{ github.sha }}
+
+      - name: Scan Image for Vulnerabilities
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy Results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  # Deploy to Development
+  deploy-dev:
+    name: Deploy to Development
+    needs: docker-build
+    if: github.ref == 'refs/heads/develop'
+    runs-on: ubuntu-latest
+    environment:
+      name: development
+      url: https://dev.hft-trading.example.com
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+
+      - name: Configure Kubernetes Context
+        run: |
+          echo "${{ secrets.KUBE_CONFIG_DEV }}" | base64 -d > kubeconfig
+          export KUBECONFIG=kubeconfig
+
+      - name: Deploy to Development
+        run: |
+          kubectl set image deployment/hft-trading-engine \
+            hft-trading-engine=${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            -n development
+          kubectl rollout status deployment/hft-trading-engine -n development
+
+      - name: Run Smoke Tests
+        run: |
+          ./scripts/smoke-tests.sh https://dev.hft-trading.example.com
+
+  # Deploy to Staging
+  deploy-staging:
+    name: Deploy to Staging
+    needs: docker-build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: https://staging.hft-trading.example.com
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: Configure Kubernetes Context
+        run: |
+          echo "${{ secrets.KUBE_CONFIG_STAGING }}" | base64 -d > kubeconfig
+          export KUBECONFIG=kubeconfig
+
+      - name: Deploy to Staging (Blue-Green)
+        run: |
+          # Deploy to green environment
+          ./scripts/deploy-blue-green.sh staging green \
+            ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+      - name: Run Integration Tests
+        run: |
+          ./scripts/integration-tests.sh https://staging-green.hft-trading.example.com
+
+      - name: Switch Traffic to Green
+        run: |
+          kubectl patch service hft-trading-engine -n staging \
+            -p '{"spec":{"selector":{"version":"green"}}}'
+
+  # Deploy to Production
+  deploy-production:
+    name: Deploy to Production
+    needs: deploy-staging
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://hft-trading.example.com
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: Configure Kubernetes Context
+        run: |
+          echo "${{ secrets.KUBE_CONFIG_PROD }}" | base64 -d > kubeconfig
+          export KUBECONFIG=kubeconfig
+
+      - name: Canary Deployment (10%)
+        run: |
+          ./scripts/deploy-canary.sh production 10 \
+            ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+      - name: Monitor Canary Metrics
+        run: |
+          ./scripts/monitor-canary.sh production 300
+
+      - name: Gradual Rollout (50%)
+        run: |
+          ./scripts/deploy-canary.sh production 50 \
+            ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          ./scripts/monitor-canary.sh production 300
+
+      - name: Complete Rollout (100%)
+        run: |
+          ./scripts/deploy-canary.sh production 100 \
+            ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+      - name: Create Release Notes
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const release = await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: context.ref.replace('refs/tags/', ''),
+              name: `Release ${context.ref.replace('refs/tags/', '')}`,
+              body: 'Automated release from CI/CD pipeline',
+              draft: false,
+              prerelease: false
+            });
+
+================================================================================
+2. JENKINS PIPELINE SETUP
+================================================================================
+
+# Jenkinsfile - Declarative Pipeline for HFT System
+pipeline {
+    agent {
+        kubernetes {
+            yaml """
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    jenkins: agent
+spec:
+  containers:
+  - name: cpp-builder
+    image: gcc:13
+    command:
+    - cat
+    tty: true
+    resources:
+      requests:
+        memory: "4Gi"
+        cpu: "2"
+      limits:
+        memory: "8Gi"
+        cpu: "4"
+  - name: docker
+    image: docker:24-dind
+    securityContext:
+      privileged: true
+  - name: kubectl
+    image: bitnami/kubectl:1.28
+    command:
+    - cat
+    tty: true
+"""
+        }
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+        timestamps()
+        timeout(time: 2, unit: 'HOURS')
+        disableConcurrentBuilds()
+    }
+
+    environment {
+        BUILD_TYPE = 'Release'
+        DOCKER_REGISTRY = 'registry.example.com'
+        IMAGE_NAME = 'hft-trading-engine'
+        CONAN_USER_HOME = "${WORKSPACE}/conan"
+        CCACHE_DIR = "${WORKSPACE}/ccache"
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.GIT_COMMIT_SHORT = sh(
+                        script: "git rev-parse --short HEAD",
+                        returnStdout: true
+                    ).trim()
+                }
+            }
+        }
+
+        stage('Static Analysis') {
+            parallel {
+                stage('Clang-Tidy') {
+                    steps {
+                        container('cpp-builder') {
+                            sh '''
+                                apt-get update && apt-get install -y clang-tidy cmake
+                                cmake -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+                                clang-tidy --config-file=.clang-tidy \
+                                  -p build src/*.cpp > clang-tidy-report.txt
+                            '''
+                            recordIssues(
+                                tools: [clangTidy(pattern: 'clang-tidy-report.txt')]
+                            )
+                        }
+                    }
+                }
+
+                stage('Cppcheck') {
+                    steps {
+                        container('cpp-builder') {
+                            sh '''
+                                apt-get update && apt-get install -y cppcheck
+                                cppcheck --enable=all --xml --xml-version=2 \
+                                  src/ include/ 2> cppcheck-report.xml
+                            '''
+                            recordIssues(
+                                tools: [cppCheck(pattern: 'cppcheck-report.xml')]
+                            )
+                        }
+                    }
+                }
+
+                stage('SonarQube Analysis') {
+                    steps {
+                        container('cpp-builder') {
+                            withSonarQubeEnv('SonarQube') {
+                                sh '''
+                                    sonar-scanner \
+                                      -Dsonar.projectKey=hft-trading-system \
+                                      -Dsonar.sources=src,include \
+                                      -Dsonar.cfamily.build-wrapper-output=bw-output
+                                '''
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Build') {
+            steps {
+                container('cpp-builder') {
+                    sh '''
+                        # Install dependencies
+                        apt-get update && apt-get install -y \
+                          cmake ninja-build python3-pip ccache
+                        pip3 install conan
+
+                        # Configure Conan
+                        conan profile detect --force
+                        conan install . --build=missing \
+                          -s build_type=${BUILD_TYPE} \
+                          -s compiler.cppstd=20
+
+                        # Build with CMake
+                        cmake -B build -G Ninja \
+                          -DCMAKE_BUILD_TYPE=${BUILD_TYPE} \
+                          -DCMAKE_TOOLCHAIN_FILE=build/conan_toolchain.cmake \
+                          -DENABLE_TESTING=ON \
+                          -DENABLE_BENCHMARKS=ON
+
+                        cmake --build build -j $(nproc)
+                    '''
+                }
+            }
+        }
+
+        stage('Test') {
+            parallel {
+                stage('Unit Tests') {
+                    steps {
+                        container('cpp-builder') {
+                            sh '''
+                                cd build
+                                ctest --output-on-failure --label-regex "unit" \
+                                  --output-junit unit-tests.xml
+                            '''
+                            junit 'build/unit-tests.xml'
+                        }
+                    }
+                }
+
+                stage('Integration Tests') {
+                    steps {
+                        container('cpp-builder') {
+                            sh '''
+                                cd build
+                                ctest --output-on-failure --label-regex "integration" \
+                                  --output-junit integration-tests.xml
+                            '''
+                            junit 'build/integration-tests.xml'
+                        }
+                    }
+                }
+
+                stage('Performance Tests') {
+                    steps {
+                        container('cpp-builder') {
+                            sh '''
+                                cd build
+                                ./benchmarks/latency_benchmark \
+                                  --benchmark_format=json \
+                                  --benchmark_out=../latency-results.json
+                            '''
+                            archiveArtifacts 'latency-results.json'
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Docker Build') {
+            steps {
+                container('docker') {
+                    sh '''
+                        docker build -f docker/Dockerfile.production \
+                          -t ${DOCKER_REGISTRY}/${IMAGE_NAME}:${GIT_COMMIT_SHORT} \
+                          -t ${DOCKER_REGISTRY}/${IMAGE_NAME}:${BRANCH_NAME} \
+                          --build-arg BUILD_TYPE=${BUILD_TYPE} .
+
+                        docker push ${DOCKER_REGISTRY}/${IMAGE_NAME}:${GIT_COMMIT_SHORT}
+                        docker push ${DOCKER_REGISTRY}/${IMAGE_NAME}:${BRANCH_NAME}
+                    '''
+                }
+            }
+        }
+
+        stage('Security Scan') {
+            steps {
+                container('docker') {
+                    sh '''
+                        trivy image --severity HIGH,CRITICAL \
+                          --format json --output trivy-report.json \
+                          ${DOCKER_REGISTRY}/${IMAGE_NAME}:${GIT_COMMIT_SHORT}
+                    '''
+                    archiveArtifacts 'trivy-report.json'
+                }
+            }
+        }
+
+        stage('Deploy to Dev') {
+            when {
+                branch 'develop'
+            }
+            steps {
+                container('kubectl') {
+                    withKubeConfig([credentialsId: 'kubeconfig-dev']) {
+                        sh '''
+                            kubectl set image deployment/hft-trading-engine \
+                              hft-trading-engine=${DOCKER_REGISTRY}/${IMAGE_NAME}:${GIT_COMMIT_SHORT} \
+                              -n development
+                            kubectl rollout status deployment/hft-trading-engine -n development
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Deploy to Staging') {
+            when {
+                branch 'main'
+            }
+            steps {
+                container('kubectl') {
+                    withKubeConfig([credentialsId: 'kubeconfig-staging']) {
+                        sh '''
+                            ./scripts/deploy-blue-green.sh staging green \
+                              ${DOCKER_REGISTRY}/${IMAGE_NAME}:${GIT_COMMIT_SHORT}
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Deploy to Production') {
+            when {
+                tag pattern: "v\\d+\\.\\d+\\.\\d+", comparator: "REGEXP"
+            }
+            steps {
+                input message: 'Deploy to Production?', ok: 'Deploy'
+                container('kubectl') {
+                    withKubeConfig([credentialsId: 'kubeconfig-prod']) {
+                        sh '''
+                            ./scripts/deploy-canary.sh production 10 \
+                              ${DOCKER_REGISTRY}/${IMAGE_NAME}:${GIT_COMMIT_SHORT}
+                            sleep 300
+                            ./scripts/deploy-canary.sh production 50 \
+                              ${DOCKER_REGISTRY}/${IMAGE_NAME}:${GIT_COMMIT_SHORT}
+                            sleep 300
+                            ./scripts/deploy-canary.sh production 100 \
+                              ${DOCKER_REGISTRY}/${IMAGE_NAME}:${GIT_COMMIT_SHORT}
+                        '''
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            cleanWs()
+        }
+        success {
+            slackSend(
+                color: 'good',
+                message: "Build Successful: ${env.JOB_NAME} - ${env.BUILD_NUMBER}"
+            )
+        }
+        failure {
+            slackSend(
+                color: 'danger',
+                message: "Build Failed: ${env.JOB_NAME} - ${env.BUILD_NUMBER}"
+            )
+        }
+    }
+}
+
+================================================================================
+3. GITLAB CI CONFIGURATION
+================================================================================
+
+# .gitlab-ci.yml - Complete GitLab CI/CD Pipeline
+variables:
+  BUILD_TYPE: "Release"
+  DOCKER_REGISTRY: "registry.gitlab.com"
+  DOCKER_IMAGE: "${CI_REGISTRY_IMAGE}/hft-trading-engine"
+  CMAKE_VERSION: "3.27.0"
+  CONAN_VERSION: "2.0.13"
+
+stages:
+  - validate
+  - build
+  - test
+  - benchmark
+  - package
+  - deploy-dev
+  - deploy-staging
+  - deploy-prod
+
+# Global cache configuration
+.cache_template: &global_cache
+  cache:
+    key: "${CI_COMMIT_REF_SLUG}"
+    paths:
+      - .conan/
+      - .ccache/
+      - build/
+
+# Docker in Docker configuration
+.dind_template: &dind_config
+  services:
+    - docker:24-dind
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+
+# Code Quality Check
+code-quality:
+  stage: validate
+  image: gcc:13
+  script:
+    - apt-get update && apt-get install -y clang-format clang-tidy cppcheck
+    - find src include -name '*.cpp' -o -name '*.hpp' | xargs clang-format --dry-run --Werror
+    - cmake -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+    - clang-tidy --config-file=.clang-tidy -p build src/*.cpp
+    - cppcheck --enable=all --error-exitcode=1 src/ include/
+  allow_failure: false
+
+# Security scanning
+security-scan:
+  stage: validate
+  image: returntocorp/semgrep:latest
+  script:
+    - semgrep --config=auto --json --output=semgrep-report.json src/
+  artifacts:
+    reports:
+      sast: semgrep-report.json
+    expire_in: 1 week
+
+# Build job
+build:
+  stage: build
+  image: gcc:13
+  <<: *global_cache
+  script:
+    - apt-get update && apt-get install -y cmake ninja-build python3-pip ccache
+    - pip3 install conan==${CONAN_VERSION}
+    - export CCACHE_DIR=${CI_PROJECT_DIR}/.ccache
+    - conan profile detect --force
+    - conan install . --build=missing -s build_type=${BUILD_TYPE}
+    - cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=${BUILD_TYPE} -DENABLE_TESTING=ON
+    - cmake --build build -j $(nproc)
+  artifacts:
+    paths:
+      - build/
+    expire_in: 1 day
+
+# Unit tests
+unit-tests:
+  stage: test
+  image: gcc:13
+  dependencies:
+    - build
+  script:
+    - cd build
+    - ctest --output-on-failure --label-regex "unit" --output-junit ../unit-tests.xml
+  artifacts:
+    reports:
+      junit: unit-tests.xml
+    expire_in: 1 week
+
+# Integration tests
+integration-tests:
+  stage: test
+  image: gcc:13
+  dependencies:
+    - build
+  script:
+    - cd build
+    - ctest --output-on-failure --label-regex "integration" --output-junit ../integration-tests.xml
+  artifacts:
+    reports:
+      junit: integration-tests.xml
+    expire_in: 1 week
+
+# Performance benchmarks
+benchmarks:
+  stage: benchmark
+  image: gcc:13
+  dependencies:
+    - build
+  script:
+    - cd build
+    - ./benchmarks/latency_benchmark --benchmark_format=json > ../benchmark-results.json
+  artifacts:
+    paths:
+      - benchmark-results.json
+    expire_in: 1 month
+
+# Docker image build
+docker-build:
+  stage: package
+  <<: *dind_config
+  image: docker:24
+  dependencies:
+    - build
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - docker build -f docker/Dockerfile.production -t ${DOCKER_IMAGE}:${CI_COMMIT_SHA} .
+    - docker push ${DOCKER_IMAGE}:${CI_COMMIT_SHA}
+    - docker tag ${DOCKER_IMAGE}:${CI_COMMIT_SHA} ${DOCKER_IMAGE}:${CI_COMMIT_REF_NAME}
+    - docker push ${DOCKER_IMAGE}:${CI_COMMIT_REF_NAME}
+
+# Deploy to development
+deploy-development:
+  stage: deploy-dev
+  image: bitnami/kubectl:1.28
+  only:
+    - develop
+  environment:
+    name: development
+    url: https://dev.hft-trading.example.com
+  script:
+    - kubectl config use-context ${KUBE_CONTEXT_DEV}
+    - kubectl set image deployment/hft-trading-engine hft-trading-engine=${DOCKER_IMAGE}:${CI_COMMIT_SHA} -n development
+    - kubectl rollout status deployment/hft-trading-engine -n development
+
+# Deploy to staging
+deploy-staging:
+  stage: deploy-staging
+  image: bitnami/kubectl:1.28
+  only:
+    - main
+  environment:
+    name: staging
+    url: https://staging.hft-trading.example.com
+  script:
+    - kubectl config use-context ${KUBE_CONTEXT_STAGING}
+    - ./scripts/deploy-blue-green.sh staging green ${DOCKER_IMAGE}:${CI_COMMIT_SHA}
+
+# Deploy to production
+deploy-production:
+  stage: deploy-prod
+  image: bitnami/kubectl:1.28
+  only:
+    - tags
+  when: manual
+  environment:
+    name: production
+    url: https://hft-trading.example.com
+  script:
+    - kubectl config use-context ${KUBE_CONTEXT_PROD}
+    - ./scripts/deploy-canary.sh production 10 ${DOCKER_IMAGE}:${CI_COMMIT_SHA}
+    - sleep 300
+    - ./scripts/deploy-canary.sh production 50 ${DOCKER_IMAGE}:${CI_COMMIT_SHA}
+    - sleep 300
+    - ./scripts/deploy-canary.sh production 100 ${DOCKER_IMAGE}:${CI_COMMIT_SHA}
+
+================================================================================
+4. PIPELINE BEST PRACTICES FOR HFT SYSTEMS
+================================================================================
+
+1. LATENCY-CRITICAL BUILD OPTIMIZATION
+   - Use ccache for faster incremental builds
+   - Enable distributed compilation (distcc/icecc)
+   - Leverage build caching across pipeline runs
+   - Parallel test execution with proper resource allocation
+
+2. TESTING STRATEGY
+   - Unit tests: < 30 seconds total
+   - Integration tests: < 5 minutes total
+   - Performance tests: Baseline comparison mandatory
+   - Latency regression detection threshold: 5%
+
+3. DEPLOYMENT SAFETY
+   - Automated rollback on metric degradation
+   - Canary deployment with gradual traffic shift
+   - Blue-green for zero-downtime staging deployments
+   - Production deployments during low-volume windows
+
+4. MONITORING AND ALERTING
+   - Pipeline execution time tracking
+   - Build success/failure rates
+   - Test coverage trends
+   - Performance benchmark trends
+   - Deployment success rates
+
+5. SECURITY SCANNING
+   - SAST (Static Application Security Testing)
+   - Dependency vulnerability scanning
+   - Container image scanning
+   - Secret detection in code
+
+================================================================================
+5. HELPER SCRIPTS
+================================================================================
+
+# scripts/smoke-tests.sh
+#!/bin/bash
+set -e
+
+ENDPOINT=$1
+MAX_RETRIES=30
+RETRY_DELAY=10
+
+echo "Running smoke tests against ${ENDPOINT}"
+
+# Health check
+for i in $(seq 1 $MAX_RETRIES); do
+    if curl -f "${ENDPOINT}/health"; then
+        echo "Health check passed"
+        break
+    fi
+    echo "Retry $i/$MAX_RETRIES..."
+    sleep $RETRY_DELAY
+done
+
+# Order placement test
+curl -X POST "${ENDPOINT}/api/orders" \
+  -H "Content-Type: application/json" \
+  -d '{"symbol":"AAPL","quantity":100,"side":"BUY","type":"LIMIT","price":150.00}'
+
+# Market data test
+curl "${ENDPOINT}/api/marketdata/AAPL"
+
+echo "Smoke tests completed successfully"
+
+# scripts/compare_benchmarks.py
+#!/usr/bin/env python3
+import json
+import sys
+
+def compare_benchmarks(current_file, baseline_file):
+    with open(current_file) as f:
+        current = json.load(f)
+    with open(baseline_file) as f:
+        baseline = json.load(f)
+
+    threshold = 0.05  # 5% regression threshold
+    regressions = []
+
+    for curr_bench in current['benchmarks']:
+        name = curr_bench['name']
+        baseline_bench = next((b for b in baseline['benchmarks'] if b['name'] == name), None)
+
+        if baseline_bench:
+            curr_time = curr_bench['real_time']
+            base_time = baseline_bench['real_time']
+            diff = (curr_time - base_time) / base_time
+
+            if diff > threshold:
+                regressions.append({
+                    'name': name,
+                    'regression': f'{diff*100:.2f}%',
+                    'current': curr_time,
+                    'baseline': base_time
+                })
+
+    if regressions:
+        print("Performance regressions detected:")
+        for reg in regressions:
+            print(f"  {reg['name']}: {reg['regression']} slower")
+        sys.exit(1)
+    else:
+        print("No performance regressions detected")
+        sys.exit(0)
+
+if __name__ == '__main__':
+    compare_benchmarks(sys.argv[1], sys.argv[2])
+
+================================================================================
+END OF CI/CD PIPELINE CONFIGURATION
+================================================================================

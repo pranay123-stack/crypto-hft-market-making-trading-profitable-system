@@ -1,0 +1,1021 @@
+================================================================================
+API KEY MANAGEMENT AND ROTATION FOR HFT TRADING SYSTEMS
+================================================================================
+
+OVERVIEW
+--------
+This document provides comprehensive guidelines for API key management, rotation,
+and security best practices in high-frequency trading systems. Proper API key
+management is critical to prevent unauthorized access to exchange APIs, broker
+connections, and internal services.
+
+================================================================================
+SECURITY ARCHITECTURE
+================================================================================
+
+1. KEY LIFECYCLE MANAGEMENT
+---------------------------
+Phase 1: Generation
+- Use cryptographically secure random number generators
+- Minimum key length: 256 bits for symmetric, 2048 bits for asymmetric
+- Generate keys in secure, isolated environments
+- Never generate keys on production systems
+
+Phase 2: Distribution
+- Encrypt keys during transmission (TLS 1.3 minimum)
+- Use out-of-band verification for initial key exchange
+- Implement key wrapping using KEK (Key Encryption Key)
+- Maintain audit trail of key distribution
+
+Phase 3: Storage
+- Hardware Security Modules (HSM) for critical keys
+- Encrypted key stores with access controls
+- Memory protection (mlock, secure allocators)
+- Environment-based key segregation
+
+Phase 4: Rotation
+- Automated rotation every 30-90 days
+- Emergency rotation procedures
+- Zero-downtime rotation strategies
+- Rotation audit logging
+
+Phase 5: Revocation
+- Immediate revocation capability
+- Revocation list distribution
+- Key compromise response procedures
+- Post-revocation verification
+
+2. HIERARCHICAL KEY STRUCTURE
+------------------------------
+Master Keys (Level 0)
+├── Service Keys (Level 1)
+│   ├── Exchange API Keys (Level 2)
+│   ├── Broker API Keys (Level 2)
+│   └── Internal Service Keys (Level 2)
+└── Data Encryption Keys (Level 1)
+    ├── Database Encryption Keys (Level 2)
+    └── Message Encryption Keys (Level 2)
+
+3. ACCESS CONTROL MATRIX
+-------------------------
+Key Type              | Read Access      | Write Access     | Rotate Access
+----------------------|------------------|------------------|------------------
+Master Keys           | Security Team    | Security Lead    | CISO Only
+Exchange API Keys     | Trading Systems  | DevOps + Security| Security Team
+Broker API Keys       | Risk Management  | DevOps + Security| Security Team
+Internal Service Keys | Service Accounts | CI/CD System     | Automated System
+Database Keys         | DB Administrators| Security Team    | Automated System
+
+================================================================================
+IMPLEMENTATION CODE EXAMPLES
+================================================================================
+
+1. SECURE API KEY GENERATOR (C++)
+----------------------------------
+
+```cpp
+#include <openssl/rand.h>
+#include <openssl/evp.h>
+#include <openssl/sha.h>
+#include <string>
+#include <vector>
+#include <stdexcept>
+#include <iomanip>
+#include <sstream>
+
+class SecureAPIKeyGenerator {
+private:
+    static constexpr size_t KEY_LENGTH = 32; // 256 bits
+    static constexpr size_t SALT_LENGTH = 16;
+
+    // Secure memory allocator
+    template<typename T>
+    struct SecureAllocator {
+        typedef T value_type;
+
+        SecureAllocator() = default;
+        template<typename U>
+        SecureAllocator(const SecureAllocator<U>&) {}
+
+        T* allocate(std::size_t n) {
+            void* ptr = nullptr;
+            if (posix_memalign(&ptr, 64, n * sizeof(T)) != 0) {
+                throw std::bad_alloc();
+            }
+            mlock(ptr, n * sizeof(T));
+            return static_cast<T*>(ptr);
+        }
+
+        void deallocate(T* p, std::size_t n) {
+            if (p) {
+                explicit_bzero(p, n * sizeof(T));
+                munlock(p, n * sizeof(T));
+                free(p);
+            }
+        }
+    };
+
+    using SecureString = std::basic_string<char, std::char_traits<char>,
+                                           SecureAllocator<char>>;
+
+public:
+    struct APIKey {
+        std::string key_id;
+        SecureString secret_key;
+        std::string created_at;
+        std::string expires_at;
+        std::vector<std::string> permissions;
+        std::string checksum;
+    };
+
+    static APIKey generateKey(const std::vector<std::string>& permissions,
+                             uint32_t validity_days = 90) {
+        APIKey key;
+
+        // Generate key ID (non-sensitive, can be logged)
+        unsigned char key_id_bytes[16];
+        if (RAND_bytes(key_id_bytes, sizeof(key_id_bytes)) != 1) {
+            throw std::runtime_error("Failed to generate key ID");
+        }
+        key.key_id = "hft_" + bytesToHex(key_id_bytes, sizeof(key_id_bytes));
+
+        // Generate secret key (sensitive, must be protected)
+        unsigned char secret_bytes[KEY_LENGTH];
+        if (RAND_bytes(secret_bytes, sizeof(secret_bytes)) != 1) {
+            throw std::runtime_error("Failed to generate secret key");
+        }
+
+        // Encode secret key in base64
+        key.secret_key = base64Encode(secret_bytes, sizeof(secret_bytes));
+
+        // Set timestamps
+        auto now = std::chrono::system_clock::now();
+        key.created_at = formatTimestamp(now);
+
+        auto expiry = now + std::chrono::hours(24 * validity_days);
+        key.expires_at = formatTimestamp(expiry);
+
+        // Set permissions
+        key.permissions = permissions;
+
+        // Generate checksum for integrity verification
+        key.checksum = generateChecksum(key);
+
+        // Clear sensitive data from stack
+        explicit_bzero(secret_bytes, sizeof(secret_bytes));
+
+        return key;
+    }
+
+    static std::string hashAPIKey(const SecureString& api_key) {
+        unsigned char hash[SHA256_DIGEST_LENGTH];
+        SHA256_CTX sha256;
+        SHA256_Init(&sha256);
+        SHA256_Update(&sha256, api_key.c_str(), api_key.length());
+        SHA256_Final(hash, &sha256);
+
+        return bytesToHex(hash, SHA256_DIGEST_LENGTH);
+    }
+
+private:
+    static std::string bytesToHex(const unsigned char* data, size_t len) {
+        std::stringstream ss;
+        ss << std::hex << std::setfill('0');
+        for (size_t i = 0; i < len; ++i) {
+            ss << std::setw(2) << static_cast<int>(data[i]);
+        }
+        return ss.str();
+    }
+
+    static SecureString base64Encode(const unsigned char* data, size_t len) {
+        BIO *bio, *b64;
+        BUF_MEM *buffer_ptr;
+
+        b64 = BIO_new(BIO_f_base64());
+        bio = BIO_new(BIO_s_mem());
+        bio = BIO_push(b64, bio);
+
+        BIO_set_flags(bio, BIO_FLAGS_BASE64_NO_NL);
+        BIO_write(bio, data, len);
+        BIO_flush(bio);
+        BIO_get_mem_ptr(bio, &buffer_ptr);
+
+        SecureString result(buffer_ptr->data, buffer_ptr->length);
+        BIO_free_all(bio);
+
+        return result;
+    }
+
+    static std::string formatTimestamp(std::chrono::system_clock::time_point tp) {
+        auto tt = std::chrono::system_clock::to_time_t(tp);
+        std::stringstream ss;
+        ss << std::put_time(std::gmtime(&tt), "%Y-%m-%dT%H:%M:%SZ");
+        return ss.str();
+    }
+
+    static std::string generateChecksum(const APIKey& key) {
+        std::string data = key.key_id + key.created_at + key.expires_at;
+        for (const auto& perm : key.permissions) {
+            data += perm;
+        }
+
+        unsigned char hash[SHA256_DIGEST_LENGTH];
+        SHA256(reinterpret_cast<const unsigned char*>(data.c_str()),
+               data.length(), hash);
+
+        return bytesToHex(hash, SHA256_DIGEST_LENGTH);
+    }
+};
+```
+
+2. API KEY ROTATION MANAGER
+----------------------------
+
+```cpp
+#include <mutex>
+#include <shared_mutex>
+#include <unordered_map>
+#include <chrono>
+#include <thread>
+
+class APIKeyRotationManager {
+private:
+    struct KeyPair {
+        SecureAPIKeyGenerator::APIKey current_key;
+        SecureAPIKeyGenerator::APIKey next_key;
+        std::chrono::system_clock::time_point rotation_time;
+        bool rotation_in_progress;
+    };
+
+    std::unordered_map<std::string, KeyPair> key_pairs_;
+    mutable std::shared_mutex mutex_;
+    std::thread rotation_thread_;
+    std::atomic<bool> running_{false};
+
+    // Configuration
+    static constexpr uint32_t ROTATION_OVERLAP_HOURS = 24;
+    static constexpr uint32_t CHECK_INTERVAL_SECONDS = 3600;
+
+public:
+    APIKeyRotationManager() {
+        running_ = true;
+        rotation_thread_ = std::thread(&APIKeyRotationManager::rotationWorker, this);
+    }
+
+    ~APIKeyRotationManager() {
+        running_ = false;
+        if (rotation_thread_.joinable()) {
+            rotation_thread_.join();
+        }
+    }
+
+    // Register a service that needs key rotation
+    void registerService(const std::string& service_name,
+                        const std::vector<std::string>& permissions) {
+        std::unique_lock lock(mutex_);
+
+        KeyPair pair;
+        pair.current_key = SecureAPIKeyGenerator::generateKey(permissions);
+        pair.next_key = {}; // Empty initially
+        pair.rotation_time = std::chrono::system_clock::now() +
+                            std::chrono::hours(24 * 90); // 90 days
+        pair.rotation_in_progress = false;
+
+        key_pairs_[service_name] = std::move(pair);
+
+        // Log registration (key_id is safe to log, not the secret)
+        logAudit("KEY_REGISTERED", service_name, pair.current_key.key_id);
+    }
+
+    // Get current valid key for a service
+    std::optional<SecureAPIKeyGenerator::APIKey> getCurrentKey(
+        const std::string& service_name) const {
+        std::shared_lock lock(mutex_);
+
+        auto it = key_pairs_.find(service_name);
+        if (it == key_pairs_.end()) {
+            return std::nullopt;
+        }
+
+        return it->second.current_key;
+    }
+
+    // Initiate key rotation for a service
+    bool rotateKey(const std::string& service_name, bool force = false) {
+        std::unique_lock lock(mutex_);
+
+        auto it = key_pairs_.find(service_name);
+        if (it == key_pairs_.end()) {
+            return false;
+        }
+
+        auto& pair = it->second;
+
+        // Check if rotation is already in progress
+        if (pair.rotation_in_progress && !force) {
+            return false;
+        }
+
+        // Generate new key
+        auto new_key = SecureAPIKeyGenerator::generateKey(
+            pair.current_key.permissions);
+
+        // Start overlap period
+        pair.next_key = new_key;
+        pair.rotation_in_progress = true;
+
+        logAudit("KEY_ROTATION_STARTED", service_name, new_key.key_id);
+
+        // Schedule completion of rotation
+        auto rotation_complete_time = std::chrono::system_clock::now() +
+                                     std::chrono::hours(ROTATION_OVERLAP_HOURS);
+        pair.rotation_time = rotation_complete_time;
+
+        return true;
+    }
+
+    // Complete rotation (called after overlap period)
+    void completeRotation(const std::string& service_name) {
+        std::unique_lock lock(mutex_);
+
+        auto it = key_pairs_.find(service_name);
+        if (it == key_pairs_.end() || !it->second.rotation_in_progress) {
+            return;
+        }
+
+        auto& pair = it->second;
+
+        // Archive old key
+        archiveKey(service_name, pair.current_key);
+
+        // Promote next key to current
+        pair.current_key = std::move(pair.next_key);
+        pair.next_key = {};
+        pair.rotation_in_progress = false;
+
+        // Set next rotation time
+        pair.rotation_time = std::chrono::system_clock::now() +
+                            std::chrono::hours(24 * 90);
+
+        logAudit("KEY_ROTATION_COMPLETED", service_name, pair.current_key.key_id);
+    }
+
+    // Verify API key
+    bool verifyKey(const std::string& service_name,
+                   const std::string& key_id) const {
+        std::shared_lock lock(mutex_);
+
+        auto it = key_pairs_.find(service_name);
+        if (it == key_pairs_.end()) {
+            return false;
+        }
+
+        const auto& pair = it->second;
+
+        // Accept both current and next key during rotation
+        if (pair.current_key.key_id == key_id) {
+            return true;
+        }
+
+        if (pair.rotation_in_progress && pair.next_key.key_id == key_id) {
+            return true;
+        }
+
+        return false;
+    }
+
+private:
+    void rotationWorker() {
+        while (running_) {
+            std::this_thread::sleep_for(
+                std::chrono::seconds(CHECK_INTERVAL_SECONDS));
+
+            auto now = std::chrono::system_clock::now();
+
+            std::unique_lock lock(mutex_);
+            for (auto& [service_name, pair] : key_pairs_) {
+                // Check if rotation needs to be completed
+                if (pair.rotation_in_progress && now >= pair.rotation_time) {
+                    lock.unlock();
+                    completeRotation(service_name);
+                    lock.lock();
+                }
+                // Check if new rotation needs to be initiated
+                else if (!pair.rotation_in_progress &&
+                        now >= (pair.rotation_time -
+                               std::chrono::hours(ROTATION_OVERLAP_HOURS))) {
+                    lock.unlock();
+                    rotateKey(service_name);
+                    lock.lock();
+                }
+            }
+        }
+    }
+
+    void archiveKey(const std::string& service_name,
+                   const SecureAPIKeyGenerator::APIKey& key) {
+        // Implementation: Store in secure archive for audit purposes
+        logAudit("KEY_ARCHIVED", service_name, key.key_id);
+    }
+
+    void logAudit(const std::string& event, const std::string& service,
+                 const std::string& key_id) const {
+        // Implementation: Write to secure audit log
+        // Never log the actual secret key, only key_id
+        std::cout << "[AUDIT] " << event << " | Service: " << service
+                  << " | Key ID: " << key_id << std::endl;
+    }
+};
+```
+
+3. API KEY VAULT INTEGRATION
+-----------------------------
+
+```cpp
+#include <curl/curl.h>
+#include <json/json.h>
+
+class VaultAPIKeyStore {
+private:
+    std::string vault_addr_;
+    std::string vault_token_;
+    std::string mount_path_;
+
+public:
+    VaultAPIKeyStore(const std::string& addr, const std::string& token,
+                     const std::string& mount = "secret")
+        : vault_addr_(addr), vault_token_(token), mount_path_(mount) {}
+
+    // Store API key in Vault
+    bool storeKey(const std::string& service_name,
+                 const SecureAPIKeyGenerator::APIKey& key) {
+        Json::Value data;
+        data["key_id"] = key.key_id;
+        data["secret_key"] = std::string(key.secret_key.begin(),
+                                        key.secret_key.end());
+        data["created_at"] = key.created_at;
+        data["expires_at"] = key.expires_at;
+        data["checksum"] = key.checksum;
+
+        Json::Value permissions(Json::arrayValue);
+        for (const auto& perm : key.permissions) {
+            permissions.append(perm);
+        }
+        data["permissions"] = permissions;
+
+        std::string path = mount_path_ + "/data/api_keys/" + service_name;
+        return writeToVault(path, data);
+    }
+
+    // Retrieve API key from Vault
+    std::optional<SecureAPIKeyGenerator::APIKey> retrieveKey(
+        const std::string& service_name) {
+        std::string path = mount_path_ + "/data/api_keys/" + service_name;
+        auto response = readFromVault(path);
+
+        if (!response) {
+            return std::nullopt;
+        }
+
+        SecureAPIKeyGenerator::APIKey key;
+        key.key_id = (*response)["key_id"].asString();
+
+        std::string secret = (*response)["secret_key"].asString();
+        key.secret_key.assign(secret.begin(), secret.end());
+
+        key.created_at = (*response)["created_at"].asString();
+        key.expires_at = (*response)["expires_at"].asString();
+        key.checksum = (*response)["checksum"].asString();
+
+        const auto& perms = (*response)["permissions"];
+        for (const auto& perm : perms) {
+            key.permissions.push_back(perm.asString());
+        }
+
+        return key;
+    }
+
+    // Delete API key from Vault
+    bool deleteKey(const std::string& service_name) {
+        std::string path = mount_path_ + "/data/api_keys/" + service_name;
+        return deleteFromVault(path);
+    }
+
+private:
+    static size_t writeCallback(void* contents, size_t size, size_t nmemb,
+                               void* userp) {
+        ((std::string*)userp)->append((char*)contents, size * nmemb);
+        return size * nmemb;
+    }
+
+    bool writeToVault(const std::string& path, const Json::Value& data) {
+        CURL* curl = curl_easy_init();
+        if (!curl) return false;
+
+        Json::StreamWriterBuilder builder;
+        std::string json_data = Json::writeString(builder, data);
+
+        std::string url = vault_addr_ + "/v1/" + path;
+        std::string response;
+
+        struct curl_slist* headers = nullptr;
+        headers = curl_slist_append(headers,
+                  ("X-Vault-Token: " + vault_token_).c_str());
+        headers = curl_slist_append(headers, "Content-Type: application/json");
+
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "POST");
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_data.c_str());
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+
+        CURLcode res = curl_easy_perform(curl);
+        bool success = (res == CURLE_OK);
+
+        curl_slist_free_all(headers);
+        curl_easy_cleanup(curl);
+
+        return success;
+    }
+
+    std::optional<Json::Value> readFromVault(const std::string& path) {
+        CURL* curl = curl_easy_init();
+        if (!curl) return std::nullopt;
+
+        std::string url = vault_addr_ + "/v1/" + path;
+        std::string response;
+
+        struct curl_slist* headers = nullptr;
+        headers = curl_slist_append(headers,
+                  ("X-Vault-Token: " + vault_token_).c_str());
+
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+
+        CURLcode res = curl_easy_perform(curl);
+
+        curl_slist_free_all(headers);
+        curl_easy_cleanup(curl);
+
+        if (res != CURLE_OK) {
+            return std::nullopt;
+        }
+
+        Json::CharReaderBuilder builder;
+        Json::Value root;
+        std::istringstream ss(response);
+        std::string errs;
+
+        if (!Json::parseFromStream(builder, ss, &root, &errs)) {
+            return std::nullopt;
+        }
+
+        return root["data"]["data"];
+    }
+
+    bool deleteFromVault(const std::string& path) {
+        CURL* curl = curl_easy_init();
+        if (!curl) return false;
+
+        std::string url = vault_addr_ + "/v1/" + path;
+
+        struct curl_slist* headers = nullptr;
+        headers = curl_slist_append(headers,
+                  ("X-Vault-Token: " + vault_token_).c_str());
+
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+
+        CURLcode res = curl_easy_perform(curl);
+        bool success = (res == CURLE_OK);
+
+        curl_slist_free_all(headers);
+        curl_easy_cleanup(curl);
+
+        return success;
+    }
+};
+```
+
+================================================================================
+CONFIGURATION TEMPLATES
+================================================================================
+
+1. API KEY POLICY CONFIGURATION (YAML)
+---------------------------------------
+
+```yaml
+api_key_policy:
+  global_settings:
+    default_validity_days: 90
+    rotation_overlap_hours: 24
+    minimum_key_length: 256
+    hash_algorithm: "SHA-256"
+
+  key_types:
+    exchange_api:
+      validity_days: 60
+      rotation_required: true
+      auto_rotate: true
+      permissions:
+        - "read_market_data"
+        - "place_orders"
+        - "cancel_orders"
+        - "read_account_info"
+      rate_limits:
+        requests_per_second: 100
+        requests_per_minute: 5000
+
+    broker_api:
+      validity_days: 90
+      rotation_required: true
+      auto_rotate: true
+      permissions:
+        - "read_positions"
+        - "read_executions"
+        - "submit_orders"
+      rate_limits:
+        requests_per_second: 50
+        requests_per_minute: 2000
+
+    internal_service:
+      validity_days: 30
+      rotation_required: true
+      auto_rotate: true
+      permissions:
+        - "service_to_service_auth"
+      rate_limits:
+        requests_per_second: 1000
+
+  storage:
+    primary_backend: "vault"
+    vault_config:
+      address: "https://vault.hft-system.local:8200"
+      mount_path: "secret"
+      tls_verify: true
+      tls_ca_cert: "/etc/pki/ca-trust/vault-ca.crt"
+
+    backup_backend: "hsm"
+    hsm_config:
+      type: "thales"
+      partition: "hft_keys"
+
+  rotation:
+    schedule: "0 2 * * 0"  # Every Sunday at 2 AM
+    notification_email: "security@hft-system.com"
+    pre_rotation_warning_days: 7
+    emergency_rotation_enabled: true
+
+  audit:
+    log_level: "INFO"
+    log_destination: "/var/log/hft/api_key_audit.log"
+    syslog_enabled: true
+    syslog_facility: "LOCAL5"
+    retention_days: 365
+```
+
+2. KEY ROTATION SCHEDULE (JSON)
+--------------------------------
+
+```json
+{
+  "rotation_schedule": {
+    "services": [
+      {
+        "service_name": "binance_spot_trading",
+        "key_type": "exchange_api",
+        "rotation_frequency_days": 60,
+        "last_rotation": "2025-09-25T00:00:00Z",
+        "next_rotation": "2025-11-24T00:00:00Z",
+        "auto_rotate": true,
+        "notification_recipients": [
+          "trading-ops@hft-system.com",
+          "security@hft-system.com"
+        ]
+      },
+      {
+        "service_name": "interactive_brokers",
+        "key_type": "broker_api",
+        "rotation_frequency_days": 90,
+        "last_rotation": "2025-08-26T00:00:00Z",
+        "next_rotation": "2025-11-24T00:00:00Z",
+        "auto_rotate": true,
+        "notification_recipients": [
+          "trading-ops@hft-system.com"
+        ]
+      },
+      {
+        "service_name": "risk_engine_service",
+        "key_type": "internal_service",
+        "rotation_frequency_days": 30,
+        "last_rotation": "2025-10-26T00:00:00Z",
+        "next_rotation": "2025-11-25T00:00:00Z",
+        "auto_rotate": true,
+        "notification_recipients": [
+          "devops@hft-system.com"
+        ]
+      }
+    ],
+    "rotation_windows": [
+      {
+        "window_name": "weekend_maintenance",
+        "start_time": "Saturday 02:00 UTC",
+        "duration_hours": 4,
+        "allowed_services": ["all"]
+      },
+      {
+        "window_name": "emergency_rotation",
+        "start_time": "immediate",
+        "duration_hours": 1,
+        "allowed_services": ["all"],
+        "requires_approval": true
+      }
+    ]
+  }
+}
+```
+
+================================================================================
+THREAT MODELS
+================================================================================
+
+THREAT 1: API KEY COMPROMISE VIA MEMORY DUMP
+---------------------------------------------
+Threat Actor: External attacker with system access
+Attack Vector: Memory dump of running process
+Impact: HIGH - Full access to exchange/broker APIs
+
+Mitigation:
+1. Use secure memory allocators (mlock, VirtualLock)
+2. Clear sensitive data immediately after use (explicit_bzero)
+3. Encrypt keys in memory using TEE (Trusted Execution Environment)
+4. Implement memory access controls (ASLR, DEP)
+5. Monitor for memory dump attempts
+
+Detection:
+- Process monitoring for debugger attachment
+- Anomalous memory access patterns
+- Unauthorized ptrace calls
+
+Response:
+1. Immediately rotate all potentially compromised keys
+2. Terminate affected processes
+3. Perform forensic analysis
+4. Review access logs for unauthorized API calls
+
+THREAT 2: API KEY THEFT FROM CONFIGURATION FILES
+-------------------------------------------------
+Threat Actor: Insider threat or external attacker
+Attack Vector: Access to configuration files or environment variables
+Impact: CRITICAL - Direct access to API credentials
+
+Mitigation:
+1. Never store keys in configuration files
+2. Use external secret management (Vault, AWS Secrets Manager)
+3. Implement strict file system permissions (600)
+4. Encrypt configuration files at rest
+5. Use key references instead of actual keys
+
+Detection:
+- File integrity monitoring (FIM)
+- Access auditing on sensitive directories
+- Configuration file change detection
+
+Response:
+1. Revoke compromised keys immediately
+2. Review all API activity for the compromised period
+3. Investigate access patterns
+4. Update security policies
+
+THREAT 3: MAN-IN-THE-MIDDLE ATTACK DURING KEY DISTRIBUTION
+-----------------------------------------------------------
+Threat Actor: Network-level attacker
+Attack Vector: Intercept key distribution over network
+Impact: HIGH - Ability to steal or modify keys in transit
+
+Mitigation:
+1. Always use TLS 1.3 for key distribution
+2. Implement certificate pinning
+3. Use out-of-band key verification
+4. Encrypt keys with recipient's public key before transmission
+5. Use VPN or private networks for key distribution
+
+Detection:
+- TLS certificate validation failures
+- Unexpected network paths
+- Certificate pinning violations
+
+Response:
+1. Abort key distribution
+2. Generate new keys
+3. Investigate network infrastructure
+4. Review certificates and PKI
+
+================================================================================
+SECURITY CHECKLISTS
+================================================================================
+
+API KEY GENERATION CHECKLIST
+-----------------------------
+[ ] Use cryptographically secure random number generator (CSPRNG)
+[ ] Minimum key length meets policy requirements (256 bits)
+[ ] Key generated in secure, isolated environment
+[ ] Generation process audited and logged
+[ ] Key metadata recorded (creation time, expiry, permissions)
+[ ] Checksum calculated for integrity verification
+[ ] Key securely transferred to storage
+[ ] Source entropy verified before generation
+
+API KEY STORAGE CHECKLIST
+--------------------------
+[ ] Keys stored in approved secret management system
+[ ] Encryption at rest enabled
+[ ] Access controls configured (principle of least privilege)
+[ ] Backup procedures in place
+[ ] HSM used for critical keys
+[ ] Memory protection enabled (mlock)
+[ ] File system permissions set correctly (600/400)
+[ ] Storage audit logging enabled
+
+API KEY ROTATION CHECKLIST
+---------------------------
+[ ] Rotation schedule defined and documented
+[ ] Automated rotation configured
+[ ] Overlap period allows zero-downtime rotation
+[ ] Old keys archived securely
+[ ] Rotation events logged
+[ ] Stakeholders notified
+[ ] Post-rotation verification completed
+[ ] Emergency rotation procedure tested
+
+API KEY REVOCATION CHECKLIST
+-----------------------------
+[ ] Revocation list updated
+[ ] All systems notified of revocation
+[ ] Revoked key archived for audit
+[ ] Revocation event logged
+[ ] Root cause analysis initiated
+[ ] New key generated if needed
+[ ] Access review performed
+
+================================================================================
+INCIDENT RESPONSE PROCEDURES
+================================================================================
+
+INCIDENT: SUSPECTED API KEY COMPROMISE
+---------------------------------------
+
+PHASE 1: DETECTION AND ASSESSMENT (0-15 minutes)
+-------------------------------------------------
+1. Identify compromised or potentially compromised keys
+   - Check audit logs for unusual API activity
+   - Review access patterns and geo-locations
+   - Analyze rate limit violations
+   - Examine authentication failures
+
+2. Assess scope of compromise
+   - Determine which services are affected
+   - Identify timeframe of potential compromise
+   - Evaluate potential data exposure
+   - Calculate financial impact (unauthorized trades)
+
+3. Classify incident severity
+   - CRITICAL: Active exploitation detected
+   - HIGH: Strong indicators of compromise
+   - MEDIUM: Suspicious activity, needs investigation
+   - LOW: Potential vulnerability, no active exploitation
+
+PHASE 2: CONTAINMENT (15-30 minutes)
+-------------------------------------
+1. Immediate actions for CRITICAL/HIGH severity:
+   - Revoke compromised keys immediately
+   - Suspend affected services if necessary
+   - Block suspicious IP addresses
+   - Enable enhanced monitoring
+
+2. Generate new temporary keys:
+   - Create emergency replacement keys
+   - Distribute to authorized systems only
+   - Document emergency key issuance
+
+3. Isolate affected systems:
+   - Disconnect from network if needed
+   - Preserve evidence for forensics
+   - Take memory snapshots
+
+PHASE 3: ERADICATION (30-120 minutes)
+--------------------------------------
+1. Root cause analysis:
+   - Determine how keys were compromised
+   - Identify vulnerabilities
+   - Review security controls
+
+2. Remove threat:
+   - Patch vulnerabilities
+   - Update security controls
+   - Remove malicious code if present
+
+3. Verify system integrity:
+   - Scan for additional compromises
+   - Verify configuration integrity
+   - Check for persistence mechanisms
+
+PHASE 4: RECOVERY (2-24 hours)
+-------------------------------
+1. Generate permanent replacement keys:
+   - Use enhanced security procedures
+   - Verify key generation environment
+   - Document new keys
+
+2. Restore normal operations:
+   - Deploy new keys to all systems
+   - Verify functionality
+   - Monitor for issues
+
+3. Enhanced monitoring:
+   - Increase audit log detail
+   - Set up alerting for similar patterns
+   - Review access more frequently
+
+PHASE 5: POST-INCIDENT (24-72 hours)
+-------------------------------------
+1. Complete incident report:
+   - Timeline of events
+   - Root cause analysis
+   - Impact assessment
+   - Response effectiveness
+
+2. Update security controls:
+   - Implement lessons learned
+   - Update policies and procedures
+   - Enhance detection capabilities
+
+3. Stakeholder communication:
+   - Notify affected parties
+   - Regulatory reporting if required
+   - Internal communication
+
+ESCALATION MATRIX
+-----------------
+Severity  | Initial Contact      | Escalation (30 min) | Escalation (1 hour)
+----------|---------------------|---------------------|--------------------
+CRITICAL  | Security Team       | CISO                | CEO, Board
+HIGH      | Security Team       | Security Manager    | CISO
+MEDIUM    | DevOps Team         | Security Team       | Security Manager
+LOW       | Service Owner       | DevOps Team         | Security Team
+
+COMMUNICATION TEMPLATES
+-----------------------
+Subject: [CRITICAL] API Key Compromise - Immediate Action Required
+
+Team,
+
+We have detected a potential compromise of API keys for [SERVICE_NAME].
+
+IMMEDIATE ACTIONS REQUIRED:
+1. All trading activities using [SERVICE_NAME] API suspended
+2. Compromised keys revoked at [TIMESTAMP]
+3. Emergency replacement keys generated
+
+TIMELINE:
+- Detection: [TIMESTAMP]
+- Revocation: [TIMESTAMP]
+- Expected Resolution: [TIMESTAMP]
+
+IMPACT:
+- Affected Services: [LIST]
+- Trading Disruption: [DURATION]
+- Potential Financial Impact: [AMOUNT]
+
+Next update in 30 minutes.
+
+Security Team
+
+================================================================================
+BEST PRACTICES SUMMARY
+================================================================================
+
+1. NEVER hardcode API keys in source code
+2. ALWAYS use secure secret management systems (Vault, HSM)
+3. IMPLEMENT automatic key rotation (30-90 day cycle)
+4. USE secure memory allocation for key storage
+5. ENABLE comprehensive audit logging
+6. IMPLEMENT key usage monitoring and alerting
+7. MAINTAIN key inventory and lifecycle tracking
+8. TEST rotation and revocation procedures regularly
+9. USE separate keys for different environments (dev/staging/prod)
+10. IMPLEMENT zero-trust architecture for key access
+
+================================================================================
+END OF DOCUMENT
+================================================================================

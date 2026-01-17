@@ -1,0 +1,644 @@
+================================================================================
+DATABASE INSTALLATION FOR HIGH-FREQUENCY TRADING SYSTEM
+================================================================================
+
+OVERVIEW
+--------
+This guide covers installation and configuration of all database systems for
+HFT operations:
+- PostgreSQL 16 + TimescaleDB: Primary transactional database, time-series data
+- Redis 7.x: In-memory cache, real-time data, session management
+- ClickHouse 24.x: Analytics, historical data, backtesting
+
+Each database is optimized for low-latency, high-throughput operations.
+
+PREREQUISITES
+-------------
+- System with 64GB+ RAM (128GB recommended)
+- NVMe SSD storage (1TB+ recommended)
+- Root or sudo access
+- Completed: 01_package_managers.txt
+
+POSTGRESQL 16 + TIMESCALEDB
+============================
+
+1. POSTGRESQL 16 INSTALLATION
+------------------------------
+
+Ubuntu/Debian Installation:
+---------------------------
+# Add PostgreSQL APT repository
+sudo apt install -y wget ca-certificates
+wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | \
+    sudo gpg --dearmor -o /usr/share/keyrings/postgresql-keyring.gpg
+
+echo "deb [signed-by=/usr/share/keyrings/postgresql-keyring.gpg] \
+    http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | \
+    sudo tee /etc/apt/sources.list.d/pgdg.list
+
+sudo apt update
+sudo apt install -y postgresql-16 postgresql-contrib-16 postgresql-16-dev
+
+# Start PostgreSQL
+sudo systemctl enable postgresql
+sudo systemctl start postgresql
+sudo systemctl status postgresql
+
+RHEL/CentOS Installation:
+-------------------------
+# Install PostgreSQL repository
+sudo dnf install -y \
+    https://download.postgresql.org/pub/repos/yum/reporpms/EL-9-x86_64/pgdg-redhat-repo-latest.noarch.rpm
+
+# Disable built-in PostgreSQL module
+sudo dnf -qy module disable postgresql
+
+# Install PostgreSQL 16
+sudo dnf install -y postgresql16 postgresql16-server postgresql16-contrib postgresql16-devel
+
+# Initialize database
+sudo /usr/pgsql-16/bin/postgresql-16-setup initdb
+
+# Enable and start
+sudo systemctl enable postgresql-16
+sudo systemctl start postgresql-16
+
+Initial Configuration:
+---------------------
+# Switch to postgres user
+sudo -i -u postgres
+
+# Create HFT database and user
+createuser hfttrader
+createdb -O hfttrader hft_db
+createdb -O hfttrader hft_analytics
+
+# Set password for hfttrader
+psql -c "ALTER USER hfttrader WITH ENCRYPTED PASSWORD 'STRONG_PASSWORD_HERE';"
+
+# Create extensions
+psql hft_db -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements;"
+psql hft_db -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;"
+psql hft_db -c "CREATE EXTENSION IF NOT EXISTS btree_gin;"
+
+exit  # Exit postgres user
+
+
+2. TIMESCALEDB INSTALLATION
+----------------------------
+TimescaleDB adds time-series capabilities to PostgreSQL.
+
+Ubuntu/Debian:
+-------------
+# Add TimescaleDB repository
+sudo sh -c "echo 'deb [signed-by=/usr/share/keyrings/timescaledb-keyring.gpg] \
+    https://packagecloud.io/timescale/timescaledb/ubuntu/ $(lsb_release -c -s) main' \
+    > /etc/apt/sources.list.d/timescaledb.list"
+
+wget --quiet -O - https://packagecloud.io/timescale/timescaledb/gpgkey | \
+    sudo gpg --dearmor -o /usr/share/keyrings/timescaledb-keyring.gpg
+
+sudo apt update
+sudo apt install -y timescaledb-2-postgresql-16
+
+# Tune PostgreSQL for TimescaleDB
+sudo timescaledb-tune --quiet --yes
+
+# Restart PostgreSQL
+sudo systemctl restart postgresql
+
+RHEL/CentOS:
+-----------
+sudo tee /etc/yum.repos.d/timescale_timescaledb.repo << 'EOF'
+[timescale_timescaledb]
+name=timescale_timescaledb
+baseurl=https://packagecloud.io/timescale/timescaledb/el/$(rpm -E %{rhel})/x86_64
+gpgkey=https://packagecloud.io/timescale/timescaledb/gpgkey
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+EOF
+
+sudo dnf install -y timescaledb-2-postgresql-16
+sudo timescaledb-tune --quiet --yes
+sudo systemctl restart postgresql-16
+
+Enable TimescaleDB Extension:
+-----------------------------
+sudo -i -u postgres
+psql hft_db -c "CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;"
+psql hft_analytics -c "CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;"
+exit
+
+
+3. POSTGRESQL HFT OPTIMIZATION
+-------------------------------
+
+Edit PostgreSQL Configuration:
+------------------------------
+# Edit postgresql.conf (location varies)
+# Ubuntu: /etc/postgresql/16/main/postgresql.conf
+# RHEL: /var/lib/pgsql/16/data/postgresql.conf
+
+sudo vim /etc/postgresql/16/main/postgresql.conf
+
+# Add/modify these settings for HFT:
+
+## CONNECTIONS AND MEMORY
+max_connections = 100
+shared_buffers = 16GB                    # 25% of total RAM
+effective_cache_size = 48GB              # 75% of total RAM
+maintenance_work_mem = 2GB
+work_mem = 512MB
+wal_buffers = 16MB
+
+## WRITE-AHEAD LOG (WAL)
+wal_level = replica
+wal_compression = on
+max_wal_size = 8GB
+min_wal_size = 2GB
+checkpoint_completion_target = 0.9
+checkpoint_timeout = 15min
+
+## QUERY PLANNER
+random_page_cost = 1.1                   # SSD optimization
+effective_io_concurrency = 200           # NVMe SSD
+default_statistics_target = 100
+
+## PERFORMANCE
+synchronous_commit = off                 # Faster writes, minimal data loss risk
+fsync = on                               # Keep on for data integrity
+full_page_writes = on
+
+## LOGGING (for HFT troubleshooting)
+logging_collector = on
+log_directory = 'log'
+log_filename = 'postgresql-%Y-%m-%d_%H%M%S.log'
+log_min_duration_statement = 100         # Log queries > 100ms
+log_line_prefix = '%t [%p]: user=%u,db=%d,app=%a,client=%h '
+log_lock_waits = on
+log_temp_files = 0
+log_checkpoints = on
+
+## AUTOVACUUM (critical for high-throughput)
+autovacuum = on
+autovacuum_max_workers = 4
+autovacuum_naptime = 10s
+autovacuum_vacuum_scale_factor = 0.05
+autovacuum_analyze_scale_factor = 0.02
+
+## TIMESCALEDB SPECIFIC
+timescaledb.max_background_workers = 8
+
+Configure pg_hba.conf (Access Control):
+---------------------------------------
+# Edit: /etc/postgresql/16/main/pg_hba.conf
+
+# Allow local connections
+local   all             postgres                                peer
+local   all             hfttrader                               md5
+
+# Allow network connections from HFT servers
+# Replace 10.0.0.0/24 with your actual network
+host    hft_db          hfttrader       10.0.0.0/24            scram-sha-256
+host    hft_analytics   hfttrader       10.0.0.0/24            scram-sha-256
+
+# Restart PostgreSQL
+sudo systemctl restart postgresql
+
+Create HFT Database Schema:
+--------------------------
+cat > /tmp/create_hft_schema.sql << 'EOF'
+-- Connect to HFT database
+\c hft_db
+
+-- Create schemas
+CREATE SCHEMA IF NOT EXISTS trading;
+CREATE SCHEMA IF NOT EXISTS market_data;
+CREATE SCHEMA IF NOT EXISTS risk;
+
+-- Orders table (hypertable for time-series)
+CREATE TABLE trading.orders (
+    order_id BIGSERIAL,
+    timestamp TIMESTAMPTZ NOT NULL,
+    exchange VARCHAR(50) NOT NULL,
+    symbol VARCHAR(20) NOT NULL,
+    side VARCHAR(4) NOT NULL,
+    order_type VARCHAR(20) NOT NULL,
+    price NUMERIC(20, 8),
+    quantity NUMERIC(20, 8) NOT NULL,
+    filled_quantity NUMERIC(20, 8) DEFAULT 0,
+    status VARCHAR(20) NOT NULL,
+    client_order_id VARCHAR(100),
+    exchange_order_id VARCHAR(100),
+    PRIMARY KEY (timestamp, order_id)
+);
+
+-- Convert to hypertable (TimescaleDB)
+SELECT create_hypertable('trading.orders', 'timestamp',
+    chunk_time_interval => INTERVAL '1 day');
+
+-- Create indexes for fast lookups
+CREATE INDEX idx_orders_symbol ON trading.orders (symbol, timestamp DESC);
+CREATE INDEX idx_orders_status ON trading.orders (status, timestamp DESC);
+CREATE INDEX idx_orders_client_id ON trading.orders (client_order_id);
+
+-- Trades table
+CREATE TABLE trading.trades (
+    trade_id BIGSERIAL,
+    timestamp TIMESTAMPTZ NOT NULL,
+    order_id BIGINT NOT NULL,
+    exchange VARCHAR(50) NOT NULL,
+    symbol VARCHAR(20) NOT NULL,
+    side VARCHAR(4) NOT NULL,
+    price NUMERIC(20, 8) NOT NULL,
+    quantity NUMERIC(20, 8) NOT NULL,
+    fee NUMERIC(20, 8),
+    fee_currency VARCHAR(10),
+    PRIMARY KEY (timestamp, trade_id)
+);
+
+SELECT create_hypertable('trading.trades', 'timestamp',
+    chunk_time_interval => INTERVAL '1 day');
+
+CREATE INDEX idx_trades_symbol ON trading.trades (symbol, timestamp DESC);
+CREATE INDEX idx_trades_order_id ON trading.trades (order_id);
+
+-- Market data (ticks)
+CREATE TABLE market_data.ticks (
+    timestamp TIMESTAMPTZ NOT NULL,
+    exchange VARCHAR(50) NOT NULL,
+    symbol VARCHAR(20) NOT NULL,
+    bid_price NUMERIC(20, 8),
+    bid_size NUMERIC(20, 8),
+    ask_price NUMERIC(20, 8),
+    ask_size NUMERIC(20, 8),
+    last_price NUMERIC(20, 8),
+    PRIMARY KEY (timestamp, exchange, symbol)
+);
+
+SELECT create_hypertable('market_data.ticks', 'timestamp',
+    chunk_time_interval => INTERVAL '1 hour');
+
+CREATE INDEX idx_ticks_symbol ON market_data.ticks (symbol, timestamp DESC);
+
+-- Continuous aggregates for fast queries
+CREATE MATERIALIZED VIEW market_data.ohlcv_1min
+WITH (timescaledb.continuous) AS
+SELECT
+    time_bucket('1 minute', timestamp) AS bucket,
+    exchange,
+    symbol,
+    first(last_price, timestamp) AS open,
+    max(last_price) AS high,
+    min(last_price) AS low,
+    last(last_price, timestamp) AS close,
+    count(*) AS volume
+FROM market_data.ticks
+GROUP BY bucket, exchange, symbol;
+
+-- Refresh policy (update every minute)
+SELECT add_continuous_aggregate_policy('market_data.ohlcv_1min',
+    start_offset => INTERVAL '2 hours',
+    end_offset => INTERVAL '1 minute',
+    schedule_interval => INTERVAL '1 minute');
+
+-- Risk management table
+CREATE TABLE risk.position_snapshots (
+    timestamp TIMESTAMPTZ NOT NULL,
+    symbol VARCHAR(20) NOT NULL,
+    quantity NUMERIC(20, 8) NOT NULL,
+    avg_entry_price NUMERIC(20, 8) NOT NULL,
+    unrealized_pnl NUMERIC(20, 8),
+    realized_pnl NUMERIC(20, 8),
+    PRIMARY KEY (timestamp, symbol)
+);
+
+SELECT create_hypertable('risk.position_snapshots', 'timestamp',
+    chunk_time_interval => INTERVAL '1 day');
+
+-- Data retention policies
+SELECT add_retention_policy('market_data.ticks', INTERVAL '30 days');
+SELECT add_retention_policy('trading.orders', INTERVAL '1 year');
+SELECT add_retention_policy('trading.trades', INTERVAL '1 year');
+
+-- Grant permissions
+GRANT ALL PRIVILEGES ON SCHEMA trading TO hfttrader;
+GRANT ALL PRIVILEGES ON SCHEMA market_data TO hfttrader;
+GRANT ALL PRIVILEGES ON SCHEMA risk TO hfttrader;
+GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA trading TO hfttrader;
+GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA market_data TO hfttrader;
+GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA risk TO hfttrader;
+GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA trading TO hfttrader;
+
+EOF
+
+# Execute schema creation
+sudo -u postgres psql -f /tmp/create_hft_schema.sql
+
+
+REDIS 7.x INSTALLATION
+======================
+
+Ubuntu/Debian Installation:
+---------------------------
+# Add Redis repository
+curl -fsSL https://packages.redis.io/gpg | sudo gpg --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg
+
+echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg] \
+    https://packages.redis.io/deb $(lsb_release -cs) main" | \
+    sudo tee /etc/apt/sources.list.d/redis.list
+
+sudo apt update
+sudo apt install -y redis
+
+RHEL/CentOS Installation:
+-------------------------
+sudo dnf install -y redis
+
+# Or from source for latest version
+cd /tmp
+wget https://download.redis.io/redis-stable.tar.gz
+tar -xzf redis-stable.tar.gz
+cd redis-stable
+make -j $(nproc) USE_SYSTEMD=yes
+sudo make install
+
+Redis Configuration for HFT:
+----------------------------
+# Edit /etc/redis/redis.conf (or /etc/redis.conf)
+
+sudo vim /etc/redis/redis.conf
+
+# Key HFT settings:
+
+# Network
+bind 127.0.0.1 10.0.0.10          # Bind to specific IPs
+protected-mode yes
+port 6379
+tcp-backlog 511
+timeout 0
+tcp-keepalive 300
+
+# Memory
+maxmemory 8gb                      # Adjust based on available RAM
+maxmemory-policy allkeys-lru       # Evict least recently used keys
+
+# Persistence (balanced for HFT)
+save 900 1                         # Save after 900 sec if 1 key changed
+save 300 10
+save 60 10000
+
+# AOF for durability
+appendonly yes
+appendfilename "appendonly.aof"
+appendfsync everysec               # Good balance of speed/safety
+no-appendfsync-on-rewrite no
+
+# Performance
+hz 10                              # Internal timer frequency
+dynamic-hz yes
+repl-disable-tcp-nodelay no
+tcp-nodelay yes                    # Disable Nagle algorithm
+
+# Logging
+loglevel notice
+logfile /var/log/redis/redis-server.log
+
+# Start Redis
+sudo systemctl enable redis
+sudo systemctl start redis
+sudo systemctl status redis
+
+Test Redis:
+----------
+redis-cli ping                     # Should return PONG
+redis-cli info stats
+
+Redis Data Structures for HFT:
+------------------------------
+# Example Redis usage patterns
+
+# 1. Real-time order book cache
+redis-cli ZADD orderbook:BTC-USD:bids 50000.5 "100@50000.5"
+redis-cli ZADD orderbook:BTC-USD:asks 50001.5 "50@50001.5"
+
+# 2. Market data cache (last price)
+redis-cli HSET market:BTC-USD price 50000 volume 1000 timestamp 1234567890
+
+# 3. Session management
+redis-cli SETEX session:abc123 3600 "user_data"
+
+# 4. Rate limiting (for API calls)
+redis-cli INCR ratelimit:api:user123
+redis-cli EXPIRE ratelimit:api:user123 60
+
+# 5. Pub/Sub for real-time updates
+redis-cli SUBSCRIBE trades:BTC-USD
+
+
+CLICKHOUSE 24.x INSTALLATION
+=============================
+
+Ubuntu/Debian Installation:
+---------------------------
+# Add ClickHouse repository
+sudo apt install -y apt-transport-https ca-certificates dirmngr
+
+sudo gpg --no-default-keyring \
+    --keyring /usr/share/keyrings/clickhouse-keyring.gpg \
+    --keyserver hkp://keyserver.ubuntu.com:80 \
+    --recv-keys 8919F6BD2B48D754
+
+echo "deb [signed-by=/usr/share/keyrings/clickhouse-keyring.gpg] \
+    https://packages.clickhouse.com/deb stable main" | \
+    sudo tee /etc/apt/sources.list.d/clickhouse.list
+
+sudo apt update
+sudo apt install -y clickhouse-server clickhouse-client
+
+RHEL/CentOS Installation:
+-------------------------
+sudo yum install -y yum-utils
+sudo yum-config-manager --add-repo https://packages.clickhouse.com/rpm/clickhouse.repo
+sudo yum install -y clickhouse-server clickhouse-client
+
+ClickHouse Configuration for HFT:
+---------------------------------
+# Edit /etc/clickhouse-server/config.xml
+
+sudo vim /etc/clickhouse-server/config.xml
+
+# Key settings (add inside <clickhouse> tag):
+<max_connections>1024</max_connections>
+<max_concurrent_queries>100</max_concurrent_queries>
+<max_server_memory_usage_to_ram_ratio>0.9</max_server_memory_usage_to_ram_ratio>
+
+# Mark cache size
+<mark_cache_size>10737418240</mark_cache_size>
+
+# Uncompressed cache
+<uncompressed_cache_size>21474836480</uncompressed_cache_size>
+
+# Compression
+<compression>
+    <case>
+        <method>lz4</method>
+    </case>
+</compression>
+
+# Listen on all interfaces (or specific IP)
+<listen_host>::</listen_host>
+<listen_host>0.0.0.0</listen_host>
+
+# Start ClickHouse
+sudo systemctl enable clickhouse-server
+sudo systemctl start clickhouse-server
+sudo systemctl status clickhouse-server
+
+Create HFT Tables in ClickHouse:
+--------------------------------
+cat > /tmp/create_clickhouse_schema.sql << 'EOF'
+-- Create database
+CREATE DATABASE IF NOT EXISTS hft_analytics;
+
+-- Historical trades (for backtesting)
+CREATE TABLE hft_analytics.trades
+(
+    timestamp DateTime64(6),
+    exchange String,
+    symbol String,
+    side Enum8('BUY' = 1, 'SELL' = 2),
+    price Decimal(20, 8),
+    quantity Decimal(20, 8),
+    trade_id String
+)
+ENGINE = MergeTree()
+PARTITION BY toYYYYMM(timestamp)
+ORDER BY (symbol, timestamp)
+SETTINGS index_granularity = 8192;
+
+-- Market data ticks (compressed for long-term storage)
+CREATE TABLE hft_analytics.market_ticks
+(
+    timestamp DateTime64(6),
+    exchange String,
+    symbol String,
+    bid_price Decimal(20, 8),
+    bid_size Decimal(20, 8),
+    ask_price Decimal(20, 8),
+    ask_size Decimal(20, 8),
+    last_price Decimal(20, 8)
+)
+ENGINE = MergeTree()
+PARTITION BY toYYYYMM(timestamp)
+ORDER BY (symbol, exchange, timestamp)
+SETTINGS index_granularity = 8192;
+
+-- OHLCV aggregated data
+CREATE TABLE hft_analytics.ohlcv_1min
+(
+    timestamp DateTime,
+    exchange String,
+    symbol String,
+    open Decimal(20, 8),
+    high Decimal(20, 8),
+    low Decimal(20, 8),
+    close Decimal(20, 8),
+    volume Decimal(20, 8)
+)
+ENGINE = MergeTree()
+PARTITION BY toYYYYMM(timestamp)
+ORDER BY (symbol, timestamp);
+
+-- Strategy performance
+CREATE TABLE hft_analytics.strategy_pnl
+(
+    timestamp DateTime,
+    strategy_name String,
+    symbol String,
+    realized_pnl Decimal(20, 8),
+    unrealized_pnl Decimal(20, 8),
+    num_trades UInt32,
+    win_rate Float32
+)
+ENGINE = MergeTree()
+PARTITION BY toYYYYMM(timestamp)
+ORDER BY (strategy_name, timestamp);
+
+EOF
+
+# Execute
+clickhouse-client --multiquery < /tmp/create_clickhouse_schema.sql
+
+Test ClickHouse:
+---------------
+clickhouse-client --query "SELECT version()"
+clickhouse-client --query "SHOW DATABASES"
+clickhouse-client --query "SELECT count(*) FROM hft_analytics.trades"
+
+
+DATABASE BACKUP CONFIGURATION
+==============================
+
+PostgreSQL Backup:
+-----------------
+# Create backup script
+sudo mkdir -p /opt/hft/backups/postgresql
+
+cat > /opt/hft/scripts/backup_postgres.sh << 'EOF'
+#!/bin/bash
+BACKUP_DIR="/opt/hft/backups/postgresql"
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+
+# Full database backup
+sudo -u postgres pg_dump hft_db | gzip > "$BACKUP_DIR/hft_db_$TIMESTAMP.sql.gz"
+sudo -u postgres pg_dump hft_analytics | gzip > "$BACKUP_DIR/hft_analytics_$TIMESTAMP.sql.gz"
+
+# Keep only last 7 days
+find "$BACKUP_DIR" -name "*.sql.gz" -mtime +7 -delete
+EOF
+
+chmod +x /opt/hft/scripts/backup_postgres.sh
+
+# Schedule daily backups
+echo "0 2 * * * /opt/hft/scripts/backup_postgres.sh" | crontab -
+
+Redis Backup:
+------------
+# Redis automatically saves RDB files, configure in redis.conf
+# Additional manual backup:
+redis-cli --rdb /opt/hft/backups/redis/dump_$(date +%Y%m%d).rdb
+
+
+VERIFICATION
+============
+
+Test All Databases:
+------------------
+# PostgreSQL
+psql -U hfttrader -d hft_db -c "SELECT version();"
+psql -U hfttrader -d hft_db -c "\dx"  # List extensions
+
+# Redis
+redis-cli ping
+redis-cli info stats
+
+# ClickHouse
+clickhouse-client --query "SELECT version()"
+
+Performance Tests:
+-----------------
+# PostgreSQL write test
+pgbench -i -s 50 hft_db
+pgbench -c 10 -j 2 -t 10000 -U hfttrader hft_db
+
+# Redis benchmark
+redis-benchmark -q -n 100000
+
+# ClickHouse insert test
+clickhouse-benchmark --query "INSERT INTO hft_analytics.trades VALUES"
+
+================================================================================
+Next: 04_networking_libraries.txt
+================================================================================

@@ -1,0 +1,1393 @@
+================================================================================
+                          TICK DATA FORMATS
+                    Comprehensive Format Comparison
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Overview of Tick Data Formats
+2. Binary Formats
+3. Text Formats (CSV, JSON)
+4. Columnar Formats (Parquet, ORC)
+5. Custom HFT Formats
+6. Format Comparison Matrix
+7. Serialization/Deserialization Code
+8. Format Conversion Utilities
+9. Best Practices
+10. Format Selection Guide
+
+================================================================================
+1. OVERVIEW OF TICK DATA FORMATS
+================================================================================
+
+The choice of tick data format has profound implications for:
+- Storage efficiency (10-50x difference)
+- Write performance (100x difference)
+- Query performance (10-100x difference)
+- Compatibility and tooling
+- Development complexity
+
+FORMAT CATEGORIES
+-----------------
+1. BINARY FORMATS
+   - Fixed-width structs
+   - Protocol Buffers
+   - FlatBuffers
+   - Cap'n Proto
+   - Custom formats
+
+2. TEXT FORMATS
+   - CSV (Comma-Separated Values)
+   - JSON (JavaScript Object Notation)
+   - XML (eXtensible Markup Language)
+
+3. COLUMNAR FORMATS
+   - Apache Parquet
+   - Apache ORC
+   - Apache Arrow
+
+4. DATABASE-NATIVE FORMATS
+   - kdb+ (K format)
+   - QuestDB (proprietary)
+   - TimescaleDB (PostgreSQL)
+
+EVALUATION CRITERIA
+-------------------
+┌──────────────────────┬────────────────────────────────────────────┐
+│ Criterion            │ Description                                │
+├──────────────────────┼────────────────────────────────────────────┤
+│ Storage Efficiency   │ Bytes per tick (compression)               │
+│ Write Speed          │ Ticks per second ingestion rate            │
+│ Read Speed           │ Query performance (point & range)          │
+│ Schema Evolution     │ Ability to add/modify fields               │
+│ Portability          │ Cross-platform, cross-language support     │
+│ Tooling              │ Available libraries and tools              │
+│ Human Readability    │ Can inspect without special tools          │
+│ Complexity           │ Implementation and maintenance effort      │
+└──────────────────────┴────────────────────────────────────────────┘
+
+================================================================================
+2. BINARY FORMATS
+================================================================================
+
+2.1 FIXED-WIDTH STRUCT FORMAT
+------------------------------
+The simplest and often fastest format for HFT applications.
+
+ADVANTAGES:
++ Fastest write speed (memory copy)
++ Fastest read speed (direct memory mapping)
++ Zero serialization overhead
++ Predictable memory layout
++ Cache-friendly
++ Simple implementation
+
+DISADVANTAGES:
+- No schema evolution (breaks compatibility)
+- Padding overhead for alignment
+- Not human-readable
+- Endianness issues (cross-platform)
+- No built-in compression
+
+STANDARD TICK FORMAT (41 bytes)
+--------------------------------
+#pragma pack(push, 1)
+struct StandardTick {
+    uint64_t timestamp_ns;    // 8 bytes: Nanosecond timestamp
+    uint32_t symbol_id;       // 4 bytes: Symbol identifier
+    double price;             // 8 bytes: Price (IEEE 754)
+    uint64_t volume;          // 8 bytes: Volume/quantity
+    uint8_t side;            // 1 byte:  Bid(0)/Ask(1)/Trade(2)
+    uint16_t exchange_id;    // 2 bytes: Exchange identifier
+    uint8_t conditions;      // 1 byte:  Trade conditions bitfield
+    uint32_t sequence_num;   // 4 bytes: Sequence number
+    uint32_t checksum;       // 4 bytes: CRC32 checksum
+    uint8_t reserved;        // 1 byte:  Reserved for future use
+};
+#pragma pack(pop)
+// Total: 41 bytes per tick
+
+OPTIMIZED COMPACT FORMAT (20 bytes)
+------------------------------------
+#pragma pack(push, 1)
+struct CompactTick {
+    uint64_t timestamp_ns : 56; // 56 bits: 2.2 years range
+    uint8_t side : 2;           // 2 bits: Bid/Ask/Trade/Unknown
+    uint8_t exchange_id : 6;    // 6 bits: 64 exchanges
+    uint32_t symbol_id;         // 4 bytes: Symbol ID
+    uint32_t price_scaled;      // 4 bytes: Price * 10000 (fixed-point)
+    uint32_t volume;            // 4 bytes: Volume
+    uint16_t sequence_delta;    // 2 bytes: Sequence # delta
+    uint16_t conditions;        // 2 bytes: Conditions
+};
+#pragma pack(pop)
+// Total: 20 bytes per tick (51% size reduction)
+
+WRITE EXAMPLE:
+--------------
+class BinaryTickWriter {
+public:
+    BinaryTickWriter(const std::string& filename) {
+        fd_ = open(filename.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd_ < 0) {
+            throw std::runtime_error("Failed to open file");
+        }
+    }
+
+    ~BinaryTickWriter() {
+        if (fd_ >= 0) close(fd_);
+    }
+
+    void write(const CompactTick& tick) {
+        ssize_t written = ::write(fd_, &tick, sizeof(tick));
+        if (written != sizeof(tick)) {
+            throw std::runtime_error("Write failed");
+        }
+        tick_count_++;
+    }
+
+    void write_batch(const std::vector<CompactTick>& ticks) {
+        size_t total_bytes = ticks.size() * sizeof(CompactTick);
+        ssize_t written = ::write(fd_, ticks.data(), total_bytes);
+        if (written != total_bytes) {
+            throw std::runtime_error("Batch write failed");
+        }
+        tick_count_ += ticks.size();
+    }
+
+    void flush() {
+        fsync(fd_);
+    }
+
+    size_t tick_count() const { return tick_count_; }
+
+private:
+    int fd_;
+    size_t tick_count_ = 0;
+};
+
+READ EXAMPLE:
+-------------
+class BinaryTickReader {
+public:
+    BinaryTickReader(const std::string& filename) {
+        fd_ = open(filename.c_str(), O_RDONLY);
+        if (fd_ < 0) {
+            throw std::runtime_error("Failed to open file");
+        }
+
+        // Get file size
+        struct stat st;
+        fstat(fd_, &st);
+        file_size_ = st.st_size;
+        tick_count_ = file_size_ / sizeof(CompactTick);
+
+        // Memory map the file for fast access
+        data_ = static_cast<const CompactTick*>(
+            mmap(nullptr, file_size_, PROT_READ, MAP_SHARED, fd_, 0)
+        );
+        if (data_ == MAP_FAILED) {
+            throw std::runtime_error("mmap failed");
+        }
+    }
+
+    ~BinaryTickReader() {
+        if (data_ != MAP_FAILED) {
+            munmap(const_cast<CompactTick*>(data_), file_size_);
+        }
+        if (fd_ >= 0) close(fd_);
+    }
+
+    const CompactTick& operator[](size_t index) const {
+        if (index >= tick_count_) {
+            throw std::out_of_range("Tick index out of range");
+        }
+        return data_[index];
+    }
+
+    size_t size() const { return tick_count_; }
+
+    // Iterator support
+    const CompactTick* begin() const { return data_; }
+    const CompactTick* end() const { return data_ + tick_count_; }
+
+private:
+    int fd_;
+    const CompactTick* data_;
+    size_t file_size_;
+    size_t tick_count_;
+};
+
+PERFORMANCE:
+- Write: 10-20 million ticks/second (single thread)
+- Read (sequential): 50-100 million ticks/second
+- Read (random): 1-5 million ticks/second
+
+2.2 PROTOCOL BUFFERS (PROTOBUF)
+--------------------------------
+Google's language-neutral, platform-neutral serialization format.
+
+ADVANTAGES:
++ Schema evolution support (backward/forward compatible)
++ Language-agnostic (C++, Python, Java, etc.)
++ Compact binary format
++ Built-in validation
++ Extensive tooling
+
+DISADVANTAGES:
+- Slower than raw binary (2-5x overhead)
+- Requires code generation
+- Variable-length encoding (unpredictable memory)
+- Not suitable for ultra-low latency
+
+PROTOBUF SCHEMA:
+----------------
+// tick.proto
+syntax = "proto3";
+
+message Tick {
+    uint64 timestamp_ns = 1;
+    uint32 symbol_id = 2;
+    double price = 3;
+    uint64 volume = 4;
+
+    enum Side {
+        UNKNOWN = 0;
+        BID = 1;
+        ASK = 2;
+        TRADE = 3;
+    }
+    Side side = 5;
+
+    uint32 exchange_id = 6;
+    uint32 conditions = 7;
+    uint32 sequence_num = 8;
+}
+
+message TickBatch {
+    repeated Tick ticks = 1;
+    uint64 batch_id = 2;
+    uint64 start_time = 3;
+    uint64 end_time = 4;
+}
+
+C++ USAGE:
+----------
+#include "tick.pb.h"
+#include <fstream>
+
+// Write ticks
+void write_protobuf_ticks(const std::string& filename,
+                          const std::vector<Tick>& ticks) {
+    TickBatch batch;
+    batch.set_batch_id(1);
+    batch.set_start_time(ticks.front().timestamp_ns());
+    batch.set_end_time(ticks.back().timestamp_ns());
+
+    for (const auto& tick : ticks) {
+        *batch.add_ticks() = tick;
+    }
+
+    std::ofstream output(filename, std::ios::binary);
+    batch.SerializeToOstream(&output);
+}
+
+// Read ticks
+std::vector<Tick> read_protobuf_ticks(const std::string& filename) {
+    TickBatch batch;
+    std::ifstream input(filename, std::ios::binary);
+    batch.ParseFromIstream(&input);
+
+    std::vector<Tick> ticks;
+    ticks.reserve(batch.ticks_size());
+    for (const auto& tick : batch.ticks()) {
+        ticks.push_back(tick);
+    }
+    return ticks;
+}
+
+PERFORMANCE:
+- Write: 500K-2M ticks/second
+- Read: 1-3M ticks/second
+- Size: 25-35 bytes per tick (with varint encoding)
+
+2.3 FLATBUFFERS
+---------------
+Zero-copy serialization library by Google.
+
+ADVANTAGES:
++ No parsing required (direct memory access)
++ Faster than Protobuf (2-5x)
++ Schema evolution support
++ Small runtime overhead
++ Forward/backward compatible
+
+DISADVANTAGES:
+- More complex API than Protobuf
+- Manual memory management
+- Larger serialized size than Protobuf
+- Less mature ecosystem
+
+FLATBUFFER SCHEMA:
+------------------
+// tick.fbs
+namespace HFT;
+
+enum Side : byte { Unknown = 0, Bid = 1, Ask = 2, Trade = 3 }
+
+struct CompactTick {
+    timestamp_ns: uint64;
+    symbol_id: uint32;
+    price_scaled: uint32;
+    volume: uint32;
+    side: Side;
+    exchange_id: uint16;
+    conditions: uint16;
+    sequence_num: uint32;
+}
+
+table TickBatch {
+    ticks: [CompactTick];
+    batch_id: uint64;
+    start_time: uint64;
+    end_time: uint64;
+}
+
+root_type TickBatch;
+
+C++ USAGE:
+----------
+#include "tick_generated.h"
+
+// Write ticks
+void write_flatbuffer_ticks(const std::string& filename,
+                            const std::vector<CompactTick>& ticks) {
+    flatbuffers::FlatBufferBuilder builder(1024 * 1024);
+
+    auto tick_vector = builder.CreateVectorOfStructs(ticks);
+
+    auto batch = HFT::CreateTickBatch(builder,
+                                      tick_vector,
+                                      1,  // batch_id
+                                      ticks.front().timestamp_ns,
+                                      ticks.back().timestamp_ns);
+    builder.Finish(batch);
+
+    std::ofstream output(filename, std::ios::binary);
+    output.write(reinterpret_cast<const char*>(builder.GetBufferPointer()),
+                 builder.GetSize());
+}
+
+// Read ticks (zero-copy)
+void read_flatbuffer_ticks(const std::string& filename) {
+    std::ifstream input(filename, std::ios::binary);
+    std::vector<uint8_t> buffer((std::istreambuf_iterator<char>(input)),
+                                std::istreambuf_iterator<char>());
+
+    auto batch = HFT::GetTickBatch(buffer.data());
+    auto ticks = batch->ticks();
+
+    // Direct access without copying
+    for (size_t i = 0; i < ticks->size(); ++i) {
+        const auto* tick = ticks->Get(i);
+        // Process tick->timestamp_ns(), etc.
+    }
+}
+
+PERFORMANCE:
+- Write: 2-5M ticks/second
+- Read: 10-20M ticks/second (zero-copy)
+- Size: 22-28 bytes per tick
+
+================================================================================
+3. TEXT FORMATS (CSV, JSON)
+================================================================================
+
+3.1 CSV FORMAT
+--------------
+Human-readable, widely supported, but inefficient.
+
+ADVANTAGES:
++ Human-readable
++ Universal tool support
++ Simple parsing
++ Easy debugging
++ Portable across systems
+
+DISADVANTAGES:
+- 10-20x larger than binary
+- 100x slower to parse
+- No data typing (strings only)
+- Ambiguous escaping rules
+- Poor for nested data
+
+STANDARD CSV FORMAT:
+--------------------
+timestamp,symbol,price,volume,side,exchange,conditions,sequence
+1706184600000000000,AAPL,182.34,100,B,NASDAQ,0,12345
+1706184600000001000,AAPL,182.35,200,A,NASDAQ,0,12346
+1706184600000002000,AAPL,182.34,150,T,NASDAQ,16,12347
+
+CSV WRITER:
+-----------
+class CSVTickWriter {
+public:
+    CSVTickWriter(const std::string& filename)
+        : file_(filename) {
+        if (!file_.is_open()) {
+            throw std::runtime_error("Failed to open file");
+        }
+        // Write header
+        file_ << "timestamp,symbol,price,volume,side,exchange,"
+              << "conditions,sequence\n";
+    }
+
+    void write(uint64_t timestamp, const std::string& symbol,
+               double price, uint64_t volume, char side,
+               const std::string& exchange, uint32_t conditions,
+               uint32_t sequence) {
+        file_ << timestamp << ','
+              << symbol << ','
+              << std::fixed << std::setprecision(4) << price << ','
+              << volume << ','
+              << side << ','
+              << exchange << ','
+              << conditions << ','
+              << sequence << '\n';
+    }
+
+    void flush() {
+        file_.flush();
+    }
+
+private:
+    std::ofstream file_;
+};
+
+CSV READER:
+-----------
+struct CSVTick {
+    uint64_t timestamp;
+    std::string symbol;
+    double price;
+    uint64_t volume;
+    char side;
+    std::string exchange;
+    uint32_t conditions;
+    uint32_t sequence;
+};
+
+class CSVTickReader {
+public:
+    CSVTickReader(const std::string& filename)
+        : file_(filename) {
+        if (!file_.is_open()) {
+            throw std::runtime_error("Failed to open file");
+        }
+        // Skip header
+        std::string header;
+        std::getline(file_, header);
+    }
+
+    bool read(CSVTick& tick) {
+        std::string line;
+        if (!std::getline(file_, line)) {
+            return false;
+        }
+
+        std::istringstream ss(line);
+        std::string field;
+
+        std::getline(ss, field, ',');
+        tick.timestamp = std::stoull(field);
+
+        std::getline(ss, tick.symbol, ',');
+
+        std::getline(ss, field, ',');
+        tick.price = std::stod(field);
+
+        std::getline(ss, field, ',');
+        tick.volume = std::stoull(field);
+
+        std::getline(ss, field, ',');
+        tick.side = field[0];
+
+        std::getline(ss, tick.exchange, ',');
+
+        std::getline(ss, field, ',');
+        tick.conditions = std::stoul(field);
+
+        std::getline(ss, field, ',');
+        tick.sequence = std::stoul(field);
+
+        return true;
+    }
+
+private:
+    std::ifstream file_;
+};
+
+PERFORMANCE:
+- Write: 50K-200K ticks/second
+- Read: 100K-500K ticks/second
+- Size: 80-120 bytes per tick (uncompressed)
+
+3.2 JSON FORMAT
+---------------
+Structured, human-readable, but very inefficient for tick data.
+
+ADVANTAGES:
++ Human-readable
++ Structured data (nested objects)
++ Schema-flexible
++ Wide language support
++ Easy debugging
+
+DISADVANTAGES:
+- 20-50x larger than binary
+- Very slow parsing (1000x slower)
+- High memory overhead
+- Completely unsuitable for HFT
+
+JSON EXAMPLE:
+-------------
+{
+  "ticks": [
+    {
+      "timestamp": 1706184600000000000,
+      "symbol": "AAPL",
+      "price": 182.34,
+      "volume": 100,
+      "side": "BID",
+      "exchange": "NASDAQ",
+      "conditions": 0,
+      "sequence": 12345
+    },
+    {
+      "timestamp": 1706184600000001000,
+      "symbol": "AAPL",
+      "price": 182.35,
+      "volume": 200,
+      "side": "ASK",
+      "exchange": "NASDAQ",
+      "conditions": 0,
+      "sequence": 12346
+    }
+  ]
+}
+
+JSON WRITER (using RapidJSON):
+-------------------------------
+#include <rapidjson/writer.h>
+#include <rapidjson/stringbuffer.h>
+
+void write_json_ticks(const std::string& filename,
+                      const std::vector<Tick>& ticks) {
+    using namespace rapidjson;
+
+    StringBuffer sb;
+    Writer<StringBuffer> writer(sb);
+
+    writer.StartObject();
+    writer.Key("ticks");
+    writer.StartArray();
+
+    for (const auto& tick : ticks) {
+        writer.StartObject();
+        writer.Key("timestamp");
+        writer.Uint64(tick.timestamp_ns);
+        writer.Key("symbol_id");
+        writer.Uint(tick.symbol_id);
+        writer.Key("price");
+        writer.Double(tick.price);
+        writer.Key("volume");
+        writer.Uint64(tick.volume);
+        writer.Key("side");
+        writer.Uint(tick.side);
+        writer.Key("exchange_id");
+        writer.Uint(tick.exchange_id);
+        writer.Key("conditions");
+        writer.Uint(tick.conditions);
+        writer.Key("sequence");
+        writer.Uint(tick.sequence_num);
+        writer.EndObject();
+    }
+
+    writer.EndArray();
+    writer.EndObject();
+
+    std::ofstream output(filename);
+    output << sb.GetString();
+}
+
+RECOMMENDATION: Never use JSON for production tick storage!
+Use only for: Debugging, small samples, configuration
+
+PERFORMANCE:
+- Write: 10K-50K ticks/second
+- Read: 20K-100K ticks/second
+- Size: 150-250 bytes per tick
+
+================================================================================
+4. COLUMNAR FORMATS (PARQUET, ORC)
+================================================================================
+
+4.1 APACHE PARQUET
+------------------
+Columnar storage format designed for analytics workloads.
+
+ADVANTAGES:
++ Excellent compression (15-30x)
++ Fast column scans
++ Schema evolution support
++ Industry standard
++ Great for analytics
++ Rich ecosystem (Spark, Pandas, etc.)
+
+DISADVANTAGES:
+- Slower writes (batch-oriented)
+- Complex format
+- Not suitable for streaming
+- Overhead for small queries
+
+PARQUET STRUCTURE:
+------------------
+Row Group 1 (1M ticks):
+  ├─ Column: timestamp_ns [compressed, 8MB]
+  ├─ Column: symbol_id    [compressed, 4MB]
+  ├─ Column: price        [compressed, 2MB]
+  ├─ Column: volume       [compressed, 3MB]
+  └─ Column: side         [compressed, 100KB]
+Row Group 2 (1M ticks):
+  ├─ ... (same structure)
+
+Footer:
+  ├─ Schema
+  ├─ Column statistics (min/max/count)
+  └─ Row group metadata
+
+PARQUET WRITER (using Arrow):
+------------------------------
+#include <arrow/api.h>
+#include <arrow/io/api.h>
+#include <parquet/arrow/writer.h>
+
+class ParquetTickWriter {
+public:
+    ParquetTickWriter(const std::string& filename) {
+        // Define schema
+        schema_ = arrow::schema({
+            arrow::field("timestamp_ns", arrow::uint64()),
+            arrow::field("symbol_id", arrow::uint32()),
+            arrow::field("price", arrow::float64()),
+            arrow::field("volume", arrow::uint64()),
+            arrow::field("side", arrow::uint8()),
+            arrow::field("exchange_id", arrow::uint16()),
+            arrow::field("conditions", arrow::uint8()),
+            arrow::field("sequence_num", arrow::uint32())
+        });
+
+        // Open file
+        PARQUET_ASSIGN_OR_THROW(
+            outfile_,
+            arrow::io::FileOutputStream::Open(filename)
+        );
+
+        // Create writer
+        PARQUET_THROW_NOT_OK(
+            parquet::arrow::WriteTable(
+                *table, arrow::default_memory_pool(),
+                outfile_, /*chunk_size=*/1024 * 1024
+            )
+        );
+    }
+
+    void write_batch(const std::vector<CompactTick>& ticks) {
+        // Build Arrow arrays
+        arrow::UInt64Builder ts_builder;
+        arrow::UInt32Builder symbol_builder;
+        arrow::DoubleBuilder price_builder;
+        arrow::UInt64Builder volume_builder;
+        arrow::UInt8Builder side_builder;
+        arrow::UInt16Builder exchange_builder;
+        arrow::UInt8Builder conditions_builder;
+        arrow::UInt32Builder sequence_builder;
+
+        for (const auto& tick : ticks) {
+            PARQUET_THROW_NOT_OK(ts_builder.Append(tick.timestamp_ns));
+            PARQUET_THROW_NOT_OK(symbol_builder.Append(tick.symbol_id));
+            PARQUET_THROW_NOT_OK(price_builder.Append(
+                tick.price_scaled / 10000.0));
+            PARQUET_THROW_NOT_OK(volume_builder.Append(tick.volume));
+            PARQUET_THROW_NOT_OK(side_builder.Append(tick.side));
+            PARQUET_THROW_NOT_OK(exchange_builder.Append(tick.exchange_id));
+            PARQUET_THROW_NOT_OK(conditions_builder.Append(tick.conditions));
+            PARQUET_THROW_NOT_OK(sequence_builder.Append(tick.sequence_delta));
+        }
+
+        // Finish arrays
+        std::shared_ptr<arrow::Array> ts_array, symbol_array, price_array,
+                                       volume_array, side_array, exchange_array,
+                                       conditions_array, sequence_array;
+        PARQUET_THROW_NOT_OK(ts_builder.Finish(&ts_array));
+        PARQUET_THROW_NOT_OK(symbol_builder.Finish(&symbol_array));
+        PARQUET_THROW_NOT_OK(price_builder.Finish(&price_array));
+        PARQUET_THROW_NOT_OK(volume_builder.Finish(&volume_array));
+        PARQUET_THROW_NOT_OK(side_builder.Finish(&side_array));
+        PARQUET_THROW_NOT_OK(exchange_builder.Finish(&exchange_array));
+        PARQUET_THROW_NOT_OK(conditions_builder.Finish(&conditions_array));
+        PARQUET_THROW_NOT_OK(sequence_builder.Finish(&sequence_array));
+
+        // Create record batch
+        auto batch = arrow::RecordBatch::Make(
+            schema_, ticks.size(),
+            {ts_array, symbol_array, price_array, volume_array,
+             side_array, exchange_array, conditions_array, sequence_array}
+        );
+
+        // Write to file
+        PARQUET_THROW_NOT_OK(writer_->WriteRecordBatch(*batch));
+    }
+
+    void close() {
+        PARQUET_THROW_NOT_OK(writer_->Close());
+        PARQUET_THROW_NOT_OK(outfile_->Close());
+    }
+
+private:
+    std::shared_ptr<arrow::Schema> schema_;
+    std::shared_ptr<arrow::io::FileOutputStream> outfile_;
+    std::unique_ptr<parquet::arrow::FileWriter> writer_;
+};
+
+PARQUET READER:
+---------------
+class ParquetTickReader {
+public:
+    ParquetTickReader(const std::string& filename) {
+        // Open file
+        PARQUET_ASSIGN_OR_THROW(
+            infile_,
+            arrow::io::ReadableFile::Open(filename)
+        );
+
+        // Open reader
+        PARQUET_THROW_NOT_OK(
+            parquet::arrow::OpenFile(infile_, arrow::default_memory_pool(),
+                                     &reader_)
+        );
+    }
+
+    std::vector<CompactTick> read_all() {
+        std::shared_ptr<arrow::Table> table;
+        PARQUET_THROW_NOT_OK(reader_->ReadTable(&table));
+
+        std::vector<CompactTick> ticks;
+        ticks.reserve(table->num_rows());
+
+        // Access columns
+        auto ts_col = std::static_pointer_cast<arrow::UInt64Array>(
+            table->column(0)->chunk(0));
+        auto symbol_col = std::static_pointer_cast<arrow::UInt32Array>(
+            table->column(1)->chunk(0));
+        auto price_col = std::static_pointer_cast<arrow::DoubleArray>(
+            table->column(2)->chunk(0));
+        // ... other columns
+
+        for (int64_t i = 0; i < table->num_rows(); ++i) {
+            CompactTick tick;
+            tick.timestamp_ns = ts_col->Value(i);
+            tick.symbol_id = symbol_col->Value(i);
+            tick.price_scaled = static_cast<uint32_t>(
+                price_col->Value(i) * 10000);
+            // ... other fields
+            ticks.push_back(tick);
+        }
+
+        return ticks;
+    }
+
+    // Read with filter (only specific columns and rows)
+    std::vector<uint64_t> read_timestamps_filtered(
+            uint64_t start_time, uint64_t end_time) {
+
+        // Build filter expression
+        auto filter = arrow::compute::and_(
+            arrow::compute::greater_equal(
+                arrow::compute::field_ref("timestamp_ns"),
+                arrow::compute::literal(start_time)
+            ),
+            arrow::compute::less_equal(
+                arrow::compute::field_ref("timestamp_ns"),
+                arrow::compute::literal(end_time)
+            )
+        );
+
+        // Read only timestamp column with filter
+        std::shared_ptr<arrow::Table> table;
+        PARQUET_THROW_NOT_OK(
+            reader_->ReadTable({"timestamp_ns"}, &table, filter)
+        );
+
+        // Extract values
+        auto ts_col = std::static_pointer_cast<arrow::UInt64Array>(
+            table->column(0)->chunk(0));
+
+        std::vector<uint64_t> timestamps;
+        timestamps.reserve(ts_col->length());
+        for (int64_t i = 0; i < ts_col->length(); ++i) {
+            timestamps.push_back(ts_col->Value(i));
+        }
+
+        return timestamps;
+    }
+
+private:
+    std::shared_ptr<arrow::io::ReadableFile> infile_;
+    std::unique_ptr<parquet::arrow::FileReader> reader_;
+};
+
+PERFORMANCE:
+- Write: 100K-500K ticks/second
+- Read (full scan): 5-10M ticks/second
+- Read (filtered): 2-5M ticks/second
+- Size: 1-3 bytes per tick (with compression)
+
+RECOMMENDATION:
+Best for long-term storage, analytics, and archival.
+Not suitable for real-time ingestion.
+
+================================================================================
+5. CUSTOM HFT FORMATS
+================================================================================
+
+5.1 DELTA-ENCODED BINARY
+-------------------------
+Exploit temporal correlation to minimize size.
+
+CONCEPT:
+- Store first tick completely
+- Store subsequent ticks as deltas
+- Typical compression: 60-80% size reduction
+
+DELTA TICK FORMAT:
+------------------
+struct FirstTick {
+    uint64_t timestamp_ns;
+    uint32_t symbol_id;
+    uint32_t price_scaled;
+    uint32_t volume;
+    uint8_t side;
+    uint16_t exchange_id;
+    uint16_t conditions;
+    uint32_t sequence_num;
+};  // 27 bytes
+
+struct DeltaTick {
+    uint16_t timestamp_delta_us;  // 2 bytes: +/- 32ms
+    int16_t price_delta;          // 2 bytes: +/- 327 ticks
+    uint16_t volume;              // 2 bytes: up to 65K
+    uint8_t flags;                // 1 byte: side(2) + exchange(3) + cond(3)
+};  // 7 bytes (74% reduction!)
+
+DELTA ENCODER:
+--------------
+class DeltaTickEncoder {
+public:
+    void encode(const CompactTick& tick, std::vector<uint8_t>& output) {
+        if (is_first_tick_) {
+            // Write full tick
+            FirstTick first;
+            first.timestamp_ns = tick.timestamp_ns;
+            first.symbol_id = tick.symbol_id;
+            first.price_scaled = tick.price_scaled;
+            first.volume = tick.volume;
+            first.side = tick.side;
+            first.exchange_id = tick.exchange_id;
+            first.conditions = tick.conditions;
+            first.sequence_num = tick.sequence_delta;
+
+            output.insert(output.end(),
+                         reinterpret_cast<uint8_t*>(&first),
+                         reinterpret_cast<uint8_t*>(&first) + sizeof(first));
+
+            prev_tick_ = tick;
+            is_first_tick_ = false;
+        } else {
+            // Write delta tick
+            DeltaTick delta;
+
+            // Timestamp delta in microseconds
+            int64_t ts_delta = tick.timestamp_ns - prev_tick_.timestamp_ns;
+            delta.timestamp_delta_us = static_cast<uint16_t>(ts_delta / 1000);
+
+            // Price delta
+            int32_t price_delta = tick.price_scaled - prev_tick_.price_scaled;
+            if (price_delta < -32768 || price_delta > 32767) {
+                // Delta too large, write full tick
+                is_first_tick_ = true;
+                encode(tick, output);
+                return;
+            }
+            delta.price_delta = static_cast<int16_t>(price_delta);
+
+            // Volume
+            delta.volume = static_cast<uint16_t>(
+                std::min(tick.volume, static_cast<uint32_t>(65535)));
+
+            // Pack flags: side(2) + exchange(3) + conditions(3)
+            delta.flags = (tick.side & 0x03) |
+                         ((tick.exchange_id & 0x07) << 2) |
+                         ((tick.conditions & 0x07) << 5);
+
+            output.insert(output.end(),
+                         reinterpret_cast<uint8_t*>(&delta),
+                         reinterpret_cast<uint8_t*>(&delta) + sizeof(delta));
+
+            prev_tick_ = tick;
+        }
+    }
+
+    void reset() {
+        is_first_tick_ = true;
+    }
+
+private:
+    bool is_first_tick_ = true;
+    CompactTick prev_tick_;
+};
+
+5.2 COMPRESSED BLOCK FORMAT
+----------------------------
+Combine batching with compression for optimal storage.
+
+BLOCK FORMAT:
+-------------
+struct BlockHeader {
+    uint32_t magic;              // 0x5449434B ("TICK")
+    uint32_t version;            // Format version
+    uint32_t block_size;         // Compressed size
+    uint32_t tick_count;         // Number of ticks
+    uint64_t start_timestamp;    // First tick timestamp
+    uint64_t end_timestamp;      // Last tick timestamp
+    uint32_t symbol_id;          // Symbol (if single-symbol block)
+    uint32_t checksum;           // CRC32 of compressed data
+    uint32_t compression_type;   // 0=none, 1=LZ4, 2=ZSTD, 3=LZMA
+    uint32_t reserved[3];        // Reserved for future use
+};  // 64 bytes
+
+[BlockHeader][Compressed Data][BlockHeader][Compressed Data]...
+
+BLOCK WRITER:
+-------------
+#include <lz4.h>
+
+class CompressedBlockWriter {
+public:
+    CompressedBlockWriter(const std::string& filename,
+                          int block_size = 1000000)
+        : block_size_(block_size) {
+        fd_ = open(filename.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd_ < 0) {
+            throw std::runtime_error("Failed to open file");
+        }
+        buffer_.reserve(block_size * sizeof(CompactTick));
+        compressed_.reserve(LZ4_compressBound(buffer_.capacity()));
+    }
+
+    ~CompressedBlockWriter() {
+        if (!buffer_.empty()) {
+            flush();
+        }
+        if (fd_ >= 0) close(fd_);
+    }
+
+    void write(const CompactTick& tick) {
+        buffer_.push_back(tick);
+        if (buffer_.size() >= block_size_) {
+            flush();
+        }
+    }
+
+    void flush() {
+        if (buffer_.empty()) return;
+
+        // Prepare header
+        BlockHeader header;
+        header.magic = 0x5449434B;
+        header.version = 1;
+        header.tick_count = buffer_.size();
+        header.start_timestamp = buffer_.front().timestamp_ns;
+        header.end_timestamp = buffer_.back().timestamp_ns;
+        header.symbol_id = buffer_.front().symbol_id;
+        header.compression_type = 1;  // LZ4
+
+        // Compress data
+        const char* src = reinterpret_cast<const char*>(buffer_.data());
+        size_t src_size = buffer_.size() * sizeof(CompactTick);
+
+        compressed_.resize(LZ4_compressBound(src_size));
+        int compressed_size = LZ4_compress_default(
+            src, compressed_.data(), src_size, compressed_.size());
+
+        if (compressed_size <= 0) {
+            throw std::runtime_error("Compression failed");
+        }
+
+        header.block_size = compressed_size;
+        header.checksum = crc32(0,
+                               reinterpret_cast<const uint8_t*>(compressed_.data()),
+                               compressed_size);
+
+        // Write header and compressed data
+        ::write(fd_, &header, sizeof(header));
+        ::write(fd_, compressed_.data(), compressed_size);
+
+        block_count_++;
+        buffer_.clear();
+    }
+
+    size_t block_count() const { return block_count_; }
+
+private:
+    int fd_;
+    size_t block_size_;
+    std::vector<CompactTick> buffer_;
+    std::vector<char> compressed_;
+    size_t block_count_ = 0;
+
+    uint32_t crc32(uint32_t crc, const uint8_t* buf, size_t len) {
+        // CRC32 implementation (use zlib or custom)
+        static const uint32_t crc_table[256] = { /* ... */ };
+        for (size_t i = 0; i < len; i++) {
+            crc = crc_table[(crc ^ buf[i]) & 0xFF] ^ (crc >> 8);
+        }
+        return crc;
+    }
+};
+
+PERFORMANCE:
+- Write: 2-5M ticks/second (with LZ4 compression)
+- Read: 5-10M ticks/second
+- Size: 1.5-3 bytes per tick (7-15x compression)
+
+================================================================================
+6. FORMAT COMPARISON MATRIX
+================================================================================
+
+COMPREHENSIVE COMPARISON:
+--------------------------
+┌─────────────────┬────────┬─────────┬─────────┬──────────┬─────────┬──────────┐
+│ Format          │ Size   │ Write   │ Read    │ Query   │ Tools   │ Use Case │
+│                 │ (bytes)│ (Mtps)  │ (Mtps)  │ Speed   │         │          │
+├─────────────────┼────────┼─────────┼─────────┼──────────┼─────────┼──────────┤
+│ Binary Struct   │  20-41 │  10-20  │  50-100 │ ★★★★★   │ ★☆☆☆☆  │ Real-time│
+│ Delta Binary    │   4-10 │   5-10  │  10-30  │ ★★★★☆   │ ★☆☆☆☆  │ Storage  │
+│ Compressed Blk  │   1-3  │   2-5   │   5-10  │ ★★★★☆   │ ★☆☆☆☆  │ Archive  │
+│ Protocol Buffers│  25-35 │   1-2   │   1-3   │ ★★★☆☆   │ ★★★★★  │ Inter-op │
+│ FlatBuffers     │  22-28 │   2-5   │  10-20  │ ★★★★☆   │ ★★★☆☆  │ Low-lat  │
+│ Parquet         │   1-3  │   0.1-0.5│  5-10  │ ★★★★★   │ ★★★★★  │ Analytics│
+│ CSV             │  80-120│   0.05-0.2│ 0.1-0.5│ ★☆☆☆☆   │ ★★★★★  │ Debug    │
+│ JSON            │ 150-250│   0.01-0.05│0.02-0.1│ ☆☆☆☆☆   │ ★★★★★  │ Never    │
+└─────────────────┴────────┴─────────┴─────────┴──────────┴─────────┴──────────┘
+
+STORAGE EFFICIENCY COMPARISON (1 Billion Ticks):
+--------------------------------------------------
+Format              Raw Size    Compressed    Ratio
+----------------------------------------------------
+JSON                200 GB      50 GB         4:1
+CSV                 100 GB      30 GB         3.3:1
+Binary Struct       41 GB       6-8 GB        5-7:1
+Protocol Buffers    30 GB       5-7 GB        4-6:1
+FlatBuffers         25 GB       4-6 GB        4-6:1
+Delta Binary        6 GB        2-3 GB        2:1
+Compressed Blocks   2 GB        2 GB          1:1
+Parquet             1.5-3 GB    1.5-3 GB      1:1
+
+PERFORMANCE COMPARISON (Single Thread):
+----------------------------------------
+Format              Write Speed      Read Speed       Latency
+--------------------------------------------------------------
+Binary Struct       10-20M tps       50-100M tps      50ns
+Delta Binary        5-10M tps        10-30M tps       100ns
+Compressed Blocks   2-5M tps         5-10M tps        200ns
+FlatBuffers         2-5M tps         10-20M tps       100ns
+Protocol Buffers    1-2M tps         1-3M tps         500ns
+Parquet             100-500K tps     5-10M tps        1μs
+CSV                 50-200K tps      100-500K tps     5μs
+JSON                10-50K tps       20-100K tps      10μs
+
+================================================================================
+7. SERIALIZATION/DESERIALIZATION CODE
+================================================================================
+
+ZERO-COPY SERIALIZATION:
+------------------------
+// Fast tick batch serialization without copying
+class ZeroCopySerializer {
+public:
+    // Serialize vector directly to file descriptor
+    static ssize_t serialize_to_fd(int fd,
+                                   const std::vector<CompactTick>& ticks) {
+        // Write count
+        uint64_t count = ticks.size();
+        ::write(fd, &count, sizeof(count));
+
+        // Write data (zero-copy)
+        ssize_t written = ::write(fd, ticks.data(),
+                                 ticks.size() * sizeof(CompactTick));
+        return written;
+    }
+
+    // Memory-map and access without copying
+    static const CompactTick* deserialize_from_mmap(
+            const char* filename, size_t* count_out) {
+        int fd = open(filename, O_RDONLY);
+        if (fd < 0) return nullptr;
+
+        // Read count
+        uint64_t count;
+        read(fd, &count, sizeof(count));
+        *count_out = count;
+
+        // Memory map the data
+        size_t data_size = count * sizeof(CompactTick);
+        const CompactTick* data = static_cast<const CompactTick*>(
+            mmap(nullptr, data_size, PROT_READ, MAP_SHARED,
+                 fd, sizeof(count))
+        );
+
+        close(fd);
+        return data;
+    }
+};
+
+SIMD-ACCELERATED CONVERSION:
+-----------------------------
+#include <immintrin.h>
+
+// Convert array of doubles to fixed-point integers using AVX2
+void convert_prices_avx2(const double* prices, uint32_t* output, size_t count) {
+    const __m256d multiplier = _mm256_set1_pd(10000.0);
+
+    size_t i = 0;
+    for (; i + 4 <= count; i += 4) {
+        // Load 4 doubles
+        __m256d prices_vec = _mm256_loadu_pd(&prices[i]);
+
+        // Multiply by 10000
+        __m256d scaled = _mm256_mul_pd(prices_vec, multiplier);
+
+        // Convert to int32
+        __m128i result_low = _mm256_cvtpd_epi32(scaled);
+
+        // Store result
+        _mm_storeu_si128((__m128i*)&output[i], result_low);
+    }
+
+    // Handle remaining elements
+    for (; i < count; i++) {
+        output[i] = static_cast<uint32_t>(prices[i] * 10000.0);
+    }
+}
+
+================================================================================
+8. FORMAT CONVERSION UTILITIES
+================================================================================
+
+UNIVERSAL CONVERTER:
+--------------------
+class TickFormatConverter {
+public:
+    // CSV to Binary
+    static void csv_to_binary(const std::string& csv_file,
+                             const std::string& bin_file) {
+        CSVTickReader reader(csv_file);
+        BinaryTickWriter writer(bin_file);
+
+        CSVTick csv_tick;
+        while (reader.read(csv_tick)) {
+            CompactTick binary_tick;
+            binary_tick.timestamp_ns = csv_tick.timestamp;
+            binary_tick.symbol_id = symbol_to_id(csv_tick.symbol);
+            binary_tick.price_scaled =
+                static_cast<uint32_t>(csv_tick.price * 10000);
+            binary_tick.volume = csv_tick.volume;
+            binary_tick.side = csv_tick.side == 'B' ? 0 :
+                              (csv_tick.side == 'A' ? 1 : 2);
+            // ... set other fields
+
+            writer.write(binary_tick);
+        }
+    }
+
+    // Binary to Parquet
+    static void binary_to_parquet(const std::string& bin_file,
+                                  const std::string& parquet_file,
+                                  size_t batch_size = 1000000) {
+        BinaryTickReader reader(bin_file);
+        ParquetTickWriter writer(parquet_file);
+
+        std::vector<CompactTick> batch;
+        batch.reserve(batch_size);
+
+        for (const auto& tick : reader) {
+            batch.push_back(tick);
+            if (batch.size() >= batch_size) {
+                writer.write_batch(batch);
+                batch.clear();
+            }
+        }
+
+        if (!batch.empty()) {
+            writer.write_batch(batch);
+        }
+
+        writer.close();
+    }
+
+    // Parquet to Binary (specific time range)
+    static void parquet_to_binary_filtered(
+            const std::string& parquet_file,
+            const std::string& bin_file,
+            uint64_t start_time, uint64_t end_time) {
+
+        ParquetTickReader reader(parquet_file);
+        BinaryTickWriter writer(bin_file);
+
+        // Read with filter
+        auto ticks = reader.read_filtered(start_time, end_time);
+        writer.write_batch(ticks);
+    }
+
+private:
+    static std::unordered_map<std::string, uint32_t> symbol_map_;
+
+    static uint32_t symbol_to_id(const std::string& symbol) {
+        auto it = symbol_map_.find(symbol);
+        if (it != symbol_map_.end()) {
+            return it->second;
+        }
+        uint32_t id = symbol_map_.size();
+        symbol_map_[symbol] = id;
+        return id;
+    }
+};
+
+================================================================================
+9. BEST PRACTICES
+================================================================================
+
+FORMAT SELECTION DECISION TREE:
+--------------------------------
+Real-time ingestion (market hours)?
+├─ YES → Binary struct or Delta binary
+│  ├─ Need absolute max speed? → Binary struct
+│  └─ Storage constrained? → Delta binary
+│
+└─ NO → Post-processing or analytics?
+   ├─ Need SQL queries? → TimescaleDB native format
+   ├─ Need analytics/Spark? → Parquet
+   ├─ Long-term archive? → Compressed blocks → Parquet
+   └─ Inter-system exchange? → Protocol Buffers
+
+VERSIONING STRATEGY:
+--------------------
+Always include version field in custom formats:
+
+struct VersionedTickV1 {
+    uint32_t version = 1;
+    // V1 fields
+};
+
+struct VersionedTickV2 {
+    uint32_t version = 2;
+    // V1 fields
+    // V2 additional fields
+};
+
+// Reader handles both versions
+CompactTick read_versioned_tick(const void* data) {
+    uint32_t version = *static_cast<const uint32_t*>(data);
+    if (version == 1) {
+        return convert_v1_to_latest(
+            static_cast<const VersionedTickV1*>(data));
+    } else if (version == 2) {
+        return convert_v2_to_latest(
+            static_cast<const VersionedTickV2*>(data));
+    }
+    throw std::runtime_error("Unknown version");
+}
+
+ERROR HANDLING:
+---------------
+Always validate data integrity:
+
+bool validate_tick(const CompactTick& tick) {
+    // Timestamp sanity check (not in future, not too old)
+    uint64_t now = get_current_time_ns();
+    if (tick.timestamp_ns > now ||
+        tick.timestamp_ns < now - 365*24*3600*1000000000ULL) {
+        return false;
+    }
+
+    // Price sanity check (positive, not too large)
+    if (tick.price_scaled == 0 || tick.price_scaled > 100000000) {
+        return false;
+    }
+
+    // Volume sanity check
+    if (tick.volume == 0 || tick.volume > 1000000000) {
+        return false;
+    }
+
+    // Side validation
+    if (tick.side > 3) {
+        return false;
+    }
+
+    return true;
+}
+
+================================================================================
+10. FORMAT SELECTION GUIDE
+================================================================================
+
+DECISION MATRIX:
+----------------
+┌─────────────────────────┬──────────────────────────────────────────┐
+│ Scenario                │ Recommended Format                       │
+├─────────────────────────┼──────────────────────────────────────────┤
+│ Real-time ingestion     │ Binary struct → QuestDB                  │
+│ Hot storage (0-7 days)  │ Binary struct or Delta binary            │
+│ Warm storage (8-90 days)│ Compressed blocks or TimescaleDB         │
+│ Cold storage (90+ days) │ Parquet with ZSTD compression            │
+│ Long-term archive (1y+) │ Parquet on object storage (S3/GCS)       │
+│ Data exchange           │ Protocol Buffers or FlatBuffers          │
+│ Analytics/ML            │ Parquet (best for Spark/Pandas)          │
+│ Backtesting             │ Binary struct (fastest sequential read)  │
+│ Debugging               │ CSV (human-readable)                     │
+│ Web APIs                │ JSON (only for small samples!)           │
+└─────────────────────────┴──────────────────────────────────────────┘
+
+COST-PERFORMANCE TRADE-OFF:
+----------------------------
+For 10 billion ticks/year:
+
+Format          Storage Cost   Query Cost   Total Cost   Performance
+---------------------------------------------------------------------
+JSON/CSV        $500/month     High CPU     $1000/mo     Poor
+Binary Struct   $100/month     Low CPU      $150/mo      Excellent
+Protocol Buf    $80/month      Med CPU      $130/mo      Good
+Parquet         $30/month      Med CPU      $80/mo       Good (OLAP)
+Compressed      $20/month      Low CPU      $50/mo       Excellent
+
+RECOMMENDATION:
+Hybrid approach for optimal cost/performance:
+- Real-time: Binary struct
+- Recent (30 days): Binary or database native
+- Archive (30+ days): Parquet with compression
+
+================================================================================
+END OF TICK DATA FORMATS DOCUMENTATION
+================================================================================

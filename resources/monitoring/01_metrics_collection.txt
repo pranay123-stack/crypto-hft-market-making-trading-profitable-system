@@ -1,0 +1,1144 @@
+METRICS COLLECTION FRAMEWORK FOR HFT SYSTEMS
+============================================
+
+TABLE OF CONTENTS
+-----------------
+1. Overview & Architecture
+2. Prometheus Setup & Configuration
+3. StatsD Implementation
+4. InfluxDB Time-Series Storage
+5. C++ Metrics Instrumentation
+6. Metric Naming Conventions
+7. Collection Performance Optimization
+8. High-Frequency Metrics Handling
+9. Production Deployment Guide
+10. Example Queries & Analysis
+
+============================================
+1. OVERVIEW & ARCHITECTURE
+============================================
+
+Multi-Tier Metrics Collection Architecture:
+-------------------------------------------
+┌─────────────────────────────────────────────────────────────┐
+│                    Trading Application                       │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐   │
+│  │  Order   │  │ Market  │  │  Risk    │  │ Position │   │
+│  │  Engine  │  │  Data   │  │  Manager │  │  Manager │   │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘   │
+│       │             │              │              │          │
+│       └─────────────┴──────────────┴──────────────┘          │
+│                           │                                   │
+│                   ┌───────▼────────┐                         │
+│                   │ MetricsCollector│                         │
+│                   │   (Lock-Free)   │                         │
+│                   └───────┬────────┘                         │
+└───────────────────────────┼──────────────────────────────────┘
+                            │
+        ┌───────────────────┼───────────────────┐
+        │                   │                   │
+   ┌────▼─────┐      ┌─────▼──────┐     ┌─────▼──────┐
+   │ StatsD   │      │ Prometheus │     │  InfluxDB  │
+   │ (UDP)    │      │ (Pull)     │     │  (Direct)  │
+   │ Low      │      │ Standard   │     │  High      │
+   │ Latency  │      │ Metrics    │     │  Precision │
+   └────┬─────┘      └─────┬──────┘     └─────┬──────┘
+        │                  │                   │
+        └──────────────────┼───────────────────┘
+                           │
+                    ┌──────▼───────┐
+                    │  Aggregation │
+                    │    Layer     │
+                    └──────┬───────┘
+                           │
+                    ┌──────▼───────┐
+                    │   Grafana    │
+                    │  Dashboards  │
+                    └──────────────┘
+
+Metrics Categories for HFT:
+----------------------------
+1. Performance Metrics
+   - Latency percentiles (p50, p95, p99, p99.9)
+   - Throughput (orders/sec, messages/sec)
+   - Queue depths and backlogs
+
+2. Business Metrics
+   - Order fill rates
+   - Slippage measurements
+   - PnL tracking
+   - Market share percentages
+
+3. System Metrics
+   - CPU utilization per core
+   - Memory usage (heap, stack)
+   - Network bandwidth
+   - Disk I/O patterns
+
+4. Reliability Metrics
+   - Error rates by type
+   - Circuit breaker states
+   - Retry attempts
+   - Connection stability
+
+============================================
+2. PROMETHEUS SETUP & CONFIGURATION
+============================================
+
+Prometheus Configuration (prometheus.yml):
+-------------------------------------------
+global:
+  scrape_interval: 5s          # HFT requires frequent scraping
+  evaluation_interval: 5s
+  external_labels:
+    cluster: 'hft-prod'
+    environment: 'production'
+    datacenter: 'ny4'
+
+# Alert manager configuration
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - 'alertmanager:9093'
+      timeout: 10s
+
+# Rule files for alerting
+rule_files:
+  - 'alerts/trading_alerts.yml'
+  - 'alerts/system_alerts.yml'
+  - 'alerts/latency_alerts.yml'
+
+# Scrape configurations
+scrape_configs:
+  # HFT Trading System
+  - job_name: 'hft-trading-engine'
+    scrape_interval: 1s         # Ultra-low latency monitoring
+    scrape_timeout: 800ms
+    metrics_path: '/metrics'
+    static_configs:
+      - targets:
+          - 'trading-engine-01:8080'
+          - 'trading-engine-02:8080'
+          - 'trading-engine-03:8080'
+        labels:
+          role: 'primary'
+          strategy: 'market-making'
+
+    metric_relabel_configs:
+      # Drop high-cardinality metrics
+      - source_labels: [__name__]
+        regex: 'order_id_.*'
+        action: drop
+
+      # Aggregate by exchange
+      - source_labels: [exchange]
+        target_label: exchange_group
+        replacement: '${1}'
+
+  # Market Data Feed
+  - job_name: 'market-data'
+    scrape_interval: 2s
+    static_configs:
+      - targets:
+          - 'market-data-01:8081'
+          - 'market-data-02:8081'
+        labels:
+          role: 'feed-handler'
+
+  # Risk Management
+  - job_name: 'risk-management'
+    scrape_interval: 5s
+    static_configs:
+      - targets: ['risk-manager:8082']
+        labels:
+          role: 'risk'
+
+  # Node Exporter (System Metrics)
+  - job_name: 'node-exporter'
+    scrape_interval: 10s
+    static_configs:
+      - targets:
+          - 'localhost:9100'
+
+  # Process Exporter (Process-level metrics)
+  - job_name: 'process-exporter'
+    scrape_interval: 5s
+    static_configs:
+      - targets: ['localhost:9256']
+
+# Remote write for long-term storage
+remote_write:
+  - url: 'http://influxdb:8086/api/v1/prom/write?db=hft_metrics'
+    queue_config:
+      capacity: 10000
+      max_shards: 5
+      max_samples_per_send: 500
+      batch_send_deadline: 5s
+
+C++ Prometheus Client Integration:
+-----------------------------------
+#include <prometheus/counter.h>
+#include <prometheus/gauge.h>
+#include <prometheus/histogram.h>
+#include <prometheus/registry.h>
+#include <prometheus/exposer.h>
+#include <prometheus/summary.h>
+#include <memory>
+#include <atomic>
+
+class PrometheusMetricsCollector {
+private:
+    std::shared_ptr<prometheus::Registry> registry_;
+    std::unique_ptr<prometheus::Exposer> exposer_;
+
+    // Counters
+    prometheus::Family<prometheus::Counter>* orders_total_family_;
+    prometheus::Family<prometheus::Counter>* fills_total_family_;
+    prometheus::Family<prometheus::Counter>* rejects_total_family_;
+
+    // Gauges
+    prometheus::Family<prometheus::Gauge>* active_orders_family_;
+    prometheus::Family<prometheus::Gauge>* position_size_family_;
+    prometheus::Family<prometheus::Gauge>* pnl_family_;
+
+    // Histograms for latency
+    prometheus::Family<prometheus::Histogram>* order_latency_family_;
+    prometheus::Family<prometheus::Histogram>* market_data_latency_family_;
+
+    // Summary for percentiles
+    prometheus::Family<prometheus::Summary>* execution_latency_family_;
+
+public:
+    PrometheusMetricsCollector(const std::string& bind_address, uint16_t port)
+        : registry_(std::make_shared<prometheus::Registry>()),
+          exposer_(std::make_unique<prometheus::Exposer>(bind_address + ":" + std::to_string(port))) {
+
+        // Register the registry with the exposer
+        exposer_->RegisterCollectable(registry_);
+
+        // Initialize metric families
+        initializeMetrics();
+    }
+
+    void initializeMetrics() {
+        // Order counters
+        orders_total_family_ = &prometheus::BuildCounter()
+            .Name("hft_orders_total")
+            .Help("Total number of orders sent")
+            .Labels({{"component", "trading_engine"}})
+            .Register(*registry_);
+
+        fills_total_family_ = &prometheus::BuildCounter()
+            .Name("hft_fills_total")
+            .Help("Total number of order fills")
+            .Labels({{"component", "trading_engine"}})
+            .Register(*registry_);
+
+        rejects_total_family_ = &prometheus::BuildCounter()
+            .Name("hft_rejects_total")
+            .Help("Total number of order rejects")
+            .Labels({{"component", "trading_engine"}})
+            .Register(*registry_);
+
+        // Active orders gauge
+        active_orders_family_ = &prometheus::BuildGauge()
+            .Name("hft_active_orders")
+            .Help("Current number of active orders")
+            .Labels({{"component", "trading_engine"}})
+            .Register(*registry_);
+
+        // Position size gauge
+        position_size_family_ = &prometheus::BuildGauge()
+            .Name("hft_position_size")
+            .Help("Current position size by symbol")
+            .Labels({{"component", "position_manager"}})
+            .Register(*registry_);
+
+        // PnL gauge
+        pnl_family_ = &prometheus::BuildGauge()
+            .Name("hft_pnl_usd")
+            .Help("Current profit and loss in USD")
+            .Labels({{"component", "position_manager"}})
+            .Register(*registry_);
+
+        // Latency histogram with custom buckets (microseconds)
+        order_latency_family_ = &prometheus::BuildHistogram()
+            .Name("hft_order_latency_microseconds")
+            .Help("Order processing latency distribution")
+            .Labels({{"component", "trading_engine"}})
+            .Register(*registry_);
+
+        market_data_latency_family_ = &prometheus::BuildHistogram()
+            .Name("hft_market_data_latency_microseconds")
+            .Help("Market data processing latency distribution")
+            .Labels({{"component", "market_data"}})
+            .Register(*registry_);
+
+        // Execution latency summary with quantiles
+        execution_latency_family_ = &prometheus::BuildSummary()
+            .Name("hft_execution_latency_microseconds")
+            .Help("End-to-end execution latency")
+            .Labels({{"component", "trading_engine"}})
+            .Register(*registry_);
+    }
+
+    // Record order sent
+    void recordOrderSent(const std::string& exchange, const std::string& symbol,
+                         const std::string& side) {
+        auto& counter = orders_total_family_->Add({
+            {"exchange", exchange},
+            {"symbol", symbol},
+            {"side", side}
+        });
+        counter.Increment();
+    }
+
+    // Record order fill
+    void recordOrderFill(const std::string& exchange, const std::string& symbol,
+                         const std::string& side, double quantity, double price) {
+        auto& counter = fills_total_family_->Add({
+            {"exchange", exchange},
+            {"symbol", symbol},
+            {"side", side}
+        });
+        counter.Increment();
+    }
+
+    // Record order reject
+    void recordOrderReject(const std::string& exchange, const std::string& symbol,
+                           const std::string& reason) {
+        auto& counter = rejects_total_family_->Add({
+            {"exchange", exchange},
+            {"symbol", symbol},
+            {"reason", reason}
+        });
+        counter.Increment();
+    }
+
+    // Update active orders
+    void updateActiveOrders(const std::string& exchange, const std::string& symbol,
+                           int count) {
+        auto& gauge = active_orders_family_->Add({
+            {"exchange", exchange},
+            {"symbol", symbol}
+        });
+        gauge.Set(count);
+    }
+
+    // Update position size
+    void updatePosition(const std::string& symbol, double size) {
+        auto& gauge = position_size_family_->Add({
+            {"symbol", symbol}
+        });
+        gauge.Set(size);
+    }
+
+    // Update PnL
+    void updatePnL(const std::string& strategy, double pnl) {
+        auto& gauge = pnl_family_->Add({
+            {"strategy", strategy}
+        });
+        gauge.Set(pnl);
+    }
+
+    // Record order latency (microseconds)
+    void recordOrderLatency(const std::string& exchange, const std::string& order_type,
+                           double latency_us) {
+        // Custom buckets for HFT: 1us, 5us, 10us, 50us, 100us, 500us, 1ms, 5ms, 10ms
+        static const std::vector<double> buckets = {
+            1, 5, 10, 50, 100, 500, 1000, 5000, 10000
+        };
+
+        auto& histogram = order_latency_family_->Add({
+            {"exchange", exchange},
+            {"order_type", order_type}
+        }, buckets);
+
+        histogram.Observe(latency_us);
+    }
+
+    // Record market data latency
+    void recordMarketDataLatency(const std::string& exchange, const std::string& feed_type,
+                                 double latency_us) {
+        static const std::vector<double> buckets = {
+            1, 5, 10, 50, 100, 500, 1000, 5000, 10000
+        };
+
+        auto& histogram = market_data_latency_family_->Add({
+            {"exchange", exchange},
+            {"feed_type", feed_type}
+        }, buckets);
+
+        histogram.Observe(latency_us);
+    }
+
+    // Record execution latency with quantiles
+    void recordExecutionLatency(const std::string& strategy, double latency_us) {
+        // Quantiles: 0.5 (median), 0.9, 0.95, 0.99, 0.999
+        static const prometheus::Summary::Quantiles quantiles = {
+            {0.5, 0.05},    // 50th percentile with 5% error
+            {0.9, 0.01},    // 90th percentile with 1% error
+            {0.95, 0.005},  // 95th percentile with 0.5% error
+            {0.99, 0.001},  // 99th percentile with 0.1% error
+            {0.999, 0.0001} // 99.9th percentile with 0.01% error
+        };
+
+        auto& summary = execution_latency_family_->Add({
+            {"strategy", strategy}
+        }, quantiles);
+
+        summary.Observe(latency_us);
+    }
+};
+
+// Usage Example
+class TradingEngine {
+private:
+    std::shared_ptr<PrometheusMetricsCollector> metrics_;
+
+public:
+    void processOrder(const Order& order) {
+        auto start = std::chrono::high_resolution_clock::now();
+
+        // Process order logic
+        sendOrderToExchange(order);
+
+        auto end = std::chrono::high_resolution_clock::now();
+        auto latency_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            end - start).count();
+
+        // Record metrics
+        metrics_->recordOrderSent(order.exchange, order.symbol, order.side);
+        metrics_->recordOrderLatency(order.exchange, order.type, latency_us);
+        metrics_->recordExecutionLatency(order.strategy, latency_us);
+    }
+
+    void onOrderFill(const Fill& fill) {
+        metrics_->recordOrderFill(fill.exchange, fill.symbol, fill.side,
+                                 fill.quantity, fill.price);
+
+        // Update position
+        double new_position = calculatePosition(fill.symbol);
+        metrics_->updatePosition(fill.symbol, new_position);
+
+        // Update PnL
+        double pnl = calculatePnL(fill.strategy);
+        metrics_->updatePnL(fill.strategy, pnl);
+    }
+};
+
+============================================
+3. STATSD IMPLEMENTATION
+============================================
+
+StatsD Configuration:
+---------------------
+# statsd.conf
+{
+  "port": 8125,
+  "mgmt_port": 8126,
+  "backends": [
+    "./backends/graphite",
+    "./backends/console"
+  ],
+  "graphiteHost": "graphite.hft.local",
+  "graphitePort": 2003,
+  "flushInterval": 1000,       # 1 second flush for HFT
+  "deleteIdleStats": false,
+  "deleteGauges": false,
+  "deleteTimers": false,
+  "deleteSets": false,
+  "deleteCounters": false,
+  "percentThreshold": [50, 75, 90, 95, 99, 99.9, 99.99],
+  "histogram": [
+    {
+      "metric": "latency",
+      "bins": [1, 5, 10, 50, 100, 500, 1000, 5000, 10000]
+    }
+  ],
+  "keyNameSanitize": true
+}
+
+C++ StatsD Client (Lock-Free):
+-------------------------------
+#include <string>
+#include <sstream>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <atomic>
+#include <array>
+
+class StatsDClient {
+private:
+    int socket_fd_;
+    struct sockaddr_in server_addr_;
+    std::string prefix_;
+
+    // Lock-free buffer pool for zero-copy metrics
+    static constexpr size_t BUFFER_SIZE = 512;
+    static constexpr size_t BUFFER_POOL_SIZE = 1024;
+    std::array<std::array<char, BUFFER_SIZE>, BUFFER_POOL_SIZE> buffer_pool_;
+    std::atomic<size_t> buffer_index_{0};
+
+public:
+    StatsDClient(const std::string& host, int port, const std::string& prefix = "")
+        : prefix_(prefix) {
+        // Create UDP socket
+        socket_fd_ = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+        if (socket_fd_ < 0) {
+            throw std::runtime_error("Failed to create socket");
+        }
+
+        // Configure server address
+        memset(&server_addr_, 0, sizeof(server_addr_));
+        server_addr_.sin_family = AF_INET;
+        server_addr_.sin_port = htons(port);
+        inet_pton(AF_INET, host.c_str(), &server_addr_.sin_addr);
+
+        // Set socket buffer sizes for high throughput
+        int send_buffer_size = 1024 * 1024; // 1MB
+        setsockopt(socket_fd_, SOL_SOCKET, SO_SNDBUF,
+                   &send_buffer_size, sizeof(send_buffer_size));
+    }
+
+    ~StatsDClient() {
+        if (socket_fd_ >= 0) {
+            close(socket_fd_);
+        }
+    }
+
+    // Increment counter
+    void increment(const std::string& metric, int64_t value = 1,
+                   double sample_rate = 1.0, const std::string& tags = "") {
+        count(metric, value, sample_rate, tags);
+    }
+
+    // Decrement counter
+    void decrement(const std::string& metric, int64_t value = 1,
+                   double sample_rate = 1.0, const std::string& tags = "") {
+        count(metric, -value, sample_rate, tags);
+    }
+
+    // Send counter value
+    void count(const std::string& metric, int64_t value,
+               double sample_rate = 1.0, const std::string& tags = "") {
+        if (sample_rate < 1.0 && (rand() / (double)RAND_MAX) > sample_rate) {
+            return;
+        }
+
+        auto* buffer = getBuffer();
+        int len;
+
+        if (sample_rate < 1.0) {
+            len = snprintf(buffer, BUFFER_SIZE, "%s%s:%ld|c|@%.2f%s",
+                          prefix_.c_str(), metric.c_str(), value, sample_rate,
+                          tags.empty() ? "" : ("|#" + tags).c_str());
+        } else {
+            len = snprintf(buffer, BUFFER_SIZE, "%s%s:%ld|c%s",
+                          prefix_.c_str(), metric.c_str(), value,
+                          tags.empty() ? "" : ("|#" + tags).c_str());
+        }
+
+        send(buffer, len);
+    }
+
+    // Send gauge value
+    void gauge(const std::string& metric, double value,
+               const std::string& tags = "") {
+        auto* buffer = getBuffer();
+        int len = snprintf(buffer, BUFFER_SIZE, "%s%s:%.6f|g%s",
+                          prefix_.c_str(), metric.c_str(), value,
+                          tags.empty() ? "" : ("|#" + tags).c_str());
+        send(buffer, len);
+    }
+
+    // Send timing value (milliseconds)
+    void timing(const std::string& metric, uint64_t ms,
+                const std::string& tags = "") {
+        auto* buffer = getBuffer();
+        int len = snprintf(buffer, BUFFER_SIZE, "%s%s:%lu|ms%s",
+                          prefix_.c_str(), metric.c_str(), ms,
+                          tags.empty() ? "" : ("|#" + tags).c_str());
+        send(buffer, len);
+    }
+
+    // Send histogram value (microseconds for HFT)
+    void histogram(const std::string& metric, double value,
+                   const std::string& tags = "") {
+        auto* buffer = getBuffer();
+        int len = snprintf(buffer, BUFFER_SIZE, "%s%s:%.3f|h%s",
+                          prefix_.c_str(), metric.c_str(), value,
+                          tags.empty() ? "" : ("|#" + tags).c_str());
+        send(buffer, len);
+    }
+
+    // Send set value
+    void set(const std::string& metric, const std::string& value,
+             const std::string& tags = "") {
+        auto* buffer = getBuffer();
+        int len = snprintf(buffer, BUFFER_SIZE, "%s%s:%s|s%s",
+                          prefix_.c_str(), metric.c_str(), value.c_str(),
+                          tags.empty() ? "" : ("|#" + tags).c_str());
+        send(buffer, len);
+    }
+
+private:
+    char* getBuffer() {
+        size_t idx = buffer_index_.fetch_add(1, std::memory_order_relaxed)
+                     % BUFFER_POOL_SIZE;
+        return buffer_pool_[idx].data();
+    }
+
+    void send(const char* data, size_t len) {
+        // Non-blocking send - drop on failure for ultra-low latency
+        sendto(socket_fd_, data, len, MSG_DONTWAIT,
+               (struct sockaddr*)&server_addr_, sizeof(server_addr_));
+    }
+};
+
+// RAII Timer for automatic latency measurement
+class StatsDTimer {
+private:
+    StatsDClient& client_;
+    std::string metric_;
+    std::string tags_;
+    std::chrono::high_resolution_clock::time_point start_;
+
+public:
+    StatsDTimer(StatsDClient& client, const std::string& metric,
+                const std::string& tags = "")
+        : client_(client), metric_(metric), tags_(tags),
+          start_(std::chrono::high_resolution_clock::now()) {}
+
+    ~StatsDTimer() {
+        auto end = std::chrono::high_resolution_clock::now();
+        auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            end - start_).count();
+
+        // Send as histogram for percentile calculation
+        client_.histogram(metric_, duration_us, tags_);
+    }
+
+    // Manual stop
+    void stop() {
+        auto end = std::chrono::high_resolution_clock::now();
+        auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            end - start_).count();
+        client_.histogram(metric_, duration_us, tags_);
+    }
+};
+
+// Usage Example
+class OrderProcessor {
+private:
+    StatsDClient statsd_;
+
+public:
+    OrderProcessor()
+        : statsd_("localhost", 8125, "hft.trading.") {}
+
+    void processOrder(const Order& order) {
+        StatsDTimer timer(statsd_, "order.processing.latency",
+                         "exchange:" + order.exchange + ",symbol:" + order.symbol);
+
+        // Increment order counter
+        statsd_.increment("orders.total",
+                         "exchange:" + order.exchange + ",type:" + order.type);
+
+        // Process order
+        bool success = executeOrder(order);
+
+        if (success) {
+            statsd_.increment("orders.success",
+                             "exchange:" + order.exchange);
+        } else {
+            statsd_.increment("orders.failed",
+                             "exchange:" + order.exchange);
+        }
+
+        // Update active orders gauge
+        int active = getActiveOrderCount();
+        statsd_.gauge("orders.active", active);
+    }
+
+    void updatePosition(const std::string& symbol, double size) {
+        statsd_.gauge("position.size", size, "symbol:" + symbol);
+    }
+
+    void recordFill(const Fill& fill) {
+        statsd_.increment("fills.total",
+                         "symbol:" + fill.symbol + ",side:" + fill.side);
+        statsd_.histogram("fills.size", fill.quantity,
+                         "symbol:" + fill.symbol);
+        statsd_.histogram("fills.price", fill.price,
+                         "symbol:" + fill.symbol);
+    }
+};
+
+============================================
+4. INFLUXDB TIME-SERIES STORAGE
+============================================
+
+InfluxDB Configuration:
+-----------------------
+# influxdb.conf
+[meta]
+  dir = "/var/lib/influxdb/meta"
+
+[data]
+  dir = "/var/lib/influxdb/data"
+  wal-dir = "/var/lib/influxdb/wal"
+
+  # High-frequency data optimization
+  cache-max-memory-size = "2g"
+  cache-snapshot-memory-size = "256m"
+  cache-snapshot-write-cold-duration = "1s"
+
+  # Compression for HFT time-series
+  tsm-use-madv-willneed = true
+
+  # Write performance
+  max-concurrent-compactions = 4
+  max-index-log-file-size = "10m"
+
+[http]
+  enabled = true
+  bind-address = ":8086"
+  auth-enabled = true
+  max-row-limit = 100000
+
+  # For high write throughput
+  max-connection-limit = 1000
+  write-tracing = false
+
+# Retention policies for different data granularities
+CREATE DATABASE hft_metrics
+CREATE RETENTION POLICY "realtime" ON "hft_metrics" DURATION 1h REPLICATION 1
+CREATE RETENTION POLICY "minutely" ON "hft_metrics" DURATION 7d REPLICATION 1
+CREATE RETENTION POLICY "hourly" ON "hft_metrics" DURATION 90d REPLICATION 1
+CREATE RETENTION POLICY "daily" ON "hft_metrics" DURATION 2y REPLICATION 1
+
+# Continuous queries for downsampling
+CREATE CONTINUOUS QUERY "cq_1min" ON "hft_metrics"
+BEGIN
+  SELECT mean("latency") AS "latency_mean",
+         percentile("latency", 95) AS "latency_p95",
+         percentile("latency", 99) AS "latency_p99",
+         sum("orders") AS "orders_total"
+  INTO "minutely"."trading_metrics_1min"
+  FROM "realtime"."trading_metrics"
+  GROUP BY time(1m), "exchange", "symbol"
+END
+
+C++ InfluxDB Client:
+--------------------
+#include <influxdb.hpp>
+#include <chrono>
+#include <queue>
+#include <mutex>
+#include <thread>
+
+class InfluxDBMetricsCollector {
+private:
+    std::unique_ptr<influxdb::InfluxDBBuilder> influx_builder_;
+    std::unique_ptr<influxdb::InfluxDB> influx_db_;
+
+    // Batching for high-throughput writes
+    std::queue<influxdb::Point> point_queue_;
+    std::mutex queue_mutex_;
+    std::thread flush_thread_;
+    std::atomic<bool> running_{true};
+
+    static constexpr size_t BATCH_SIZE = 1000;
+    static constexpr int FLUSH_INTERVAL_MS = 100;
+
+public:
+    InfluxDBMetricsCollector(const std::string& url, const std::string& database,
+                             const std::string& user = "", const std::string& password = "")
+        : influx_builder_(std::make_unique<influxdb::InfluxDBBuilder>()) {
+
+        influx_db_ = influx_builder_->url(url)
+            .database(database)
+            .username(user)
+            .password(password)
+            .batchSize(BATCH_SIZE)
+            .build();
+
+        // Start background flush thread
+        flush_thread_ = std::thread(&InfluxDBMetricsCollector::flushWorker, this);
+    }
+
+    ~InfluxDBMetricsCollector() {
+        running_ = false;
+        if (flush_thread_.joinable()) {
+            flush_thread_.join();
+        }
+        flush();
+    }
+
+    // Record order metrics
+    void recordOrder(const std::string& exchange, const std::string& symbol,
+                     const std::string& side, const std::string& type,
+                     double price, double quantity, uint64_t latency_us) {
+        auto point = influxdb::Point("orders")
+            .addTag("exchange", exchange)
+            .addTag("symbol", symbol)
+            .addTag("side", side)
+            .addTag("type", type)
+            .addField("price", price)
+            .addField("quantity", quantity)
+            .addField("latency_us", static_cast<long long>(latency_us))
+            .setTimestamp(std::chrono::system_clock::now());
+
+        enqueuePoint(std::move(point));
+    }
+
+    // Record market data metrics
+    void recordMarketData(const std::string& exchange, const std::string& symbol,
+                         double bid, double ask, double last,
+                         int64_t bid_size, int64_t ask_size,
+                         uint64_t latency_us) {
+        auto point = influxdb::Point("market_data")
+            .addTag("exchange", exchange)
+            .addTag("symbol", symbol)
+            .addField("bid", bid)
+            .addField("ask", ask)
+            .addField("last", last)
+            .addField("bid_size", bid_size)
+            .addField("ask_size", ask_size)
+            .addField("spread", ask - bid)
+            .addField("latency_us", static_cast<long long>(latency_us))
+            .setTimestamp(std::chrono::system_clock::now());
+
+        enqueuePoint(std::move(point));
+    }
+
+    // Record execution metrics
+    void recordExecution(const std::string& strategy, const std::string& symbol,
+                        const std::string& side, double fill_price,
+                        double fill_quantity, double slippage,
+                        uint64_t total_latency_us) {
+        auto point = influxdb::Point("executions")
+            .addTag("strategy", strategy)
+            .addTag("symbol", symbol)
+            .addTag("side", side)
+            .addField("fill_price", fill_price)
+            .addField("fill_quantity", fill_quantity)
+            .addField("slippage", slippage)
+            .addField("total_latency_us", static_cast<long long>(total_latency_us))
+            .setTimestamp(std::chrono::system_clock::now());
+
+        enqueuePoint(std::move(point));
+    }
+
+    // Record position metrics
+    void recordPosition(const std::string& symbol, const std::string& strategy,
+                       double quantity, double avg_price, double unrealized_pnl,
+                       double realized_pnl) {
+        auto point = influxdb::Point("positions")
+            .addTag("symbol", symbol)
+            .addTag("strategy", strategy)
+            .addField("quantity", quantity)
+            .addField("avg_price", avg_price)
+            .addField("unrealized_pnl", unrealized_pnl)
+            .addField("realized_pnl", realized_pnl)
+            .addField("total_pnl", unrealized_pnl + realized_pnl)
+            .setTimestamp(std::chrono::system_clock::now());
+
+        enqueuePoint(std::move(point));
+    }
+
+    // Record system metrics
+    void recordSystemMetrics(const std::string& component,
+                            double cpu_usage, size_t memory_bytes,
+                            size_t queue_depth, uint64_t msg_rate) {
+        auto point = influxdb::Point("system")
+            .addTag("component", component)
+            .addField("cpu_usage", cpu_usage)
+            .addField("memory_bytes", static_cast<long long>(memory_bytes))
+            .addField("queue_depth", static_cast<long long>(queue_depth))
+            .addField("msg_rate", static_cast<long long>(msg_rate))
+            .setTimestamp(std::chrono::system_clock::now());
+
+        enqueuePoint(std::move(point));
+    }
+
+private:
+    void enqueuePoint(influxdb::Point&& point) {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        point_queue_.push(std::move(point));
+
+        // Flush if batch size reached
+        if (point_queue_.size() >= BATCH_SIZE) {
+            flush();
+        }
+    }
+
+    void flush() {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+
+        while (!point_queue_.empty()) {
+            influx_db_->write(std::move(point_queue_.front()));
+            point_queue_.pop();
+        }
+
+        influx_db_->flushBatch();
+    }
+
+    void flushWorker() {
+        while (running_) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(FLUSH_INTERVAL_MS));
+            flush();
+        }
+    }
+};
+
+============================================
+5. METRIC NAMING CONVENTIONS
+============================================
+
+Hierarchical Naming Structure:
+-------------------------------
+<system>.<subsystem>.<component>.<metric>.<unit>
+
+Examples:
+---------
+hft.trading.order_engine.latency.microseconds
+hft.trading.order_engine.orders.total
+hft.market_data.feed_handler.messages.per_second
+hft.risk.position_manager.exposure.usd
+hft.execution.smart_router.fill_rate.percentage
+
+Standard Tags/Labels:
+---------------------
+- environment: prod, staging, dev
+- datacenter: ny4, ld5, tk1
+- exchange: binance, coinbase, kraken
+- symbol: BTC-USD, ETH-USD
+- strategy: market_making, arbitrage, momentum
+- side: buy, sell
+- component: order_engine, market_data, risk
+- host: hostname
+- instance: process_id
+
+Metric Type Suffixes:
+---------------------
+_total       : Counters (monotonically increasing)
+_count       : Event counts
+_rate        : Rate metrics (per second)
+_percentage  : Percentage values (0-100)
+_ratio       : Ratio values (0-1)
+_bytes       : Size in bytes
+_seconds     : Time in seconds
+_milliseconds: Time in milliseconds
+_microseconds: Time in microseconds
+_nanoseconds : Time in nanoseconds
+
+Latency Metrics Naming:
+-----------------------
+<component>.latency.<percentile>
+<component>.latency.p50
+<component>.latency.p95
+<component>.latency.p99
+<component>.latency.p999
+<component>.latency.max
+<component>.latency.mean
+
+Example Complete Metrics Schema:
+---------------------------------
+
+# Order Metrics
+hft.trading.orders.sent.total{exchange,symbol,side,type}
+hft.trading.orders.filled.total{exchange,symbol,side}
+hft.trading.orders.rejected.total{exchange,symbol,reason}
+hft.trading.orders.canceled.total{exchange,symbol,reason}
+hft.trading.orders.active{exchange,symbol}
+hft.trading.orders.latency.microseconds{exchange,type,p95,p99,p999}
+
+# Market Data Metrics
+hft.market_data.messages.total{exchange,symbol,type}
+hft.market_data.updates.per_second{exchange,symbol}
+hft.market_data.latency.microseconds{exchange,feed_type}
+hft.market_data.gap_count.total{exchange}
+hft.market_data.orderbook.depth{exchange,symbol,level}
+
+# Execution Metrics
+hft.execution.fills.total{strategy,symbol,side}
+hft.execution.fill_rate.percentage{strategy,symbol}
+hft.execution.slippage.bps{strategy,symbol}
+hft.execution.latency.microseconds{strategy}
+hft.execution.pnl.usd{strategy,symbol}
+
+# Risk Metrics
+hft.risk.position.size{symbol,strategy}
+hft.risk.exposure.usd{strategy}
+hft.risk.drawdown.percentage{strategy}
+hft.risk.var.usd{timeframe}
+hft.risk.violations.total{rule,severity}
+
+# System Metrics
+hft.system.cpu.usage.percentage{core,component}
+hft.system.memory.bytes{component,type}
+hft.system.network.bytes.total{interface,direction}
+hft.system.disk.io.bytes.total{device,operation}
+hft.system.queue.depth{component,queue_name}
+
+============================================
+6. PRODUCTION DEPLOYMENT GUIDE
+============================================
+
+Docker Compose Setup:
+---------------------
+version: '3.8'
+
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: hft-prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./alerts:/etc/prometheus/alerts
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    ports:
+      - "9090:9090"
+    networks:
+      - hft-monitoring
+    restart: unless-stopped
+
+  influxdb:
+    image: influxdb:2.7
+    container_name: hft-influxdb
+    environment:
+      - INFLUXDB_DB=hft_metrics
+      - INFLUXDB_ADMIN_USER=admin
+      - INFLUXDB_ADMIN_PASSWORD=${INFLUXDB_PASSWORD}
+      - INFLUXDB_HTTP_MAX_ROW_LIMIT=100000
+    volumes:
+      - influxdb_data:/var/lib/influxdb
+      - ./influxdb.conf:/etc/influxdb/influxdb.conf
+    ports:
+      - "8086:8086"
+    networks:
+      - hft-monitoring
+    restart: unless-stopped
+
+  statsd:
+    image: statsd/statsd:latest
+    container_name: hft-statsd
+    volumes:
+      - ./statsd.conf:/usr/src/app/config.js
+    ports:
+      - "8125:8125/udp"
+      - "8126:8126"
+    networks:
+      - hft-monitoring
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: hft-grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD}
+      - GF_INSTALL_PLUGINS=grafana-piechart-panel
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./grafana/datasources:/etc/grafana/provisioning/datasources
+    ports:
+      - "3000:3000"
+    networks:
+      - hft-monitoring
+    depends_on:
+      - prometheus
+      - influxdb
+    restart: unless-stopped
+
+volumes:
+  prometheus_data:
+  influxdb_data:
+  grafana_data:
+
+networks:
+  hft-monitoring:
+    driver: bridge
+
+CMakeLists.txt Integration:
+----------------------------
+# Find Prometheus C++ client
+find_package(prometheus-cpp CONFIG REQUIRED)
+find_package(CURL REQUIRED)
+
+# Add metrics library
+add_library(hft_metrics
+    src/metrics/prometheus_collector.cpp
+    src/metrics/statsd_client.cpp
+    src/metrics/influxdb_collector.cpp
+)
+
+target_link_libraries(hft_metrics
+    prometheus-cpp::core
+    prometheus-cpp::pull
+    CURL::libcurl
+)
+
+target_include_directories(hft_metrics PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+# Link to trading engine
+target_link_libraries(trading_engine
+    hft_metrics
+)
+
+Performance Optimization:
+-------------------------
+1. Use lock-free data structures for metric collection
+2. Batch writes to reduce network overhead
+3. Sample high-frequency metrics appropriately
+4. Use UDP for StatsD (fire-and-forget)
+5. Enable kernel bypass for network stack
+6. Pre-allocate buffers to avoid allocations in hot path
+7. Use thread-local storage for metric aggregation
+8. Flush metrics asynchronously in background thread
+
+Example Queries:
+----------------
+# Prometheus Queries
+
+# 99th percentile order latency by exchange
+histogram_quantile(0.99,
+  rate(hft_order_latency_microseconds_bucket[1m])
+) by (exchange)
+
+# Orders per second by symbol
+rate(hft_orders_total[1m]) by (symbol)
+
+# Fill rate percentage
+(rate(hft_fills_total[5m]) / rate(hft_orders_total[5m])) * 100
+
+# InfluxDB Queries
+
+# Average latency over 1 minute windows
+SELECT mean("latency_us")
+FROM "orders"
+WHERE time > now() - 1h
+GROUP BY time(1m), "exchange"
+
+# Position size evolution
+SELECT "quantity"
+FROM "positions"
+WHERE "symbol" = 'BTC-USD'
+AND time > now() - 24h
+
+# PnL by strategy
+SELECT sum("realized_pnl") + sum("unrealized_pnl")
+FROM "positions"
+GROUP BY "strategy"

@@ -1,0 +1,960 @@
+================================================================================
+                    NOTIFICATION TESTING - COMPLETE GUIDE
+================================================================================
+
+VERSION: 2.1.0
+LAST UPDATED: 2025-11-25
+STATUS: PRODUCTION
+MAINTAINER: Infrastructure Team
+
+================================================================================
+                              TABLE OF CONTENTS
+================================================================================
+
+1. Testing Overview
+2. Unit Testing
+3. Integration Testing
+4. End-to-End Testing
+5. Load Testing & Performance
+6. Failover Testing
+7. Channel-Specific Testing
+8. Test Data & Fixtures
+9. Automated Test Suite
+10. Manual Testing Procedures
+11. Production Verification
+12. Troubleshooting Guide
+
+================================================================================
+                       1. TESTING OVERVIEW
+================================================================================
+
+TESTING PYRAMID:
+
+Unit Tests (70%)
+- Individual component testing
+- Fast execution (< 1 second per test)
+- Mock external dependencies
+- Coverage: > 90%
+
+Integration Tests (20%)
+- Component interaction testing
+- Test with real dependencies (databases, Redis)
+- Slower execution (1-10 seconds per test)
+- Coverage: > 80%
+
+End-to-End Tests (10%)
+- Full workflow testing
+- Test with real external services
+- Slowest execution (10-60 seconds per test)
+- Coverage: Critical paths only
+
+TESTING ENVIRONMENTS:
+
+1. Development (Local)
+   - Individual developer machines
+   - Mock all external services
+   - Fast feedback loop
+
+2. Integration (Shared)
+   - Shared test environment
+   - Real databases and caches
+   - Isolated from production
+
+3. Staging (Pre-Production)
+   - Production-like environment
+   - Real configurations (test accounts)
+   - Final validation before production
+
+4. Production
+   - Live system
+   - Synthetic monitoring
+   - Limited testing (health checks only)
+
+TEST CATEGORIES:
+
+Functional Tests:
+- Alert creation and routing
+- Channel dispatch
+- Template rendering
+- Deduplication logic
+- Rate limiting
+
+Performance Tests:
+- Throughput (alerts/second)
+- Latency (end-to-end)
+- Resource usage
+- Scalability
+
+Reliability Tests:
+- Failover scenarios
+- Network issues
+- Service degradation
+- Error recovery
+
+Security Tests:
+- Authentication
+- Authorization
+- Input validation
+- Secret management
+
+================================================================================
+                         2. UNIT TESTING
+================================================================================
+
+TESTING FRAMEWORK: Google Test (gtest)
+
+UNIT TEST STRUCTURE:
+
+#include <gtest/gtest.h>
+#include "notification_manager.hpp"
+#include "mock_channel.hpp"
+
+namespace hft {
+namespace notification {
+namespace test {
+
+class NotificationManagerTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        config_ = create_test_config();
+        manager_ = std::make_unique<NotificationManager>(config_);
+        mock_channel_ = std::make_shared<MockChannel>();
+    }
+
+    void TearDown() override {
+        manager_.reset();
+    }
+
+    NotificationConfig config_;
+    std::unique_ptr<NotificationManager> manager_;
+    std::shared_ptr<MockChannel> mock_channel_;
+};
+
+TEST_F(NotificationManagerTest, SendAlertSuccess) {
+    // Arrange
+    Alert alert = create_test_alert(AlertSeverity::P1);
+    manager_->add_channel(mock_channel_);
+
+    EXPECT_CALL(*mock_channel_, send(_, _))
+        .WillOnce(::testing::Return(create_success_result()));
+
+    // Act
+    bool result = manager_->send_alert(alert);
+
+    // Assert
+    EXPECT_TRUE(result);
+    EXPECT_EQ(manager_->get_metrics().sent_count, 1);
+}
+
+TEST_F(NotificationManagerTest, RateLimitingWorks) {
+    // Arrange
+    config_.max_alerts_per_second = 10;
+    manager_->set_config(config_);
+
+    // Act: Send more than rate limit
+    int success_count = 0;
+    for (int i = 0; i < 20; ++i) {
+        Alert alert = create_test_alert(AlertSeverity::P3);
+        if (manager_->send_alert(alert)) {
+            success_count++;
+        }
+    }
+
+    // Assert
+    EXPECT_LE(success_count, 12);  // Allow some burst
+    EXPECT_GT(manager_->get_metrics().rate_limited_count, 0);
+}
+
+TEST_F(NotificationManagerTest, DeduplicationWorks) {
+    // Arrange
+    Alert alert1 = create_test_alert(AlertSeverity::P2);
+    alert1.dedup_key = "test_dedup_key";
+
+    Alert alert2 = create_test_alert(AlertSeverity::P2);
+    alert2.dedup_key = "test_dedup_key";  // Same dedup key
+
+    // Act
+    bool result1 = manager_->send_alert(alert1);
+    bool result2 = manager_->send_alert(alert2);  // Should be deduplicated
+
+    // Assert
+    EXPECT_TRUE(result1);
+    EXPECT_FALSE(result2);
+    EXPECT_EQ(manager_->get_metrics().deduplicated_count, 1);
+}
+
+TEST_F(NotificationManagerTest, SeverityRoutingWorks) {
+    // Arrange
+    auto mock_pagerduty = std::make_shared<MockChannel>();
+    auto mock_email = std::make_shared<MockChannel>();
+
+    manager_->add_channel(mock_pagerduty, ChannelType::PagerDuty);
+    manager_->add_channel(mock_email, ChannelType::Email);
+
+    Alert p1_alert = create_test_alert(AlertSeverity::P1);
+    Alert p4_alert = create_test_alert(AlertSeverity::P4);
+
+    // Expect P1 to use both channels
+    EXPECT_CALL(*mock_pagerduty, send(_, _)).Times(1);
+    EXPECT_CALL(*mock_email, send(_, _)).Times(2);  // P1 and P4
+
+    // Act
+    manager_->send_alert(p1_alert);
+    manager_->send_alert(p4_alert);
+
+    // Assert (expectations verified by gmock)
+}
+
+TEST_F(NotificationManagerTest, QueueOverflowHandling) {
+    // Arrange
+    config_.queue_capacity = 10;
+    manager_->set_config(config_);
+
+    // Block processing thread
+    manager_->pause_processing();
+
+    // Act: Overflow the queue
+    int overflow_count = 0;
+    for (int i = 0; i < 20; ++i) {
+        Alert alert = create_test_alert(AlertSeverity::P3);
+        if (!manager_->send_alert(alert)) {
+            overflow_count++;
+        }
+    }
+
+    // Assert
+    EXPECT_GT(overflow_count, 0);
+    EXPECT_GT(manager_->get_metrics().queue_overflow_count, 0);
+
+    manager_->resume_processing();
+}
+
+TEST_F(NotificationManagerTest, TemplateRenderingWorks) {
+    // Arrange
+    Alert alert = create_test_alert(AlertSeverity::P1);
+    alert.context["latency_ms"] = "150";
+    alert.context["threshold_ms"] = "10";
+
+    TemplateEngine engine;
+    engine.load_template("p1_alert", "Latency: {{latency_ms}}ms (threshold: {{threshold_ms}}ms)");
+
+    // Act
+    std::string rendered = engine.render("p1_alert", alert.context);
+
+    // Assert
+    EXPECT_EQ(rendered, "Latency: 150ms (threshold: 10ms)");
+}
+
+// Alert Router Tests
+
+class AlertRouterTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        router_ = std::make_unique<AlertRouter>();
+    }
+
+    std::unique_ptr<AlertRouter> router_;
+};
+
+TEST_F(AlertRouterTest, RoutesByGeverity) {
+    // Arrange
+    RoutingRule rule;
+    rule.severity = AlertSeverity::P1;
+    rule.channels = {ChannelType::PagerDuty, ChannelType::SMS};
+    router_->add_rule(rule);
+
+    Alert p1_alert = create_test_alert(AlertSeverity::P1);
+
+    // Act
+    auto decision = router_->route_alert(p1_alert);
+
+    // Assert
+    EXPECT_EQ(decision.channels.size(), 2);
+    EXPECT_TRUE(contains(decision.channels, ChannelType::PagerDuty));
+    EXPECT_TRUE(contains(decision.channels, ChannelType::SMS));
+}
+
+TEST_F(AlertRouterTest, RoutesBySource) {
+    // Arrange
+    RoutingRule rule;
+    rule.source_pattern = std::regex("execution_.*");
+    rule.recipients = {"trader@company.com"};
+    router_->add_rule(rule);
+
+    Alert alert = create_test_alert(AlertSeverity::P2);
+    alert.source = "execution_engine";
+
+    // Act
+    auto decision = router_->route_alert(alert);
+
+    // Assert
+    EXPECT_TRUE(contains(decision.recipients, "trader@company.com"));
+}
+
+TEST_F(AlertRouterTest, TimeBasedRouting) {
+    // Arrange
+    RoutingRule business_hours_rule;
+    business_hours_rule.time_window = create_business_hours_window();
+    business_hours_rule.recipients = {"dev-team@company.com"};
+
+    RoutingRule after_hours_rule;
+    after_hours_rule.time_window = create_after_hours_window();
+    after_hours_rule.recipients = {"oncall@company.com"};
+
+    router_->add_rule(business_hours_rule);
+    router_->add_rule(after_hours_rule);
+
+    // Act
+    Alert alert_9am = create_alert_at_time(9, 0);  // 9:00 AM
+    Alert alert_10pm = create_alert_at_time(22, 0);  // 10:00 PM
+
+    auto decision_9am = router_->route_alert(alert_9am);
+    auto decision_10pm = router_->route_alert(alert_10pm);
+
+    // Assert
+    EXPECT_TRUE(contains(decision_9am.recipients, "dev-team@company.com"));
+    EXPECT_TRUE(contains(decision_10pm.recipients, "oncall@company.com"));
+}
+
+// Rate Limiter Tests
+
+class RateLimiterTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        config_.max_per_second = 10;
+        config_.max_per_minute = 60;
+        limiter_ = std::make_unique<RateLimiter>(config_);
+    }
+
+    RateLimiterConfig config_;
+    std::unique_ptr<RateLimiter> limiter_;
+};
+
+TEST_F(RateLimiterTest, AllowsUnderLimit) {
+    // Act
+    bool allowed = limiter_->allow_alert("user1", AlertSeverity::P3);
+
+    // Assert
+    EXPECT_TRUE(allowed);
+}
+
+TEST_F(RateLimiterTest, BlocksOverLimit) {
+    // Arrange: Fill up the rate limit
+    for (int i = 0; i < 10; ++i) {
+        limiter_->allow_alert("user1", AlertSeverity::P3);
+    }
+
+    // Act
+    bool allowed = limiter_->allow_alert("user1", AlertSeverity::P3);
+
+    // Assert
+    EXPECT_FALSE(allowed);
+}
+
+TEST_F(RateLimiterTest, P1BypassesRateLimit) {
+    // Arrange: Fill up the rate limit
+    for (int i = 0; i < 10; ++i) {
+        limiter_->allow_alert("user1", AlertSeverity::P3);
+    }
+
+    // Act
+    bool allowed = limiter_->allow_alert("user1", AlertSeverity::P1);
+
+    // Assert
+    EXPECT_TRUE(allowed);  // P1 should bypass rate limit
+}
+
+TEST_F(RateLimiterTest, RateLimitResets) {
+    // Arrange: Fill up the rate limit
+    for (int i = 0; i < 10; ++i) {
+        limiter_->allow_alert("user1", AlertSeverity::P3);
+    }
+
+    // Act: Wait for rate limit window to expire
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    bool allowed = limiter_->allow_alert("user1", AlertSeverity::P3);
+
+    // Assert
+    EXPECT_TRUE(allowed);
+}
+
+// Helper functions
+
+Alert create_test_alert(AlertSeverity severity) {
+    Alert alert;
+    alert.id = generate_alert_id();
+    alert.severity = severity;
+    alert.title = "Test Alert";
+    alert.message = "This is a test alert";
+    alert.source = "test_system";
+    alert.timestamp = std::chrono::system_clock::now();
+    return alert;
+}
+
+DispatchResult create_success_result() {
+    DispatchResult result;
+    result.success = true;
+    result.latency = std::chrono::milliseconds(100);
+    return result;
+}
+
+} // namespace test
+} // namespace notification
+} // namespace hft
+
+RUNNING UNIT TESTS:
+
+# Build tests
+cd /path/to/notification/build
+cmake -DBUILD_TESTS=ON ..
+make -j$(nproc)
+
+# Run all tests
+./notification_tests
+
+# Run specific test suite
+./notification_tests --gtest_filter=NotificationManagerTest.*
+
+# Run with verbose output
+./notification_tests --gtest_verbose
+
+# Generate coverage report
+./notification_tests
+lcov --capture --directory . --output-file coverage.info
+genhtml coverage.info --output-directory coverage_html
+
+================================================================================
+                       3. INTEGRATION TESTING
+================================================================================
+
+INTEGRATION TEST SETUP:
+
+#include <gtest/gtest.h>
+#include "notification_manager.hpp"
+#include "email_channel.hpp"
+#include "slack_channel.hpp"
+#include "redis_deduplicator.hpp"
+
+class IntegrationTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        // Start test Redis instance
+        redis_process_ = start_test_redis();
+
+        // Start test SMTP server
+        smtp_process_ = start_test_smtp_server();
+
+        // Configure notification manager with real components
+        NotificationConfig config;
+        config.redis_host = "localhost";
+        config.redis_port = 16379;  // Test port
+
+        manager_ = std::make_unique<NotificationManager>(config);
+
+        // Add real channels
+        EmailConfig email_config;
+        email_config.smtp_host = "localhost";
+        email_config.smtp_port = 2525;  // Test SMTP port
+        auto email_channel = std::make_shared<EmailChannel>(email_config);
+        manager_->add_channel(email_channel);
+    }
+
+    void TearDown() override {
+        manager_.reset();
+        stop_process(smtp_process_);
+        stop_process(redis_process_);
+    }
+
+    std::unique_ptr<NotificationManager> manager_;
+    pid_t redis_process_;
+    pid_t smtp_process_;
+};
+
+TEST_F(IntegrationTest, EmailSentSuccessfully) {
+    // Arrange
+    Alert alert = create_test_alert(AlertSeverity::P2);
+    std::vector<std::string> recipients = {"test@example.com"};
+
+    // Act
+    auto result = manager_->send(alert, recipients);
+
+    // Assert
+    EXPECT_TRUE(result.success);
+
+    // Verify email was received by test SMTP server
+    auto emails = get_received_emails_from_test_server();
+    ASSERT_EQ(emails.size(), 1);
+    EXPECT_EQ(emails[0].to, "test@example.com");
+    EXPECT_TRUE(emails[0].subject.find("[P2]") != std::string::npos);
+}
+
+TEST_F(IntegrationTest, DeduplicationWithRedis) {
+    // Arrange
+    Alert alert1 = create_test_alert(AlertSeverity::P2);
+    alert1.dedup_key = "integration_test_key";
+
+    Alert alert2 = alert1;  // Duplicate
+
+    // Act
+    auto result1 = manager_->send(alert1, {"test@example.com"});
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    auto result2 = manager_->send(alert2, {"test@example.com"});
+
+    // Assert
+    EXPECT_TRUE(result1.success);
+    EXPECT_FALSE(result2.success);  // Should be deduplicated
+
+    // Verify only one email sent
+    auto emails = get_received_emails_from_test_server();
+    EXPECT_EQ(emails.size(), 1);
+}
+
+TEST_F(IntegrationTest, MultiChannelDispatch) {
+    // Arrange
+    SlackConfig slack_config;
+    slack_config.webhook_url = get_test_slack_webhook();
+    auto slack_channel = std::make_shared<SlackChannel>(slack_config);
+    manager_->add_channel(slack_channel);
+
+    Alert p1_alert = create_test_alert(AlertSeverity::P1);
+
+    // Act
+    auto result = manager_->send(p1_alert, {"test@example.com"});
+
+    // Assert
+    EXPECT_TRUE(result.success);
+
+    // Verify both email and Slack received message
+    auto emails = get_received_emails_from_test_server();
+    auto slack_messages = get_test_slack_messages();
+
+    EXPECT_GE(emails.size(), 1);
+    EXPECT_GE(slack_messages.size(), 1);
+}
+
+TEST_F(IntegrationTest, ChannelFailoverWorks) {
+    // Arrange
+    // Stop SMTP server to simulate failure
+    stop_process(smtp_process_);
+
+    Alert alert = create_test_alert(AlertSeverity::P1);
+
+    // Act
+    auto result = manager_->send(alert, {"test@example.com"});
+
+    // Assert
+    // Email should fail but Slack should succeed (failover)
+    EXPECT_TRUE(result.success);  // Overall success due to failover
+
+    auto metrics = manager_->get_metrics();
+    EXPECT_GT(metrics.failover_count, 0);
+}
+
+INTEGRATION TEST EXECUTION:
+
+# Run integration tests (requires Docker for test services)
+./scripts/run_integration_tests.sh
+
+# Integration test script
+#!/bin/bash
+# run_integration_tests.sh
+
+set -e
+
+echo "Starting test services..."
+
+# Start test Redis
+docker run -d --name test-redis -p 16379:6379 redis:latest
+
+# Start test SMTP server (MailHog)
+docker run -d --name test-smtp -p 2525:1025 -p 18025:8025 mailhog/mailhog
+
+# Wait for services to be ready
+sleep 5
+
+echo "Running integration tests..."
+./build/notification_integration_tests
+
+echo "Stopping test services..."
+docker stop test-redis test-smtp
+docker rm test-redis test-smtp
+
+echo "Integration tests completed successfully!"
+
+================================================================================
+                      4. END-TO-END TESTING
+================================================================================
+
+END-TO-END TEST SCENARIOS:
+
+#!/usr/bin/env python3
+"""
+E2E Test Suite for Notification System
+Tests complete workflows from alert generation to delivery
+"""
+
+import requests
+import time
+import json
+import smtplib
+from email.mime.text import MIMEText
+
+class NotificationE2ETest:
+    def __init__(self, base_url):
+        self.base_url = base_url
+
+    def test_p1_alert_workflow(self):
+        """Test P1 alert complete workflow"""
+        print("Testing P1 Alert Workflow...")
+
+        # Step 1: Generate P1 alert
+        alert = {
+            "severity": "P1",
+            "title": "Trading System Down",
+            "message": "Execution engine is unreachable",
+            "source": "execution_engine",
+            "context": {
+                "error_code": "CONN_REFUSED",
+                "last_successful_trade": "2025-11-25T10:30:00Z"
+            }
+        }
+
+        response = requests.post(
+            f"{self.base_url}/api/v1/alerts",
+            json=alert,
+            headers={"Authorization": "Bearer test_token"}
+        )
+
+        assert response.status_code == 202
+        alert_id = response.json()["alert_id"]
+
+        print(f"✓ Alert created: {alert_id}")
+
+        # Step 2: Verify PagerDuty incident created
+        time.sleep(2)  # Allow time for processing
+
+        pd_incidents = self.get_pagerduty_incidents()
+        assert len(pd_incidents) > 0
+        assert pd_incidents[0]["title"] == "Trading System Down"
+
+        print("✓ PagerDuty incident created")
+
+        # Step 3: Verify SMS sent
+        sms_messages = self.get_test_sms_messages()
+        assert len(sms_messages) > 0
+        assert "[P1-CRITICAL]" in sms_messages[0]["body"]
+
+        print("✓ SMS notification sent")
+
+        # Step 4: Verify Slack message
+        slack_messages = self.get_slack_messages("#hft-critical")
+        assert len(slack_messages) > 0
+        assert "Trading System Down" in slack_messages[0]["text"]
+
+        print("✓ Slack notification sent")
+
+        # Step 5: Verify email
+        emails = self.get_test_emails()
+        assert len(emails) > 0
+        assert "[P1]" in emails[0]["subject"]
+
+        print("✓ Email notification sent")
+
+        # Step 6: Test acknowledgment
+        ack_response = requests.post(
+            f"{self.base_url}/api/v1/alerts/{alert_id}/acknowledge",
+            headers={"Authorization": "Bearer test_token"}
+        )
+
+        assert ack_response.status_code == 200
+
+        print("✓ Alert acknowledged")
+
+        # Step 7: Verify escalation stopped
+        time.sleep(15)  # Wait past escalation time
+        metrics = self.get_alert_metrics(alert_id)
+        assert metrics["escalation_count"] == 0
+
+        print("✓ Escalation stopped after acknowledgment")
+
+        print("✅ P1 Alert Workflow Test PASSED\n")
+
+    def test_rate_limiting(self):
+        """Test rate limiting works correctly"""
+        print("Testing Rate Limiting...")
+
+        # Send alerts rapidly
+        success_count = 0
+        rate_limited_count = 0
+
+        for i in range(50):
+            alert = {
+                "severity": "P3",
+                "title": f"Test Alert {i}",
+                "message": "Rate limit test",
+                "source": "test"
+            }
+
+            response = requests.post(
+                f"{self.base_url}/api/v1/alerts",
+                json=alert
+            )
+
+            if response.status_code == 202:
+                success_count += 1
+            elif response.status_code == 429:
+                rate_limited_count += 1
+
+        print(f"Success: {success_count}, Rate Limited: {rate_limited_count}")
+
+        assert rate_limited_count > 0, "Rate limiting not working"
+        print("✅ Rate Limiting Test PASSED\n")
+
+    def test_deduplication(self):
+        """Test alert deduplication"""
+        print("Testing Deduplication...")
+
+        alert = {
+            "severity": "P2",
+            "title": "High Latency",
+            "message": "Latency > 10ms",
+            "source": "execution_engine",
+            "dedup_key": "high_latency_test"
+        }
+
+        # Send same alert multiple times
+        responses = []
+        for i in range(5):
+            response = requests.post(
+                f"{self.base_url}/api/v1/alerts",
+                json=alert
+            )
+            responses.append(response)
+            time.sleep(0.5)
+
+        # Only first should succeed
+        assert responses[0].status_code == 202
+        for i in range(1, 5):
+            assert responses[i].status_code == 409  # Conflict (duplicate)
+
+        print("✅ Deduplication Test PASSED\n")
+
+    def test_channel_failover(self):
+        """Test failover when channel fails"""
+        print("Testing Channel Failover...")
+
+        # Temporarily disable primary channel
+        requests.post(f"{self.base_url}/api/v1/channels/email/disable")
+
+        alert = {
+            "severity": "P2",
+            "title": "Failover Test",
+            "message": "Testing channel failover",
+            "source": "test"
+        }
+
+        response = requests.post(
+            f"{self.base_url}/api/v1/alerts",
+            json=alert
+        )
+
+        assert response.status_code == 202
+
+        # Verify alert sent via backup channel
+        slack_messages = self.get_slack_messages("#hft-alerts")
+        assert any("Failover Test" in msg["text"] for msg in slack_messages)
+
+        # Re-enable channel
+        requests.post(f"{self.base_url}/api/v1/channels/email/enable")
+
+        print("✅ Channel Failover Test PASSED\n")
+
+    # Helper methods
+    def get_pagerduty_incidents(self):
+        # Query test PagerDuty API
+        return []
+
+    def get_test_sms_messages(self):
+        # Query test SMS service
+        return []
+
+    def get_slack_messages(self, channel):
+        # Query test Slack API
+        return []
+
+    def get_test_emails(self):
+        # Query test SMTP server (MailHog API)
+        response = requests.get("http://localhost:18025/api/v2/messages")
+        return response.json()["items"] if response.ok else []
+
+    def get_alert_metrics(self, alert_id):
+        response = requests.get(
+            f"{self.base_url}/api/v1/alerts/{alert_id}/metrics"
+        )
+        return response.json() if response.ok else {}
+
+if __name__ == "__main__":
+    # Run E2E tests
+    test_suite = NotificationE2ETest("http://localhost:8080")
+
+    test_suite.test_p1_alert_workflow()
+    test_suite.test_rate_limiting()
+    test_suite.test_deduplication()
+    test_suite.test_channel_failover()
+
+    print("=" * 60)
+    print("ALL E2E TESTS PASSED!")
+    print("=" * 60)
+
+RUNNING E2E TESTS:
+
+# Setup test environment
+./scripts/setup_e2e_test_env.sh
+
+# Run E2E tests
+python3 tests/e2e/notification_e2e_tests.py
+
+# Cleanup
+./scripts/cleanup_e2e_test_env.sh
+
+================================================================================
+                    5. LOAD TESTING & PERFORMANCE
+================================================================================
+
+LOAD TEST SCRIPT:
+
+#!/usr/bin/env python3
+"""
+Load Test for Notification System
+Tests throughput and latency under load
+"""
+
+import asyncio
+import aiohttp
+import time
+import statistics
+from concurrent.futures import ThreadPoolExecutor
+
+class NotificationLoadTest:
+    def __init__(self, base_url, concurrency=100):
+        self.base_url = base_url
+        self.concurrency = concurrency
+        self.latencies = []
+        self.errors = []
+
+    async def send_alert(self, session, alert_num):
+        """Send single alert and measure latency"""
+        alert = {
+            "severity": "P3",
+            "title": f"Load Test Alert {alert_num}",
+            "message": "Performance testing",
+            "source": "load_test"
+        }
+
+        start_time = time.time()
+
+        try:
+            async with session.post(
+                f"{self.base_url}/api/v1/alerts",
+                json=alert,
+                headers={"Authorization": "Bearer test_token"}
+            ) as response:
+                latency = (time.time() - start_time) * 1000  # ms
+                self.latencies.append(latency)
+
+                if response.status != 202:
+                    self.errors.append(f"HTTP {response.status}")
+
+        except Exception as e:
+            self.errors.append(str(e))
+
+    async def run_load_test(self, total_alerts):
+        """Run load test with specified number of alerts"""
+        print(f"Starting load test: {total_alerts} alerts, {self.concurrency} concurrent")
+
+        async with aiohttp.ClientSession() as session:
+            tasks = []
+            for i in range(total_alerts):
+                task = asyncio.ensure_future(self.send_alert(session, i))
+                tasks.append(task)
+
+                # Limit concurrency
+                if len(tasks) >= self.concurrency:
+                    await asyncio.gather(*tasks)
+                    tasks = []
+
+            # Wait for remaining tasks
+            if tasks:
+                await asyncio.gather(*tasks)
+
+    def print_results(self, duration):
+        """Print load test results"""
+        total = len(self.latencies) + len(self.errors)
+        success_rate = (len(self.latencies) / total * 100) if total > 0 else 0
+
+        print("\n" + "=" * 60)
+        print("LOAD TEST RESULTS")
+        print("=" * 60)
+
+        print(f"\nTotal Alerts: {total}")
+        print(f"Successful: {len(self.latencies)} ({success_rate:.2f}%)")
+        print(f"Failed: {len(self.errors)}")
+        print(f"Duration: {duration:.2f} seconds")
+        print(f"Throughput: {total/duration:.2f} alerts/second")
+
+        if self.latencies:
+            print(f"\nLatency Statistics:")
+            print(f"  Min: {min(self.latencies):.2f} ms")
+            print(f"  Max: {max(self.latencies):.2f} ms")
+            print(f"  Mean: {statistics.mean(self.latencies):.2f} ms")
+            print(f"  Median: {statistics.median(self.latencies):.2f} ms")
+            print(f"  P95: {statistics.quantiles(self.latencies, n=20)[18]:.2f} ms")
+            print(f"  P99: {statistics.quantiles(self.latencies, n=100)[98]:.2f} ms")
+
+        if self.errors:
+            print(f"\nErrors:")
+            from collections import Counter
+            error_counts = Counter(self.errors)
+            for error, count in error_counts.most_common(10):
+                print(f"  {error}: {count}")
+
+async def main():
+    load_test = NotificationLoadTest(
+        base_url="http://localhost:8080",
+        concurrency=100
+    )
+
+    start_time = time.time()
+    await load_test.run_load_test(total_alerts=10000)
+    duration = time.time() - start_time
+
+    load_test.print_results(duration)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+PERFORMANCE BENCHMARKS:
+
+Target Performance:
+- Throughput: > 100,000 alerts/second
+- P50 Latency: < 50 microseconds (submission)
+- P99 Latency: < 500 microseconds (submission)
+- End-to-End: < 5 seconds (including channel delivery)
+
+Running Load Tests:
+
+# Light load (1,000 alerts)
+python3 tests/load/load_test.py --alerts=1000 --concurrency=10
+
+# Medium load (10,000 alerts)
+python3 tests/load/load_test.py --alerts=10000 --concurrency=100
+
+# Heavy load (100,000 alerts)
+python3 tests/load/load_test.py --alerts=100000 --concurrency=500
+
+# Sustained load (1 hour)
+python3 tests/load/sustained_load.py --duration=3600 --rate=1000
+
+================================================================================
+                       END OF NOTIFICATION TESTING GUIDE
+================================================================================

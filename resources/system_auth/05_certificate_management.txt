@@ -1,0 +1,1074 @@
+================================================================================
+TLS/SSL CERTIFICATE MANAGEMENT
+High-Frequency Trading System - Certificate Lifecycle & mTLS
+================================================================================
+
+VERSION: 2.0
+LAST UPDATED: 2025-11-26
+CLASSIFICATION: CONFIDENTIAL
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+
+1. Overview
+2. Certificate Types and Usage
+3. Certificate Authority (CA) Setup
+4. Mutual TLS (mTLS) Implementation
+5. Certificate Generation and Signing
+6. Automated Certificate Rotation
+7. C++ Certificate Validation
+8. Python Automation Scripts
+9. Certificate Monitoring and Alerting
+10. Troubleshooting and Best Practices
+
+================================================================================
+1. OVERVIEW
+================================================================================
+
+TLS/SSL certificates are critical for securing communications in HFT systems:
+- Encrypting data in transit between services
+- Authenticating services (mTLS)
+- Establishing trust relationships
+- Preventing man-in-the-middle attacks
+
+CERTIFICATE REQUIREMENTS FOR HFT:
+
+Security:
+- TLS 1.3 only (disable TLS 1.2 and below)
+- Strong cipher suites (AES-256-GCM, ChaCha20-Poly1305)
+- 2048-bit RSA or 256-bit ECDSA keys
+- Certificate pinning for critical connections
+- Certificate Transparency (CT) logging
+
+Performance:
+- < 10μs certificate validation (with caching)
+- Session resumption to avoid full handshake
+- OCSP stapling for revocation checking
+- Hardware acceleration (AES-NI, AVX2)
+
+Operational:
+- Automated certificate rotation (60-90 days)
+- Zero-downtime certificate updates
+- Centralized certificate management
+- Emergency revocation capability
+- Monitoring and alerting
+
+THREAT MODEL:
+
+1. Man-in-the-Middle (MITM) Attacks
+   - Attacker intercepts TLS connection
+   - Presents fraudulent certificate
+   Mitigation: Certificate pinning, mTLS, HSTS
+
+2. Certificate Theft
+   - Private key compromised from disk
+   - Stolen from memory
+   Mitigation: HSM storage, file permissions, memory protection
+
+3. Expired Certificates
+   - Service outage due to expired cert
+   - Trading downtime = lost revenue
+   Mitigation: Automated rotation, monitoring, alerting
+
+4. CA Compromise
+   - Fraudulent certificates issued
+   - Loss of trust in CA
+   Mitigation: Use multiple CAs, CT monitoring, certificate pinning
+
+================================================================================
+2. CERTIFICATE TYPES AND USAGE
+================================================================================
+
+2.1 CERTIFICATE INVENTORY
+--------------------------
+
+CERTIFICATE TYPE        USE CASE                    VALIDITY    ISSUER
+------------------------------------------------------------------------
+Server Certificate      Public API endpoints        90 days     Let's Encrypt
+Wildcard Certificate    *.trading.example.com       90 days     DigiCert
+Client Certificate      Service authentication      365 days    Internal CA
+Code Signing Cert       Algorithm signing           3 years     DigiCert
+Root CA                 Internal PKI                10 years    Self-signed
+Intermediate CA         Sign service certs          5 years     Root CA
+
+2.2 CERTIFICATE HIERARCHY
+--------------------------
+
+┌─────────────────────────────────────────────────────────────────┐
+│                       ROOT CA                                    │
+│  CN: HFT Trading Root CA                                        │
+│  Validity: 10 years                                             │
+│  Key: RSA 4096-bit                                              │
+│  Usage: Certificate Signing                                      │
+│  Storage: Hardware Security Module (HSM)                        │
+└────────────────────────────┬────────────────────────────────────┘
+                             │
+          ┌──────────────────┼──────────────────┐
+          │                  │                  │
+          ▼                  ▼                  ▼
+┌──────────────────┐ ┌──────────────────┐ ┌──────────────────┐
+│ Intermediate CA  │ │ Intermediate CA  │ │ Intermediate CA  │
+│  (Services)      │ │  (Users)         │ │  (Devices)       │
+│  Validity: 5y    │ │  Validity: 5y    │ │  Validity: 5y    │
+└────────┬─────────┘ └────────┬─────────┘ └────────┬─────────┘
+         │                    │                    │
+         ▼                    ▼                    ▼
+┌──────────────────┐ ┌──────────────────┐ ┌──────────────────┐
+│ End-Entity Certs │ │ End-Entity Certs │ │ End-Entity Certs │
+│  trading-api     │ │  user@email.com  │ │  yubikey-001     │
+│  risk-engine     │ │  trader@...      │ │  hsm-device      │
+│  market-data     │ └──────────────────┘ └──────────────────┘
+│  Validity: 1y    │
+└──────────────────┘
+
+================================================================================
+3. CERTIFICATE AUTHORITY (CA) SETUP
+================================================================================
+
+3.1 CREATE INTERNAL ROOT CA
+----------------------------
+
+```bash
+#!/bin/bash
+# Create Root CA for HFT Trading System
+
+# Create directory structure
+mkdir -p /etc/hft-ca/{root,intermediate}/{certs,crl,newcerts,private}
+chmod 700 /etc/hft-ca/root/private
+chmod 700 /etc/hft-ca/intermediate/private
+
+# Initialize database files
+touch /etc/hft-ca/root/index.txt
+echo 1000 > /etc/hft-ca/root/serial
+
+# Create Root CA configuration
+cat > /etc/hft-ca/root/openssl.cnf <<EOF
+[ ca ]
+default_ca = CA_default
+
+[ CA_default ]
+dir               = /etc/hft-ca/root
+certs             = \$dir/certs
+crl_dir           = \$dir/crl
+new_certs_dir     = \$dir/newcerts
+database          = \$dir/index.txt
+serial            = \$dir/serial
+RANDFILE          = \$dir/private/.rand
+
+private_key       = \$dir/private/ca.key.pem
+certificate       = \$dir/certs/ca.cert.pem
+
+crlnumber         = \$dir/crlnumber
+crl               = \$dir/crl/ca.crl.pem
+crl_extensions    = crl_ext
+default_crl_days  = 30
+
+default_md        = sha256
+name_opt          = ca_default
+cert_opt          = ca_default
+default_days      = 3650
+preserve          = no
+policy            = policy_strict
+
+[ policy_strict ]
+countryName             = match
+stateOrProvinceName     = match
+organizationName        = match
+organizationalUnitName  = optional
+commonName              = supplied
+emailAddress            = optional
+
+[ req ]
+default_bits        = 4096
+distinguished_name  = req_distinguished_name
+string_mask         = utf8only
+default_md          = sha256
+x509_extensions     = v3_ca
+
+[ req_distinguished_name ]
+countryName                     = Country Name (2 letter code)
+stateOrProvinceName             = State or Province Name
+localityName                    = Locality Name
+0.organizationName              = Organization Name
+organizationalUnitName          = Organizational Unit Name
+commonName                      = Common Name
+emailAddress                    = Email Address
+
+countryName_default             = US
+stateOrProvinceName_default     = New York
+localityName_default            = New York
+0.organizationName_default      = HFT Trading Inc
+organizationalUnitName_default  = Security
+emailAddress_default            = security@trading.example.com
+
+[ v3_ca ]
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always,issuer
+basicConstraints = critical, CA:true
+keyUsage = critical, digitalSignature, cRLSign, keyCertSign
+
+[ v3_intermediate_ca ]
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always,issuer
+basicConstraints = critical, CA:true, pathlen:0
+keyUsage = critical, digitalSignature, cRLSign, keyCertSign
+
+[ server_cert ]
+basicConstraints = CA:FALSE
+nsCertType = server
+nsComment = "OpenSSL Generated Server Certificate"
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid,issuer:always
+keyUsage = critical, digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
+
+[ client_cert ]
+basicConstraints = CA:FALSE
+nsCertType = client, email
+nsComment = "OpenSSL Generated Client Certificate"
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid,issuer
+keyUsage = critical, nonRepudiation, digitalSignature, keyEncipherment
+extendedKeyUsage = clientAuth, emailProtection
+EOF
+
+# Generate Root CA private key (4096-bit RSA)
+openssl genrsa -aes256 -out /etc/hft-ca/root/private/ca.key.pem 4096
+chmod 400 /etc/hft-ca/root/private/ca.key.pem
+
+# Generate Root CA certificate (10-year validity)
+openssl req -config /etc/hft-ca/root/openssl.cnf \
+    -key /etc/hft-ca/root/private/ca.key.pem \
+    -new -x509 -days 3650 -sha256 -extensions v3_ca \
+    -out /etc/hft-ca/root/certs/ca.cert.pem \
+    -subj "/C=US/ST=New York/L=New York/O=HFT Trading Inc/OU=Security/CN=HFT Trading Root CA"
+
+chmod 444 /etc/hft-ca/root/certs/ca.cert.pem
+
+# Verify Root CA certificate
+openssl x509 -noout -text -in /etc/hft-ca/root/certs/ca.cert.pem
+
+echo "Root CA created successfully!"
+```
+
+3.2 CREATE INTERMEDIATE CA
+---------------------------
+
+```bash
+#!/bin/bash
+# Create Intermediate CA for signing service certificates
+
+# Create intermediate CA directory structure
+cd /etc/hft-ca/intermediate
+touch index.txt
+echo 1000 > serial
+echo 1000 > crlnumber
+
+# Generate intermediate CA private key
+openssl genrsa -aes256 -out private/intermediate.key.pem 4096
+chmod 400 private/intermediate.key.pem
+
+# Generate intermediate CA certificate signing request (CSR)
+openssl req -config /etc/hft-ca/root/openssl.cnf -new -sha256 \
+    -key private/intermediate.key.pem \
+    -out csr/intermediate.csr.pem \
+    -subj "/C=US/ST=New York/L=New York/O=HFT Trading Inc/OU=Services/CN=HFT Trading Intermediate CA"
+
+# Sign intermediate CA certificate with Root CA (5-year validity)
+openssl ca -config /etc/hft-ca/root/openssl.cnf -extensions v3_intermediate_ca \
+    -days 1825 -notext -md sha256 \
+    -in csr/intermediate.csr.pem \
+    -out certs/intermediate.cert.pem
+
+chmod 444 certs/intermediate.cert.pem
+
+# Create certificate chain file
+cat certs/intermediate.cert.pem \
+    /etc/hft-ca/root/certs/ca.cert.pem > certs/ca-chain.cert.pem
+
+chmod 444 certs/ca-chain.cert.pem
+
+# Verify intermediate certificate
+openssl x509 -noout -text -in certs/intermediate.cert.pem
+openssl verify -CAfile /etc/hft-ca/root/certs/ca.cert.pem \
+    certs/intermediate.cert.pem
+
+echo "Intermediate CA created successfully!"
+```
+
+================================================================================
+4. MUTUAL TLS (mTLS) IMPLEMENTATION
+================================================================================
+
+4.1 mTLS SERVER CONFIGURATION
+------------------------------
+
+```cpp
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <openssl/x509v3.h>
+#include <string>
+#include <memory>
+#include <vector>
+
+class MTLSServer {
+public:
+    struct Config {
+        std::string cert_file;        // Server certificate
+        std::string key_file;         // Server private key
+        std::string ca_file;          // CA certificate (for client verification)
+        std::string cipher_suites;    // Allowed cipher suites
+        bool require_client_cert;     // Require client certificate
+        std::vector<std::string> allowed_clients;  // Allowed client CNs
+    };
+
+    MTLSServer(const Config& config) : config_(config) {
+        initializeSSL();
+    }
+
+    ~MTLSServer() {
+        if (ssl_ctx_) {
+            SSL_CTX_free(ssl_ctx_);
+        }
+    }
+
+    bool initializeSSL() {
+        // Initialize OpenSSL
+        SSL_load_error_strings();
+        OpenSSL_add_ssl_algorithms();
+
+        // Create SSL context (TLS 1.3 only)
+        const SSL_METHOD* method = TLS_server_method();
+        ssl_ctx_ = SSL_CTX_new(method);
+
+        if (!ssl_ctx_) {
+            logError("Unable to create SSL context");
+            return false;
+        }
+
+        // Set minimum and maximum TLS version to 1.3
+        SSL_CTX_set_min_proto_version(ssl_ctx_, TLS1_3_VERSION);
+        SSL_CTX_set_max_proto_version(ssl_ctx_, TLS1_3_VERSION);
+
+        // Load server certificate
+        if (SSL_CTX_use_certificate_file(ssl_ctx_, config_.cert_file.c_str(),
+                                        SSL_FILETYPE_PEM) <= 0) {
+            logError("Failed to load server certificate");
+            return false;
+        }
+
+        // Load server private key
+        if (SSL_CTX_use_PrivateKey_file(ssl_ctx_, config_.key_file.c_str(),
+                                       SSL_FILETYPE_PEM) <= 0) {
+            logError("Failed to load server private key");
+            return false;
+        }
+
+        // Verify private key matches certificate
+        if (!SSL_CTX_check_private_key(ssl_ctx_)) {
+            logError("Private key does not match certificate");
+            return false;
+        }
+
+        // Load CA certificate for client verification
+        if (SSL_CTX_load_verify_locations(ssl_ctx_, config_.ca_file.c_str(),
+                                         nullptr) <= 0) {
+            logError("Failed to load CA certificate");
+            return false;
+        }
+
+        // Require and verify client certificate
+        int verify_mode = SSL_VERIFY_PEER;
+        if (config_.require_client_cert) {
+            verify_mode |= SSL_VERIFY_FAIL_IF_NO_PEER_CERT;
+        }
+
+        SSL_CTX_set_verify(ssl_ctx_, verify_mode, verifyCallback);
+        SSL_CTX_set_verify_depth(ssl_ctx_, 4);
+
+        // Set cipher suites (TLS 1.3)
+        if (!config_.cipher_suites.empty()) {
+            if (SSL_CTX_set_ciphersuites(ssl_ctx_, config_.cipher_suites.c_str()) != 1) {
+                logError("Failed to set cipher suites");
+                return false;
+            }
+        } else {
+            // Default secure cipher suites
+            SSL_CTX_set_ciphersuites(ssl_ctx_,
+                "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256");
+        }
+
+        // Disable session tickets for forward secrecy
+        SSL_CTX_set_options(ssl_ctx_, SSL_OP_NO_TICKET);
+
+        // Enable session cache for performance
+        SSL_CTX_set_session_cache_mode(ssl_ctx_, SSL_SESS_CACHE_SERVER);
+        SSL_CTX_set_timeout(ssl_ctx_, 300);  // 5 minutes
+
+        // Enable OCSP stapling
+        SSL_CTX_set_tlsext_status_type(ssl_ctx_, TLSEXT_STATUSTYPE_ocsp);
+
+        logInfo("mTLS server initialized successfully");
+        return true;
+    }
+
+    SSL* createSSLConnection(int socket_fd) {
+        SSL* ssl = SSL_new(ssl_ctx_);
+        if (!ssl) {
+            logError("Failed to create SSL connection");
+            return nullptr;
+        }
+
+        SSL_set_fd(ssl, socket_fd);
+
+        // Perform TLS handshake
+        int ret = SSL_accept(ssl);
+        if (ret <= 0) {
+            int error = SSL_get_error(ssl, ret);
+            logError("SSL handshake failed: " + std::to_string(error));
+            ERR_print_errors_fp(stderr);
+            SSL_free(ssl);
+            return nullptr;
+        }
+
+        // Verify client certificate
+        if (!verifyClientCertificate(ssl)) {
+            logError("Client certificate verification failed");
+            SSL_free(ssl);
+            return nullptr;
+        }
+
+        logInfo("mTLS connection established");
+        return ssl;
+    }
+
+private:
+    Config config_;
+    SSL_CTX* ssl_ctx_ = nullptr;
+
+    static int verifyCallback(int preverify_ok, X509_STORE_CTX* ctx) {
+        // Custom verification logic
+        if (!preverify_ok) {
+            X509* cert = X509_STORE_CTX_get_current_cert(ctx);
+            int depth = X509_STORE_CTX_get_error_depth(ctx);
+            int error = X509_STORE_CTX_get_error(ctx);
+
+            char subject[256];
+            X509_NAME_oneline(X509_get_subject_name(cert), subject, sizeof(subject));
+
+            fprintf(stderr, "Certificate verification failed at depth %d: %s\n",
+                   depth, X509_verify_cert_error_string(error));
+            fprintf(stderr, "Subject: %s\n", subject);
+        }
+
+        return preverify_ok;
+    }
+
+    bool verifyClientCertificate(SSL* ssl) {
+        // Get client certificate
+        X509* client_cert = SSL_get_peer_certificate(ssl);
+        if (!client_cert) {
+            logError("No client certificate provided");
+            return false;
+        }
+
+        // Verify certificate chain
+        long verify_result = SSL_get_verify_result(ssl);
+        if (verify_result != X509_V_OK) {
+            logError("Certificate verification failed: " +
+                    std::string(X509_verify_cert_error_string(verify_result)));
+            X509_free(client_cert);
+            return false;
+        }
+
+        // Extract Common Name (CN) from certificate
+        char common_name[256];
+        X509_NAME* subject = X509_get_subject_name(client_cert);
+        X509_NAME_get_text_by_NID(subject, NID_commonName, common_name, sizeof(common_name));
+
+        std::string cn(common_name);
+        X509_free(client_cert);
+
+        // Check if CN is in allowed list
+        if (!config_.allowed_clients.empty()) {
+            bool found = false;
+            for (const auto& allowed : config_.allowed_clients) {
+                if (cn == allowed) {
+                    found = true;
+                    break;
+                }
+            }
+
+            if (!found) {
+                logError("Client CN not in allowed list: " + cn);
+                return false;
+            }
+        }
+
+        logInfo("Client certificate verified: " + cn);
+        return true;
+    }
+
+    void logError(const std::string& msg) {
+        // Log to system
+        fprintf(stderr, "[ERROR] %s\n", msg.c_str());
+    }
+
+    void logInfo(const std::string& msg) {
+        // Log to system
+        fprintf(stdout, "[INFO] %s\n", msg.c_str());
+    }
+};
+```
+
+4.2 mTLS CLIENT CONFIGURATION
+------------------------------
+
+```cpp
+class MTLSClient {
+public:
+    struct Config {
+        std::string server_addr;
+        int server_port;
+        std::string client_cert_file;
+        std::string client_key_file;
+        std::string ca_file;
+        bool verify_server;
+        std::string expected_server_cn;  // For certificate pinning
+    };
+
+    MTLSClient(const Config& config) : config_(config) {
+        initializeSSL();
+    }
+
+    ~MTLSClient() {
+        if (ssl_ctx_) {
+            SSL_CTX_free(ssl_ctx_);
+        }
+    }
+
+    bool initializeSSL() {
+        SSL_load_error_strings();
+        OpenSSL_add_ssl_algorithms();
+
+        const SSL_METHOD* method = TLS_client_method();
+        ssl_ctx_ = SSL_CTX_new(method);
+
+        if (!ssl_ctx_) {
+            logError("Unable to create SSL context");
+            return false;
+        }
+
+        // TLS 1.3 only
+        SSL_CTX_set_min_proto_version(ssl_ctx_, TLS1_3_VERSION);
+        SSL_CTX_set_max_proto_version(ssl_ctx_, TLS1_3_VERSION);
+
+        // Load client certificate
+        if (SSL_CTX_use_certificate_file(ssl_ctx_, config_.client_cert_file.c_str(),
+                                        SSL_FILETYPE_PEM) <= 0) {
+            logError("Failed to load client certificate");
+            return false;
+        }
+
+        // Load client private key
+        if (SSL_CTX_use_PrivateKey_file(ssl_ctx_, config_.client_key_file.c_str(),
+                                       SSL_FILETYPE_PEM) <= 0) {
+            logError("Failed to load client private key");
+            return false;
+        }
+
+        // Load CA certificate
+        if (SSL_CTX_load_verify_locations(ssl_ctx_, config_.ca_file.c_str(),
+                                         nullptr) <= 0) {
+            logError("Failed to load CA certificate");
+            return false;
+        }
+
+        // Verify server certificate
+        if (config_.verify_server) {
+            SSL_CTX_set_verify(ssl_ctx_, SSL_VERIFY_PEER, nullptr);
+        }
+
+        // Set cipher suites
+        SSL_CTX_set_ciphersuites(ssl_ctx_,
+            "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256");
+
+        logInfo("mTLS client initialized successfully");
+        return true;
+    }
+
+    SSL* connect() {
+        // Create socket
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) {
+            logError("Failed to create socket");
+            return nullptr;
+        }
+
+        // Connect to server
+        struct sockaddr_in server_addr;
+        server_addr.sin_family = AF_INET;
+        server_addr.sin_port = htons(config_.server_port);
+        inet_pton(AF_INET, config_.server_addr.c_str(), &server_addr.sin_addr);
+
+        if (::connect(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+            logError("Failed to connect to server");
+            close(sock);
+            return nullptr;
+        }
+
+        // Create SSL connection
+        SSL* ssl = SSL_new(ssl_ctx_);
+        SSL_set_fd(ssl, sock);
+
+        // Set SNI (Server Name Indication)
+        SSL_set_tlsext_host_name(ssl, config_.server_addr.c_str());
+
+        // Perform TLS handshake
+        if (SSL_connect(ssl) <= 0) {
+            logError("SSL handshake failed");
+            ERR_print_errors_fp(stderr);
+            SSL_free(ssl);
+            close(sock);
+            return nullptr;
+        }
+
+        // Verify server certificate
+        if (config_.verify_server) {
+            if (!verifyServerCertificate(ssl)) {
+                logError("Server certificate verification failed");
+                SSL_free(ssl);
+                close(sock);
+                return nullptr;
+            }
+        }
+
+        logInfo("mTLS connection established");
+        return ssl;
+    }
+
+private:
+    Config config_;
+    SSL_CTX* ssl_ctx_ = nullptr;
+
+    bool verifyServerCertificate(SSL* ssl) {
+        X509* server_cert = SSL_get_peer_certificate(ssl);
+        if (!server_cert) {
+            logError("No server certificate provided");
+            return false;
+        }
+
+        // Verify certificate chain
+        long verify_result = SSL_get_verify_result(ssl);
+        if (verify_result != X509_V_OK) {
+            logError("Certificate verification failed");
+            X509_free(server_cert);
+            return false;
+        }
+
+        // Certificate pinning: verify CN matches expected
+        if (!config_.expected_server_cn.empty()) {
+            char common_name[256];
+            X509_NAME* subject = X509_get_subject_name(server_cert);
+            X509_NAME_get_text_by_NID(subject, NID_commonName, common_name, sizeof(common_name));
+
+            if (std::string(common_name) != config_.expected_server_cn) {
+                logError("Server CN mismatch. Expected: " + config_.expected_server_cn +
+                        ", Got: " + std::string(common_name));
+                X509_free(server_cert);
+                return false;
+            }
+        }
+
+        X509_free(server_cert);
+        return true;
+    }
+
+    void logError(const std::string& msg) {}
+    void logInfo(const std::string& msg) {}
+};
+```
+
+================================================================================
+5. AUTOMATED CERTIFICATE ROTATION
+================================================================================
+
+5.1 CERTIFICATE ROTATION SCRIPT
+--------------------------------
+
+```python
+#!/usr/bin/env python3
+"""
+Automated Certificate Rotation Script
+Rotates TLS certificates before expiration
+"""
+
+import subprocess
+import os
+import datetime
+import logging
+from typing import Dict, List
+import time
+import hvac
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class CertificateRotationManager:
+    """Manages automated rotation of TLS certificates"""
+
+    def __init__(self, vault_addr: str, vault_token: str):
+        self.vault_client = hvac.Client(url=vault_addr, token=vault_token)
+        self.ca_path = '/etc/hft-ca'
+
+    def check_certificate_expiry(self, cert_path: str) -> int:
+        """Check days until certificate expiration"""
+        cmd = f"openssl x509 -enddate -noout -in {cert_path}"
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+
+        if result.returncode != 0:
+            logger.error(f"Failed to check certificate expiry: {cert_path}")
+            return -1
+
+        # Parse expiry date
+        expiry_str = result.stdout.split('=')[1].strip()
+        expiry_date = datetime.datetime.strptime(expiry_str, '%b %d %H:%M:%S %Y %Z')
+
+        days_until_expiry = (expiry_date - datetime.datetime.now()).days
+
+        return days_until_expiry
+
+    def generate_service_certificate(self, service_name: str, san_list: List[str]):
+        """Generate a new certificate for a service"""
+        logger.info(f"Generating certificate for service: {service_name}")
+
+        # Generate private key
+        key_path = f"/tmp/{service_name}.key.pem"
+        cmd = f"openssl genrsa -out {key_path} 2048"
+        subprocess.run(cmd, shell=True, check=True)
+
+        # Generate CSR with SANs
+        san_str = ','.join([f'DNS:{san}' for san in san_list])
+        csr_path = f"/tmp/{service_name}.csr.pem"
+
+        cmd = f"""openssl req -new -sha256 \\
+            -key {key_path} \\
+            -subj "/C=US/ST=New York/L=New York/O=HFT Trading Inc/CN={service_name}" \\
+            -reqexts SAN \\
+            -config <(cat /etc/ssl/openssl.cnf <(printf "[SAN]\\nsubjectAltName={san_str}")) \\
+            -out {csr_path}"""
+
+        subprocess.run(cmd, shell=True, check=True, executable='/bin/bash')
+
+        # Sign with Intermediate CA
+        cert_path = f"/tmp/{service_name}.cert.pem"
+        cmd = f"""openssl ca -config {self.ca_path}/root/openssl.cnf \\
+            -extensions server_cert -days 365 -notext -md sha256 \\
+            -in {csr_path} -out {cert_path} -batch"""
+
+        subprocess.run(cmd, shell=True, check=True)
+
+        logger.info(f"Certificate generated: {cert_path}")
+
+        return cert_path, key_path
+
+    def store_certificate_in_vault(self, service_name: str, cert_path: str, key_path: str):
+        """Store certificate and key in Vault"""
+        with open(cert_path, 'r') as f:
+            certificate = f.read()
+
+        with open(key_path, 'r') as f:
+            private_key = f.read()
+
+        # Store in Vault KV v2
+        self.vault_client.secrets.kv.v2.create_or_update_secret(
+            path=f'tls/{service_name}',
+            secret={
+                'certificate': certificate,
+                'private_key': private_key,
+                'generated_at': datetime.datetime.utcnow().isoformat()
+            }
+        )
+
+        logger.info(f"Certificate stored in Vault: tls/{service_name}")
+
+    def rotate_certificate(self, service_name: str, san_list: List[str]):
+        """Rotate certificate for a service"""
+        logger.info(f"Starting rotation for: {service_name}")
+
+        # Generate new certificate
+        cert_path, key_path = self.generate_service_certificate(service_name, san_list)
+
+        # Store in Vault
+        self.store_certificate_in_vault(service_name, cert_path, key_path)
+
+        # Notify service to reload certificate
+        self.notify_service(service_name)
+
+        # Cleanup temp files
+        os.remove(cert_path)
+        os.remove(key_path)
+
+        logger.info(f"Certificate rotation completed: {service_name}")
+
+    def notify_service(self, service_name: str):
+        """Notify service to reload certificate"""
+        # Send SIGHUP to service or call reload API
+        logger.info(f"Notifying service to reload certificate: {service_name}")
+
+    def monitor_and_rotate(self, rotation_threshold_days: int = 30):
+        """Monitor certificates and rotate if needed"""
+        services = {
+            'trading-api': ['api.trading.example.com', 'trading.example.com'],
+            'risk-engine': ['risk.internal', 'risk-engine.internal'],
+            'market-data': ['market-data.internal']
+        }
+
+        for service_name, san_list in services.items():
+            # Check current certificate in Vault
+            try:
+                secret = self.vault_client.secrets.kv.v2.read_secret_version(
+                    path=f'tls/{service_name}'
+                )
+                cert_data = secret['data']['data']['certificate']
+
+                # Write to temp file for expiry check
+                temp_cert = f'/tmp/{service_name}_current.pem'
+                with open(temp_cert, 'w') as f:
+                    f.write(cert_data)
+
+                days_until_expiry = self.check_certificate_expiry(temp_cert)
+                os.remove(temp_cert)
+
+                logger.info(f"{service_name}: {days_until_expiry} days until expiry")
+
+                if days_until_expiry <= rotation_threshold_days:
+                    logger.warning(f"Certificate expiring soon: {service_name}")
+                    self.rotate_certificate(service_name, san_list)
+
+            except Exception as e:
+                logger.error(f"Error checking certificate for {service_name}: {e}")
+
+    def run(self, check_interval_hours: int = 24):
+        """Run certificate monitoring loop"""
+        logger.info("Starting certificate rotation manager")
+
+        while True:
+            try:
+                self.monitor_and_rotate()
+            except Exception as e:
+                logger.error(f"Error in monitoring loop: {e}")
+
+            time.sleep(check_interval_hours * 3600)
+
+def main():
+    vault_addr = 'https://vault.example.com:8200'
+    vault_token = os.environ.get('VAULT_TOKEN')
+
+    manager = CertificateRotationManager(vault_addr, vault_token)
+    manager.run(check_interval_hours=24)
+
+if __name__ == '__main__':
+    main()
+```
+
+================================================================================
+6. CERTIFICATE MONITORING
+================================================================================
+
+6.1 CERTIFICATE EXPIRY MONITOR
+-------------------------------
+
+```python
+#!/usr/bin/env python3
+"""
+Certificate Expiry Monitoring and Alerting
+"""
+
+import ssl
+import socket
+import datetime
+from typing import List, Dict
+import smtplib
+from email.mime.text import MIMEText
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class CertificateMonitor:
+    """Monitors certificate expiry and sends alerts"""
+
+    def __init__(self, alert_thresholds: List[int] = [30, 14, 7, 3, 1]):
+        self.alert_thresholds = sorted(alert_thresholds, reverse=True)
+        self.last_alerts = {}
+
+    def check_remote_certificate(self, hostname: str, port: int = 443) -> Dict:
+        """Check certificate for a remote host"""
+        context = ssl.create_default_context()
+
+        try:
+            with socket.create_connection((hostname, port), timeout=10) as sock:
+                with context.wrap_socket(sock, server_hostname=hostname) as ssock:
+                    cert = ssock.getpeercert()
+
+                    # Parse expiry date
+                    expiry_str = cert['notAfter']
+                    expiry_date = datetime.datetime.strptime(
+                        expiry_str, '%b %d %H:%M:%S %Y %Z'
+                    )
+
+                    days_until_expiry = (expiry_date - datetime.datetime.now()).days
+
+                    return {
+                        'hostname': hostname,
+                        'port': port,
+                        'subject': dict(x[0] for x in cert['subject']),
+                        'issuer': dict(x[0] for x in cert['issuer']),
+                        'expiry_date': expiry_date,
+                        'days_until_expiry': days_until_expiry,
+                        'san': cert.get('subjectAltName', [])
+                    }
+
+        except Exception as e:
+            logger.error(f"Failed to check certificate for {hostname}:{port} - {e}")
+            return None
+
+    def check_all_endpoints(self, endpoints: List[tuple]) -> List[Dict]:
+        """Check certificates for all endpoints"""
+        results = []
+
+        for hostname, port in endpoints:
+            result = self.check_remote_certificate(hostname, port)
+            if result:
+                results.append(result)
+
+        return results
+
+    def send_alert(self, cert_info: Dict):
+        """Send alert email for expiring certificate"""
+        days = cert_info['days_until_expiry']
+        hostname = cert_info['hostname']
+
+        # Check if already alerted for this threshold
+        alert_key = f"{hostname}_{days}"
+        if alert_key in self.last_alerts:
+            return
+
+        subject = f"Certificate Expiring: {hostname} ({days} days)"
+        body = f"""
+Certificate Expiry Warning
+
+Hostname: {hostname}
+Port: {cert_info['port']}
+Subject: {cert_info['subject']}
+Expiry Date: {cert_info['expiry_date']}
+Days Until Expiry: {days}
+
+Please rotate this certificate immediately.
+        """
+
+        # Send email (configure SMTP settings)
+        self.send_email(
+            to_addr='security@trading.example.com',
+            subject=subject,
+            body=body
+        )
+
+        self.last_alerts[alert_key] = datetime.datetime.now()
+
+        logger.warning(f"Alert sent for {hostname} - {days} days until expiry")
+
+    def send_email(self, to_addr: str, subject: str, body: str):
+        """Send email alert"""
+        msg = MIMEText(body)
+        msg['Subject'] = subject
+        msg['From'] = 'certs@trading.example.com'
+        msg['To'] = to_addr
+
+        # Configure SMTP (example)
+        # smtp = smtplib.SMTP('smtp.example.com', 587)
+        # smtp.send_message(msg)
+        # smtp.quit()
+
+        logger.info(f"Email sent: {subject}")
+
+    def monitor(self, endpoints: List[tuple]):
+        """Monitor certificates and send alerts"""
+        results = self.check_all_endpoints(endpoints)
+
+        for cert_info in results:
+            days = cert_info['days_until_expiry']
+
+            # Check if alert needed
+            for threshold in self.alert_thresholds:
+                if days <= threshold:
+                    self.send_alert(cert_info)
+                    break
+
+            # Log status
+            hostname = cert_info['hostname']
+            if days < 0:
+                logger.error(f"EXPIRED: {hostname} (expired {abs(days)} days ago)")
+            elif days <= 7:
+                logger.warning(f"EXPIRING SOON: {hostname} ({days} days)")
+            else:
+                logger.info(f"OK: {hostname} ({days} days)")
+
+def main():
+    # List of endpoints to monitor
+    endpoints = [
+        ('api.trading.example.com', 443),
+        ('trading.example.com', 443),
+        ('risk.internal', 8443),
+        ('market-data.internal', 8443)
+    ]
+
+    monitor = CertificateMonitor()
+
+    while True:
+        monitor.monitor(endpoints)
+        time.sleep(3600)  # Check every hour
+
+if __name__ == '__main__':
+    main()
+```
+
+================================================================================
+7. BEST PRACTICES
+================================================================================
+
+1. TLS 1.3 ONLY
+   - Disable TLS 1.2 and below
+   - Use strong cipher suites only
+   - Enable perfect forward secrecy
+
+2. CERTIFICATE LIFECYCLE
+   - Rotate certificates every 60-90 days
+   - Monitor expiry 30+ days in advance
+   - Test rotation procedures regularly
+
+3. KEY MANAGEMENT
+   - Store private keys in HSM when possible
+   - Never commit keys to version control
+   - Use file permissions (600 for keys)
+
+4. mTLS FOR SERVICE-TO-SERVICE
+   - Require client certificates for internal services
+   - Use certificate pinning for critical connections
+   - Whitelist allowed client CNs
+
+5. MONITORING
+   - Alert on certificates expiring < 30 days
+   - Monitor TLS handshake failures
+   - Track certificate revocations
+
+6. EMERGENCY PROCEDURES
+   - Have process for emergency revocation
+   - Test revocation and rotation procedures
+   - Document rollback procedures
+
+================================================================================
+END OF DOCUMENT
+================================================================================

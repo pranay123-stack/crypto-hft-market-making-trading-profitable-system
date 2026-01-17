@@ -1,0 +1,796 @@
+================================================================================
+COMPLETE REPLAY ENGINE IMPLEMENTATION
+================================================================================
+
+FULL-FEATURED C++ REPLAY ENGINE WITH:
+- Multi-symbol synchronized replay
+- Accurate latency simulation
+- Realistic fill simulation
+- Order book reconstruction
+- Strategy integration
+- Performance profiling
+
+================================================================================
+CORE REPLAY ENGINE
+================================================================================
+
+// replay_engine.hpp
+
+#ifndef REPLAY_ENGINE_HPP
+#define REPLAY_ENGINE_HPP
+
+#include <memory>
+#include <unordered_map>
+#include <queue>
+#include <atomic>
+#include <thread>
+#include <chrono>
+#include "tick_loader.hpp"
+#include "order_book.hpp"
+#include "latency_simulator.hpp"
+#include "fill_simulator.hpp"
+
+namespace replay {
+
+class ReplayEngine {
+public:
+    enum class ReplaySpeed {
+        REALTIME,
+        FAST_2X,
+        FAST_10X,
+        FAST_100X,
+        MAX_SPEED,
+        STEP_BY_STEP
+    };
+
+    struct Config {
+        ReplaySpeed speed = ReplaySpeed::MAX_SPEED;
+        bool simulate_latency = true;
+        std::string latency_model = "historical";
+        uint64_t start_time = 0;
+        uint64_t end_time = UINT64_MAX;
+        bool enable_fill_simulation = true;
+        bool deterministic = true;
+        uint64_t random_seed = 12345;
+        bool validate_sequencing = true;
+        bool log_events = false;
+        bool track_statistics = true;
+        size_t max_event_queue_size = 10000000;
+    };
+
+    // Market data event
+    struct MarketEvent {
+        enum class Type : uint8_t {
+            QUOTE,
+            TRADE,
+            BOOK_SNAPSHOT,
+            BOOK_UPDATE,
+            ORDER_ACK,
+            ORDER_REJECT,
+            FILL,
+            PARTIAL_FILL,
+            CANCEL_ACK,
+            SYSTEM_EVENT
+        };
+
+        Type type;
+        std::string symbol;
+        uint64_t timestamp;
+        uint64_t exchange_timestamp;
+        uint64_t sequence_number;
+
+        // Quote/Trade data
+        Side side;
+        int64_t price;
+        int64_t size;
+        int32_t book_level;
+
+        // Order data
+        uint64_t order_id;
+        uint64_t client_order_id;
+        int64_t leaves_qty;
+        int64_t cum_qty;
+
+        // System event
+        std::string message;
+
+        MarketEvent()
+            : type(Type::QUOTE)
+            , timestamp(0)
+            , exchange_timestamp(0)
+            , sequence_number(0)
+            , side(Side::BUY)
+            , price(0)
+            , size(0)
+            , book_level(0)
+            , order_id(0)
+            , client_order_id(0)
+            , leaves_qty(0)
+            , cum_qty(0)
+        {}
+    };
+
+    // Strategy interface
+    class IStrategy {
+    public:
+        virtual ~IStrategy() = default;
+
+        virtual void onMarketData(const MarketEvent& event) = 0;
+        virtual void onOrderUpdate(const MarketEvent& event) = 0;
+        virtual void onSystemEvent(const MarketEvent& event) = 0;
+
+        // Strategy can send orders through replay engine
+        virtual void setReplayEngine(ReplayEngine* engine) {
+            replay_engine_ = engine;
+        }
+
+    protected:
+        ReplayEngine* replay_engine_ = nullptr;
+    };
+
+    // Order submitted by strategy
+    struct Order {
+        uint64_t client_order_id;
+        std::string symbol;
+        Side side;
+        int64_t price;
+        int64_t quantity;
+        OrderType type;
+        TimeInForce tif;
+        uint64_t submit_timestamp;
+
+        // Filled by replay engine
+        uint64_t exchange_order_id;
+        OrderState state;
+        int64_t filled_qty;
+        int64_t avg_fill_price;
+    };
+
+    explicit ReplayEngine(const Config& config);
+    ~ReplayEngine();
+
+    // Setup
+    bool loadTickData(const std::string& symbol, const std::string& path);
+    void subscribe(const std::string& symbol, IStrategy* strategy);
+
+    // Execution control
+    void run();
+    bool step();  // Single step (for debugging)
+    void pause();
+    void resume();
+    void stop();
+
+    // Order interface (called by strategy)
+    uint64_t submitOrder(const Order& order);
+    bool cancelOrder(uint64_t client_order_id);
+    bool modifyOrder(uint64_t client_order_id, int64_t new_price, int64_t new_qty);
+
+    // Query interface
+    uint64_t getCurrentTime() const { return current_time_; }
+    const OrderBook* getOrderBook(const std::string& symbol) const;
+    Order getOrderStatus(uint64_t client_order_id) const;
+
+    // Statistics
+    struct Statistics {
+        uint64_t events_processed;
+        uint64_t market_events;
+        uint64_t order_events;
+        uint64_t orders_submitted;
+        uint64_t orders_filled;
+        uint64_t orders_rejected;
+        uint64_t orders_cancelled;
+        double avg_latency_us;
+        double p50_latency_us;
+        double p95_latency_us;
+        double p99_latency_us;
+        double replay_duration_sec;
+        double wall_duration_sec;
+        double speedup_factor;
+    };
+
+    Statistics getStatistics() const;
+    void printStatistics() const;
+
+private:
+    // Event queue with timestamp ordering
+    struct TimestampedEvent {
+        uint64_t timestamp;
+        MarketEvent event;
+        uint32_t priority;
+
+        bool operator>(const TimestampedEvent& other) const {
+            if (timestamp != other.timestamp)
+                return timestamp > other.timestamp;
+            return priority > other.priority;
+        }
+    };
+
+    using EventQueue = std::priority_queue<
+        TimestampedEvent,
+        std::vector<TimestampedEvent>,
+        std::greater<TimestampedEvent>
+    >;
+
+    // Internal methods
+    void enqueueTicks(const std::string& symbol);
+    void processEvent(const MarketEvent& event);
+    void processQuote(const MarketEvent& event);
+    void processTrade(const MarketEvent& event);
+    void processBookUpdate(const MarketEvent& event);
+    void processOrderAck(const MarketEvent& event);
+    void processFill(const MarketEvent& event);
+    void controlTiming(uint64_t event_timestamp);
+    void checkPendingFills(const std::string& symbol);
+    void logProgress();
+
+    MarketEvent createMarketEvent(const std::string& symbol,
+                                 const TickLoader::Tick& tick);
+
+    // Member variables
+    Config config_;
+    std::mt19937_64 random_generator_;
+
+    std::unordered_map<std::string, std::unique_ptr<TickLoader>> tick_loaders_;
+    std::unordered_map<std::string, std::vector<IStrategy*>> subscribers_;
+
+    EventQueue event_queue_;
+
+    std::unique_ptr<LatencySimulator> latency_simulator_;
+    std::unique_ptr<FillSimulator> fill_simulator_;
+
+    std::unordered_map<std::string, std::unique_ptr<OrderBook>> order_books_;
+    std::unordered_map<uint64_t, Order> pending_orders_;
+    std::unordered_map<uint64_t, Order> all_orders_;
+
+    uint64_t current_time_{0};
+    uint64_t next_order_id_{1};
+
+    std::atomic<bool> running_{false};
+    std::atomic<bool> paused_{false};
+
+    // Statistics
+    mutable std::mutex stats_mutex_;
+    Statistics statistics_;
+    std::vector<double> latency_samples_;
+
+    std::chrono::steady_clock::time_point start_wall_time_;
+    uint64_t start_replay_time_;
+};
+
+// ============================================================================
+// IMPLEMENTATION
+// ============================================================================
+
+ReplayEngine::ReplayEngine(const Config& config)
+    : config_(config)
+    , random_generator_(config.random_seed)
+{
+    memset(&statistics_, 0, sizeof(statistics_));
+
+    if (config_.simulate_latency) {
+        latency_simulator_ = LatencySimulator::create(config_.latency_model);
+    }
+
+    if (config_.enable_fill_simulation) {
+        fill_simulator_ = std::make_unique<FillSimulator>();
+    }
+
+    LOG_INFO("ReplayEngine created with config:");
+    LOG_INFO("  Speed: {}", static_cast<int>(config_.speed));
+    LOG_INFO("  Simulate latency: {}", config_.simulate_latency);
+    LOG_INFO("  Fill simulation: {}", config_.enable_fill_simulation);
+    LOG_INFO("  Deterministic: {}", config_.deterministic);
+}
+
+ReplayEngine::~ReplayEngine() {
+    stop();
+}
+
+bool ReplayEngine::loadTickData(const std::string& symbol,
+                                const std::string& path) {
+    auto loader = std::make_unique<TickLoader>();
+    if (!loader->loadTickFile(path)) {
+        LOG_ERROR("Failed to load tick data for {} from {}", symbol, path);
+        return false;
+    }
+
+    tick_loaders_[symbol] = std::move(loader);
+
+    // Create order book for symbol
+    order_books_[symbol] = std::make_unique<OrderBook>(symbol);
+
+    LOG_INFO("Loaded tick data for {}: {} ticks", symbol,
+             tick_loaders_[symbol]->getTickCount());
+
+    return true;
+}
+
+void ReplayEngine::subscribe(const std::string& symbol, IStrategy* strategy) {
+    subscribers_[symbol].push_back(strategy);
+    strategy->setReplayEngine(this);
+    LOG_INFO("Strategy subscribed to {}", symbol);
+}
+
+void ReplayEngine::run() {
+    if (running_.load()) {
+        LOG_ERROR("Replay already running");
+        return;
+    }
+
+    LOG_INFO("Starting replay from {} to {}",
+             formatTimestamp(config_.start_time),
+             formatTimestamp(config_.end_time));
+
+    running_.store(true);
+    paused_.store(false);
+
+    // Enqueue all ticks from all symbols
+    for (const auto& [symbol, loader] : tick_loaders_) {
+        enqueueTicks(symbol);
+    }
+
+    LOG_INFO("Event queue size: {}", event_queue_.size());
+
+    current_time_ = config_.start_time;
+    start_wall_time_ = std::chrono::steady_clock::now();
+    start_replay_time_ = current_time_;
+
+    // Send market open event
+    MarketEvent open_event;
+    open_event.type = MarketEvent::Type::SYSTEM_EVENT;
+    open_event.timestamp = current_time_;
+    open_event.message = "MARKET_OPEN";
+
+    for (const auto& [symbol, strategies] : subscribers_) {
+        for (auto* strategy : strategies) {
+            strategy->onSystemEvent(open_event);
+        }
+    }
+
+    // Main replay loop
+    while (running_.load() && !event_queue_.empty()) {
+        // Handle pause
+        while (paused_.load() && running_.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+
+        if (!running_.load()) break;
+
+        // Get next event
+        TimestampedEvent timed_event = event_queue_.top();
+        event_queue_.pop();
+
+        // Check if beyond end time
+        if (timed_event.timestamp > config_.end_time) {
+            break;
+        }
+
+        // Update current time
+        current_time_ = timed_event.timestamp;
+
+        // Timing control
+        controlTiming(timed_event.timestamp);
+
+        // Process event
+        processEvent(timed_event.event);
+
+        statistics_.events_processed++;
+
+        // Progress logging
+        if (statistics_.events_processed % 100000 == 0) {
+            logProgress();
+        }
+    }
+
+    // Send market close event
+    MarketEvent close_event;
+    close_event.type = MarketEvent::Type::SYSTEM_EVENT;
+    close_event.timestamp = current_time_;
+    close_event.message = "MARKET_CLOSE";
+
+    for (const auto& [symbol, strategies] : subscribers_) {
+        for (auto* strategy : strategies) {
+            strategy->onSystemEvent(close_event);
+        }
+    }
+
+    auto end_wall_time = std::chrono::steady_clock::now();
+    statistics_.wall_duration_sec =
+        std::chrono::duration<double>(end_wall_time - start_wall_time_).count();
+    statistics_.replay_duration_sec =
+        (current_time_ - start_replay_time_) / 1e9;
+    statistics_.speedup_factor =
+        statistics_.replay_duration_sec / statistics_.wall_duration_sec;
+
+    running_.store(false);
+
+    LOG_INFO("Replay completed");
+    printStatistics();
+}
+
+void ReplayEngine::enqueueTicks(const std::string& symbol) {
+    auto* loader = tick_loaders_[symbol].get();
+    size_t enqueued = 0;
+
+    for (auto it = loader->begin(); it != loader->end(); ++it) {
+        const auto& tick = *it;
+
+        // Skip ticks outside time range
+        if (tick.exchange_timestamp < config_.start_time ||
+            tick.exchange_timestamp > config_.end_time) {
+            continue;
+        }
+
+        // Create market event
+        MarketEvent event = createMarketEvent(symbol, tick);
+
+        // Calculate event timestamp with latency
+        uint64_t event_time = tick.exchange_timestamp;
+
+        if (config_.simulate_latency && latency_simulator_) {
+            uint64_t latency_ns = latency_simulator_->sampleLatency(
+                tick.exchange_timestamp,
+                symbol
+            );
+            event_time += latency_ns;
+
+            if (config_.track_statistics) {
+                std::lock_guard<std::mutex> lock(stats_mutex_);
+                latency_samples_.push_back(latency_ns / 1000.0);  // Convert to microseconds
+            }
+        }
+
+        // Priority: market data = 0, order acks = 1, fills = 2
+        uint32_t priority = 0;
+        if (event.type == MarketEvent::Type::ORDER_ACK) priority = 1;
+        if (event.type == MarketEvent::Type::FILL) priority = 2;
+
+        event_queue_.push(TimestampedEvent{event_time, event, priority});
+        enqueued++;
+    }
+
+    LOG_INFO("Enqueued {} events for {}", enqueued, symbol);
+}
+
+void ReplayEngine::processEvent(const MarketEvent& event) {
+    switch (event.type) {
+        case MarketEvent::Type::QUOTE:
+            processQuote(event);
+            statistics_.market_events++;
+            break;
+
+        case MarketEvent::Type::TRADE:
+            processTrade(event);
+            statistics_.market_events++;
+            break;
+
+        case MarketEvent::Type::BOOK_UPDATE:
+            processBookUpdate(event);
+            statistics_.market_events++;
+            break;
+
+        case MarketEvent::Type::ORDER_ACK:
+            processOrderAck(event);
+            statistics_.order_events++;
+            break;
+
+        case MarketEvent::Type::FILL:
+        case MarketEvent::Type::PARTIAL_FILL:
+            processFill(event);
+            statistics_.order_events++;
+            break;
+
+        default:
+            break;
+    }
+
+    // Dispatch to subscribers
+    auto it = subscribers_.find(event.symbol);
+    if (it != subscribers_.end()) {
+        for (auto* strategy : it->second) {
+            if (event.type == MarketEvent::Type::QUOTE ||
+                event.type == MarketEvent::Type::TRADE ||
+                event.type == MarketEvent::Type::BOOK_UPDATE) {
+                strategy->onMarketData(event);
+            } else {
+                strategy->onOrderUpdate(event);
+            }
+        }
+    }
+}
+
+void ReplayEngine::processQuote(const MarketEvent& event) {
+    auto it = order_books_.find(event.symbol);
+    if (it == order_books_.end()) {
+        return;
+    }
+
+    // Update order book
+    it->second->updateLevel(event.side, event.price, event.size, event.book_level);
+
+    // Check for fills on pending orders
+    if (fill_simulator_) {
+        checkPendingFills(event.symbol);
+    }
+}
+
+void ReplayEngine::processTrade(const MarketEvent& event) {
+    // Update last trade price
+    auto it = order_books_.find(event.symbol);
+    if (it != order_books_.end()) {
+        it->second->updateLastTrade(event.price, event.size, event.side);
+    }
+
+    // Check aggressive fills
+    if (fill_simulator_) {
+        checkPendingFills(event.symbol);
+    }
+}
+
+void ReplayEngine::processBookUpdate(const MarketEvent& event) {
+    auto it = order_books_.find(event.symbol);
+    if (it == order_books_.end()) {
+        return;
+    }
+
+    it->second->updateLevel(event.side, event.price, event.size, event.book_level);
+
+    if (fill_simulator_) {
+        checkPendingFills(event.symbol);
+    }
+}
+
+void ReplayEngine::processOrderAck(const MarketEvent& event) {
+    auto it = pending_orders_.find(event.client_order_id);
+    if (it == pending_orders_.end()) {
+        LOG_WARN("Received ack for unknown order: {}", event.client_order_id);
+        return;
+    }
+
+    it->second.exchange_order_id = event.order_id;
+    it->second.state = OrderState::WORKING;
+}
+
+void ReplayEngine::processFill(const MarketEvent& event) {
+    auto it = pending_orders_.find(event.client_order_id);
+    if (it == pending_orders_.end()) {
+        LOG_WARN("Received fill for unknown order: {}", event.client_order_id);
+        return;
+    }
+
+    Order& order = it->second;
+    order.filled_qty += (event.cum_qty - order.filled_qty);
+
+    if (order.filled_qty == order.quantity) {
+        order.state = OrderState::FILLED;
+        pending_orders_.erase(it);
+        statistics_.orders_filled++;
+    } else {
+        order.state = OrderState::PARTIAL_FILLED;
+    }
+}
+
+void ReplayEngine::checkPendingFills(const std::string& symbol) {
+    auto book_it = order_books_.find(symbol);
+    if (book_it == order_books_.end()) {
+        return;
+    }
+
+    const OrderBook* book = book_it->second.get();
+
+    // Check all pending orders for this symbol
+    for (auto it = pending_orders_.begin(); it != pending_orders_.end(); ) {
+        Order& order = it->second;
+
+        if (order.symbol != symbol || order.state != OrderState::WORKING) {
+            ++it;
+            continue;
+        }
+
+        // Check if order should fill
+        FillSimulator::FillResult fill = fill_simulator_->checkFill(
+            order,
+            *book,
+            current_time_
+        );
+
+        if (fill.filled_qty > 0) {
+            // Create fill event
+            MarketEvent fill_event;
+            fill_event.type = (fill.filled_qty == order.quantity - order.filled_qty)
+                ? MarketEvent::Type::FILL
+                : MarketEvent::Type::PARTIAL_FILL;
+            fill_event.symbol = symbol;
+            fill_event.timestamp = current_time_;
+            fill_event.client_order_id = order.client_order_id;
+            fill_event.order_id = order.exchange_order_id;
+            fill_event.cum_qty = order.filled_qty + fill.filled_qty;
+            fill_event.leaves_qty = order.quantity - fill_event.cum_qty;
+            fill_event.price = fill.fill_price;
+            fill_event.size = fill.filled_qty;
+
+            // Add to event queue with high priority
+            event_queue_.push(TimestampedEvent{
+                current_time_,
+                fill_event,
+                2  // Fill priority
+            });
+
+            // Update order
+            order.filled_qty += fill.filled_qty;
+            order.avg_fill_price = fill.fill_price;
+
+            if (order.filled_qty == order.quantity) {
+                order.state = OrderState::FILLED;
+                it = pending_orders_.erase(it);
+                statistics_.orders_filled++;
+                continue;
+            } else {
+                order.state = OrderState::PARTIAL_FILLED;
+            }
+        }
+
+        ++it;
+    }
+}
+
+uint64_t ReplayEngine::submitOrder(const Order& order) {
+    Order new_order = order;
+    new_order.client_order_id = next_order_id_++;
+    new_order.submit_timestamp = current_time_;
+    new_order.state = OrderState::PENDING;
+    new_order.filled_qty = 0;
+
+    all_orders_[new_order.client_order_id] = new_order;
+    pending_orders_[new_order.client_order_id] = new_order;
+
+    statistics_.orders_submitted++;
+
+    // Simulate order ack with latency
+    uint64_t ack_latency = config_.simulate_latency && latency_simulator_
+        ? latency_simulator_->sampleLatency(current_time_, order.symbol)
+        : 0;
+
+    MarketEvent ack_event;
+    ack_event.type = MarketEvent::Type::ORDER_ACK;
+    ack_event.symbol = order.symbol;
+    ack_event.timestamp = current_time_ + ack_latency;
+    ack_event.client_order_id = new_order.client_order_id;
+    ack_event.order_id = next_order_id_ + 1000000;  // Simulated exchange ID
+
+    event_queue_.push(TimestampedEvent{
+        current_time_ + ack_latency,
+        ack_event,
+        1  // Order ack priority
+    });
+
+    return new_order.client_order_id;
+}
+
+void ReplayEngine::controlTiming(uint64_t event_timestamp) {
+    if (config_.speed == ReplaySpeed::MAX_SPEED ||
+        config_.speed == ReplaySpeed::STEP_BY_STEP) {
+        return;
+    }
+
+    uint64_t replay_elapsed = event_timestamp - start_replay_time_;
+
+    double speed_multiplier = 1.0;
+    switch (config_.speed) {
+        case ReplaySpeed::REALTIME:   speed_multiplier = 1.0; break;
+        case ReplaySpeed::FAST_2X:    speed_multiplier = 2.0; break;
+        case ReplaySpeed::FAST_10X:   speed_multiplier = 10.0; break;
+        case ReplaySpeed::FAST_100X:  speed_multiplier = 100.0; break;
+        default: break;
+    }
+
+    uint64_t target_wall_ns = replay_elapsed / speed_multiplier;
+
+    auto now = std::chrono::steady_clock::now();
+    auto actual_wall = now - start_wall_time_;
+    uint64_t actual_wall_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(actual_wall).count();
+
+    if (actual_wall_ns < target_wall_ns) {
+        uint64_t sleep_ns = target_wall_ns - actual_wall_ns;
+        std::this_thread::sleep_for(std::chrono::nanoseconds(sleep_ns));
+    }
+}
+
+void ReplayEngine::printStatistics() const {
+    Statistics stats = getStatistics();
+
+    LOG_INFO("=== Replay Statistics ===");
+    LOG_INFO("Events processed: {}", stats.events_processed);
+    LOG_INFO("  Market events: {}", stats.market_events);
+    LOG_INFO("  Order events: {}", stats.order_events);
+    LOG_INFO("Orders submitted: {}", stats.orders_submitted);
+    LOG_INFO("Orders filled: {}", stats.orders_filled);
+    LOG_INFO("Orders rejected: {}", stats.orders_rejected);
+    LOG_INFO("Orders cancelled: {}", stats.orders_cancelled);
+    LOG_INFO("Latency statistics:");
+    LOG_INFO("  Average: {:.2f} us", stats.avg_latency_us);
+    LOG_INFO("  P50: {:.2f} us", stats.p50_latency_us);
+    LOG_INFO("  P95: {:.2f} us", stats.p95_latency_us);
+    LOG_INFO("  P99: {:.2f} us", stats.p99_latency_us);
+    LOG_INFO("Duration:");
+    LOG_INFO("  Replay time: {:.2f} sec", stats.replay_duration_sec);
+    LOG_INFO("  Wall time: {:.2f} sec", stats.wall_duration_sec);
+    LOG_INFO("  Speedup: {:.1f}x", stats.speedup_factor);
+}
+
+} // namespace replay
+
+#endif // REPLAY_ENGINE_HPP
+
+================================================================================
+USAGE EXAMPLE
+================================================================================
+
+#include "replay_engine.hpp"
+
+class MyStrategy : public replay::ReplayEngine::IStrategy {
+public:
+    void onMarketData(const replay::ReplayEngine::MarketEvent& event) override {
+        // Handle market data
+        if (event.type == replay::ReplayEngine::MarketEvent::Type::QUOTE) {
+            // Check signal
+            if (checkBuySignal(event)) {
+                // Submit order through replay engine
+                replay::ReplayEngine::Order order;
+                order.symbol = event.symbol;
+                order.side = Side::BUY;
+                order.price = event.price;
+                order.quantity = 100;
+                order.type = OrderType::LIMIT;
+                order.tif = TimeInForce::DAY;
+
+                uint64_t order_id = replay_engine_->submitOrder(order);
+            }
+        }
+    }
+
+    void onOrderUpdate(const replay::ReplayEngine::MarketEvent& event) override {
+        // Handle order updates
+        if (event.type == replay::ReplayEngine::MarketEvent::Type::FILL) {
+            LOG_INFO("Order filled: {} @ {}", event.size, event.price);
+        }
+    }
+
+    void onSystemEvent(const replay::ReplayEngine::MarketEvent& event) override {
+        LOG_INFO("System event: {}", event.message);
+    }
+
+private:
+    bool checkBuySignal(const replay::ReplayEngine::MarketEvent& event) {
+        // Strategy logic
+        return false;
+    }
+};
+
+int main() {
+    // Configure replay
+    replay::ReplayEngine::Config config;
+    config.speed = replay::ReplayEngine::ReplaySpeed::MAX_SPEED;
+    config.simulate_latency = true;
+    config.enable_fill_simulation = true;
+
+    // Create replay engine
+    replay::ReplayEngine engine(config);
+
+    // Load captured tick data
+    engine.loadTickData("ES", "/data/ticks/2024-01-15/ES.ticks");
+
+    // Create and subscribe strategy
+    MyStrategy strategy;
+    engine.subscribe("ES", &strategy);
+
+    // Run replay
+    engine.run();
+
+    return 0;
+}
+
+================================================================================
+NEXT: Read 04_latency_simulation.txt for latency modeling details
+================================================================================

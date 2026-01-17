@@ -1,0 +1,1025 @@
+================================================================================
+CONTINUOUS BUILD SYSTEMS FOR HFT
+================================================================================
+
+OVERVIEW
+--------
+Continuous Integration/Continuous Deployment (CI/CD) ensures code quality,
+automated testing, and reliable deployment for HFT systems. This guide covers
+GitHub Actions, Jenkins, ccache for faster builds, artifact management, and
+automated deployment pipelines optimized for low-latency trading systems.
+
+================================================================================
+SECTION 1: CCACHE FOR FASTER BUILDS
+================================================================================
+
+1.1 INSTALLING AND CONFIGURING CCACHE
+--------------------------------------
+
+Installation:
+
+```bash
+# Ubuntu/Debian
+sudo apt-get install ccache
+
+# Verify installation
+ccache --version
+
+# Check default configuration
+ccache -p
+```
+
+Configuration:
+
+```bash
+# Set cache size (10 GB recommended for large projects)
+ccache --set-config=max_size=10G
+
+# Enable compression
+ccache --set-config=compression=true
+ccache --set-config=compression_level=6
+
+# Set cache directory
+ccache --set-config=cache_dir=/var/cache/ccache
+
+# Show statistics
+ccache -s
+
+# Clear cache
+ccache -C
+
+# Zero statistics
+ccache -z
+```
+
+Configuration file: ~/.ccache/ccache.conf
+
+```ini
+max_size = 10.0G
+compression = true
+compression_level = 6
+cache_dir = /var/cache/ccache
+sloppiness = pch_defines,time_macros
+```
+
+1.2 INTEGRATING CCACHE WITH BUILDS
+-----------------------------------
+
+Command line:
+
+```bash
+# Use ccache as compiler wrapper
+export CC="ccache gcc"
+export CXX="ccache g++"
+
+# Build
+make -j$(nproc)
+
+# Or directly
+ccache g++ -O3 main.cpp -o trading_engine
+```
+
+CMake integration:
+
+```cmake
+# Option 1: Compiler launcher (recommended)
+find_program(CCACHE_PROGRAM ccache)
+if(CCACHE_PROGRAM)
+    message(STATUS "Found ccache: ${CCACHE_PROGRAM}")
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+    set(CMAKE_C_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+
+    # Configure ccache for CMake
+    set(ENV{CCACHE_SLOPPINESS} "pch_defines,time_macros")
+    set(ENV{CCACHE_MAXSIZE} "10G")
+else()
+    message(WARNING "ccache not found")
+endif()
+
+# Option 2: Set compiler directly (alternative)
+if(CCACHE_PROGRAM)
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+    set(CMAKE_C_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+endif()
+```
+
+Build script with ccache:
+
+```bash
+#!/bin/bash
+# build.sh
+
+set -euo pipefail
+
+# Enable ccache
+export CCACHE_DIR=/var/cache/ccache
+export CCACHE_MAXSIZE=10G
+
+# Show initial stats
+echo "=== ccache statistics (before) ==="
+ccache -s
+
+# Configure and build
+cmake -DCMAKE_BUILD_TYPE=Release -B build
+cmake --build build -j$(nproc)
+
+# Show final stats
+echo "=== ccache statistics (after) ==="
+ccache -s
+
+# Show cache hit rate
+ccache -s | grep "cache hit rate"
+```
+
+1.3 CCACHE IN CI/CD
+-------------------
+
+GitHub Actions with ccache:
+
+```yaml
+# .github/workflows/build.yml
+name: Build with ccache
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ccache cmake g++-11
+
+      - name: Prepare ccache timestamp
+        id: ccache_cache_timestamp
+        run: echo "timestamp=$(date +%Y-%m-%d-%H-%M-%S)" >> $GITHUB_OUTPUT
+
+      - name: Cache ccache files
+        uses: actions/cache@v3
+        with:
+          path: ~/.ccache
+          key: ccache-${{ runner.os }}-${{ steps.ccache_cache_timestamp.outputs.timestamp }}
+          restore-keys: |
+            ccache-${{ runner.os }}-
+
+      - name: Configure ccache
+        run: |
+          ccache --set-config=max_size=2G
+          ccache --set-config=compression=true
+          ccache -z
+
+      - name: Build
+        run: |
+          cmake -DCMAKE_BUILD_TYPE=Release -B build
+          cmake --build build -j$(nproc)
+
+      - name: ccache statistics
+        run: ccache -s
+```
+
+================================================================================
+SECTION 2: GITHUB ACTIONS
+================================================================================
+
+2.1 BASIC BUILD PIPELINE
+-------------------------
+
+.github/workflows/ci.yml:
+
+```yaml
+name: CI Build
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake \
+            g++-11 \
+            ninja-build \
+            ccache \
+            libboost-all-dev \
+            libssl-dev
+
+      - name: Setup ccache
+        uses: actions/cache@v3
+        with:
+          path: ~/.ccache
+          key: ccache-${{ runner.os }}-${{ github.sha }}
+          restore-keys: ccache-${{ runner.os }}-
+
+      - name: Configure CMake
+        run: |
+          cmake -G Ninja \
+                -DCMAKE_BUILD_TYPE=$BUILD_TYPE \
+                -DCMAKE_CXX_COMPILER=g++-11 \
+                -DBUILD_TESTS=ON \
+                -B build
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Run tests
+        run: |
+          cd build
+          ctest --output-on-failure
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: trading-engine-${{ github.sha }}
+          path: build/bin/trading_engine
+```
+
+2.2 MULTI-COMPILER BUILD
+-------------------------
+
+.github/workflows/multi-compiler.yml:
+
+```yaml
+name: Multi-Compiler Build
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    name: Build with ${{ matrix.compiler }}
+    runs-on: ubuntu-22.04
+
+    strategy:
+      matrix:
+        compiler:
+          - { cc: gcc-11, cxx: g++-11 }
+          - { cc: gcc-12, cxx: g++-12 }
+          - { cc: clang-14, cxx: clang++-14 }
+          - { cc: clang-15, cxx: clang++-15 }
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install compilers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.compiler.cxx }}
+
+      - name: Build
+        env:
+          CC: ${{ matrix.compiler.cc }}
+          CXX: ${{ matrix.compiler.cxx }}
+        run: |
+          cmake -DCMAKE_BUILD_TYPE=Release -B build
+          cmake --build build -j$(nproc)
+
+      - name: Test
+        run: |
+          cd build
+          ctest --output-on-failure
+```
+
+2.3 SANITIZER BUILDS
+--------------------
+
+.github/workflows/sanitizers.yml:
+
+```yaml
+name: Sanitizer Builds
+
+on: [push, pull_request]
+
+jobs:
+  sanitizers:
+    name: ${{ matrix.sanitizer }} Build
+    runs-on: ubuntu-22.04
+
+    strategy:
+      matrix:
+        sanitizer: [asan, tsan, ubsan]
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake clang-14
+
+      - name: Build with ${{ matrix.sanitizer }}
+        run: |
+          cmake -DCMAKE_BUILD_TYPE=${{ matrix.sanitizer }} \
+                -DCMAKE_CXX_COMPILER=clang++-14 \
+                -B build
+          cmake --build build -j$(nproc)
+
+      - name: Run tests
+        run: |
+          cd build
+          ctest --output-on-failure
+```
+
+2.4 PERFORMANCE BENCHMARKS
+---------------------------
+
+.github/workflows/benchmarks.yml:
+
+```yaml
+name: Performance Benchmarks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++-11 google-benchmark
+
+      - name: Build benchmarks
+        run: |
+          cmake -DCMAKE_BUILD_TYPE=Release \
+                -DBUILD_BENCHMARKS=ON \
+                -B build
+          cmake --build build -j$(nproc)
+
+      - name: Run benchmarks
+        run: |
+          ./build/bin/hft_benchmarks --benchmark_format=json \
+            --benchmark_out=benchmark_results.json
+
+      - name: Store benchmark result
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          tool: 'googlecpp'
+          output-file-path: benchmark_results.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: true
+```
+
+2.5 DEPLOYMENT PIPELINE
+-----------------------
+
+.github/workflows/deploy.yml:
+
+```yaml
+name: Deploy to Production
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++-11 ninja-build
+
+      - name: Build production binary
+        run: |
+          cmake -G Ninja \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_CXX_COMPILER=g++-11 \
+                -DCMAKE_CXX_FLAGS="-O3 -march=x86-64-v3" \
+                -B build
+          cmake --build build -j$(nproc)
+
+      - name: Strip binary
+        run: strip --strip-all build/bin/trading_engine
+
+      - name: Create deployment package
+        run: |
+          mkdir -p deploy/bin deploy/config deploy/scripts
+          cp build/bin/trading_engine deploy/bin/
+          cp config/production.json deploy/config/
+          cp scripts/*.sh deploy/scripts/
+          tar czf trading_engine-${{ github.ref_name }}.tar.gz deploy/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: trading_engine-${{ github.ref_name }}.tar.gz
+          generate_release_notes: true
+
+      - name: Deploy to production server
+        uses: appleboy/scp-action@master
+        with:
+          host: ${{ secrets.PROD_HOST }}
+          username: ${{ secrets.PROD_USER }}
+          key: ${{ secrets.PROD_SSH_KEY }}
+          source: "trading_engine-${{ github.ref_name }}.tar.gz"
+          target: "/opt/hft/releases/"
+
+      - name: Restart service
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.PROD_HOST }}
+          username: ${{ secrets.PROD_USER }}
+          key: ${{ secrets.PROD_SSH_KEY }}
+          script: |
+            cd /opt/hft/releases
+            tar xzf trading_engine-${{ github.ref_name }}.tar.gz
+            sudo systemctl stop hft-trading
+            sudo cp deploy/bin/trading_engine /opt/hft/bin/
+            sudo systemctl start hft-trading
+            sudo systemctl status hft-trading
+```
+
+================================================================================
+SECTION 3: JENKINS
+================================================================================
+
+3.1 JENKINS SETUP
+-----------------
+
+Install Jenkins:
+
+```bash
+# Install Java
+sudo apt-get install openjdk-11-jdk
+
+# Add Jenkins repository
+wget -q -O - https://pkg.jenkins.io/debian-stable/jenkins.io.key | sudo apt-key add -
+sudo sh -c 'echo deb https://pkg.jenkins.io/debian-stable binary/ > /etc/apt/sources.list.d/jenkins.list'
+
+# Install Jenkins
+sudo apt-get update
+sudo apt-get install jenkins
+
+# Start Jenkins
+sudo systemctl start jenkins
+sudo systemctl enable jenkins
+
+# Get initial admin password
+sudo cat /var/lib/jenkins/secrets/initialAdminPassword
+
+# Access Jenkins at http://localhost:8080
+```
+
+3.2 JENKINS PIPELINE
+--------------------
+
+Jenkinsfile:
+
+```groovy
+pipeline {
+    agent any
+
+    environment {
+        BUILD_TYPE = 'Release'
+        CC = 'gcc-11'
+        CXX = 'g++-11'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Install Dependencies') {
+            steps {
+                sh '''
+                    sudo apt-get update
+                    sudo apt-get install -y cmake ninja-build ccache \
+                        libboost-all-dev libssl-dev
+                '''
+            }
+        }
+
+        stage('Configure') {
+            steps {
+                sh '''
+                    cmake -G Ninja \
+                          -DCMAKE_BUILD_TYPE=$BUILD_TYPE \
+                          -DCMAKE_CXX_COMPILER=$CXX \
+                          -DBUILD_TESTS=ON \
+                          -B build
+                '''
+            }
+        }
+
+        stage('Build') {
+            steps {
+                sh 'cmake --build build -j$(nproc)'
+            }
+        }
+
+        stage('Test') {
+            steps {
+                sh '''
+                    cd build
+                    ctest --output-on-failure --no-compress-output -T Test
+                '''
+            }
+            post {
+                always {
+                    xunit([CTest(pattern: 'build/Testing/**/*.xml')])
+                }
+            }
+        }
+
+        stage('Static Analysis') {
+            steps {
+                sh '''
+                    clang-tidy src/*.cpp -- -std=c++20 > clang-tidy-report.txt || true
+                '''
+            }
+        }
+
+        stage('Benchmarks') {
+            steps {
+                sh '''
+                    ./build/bin/hft_benchmarks --benchmark_format=json \
+                        --benchmark_out=benchmark.json
+                '''
+            }
+        }
+
+        stage('Package') {
+            steps {
+                sh '''
+                    mkdir -p artifacts
+                    cp build/bin/trading_engine artifacts/
+                    tar czf trading_engine-${BUILD_NUMBER}.tar.gz artifacts/
+                '''
+            }
+        }
+
+        stage('Archive') {
+            steps {
+                archiveArtifacts artifacts: 'trading_engine-*.tar.gz'
+            }
+        }
+
+        stage('Deploy to Staging') {
+            when {
+                branch 'develop'
+            }
+            steps {
+                sh '''
+                    scp trading_engine-${BUILD_NUMBER}.tar.gz \
+                        staging@staging.hft.com:/opt/hft/releases/
+                    ssh staging@staging.hft.com \
+                        "cd /opt/hft/releases && \
+                         tar xzf trading_engine-${BUILD_NUMBER}.tar.gz && \
+                         sudo systemctl restart hft-trading-staging"
+                '''
+            }
+        }
+
+        stage('Deploy to Production') {
+            when {
+                branch 'main'
+            }
+            steps {
+                input message: 'Deploy to production?', ok: 'Deploy'
+                sh '''
+                    scp trading_engine-${BUILD_NUMBER}.tar.gz \
+                        prod@prod.hft.com:/opt/hft/releases/
+                    ssh prod@prod.hft.com \
+                        "cd /opt/hft/releases && \
+                         tar xzf trading_engine-${BUILD_NUMBER}.tar.gz && \
+                         sudo systemctl restart hft-trading"
+                '''
+            }
+        }
+    }
+
+    post {
+        always {
+            cleanWs()
+        }
+        success {
+            emailext(
+                subject: "Build Successful: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                body: "Build succeeded",
+                to: "dev@hft.com"
+            )
+        }
+        failure {
+            emailext(
+                subject: "Build Failed: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                body: "Build failed",
+                to: "dev@hft.com"
+            )
+        }
+    }
+}
+```
+
+3.3 PARALLEL BUILDS IN JENKINS
+-------------------------------
+
+```groovy
+pipeline {
+    agent any
+
+    stages {
+        stage('Parallel Builds') {
+            parallel {
+                stage('GCC Build') {
+                    steps {
+                        sh '''
+                            cmake -DCMAKE_CXX_COMPILER=g++-11 -B build-gcc
+                            cmake --build build-gcc -j$(nproc)
+                        '''
+                    }
+                }
+                stage('Clang Build') {
+                    steps {
+                        sh '''
+                            cmake -DCMAKE_CXX_COMPILER=clang++-14 -B build-clang
+                            cmake --build build-clang -j$(nproc)
+                        '''
+                    }
+                }
+                stage('ASan Build') {
+                    steps {
+                        sh '''
+                            cmake -DCMAKE_BUILD_TYPE=Asan -B build-asan
+                            cmake --build build-asan -j$(nproc)
+                        '''
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+3.4 JENKINS SHARED LIBRARY
+---------------------------
+
+vars/buildHFT.groovy:
+
+```groovy
+def call(Map config = [:]) {
+    pipeline {
+        agent any
+
+        stages {
+            stage('Build') {
+                steps {
+                    script {
+                        def compiler = config.compiler ?: 'g++-11'
+                        def buildType = config.buildType ?: 'Release'
+
+                        sh """
+                            cmake -DCMAKE_CXX_COMPILER=${compiler} \
+                                  -DCMAKE_BUILD_TYPE=${buildType} \
+                                  -B build
+                            cmake --build build -j\$(nproc)
+                        """
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+Usage:
+
+```groovy
+// Jenkinsfile
+@Library('hft-pipeline') _
+
+buildHFT(compiler: 'g++-11', buildType: 'Release')
+```
+
+================================================================================
+SECTION 4: DOCKER FOR CI/CD
+================================================================================
+
+4.1 BUILD CONTAINER
+-------------------
+
+Dockerfile.build:
+
+```dockerfile
+FROM ubuntu:22.04
+
+# Install build tools
+RUN apt-get update && apt-get install -y \
+    cmake \
+    ninja-build \
+    g++-11 \
+    clang-14 \
+    ccache \
+    git \
+    libboost-all-dev \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set up ccache
+RUN ccache --set-config=max_size=10G && \
+    ccache --set-config=compression=true
+
+ENV CC=gcc-11
+ENV CXX=g++-11
+
+WORKDIR /workspace
+```
+
+Build in Docker:
+
+```bash
+# Build image
+docker build -f Dockerfile.build -t hft-builder .
+
+# Run build in container
+docker run --rm -v $(pwd):/workspace hft-builder \
+    bash -c "cmake -G Ninja -B build && cmake --build build -j$(nproc)"
+
+# Extract artifacts
+docker run --rm -v $(pwd):/workspace hft-builder \
+    cp build/bin/trading_engine /workspace/artifacts/
+```
+
+4.2 MULTI-STAGE DOCKERFILE
+---------------------------
+
+Dockerfile:
+
+```dockerfile
+# Build stage
+FROM ubuntu:22.04 AS builder
+
+RUN apt-get update && apt-get install -y \
+    cmake ninja-build g++-11 ccache \
+    libboost-all-dev libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY . .
+
+RUN cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -B build && \
+    cmake --build build -j$(nproc) && \
+    strip --strip-all build/bin/trading_engine
+
+# Runtime stage
+FROM ubuntu:22.04
+
+RUN apt-get update && apt-get install -y \
+    libboost-system1.74.0 \
+    libboost-thread1.74.0 \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create user
+RUN useradd -m -u 1000 hft
+
+WORKDIR /opt/hft
+COPY --from=builder /build/build/bin/trading_engine bin/
+COPY config/ config/
+
+# Set ownership
+RUN chown -R hft:hft /opt/hft
+
+USER hft
+
+ENTRYPOINT ["/opt/hft/bin/trading_engine"]
+CMD ["--config", "/opt/hft/config/production.json"]
+```
+
+Build and run:
+
+```bash
+# Build image
+docker build -t hft-trading:latest .
+
+# Run container
+docker run -d \
+    --name hft-trading \
+    --network host \
+    --restart unless-stopped \
+    -v /etc/hft:/etc/hft:ro \
+    -v /var/log/hft:/var/log/hft \
+    hft-trading:latest
+```
+
+================================================================================
+SECTION 5: ARTIFACT MANAGEMENT
+================================================================================
+
+5.1 ARTIFACTORY
+---------------
+
+Upload to Artifactory:
+
+```bash
+#!/bin/bash
+# upload_artifact.sh
+
+ARTIFACT="trading_engine-${VERSION}.tar.gz"
+ARTIFACTORY_URL="https://artifactory.hft.com/artifactory"
+REPO="hft-binaries"
+
+curl -u "${ARTIFACTORY_USER}:${ARTIFACTORY_PASSWORD}" \
+     -T "${ARTIFACT}" \
+     "${ARTIFACTORY_URL}/${REPO}/releases/${VERSION}/${ARTIFACT}"
+```
+
+Download from Artifactory:
+
+```bash
+#!/bin/bash
+# download_artifact.sh
+
+VERSION="$1"
+ARTIFACT="trading_engine-${VERSION}.tar.gz"
+ARTIFACTORY_URL="https://artifactory.hft.com/artifactory"
+REPO="hft-binaries"
+
+curl -u "${ARTIFACTORY_USER}:${ARTIFACTORY_PASSWORD}" \
+     -O "${ARTIFACTORY_URL}/${REPO}/releases/${VERSION}/${ARTIFACT}"
+```
+
+5.2 GITHUB RELEASES
+-------------------
+
+Create release with GitHub CLI:
+
+```bash
+#!/bin/bash
+# create_release.sh
+
+VERSION="$1"
+ARTIFACT="trading_engine-${VERSION}.tar.gz"
+
+# Create release
+gh release create "v${VERSION}" \
+    --title "Release v${VERSION}" \
+    --notes "Automated release v${VERSION}" \
+    "${ARTIFACT}"
+```
+
+5.3 VERSION TRACKING
+--------------------
+
+CMakeLists.txt:
+
+```cmake
+# Extract version from git
+execute_process(
+    COMMAND git describe --tags --always
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    OUTPUT_VARIABLE GIT_VERSION
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+
+# Configure version header
+configure_file(
+    ${CMAKE_SOURCE_DIR}/include/version.h.in
+    ${CMAKE_BINARY_DIR}/generated/version.h
+)
+```
+
+version.h.in:
+
+```cpp
+#pragma once
+
+namespace hft {
+namespace version {
+
+constexpr const char* git_version = "@GIT_VERSION@";
+constexpr const char* build_date = __DATE__ " " __TIME__;
+constexpr const char* compiler = "@CMAKE_CXX_COMPILER_ID@ @CMAKE_CXX_COMPILER_VERSION@";
+
+}  // namespace version
+}  // namespace hft
+```
+
+Usage:
+
+```cpp
+#include "version.h"
+#include <iostream>
+
+int main() {
+    std::cout << "Version: " << hft::version::git_version << "\n";
+    std::cout << "Built: " << hft::version::build_date << "\n";
+    std::cout << "Compiler: " << hft::version::compiler << "\n";
+    return 0;
+}
+```
+
+================================================================================
+SECTION 6: BUILD MONITORING
+================================================================================
+
+6.1 BUILD METRICS
+-----------------
+
+Collect build metrics:
+
+```bash
+#!/bin/bash
+# build_metrics.sh
+
+BUILD_START=$(date +%s)
+
+# Build
+cmake --build build -j$(nproc)
+
+BUILD_END=$(date +%s)
+BUILD_TIME=$((BUILD_END - BUILD_START))
+
+# Collect metrics
+BINARY_SIZE=$(stat -f%z build/bin/trading_engine 2>/dev/null || stat -c%s build/bin/trading_engine)
+SYMBOL_COUNT=$(nm build/bin/trading_engine | wc -l)
+
+# Report
+cat << EOF > build_metrics.json
+{
+  "build_time_seconds": $BUILD_TIME,
+  "binary_size_bytes": $BINARY_SIZE,
+  "symbol_count": $SYMBOL_COUNT,
+  "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+EOF
+
+# Send to monitoring system
+curl -X POST -H "Content-Type: application/json" \
+     -d @build_metrics.json \
+     http://monitoring.hft.com/api/metrics
+```
+
+6.2 CCACHE STATS TRACKING
+--------------------------
+
+```bash
+#!/bin/bash
+# ccache_stats.sh
+
+# Before build
+ccache -z
+
+# Build
+cmake --build build -j$(nproc)
+
+# After build
+ccache -s | tee ccache_stats.txt
+
+# Parse and report
+HIT_RATE=$(ccache -s | grep "cache hit rate" | awk '{print $4}')
+echo "Cache hit rate: $HIT_RATE"
+```
+
+================================================================================
+BEST PRACTICES
+================================================================================
+
+1. Use ccache to speed up CI builds (2-10x faster)
+2. Cache ccache directory between CI runs
+3. Run sanitizer builds in CI (ASan, TSan, UBSan)
+4. Test with multiple compilers (GCC, Clang)
+5. Run benchmarks on every PR
+6. Use parallel builds whenever possible
+7. Deploy to staging before production
+8. Tag releases with semantic versioning
+9. Archive build artifacts
+10. Monitor build times and optimize slow builds
+11. Use Docker for reproducible builds
+12. Implement automated rollback on failures
+
+================================================================================
+Last Updated: 2025-11-25
+Version: 1.0.0

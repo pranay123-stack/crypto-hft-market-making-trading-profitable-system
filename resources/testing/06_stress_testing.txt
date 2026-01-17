@@ -1,0 +1,1113 @@
+================================================================================
+STRESS TESTING FOR HFT SYSTEMS
+High Load, Edge Cases, and System Limits Testing
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Stress Testing Overview
+2. High Volume Load Testing
+3. Burst Traffic Testing
+4. Resource Exhaustion Testing
+5. Edge Case Testing
+6. Failure Mode Testing
+7. Recovery Testing
+8. Concurrent Stress Testing
+9. Long-Running Stress Tests
+10. Chaos Engineering
+
+================================================================================
+1. STRESS TESTING OVERVIEW
+================================================================================
+
+1.1 Stress Testing Goals
+-------------------------
+Objectives:
+- Identify system breaking points
+- Validate graceful degradation
+- Test error handling under extreme conditions
+- Measure recovery times
+- Find memory leaks and resource issues
+- Validate system limits
+
+Target Scenarios:
+- 10x normal trading volume
+- Network failures and timeouts
+- Exchange outages
+- Memory pressure
+- CPU saturation
+- Concurrent order floods
+
+
+1.2 Stress Test Framework
+--------------------------
+// include/stress_test/stress_test_framework.h
+#ifndef STRESS_TEST_FRAMEWORK_H
+#define STRESS_TEST_FRAMEWORK_H
+
+#include <functional>
+#include <chrono>
+#include <atomic>
+
+using namespace std::chrono;
+
+struct StressTestConfig {
+    size_t num_threads;
+    size_t requests_per_thread;
+    duration<double> test_duration;
+    size_t ramp_up_time_sec;
+    bool enable_monitoring;
+};
+
+struct StressTestResults {
+    size_t total_requests;
+    size_t successful_requests;
+    size_t failed_requests;
+    double success_rate;
+
+    long long min_latency_ns;
+    long long p50_latency_ns;
+    long long p99_latency_ns;
+    long long max_latency_ns;
+
+    double throughput_qps;
+    double error_rate;
+
+    size_t peak_memory_mb;
+    double peak_cpu_percent;
+
+    std::vector<std::string> errors;
+};
+
+class StressTestFramework {
+public:
+    explicit StressTestFramework(const StressTestConfig& config);
+
+    template<typename Func>
+    StressTestResults runStressTest(Func&& operation);
+
+    void setMonitoringInterval(milliseconds interval);
+    void enableResourceMonitoring(bool enable);
+
+    void printResults(const StressTestResults& results);
+    void exportResults(const std::string& filename);
+
+private:
+    void monitorResources();
+    void collectLatencies(std::vector<long long>& latencies);
+
+    StressTestConfig config_;
+    std::atomic<bool> monitoring_active_;
+    std::atomic<size_t> peak_memory_;
+    std::atomic<double> peak_cpu_;
+};
+
+#endif // STRESS_TEST_FRAMEWORK_H
+
+
+1.3 Stress Test Implementation
+-------------------------------
+// src/stress_test/stress_test_framework.cpp
+#include "stress_test_framework.h"
+#include <thread>
+#include <iostream>
+#include <algorithm>
+
+StressTestFramework::StressTestFramework(const StressTestConfig& config)
+    : config_(config), monitoring_active_(false), peak_memory_(0), peak_cpu_(0.0) {
+}
+
+template<typename Func>
+StressTestResults StressTestFramework::runStressTest(Func&& operation) {
+    StressTestResults results{};
+
+    std::atomic<size_t> successful_requests{0};
+    std::atomic<size_t> failed_requests{0};
+    std::vector<std::vector<long long>> thread_latencies(config_.num_threads);
+
+    std::cout << "Starting stress test..." << std::endl;
+    std::cout << "  Threads: " << config_.num_threads << std::endl;
+    std::cout << "  Requests per thread: " << config_.requests_per_thread << std::endl;
+
+    // Start resource monitoring
+    if (config_.enable_monitoring) {
+        monitoring_active_ = true;
+        std::thread monitor_thread(&StressTestFramework::monitorResources, this);
+        monitor_thread.detach();
+    }
+
+    auto test_start = high_resolution_clock::now();
+
+    // Launch worker threads
+    std::vector<std::thread> workers;
+    for (size_t i = 0; i < config_.num_threads; ++i) {
+        workers.emplace_back([&, i]() {
+            // Ramp up gradually
+            std::this_thread::sleep_for(
+                milliseconds(i * 1000 / config_.num_threads)
+            );
+
+            auto& latencies = thread_latencies[i];
+            latencies.reserve(config_.requests_per_thread);
+
+            for (size_t j = 0; j < config_.requests_per_thread; ++j) {
+                auto start = high_resolution_clock::now();
+
+                try {
+                    operation();
+                    successful_requests++;
+                } catch (const std::exception& e) {
+                    failed_requests++;
+                }
+
+                auto end = high_resolution_clock::now();
+                latencies.push_back(
+                    duration_cast<nanoseconds>(end - start).count()
+                );
+            }
+        });
+    }
+
+    // Wait for all threads
+    for (auto& worker : workers) {
+        worker.join();
+    }
+
+    auto test_end = high_resolution_clock::now();
+    monitoring_active_ = false;
+
+    // Collect results
+    results.successful_requests = successful_requests.load();
+    results.failed_requests = failed_requests.load();
+    results.total_requests = results.successful_requests + results.failed_requests;
+    results.success_rate = static_cast<double>(results.successful_requests) / results.total_requests;
+    results.error_rate = static_cast<double>(results.failed_requests) / results.total_requests;
+
+    // Merge latencies from all threads
+    std::vector<long long> all_latencies;
+    for (const auto& thread_lat : thread_latencies) {
+        all_latencies.insert(all_latencies.end(), thread_lat.begin(), thread_lat.end());
+    }
+
+    std::sort(all_latencies.begin(), all_latencies.end());
+
+    if (!all_latencies.empty()) {
+        results.min_latency_ns = all_latencies.front();
+        results.max_latency_ns = all_latencies.back();
+        results.p50_latency_ns = all_latencies[all_latencies.size() / 2];
+        results.p99_latency_ns = all_latencies[all_latencies.size() * 99 / 100];
+    }
+
+    // Calculate throughput
+    double elapsed_sec = duration_cast<milliseconds>(test_end - test_start).count() / 1000.0;
+    results.throughput_qps = results.total_requests / elapsed_sec;
+
+    results.peak_memory_mb = peak_memory_.load();
+    results.peak_cpu_percent = peak_cpu_.load();
+
+    return results;
+}
+
+
+================================================================================
+2. HIGH VOLUME LOAD TESTING
+================================================================================
+
+2.1 Order Flood Test
+---------------------
+// tests/stress/order_flood_test.cpp
+#include <gtest/gtest.h>
+#include "stress_test_framework.h"
+#include "order_manager.h"
+
+TEST(StressTest, OrderFloodTest) {
+    OrderManager order_manager;
+
+    StressTestConfig config;
+    config.num_threads = 16;
+    config.requests_per_thread = 100000;
+    config.enable_monitoring = true;
+
+    StressTestFramework stress_test(config);
+
+    std::atomic<uint64_t> order_id_counter{0};
+
+    auto submit_order = [&]() {
+        Order order;
+        order.order_id = order_id_counter.fetch_add(1);
+        order.symbol = "AAPL";
+        order.side = (order.order_id % 2 == 0) ? OrderSide::BUY : OrderSide::SELL;
+        order.price = 150.00 + (order.order_id % 100) * 0.01;
+        order.quantity = 100;
+        order.order_type = OrderType::LIMIT;
+
+        order_manager.submitOrder(order);
+    };
+
+    auto results = stress_test.runStressTest(submit_order);
+
+    stress_test.printResults(results);
+
+    // Assertions
+    EXPECT_GT(results.success_rate, 0.99) << "Success rate below 99%";
+    EXPECT_LT(results.p99_latency_ns, 100000) << "P99 latency exceeds 100us under load";
+    EXPECT_GT(results.throughput_qps, 50000) << "Throughput below 50k QPS";
+
+    std::cout << "\n=== Order Flood Test Results ===" << std::endl;
+    std::cout << "Total Orders: " << results.total_requests << std::endl;
+    std::cout << "Success Rate: " << results.success_rate * 100 << "%" << std::endl;
+    std::cout << "Throughput: " << results.throughput_qps << " QPS" << std::endl;
+    std::cout << "P99 Latency: " << results.p99_latency_ns / 1000.0 << " us" << std::endl;
+}
+
+
+2.2 Market Data Flood Test
+---------------------------
+TEST(StressTest, MarketDataFloodTest) {
+    MarketDataHandler handler;
+
+    StressTestConfig config;
+    config.num_threads = 8;
+    config.requests_per_thread = 1000000;
+    config.enable_monitoring = true;
+
+    StressTestFramework stress_test(config);
+
+    std::atomic<uint64_t> quote_counter{0};
+
+    auto process_quote = [&]() {
+        Quote quote;
+        quote.symbol = "AAPL";
+        quote.bid_price = 150.00 + (quote_counter % 1000) * 0.01;
+        quote.ask_price = quote.bid_price + 0.05;
+        quote.bid_size = 1000;
+        quote.ask_size = 1000;
+        quote.timestamp = high_resolution_clock::now();
+
+        handler.onQuoteUpdate(quote);
+        quote_counter++;
+    };
+
+    auto results = stress_test.runStressTest(process_quote);
+
+    stress_test.printResults(results);
+
+    EXPECT_GT(results.success_rate, 0.999) << "Market data drops detected";
+    EXPECT_GT(results.throughput_qps, 1000000) << "Market data throughput below 1M QPS";
+    EXPECT_LT(results.p99_latency_ns, 5000) << "Market data P99 latency exceeds 5us";
+}
+
+
+2.3 Mixed Workload Stress Test
+-------------------------------
+TEST(StressTest, MixedWorkloadStressTest) {
+    auto system = createTradingSystem();
+
+    StressTestConfig config;
+    config.num_threads = 20;
+    config.test_duration = seconds(60);
+    config.enable_monitoring = true;
+
+    StressTestFramework stress_test(config);
+
+    std::atomic<size_t> operation_counter{0};
+
+    auto mixed_operation = [&]() {
+        size_t op_type = operation_counter.fetch_add(1) % 10;
+
+        if (op_type < 5) {
+            // 50% market data updates
+            Quote quote = generateRandomQuote();
+            system->processMarketData(quote);
+        } else if (op_type < 8) {
+            // 30% order submissions
+            Order order = generateRandomOrder();
+            system->submitOrder(order);
+        } else if (op_type < 9) {
+            // 10% order cancellations
+            system->cancelRandomOrder();
+        } else {
+            // 10% position queries
+            system->getPositions();
+        }
+    };
+
+    auto results = stress_test.runStressTest(mixed_operation);
+
+    stress_test.printResults(results);
+
+    EXPECT_GT(results.success_rate, 0.95) << "High error rate in mixed workload";
+    EXPECT_LT(results.peak_memory_mb, 2048) << "Memory usage exceeds 2GB";
+}
+
+
+================================================================================
+3. BURST TRAFFIC TESTING
+================================================================================
+
+3.1 Sudden Traffic Spike
+-------------------------
+TEST(StressTest, BurstTrafficTest) {
+    OrderManager order_manager;
+
+    // Start with low traffic
+    std::cout << "Phase 1: Normal load (1000 orders)..." << std::endl;
+    for (int i = 0; i < 1000; ++i) {
+        Order order = createTestOrder(i);
+        order_manager.submitOrder(order);
+        std::this_thread::sleep_for(milliseconds(1));
+    }
+
+    // Sudden burst
+    std::cout << "Phase 2: BURST! (100k orders in 1 second)..." << std::endl;
+    auto burst_start = high_resolution_clock::now();
+
+    std::atomic<size_t> burst_success{0};
+    std::atomic<size_t> burst_fail{0};
+
+    std::vector<std::thread> burst_threads;
+    for (int t = 0; t < 10; ++t) {
+        burst_threads.emplace_back([&, t]() {
+            for (int i = 0; i < 10000; ++i) {
+                Order order = createTestOrder(t * 10000 + i);
+                if (order_manager.submitOrder(order)) {
+                    burst_success++;
+                } else {
+                    burst_fail++;
+                }
+            }
+        });
+    }
+
+    for (auto& t : burst_threads) {
+        t.join();
+    }
+
+    auto burst_end = high_resolution_clock::now();
+    double burst_duration = duration_cast<milliseconds>(burst_end - burst_start).count() / 1000.0;
+
+    std::cout << "Burst completed in " << burst_duration << " seconds" << std::endl;
+    std::cout << "Success: " << burst_success << std::endl;
+    std::cout << "Failed: " << burst_fail << std::endl;
+
+    // System should handle burst gracefully
+    EXPECT_GT(static_cast<double>(burst_success) / 100000, 0.95)
+        << "System couldn't handle burst traffic";
+
+    // Return to normal
+    std::cout << "Phase 3: Recovery (normal load)..." << std::endl;
+    std::this_thread::sleep_for(seconds(5));
+
+    // Verify system recovered
+    Order test_order = createTestOrder(200000);
+    auto start = high_resolution_clock::now();
+    bool submitted = order_manager.submitOrder(test_order);
+    auto end = high_resolution_clock::now();
+
+    EXPECT_TRUE(submitted) << "System not recovered after burst";
+    EXPECT_LT(duration_cast<microseconds>(end - start).count(), 100)
+        << "Latency not recovered after burst";
+}
+
+
+3.2 Periodic Spikes Test
+-------------------------
+TEST(StressTest, PeriodicSpikesTest) {
+    auto system = createTradingSystem();
+
+    const int test_duration_sec = 60;
+    const int spike_interval_sec = 10;
+    const int orders_per_spike = 50000;
+
+    auto test_start = high_resolution_clock::now();
+    auto next_spike = test_start;
+
+    std::atomic<size_t> total_orders{0};
+    std::atomic<size_t> total_failures{0};
+
+    while (duration_cast<seconds>(high_resolution_clock::now() - test_start).count() < test_duration_sec) {
+        auto now = high_resolution_clock::now();
+
+        if (now >= next_spike) {
+            std::cout << "SPIKE at T+" << duration_cast<seconds>(now - test_start).count() << "s" << std::endl;
+
+            // Launch spike
+            std::vector<std::thread> spike_threads;
+            for (int t = 0; t < 10; ++t) {
+                spike_threads.emplace_back([&]() {
+                    for (int i = 0; i < orders_per_spike / 10; ++i) {
+                        Order order = generateRandomOrder();
+                        if (system->submitOrder(order)) {
+                            total_orders++;
+                        } else {
+                            total_failures++;
+                        }
+                    }
+                });
+            }
+
+            for (auto& t : spike_threads) {
+                t.join();
+            }
+
+            next_spike += seconds(spike_interval_sec);
+        }
+
+        std::this_thread::sleep_for(milliseconds(100));
+    }
+
+    double failure_rate = static_cast<double>(total_failures) / total_orders;
+    std::cout << "Total orders: " << total_orders << std::endl;
+    std::cout << "Failure rate: " << failure_rate * 100 << "%" << std::endl;
+
+    EXPECT_LT(failure_rate, 0.01) << "High failure rate during periodic spikes";
+}
+
+
+================================================================================
+4. RESOURCE EXHAUSTION TESTING
+================================================================================
+
+4.1 Memory Exhaustion Test
+---------------------------
+TEST(StressTest, MemoryExhaustionTest) {
+    OrderManager order_manager;
+
+    std::cout << "Testing memory limits..." << std::endl;
+
+    size_t initial_memory = getProcessMemoryMB();
+    std::cout << "Initial memory: " << initial_memory << " MB" << std::endl;
+
+    // Submit orders until we hit memory limit
+    size_t orders_submitted = 0;
+    bool hit_limit = false;
+
+    for (size_t i = 0; i < 10000000; ++i) {
+        Order order = createTestOrder(i);
+
+        try {
+            if (!order_manager.submitOrder(order)) {
+                // Order rejected due to resource limits
+                hit_limit = true;
+                break;
+            }
+            orders_submitted++;
+
+            if (i % 100000 == 0) {
+                size_t current_memory = getProcessMemoryMB();
+                std::cout << "Orders: " << i << ", Memory: " << current_memory << " MB" << std::endl;
+
+                // Check if we're approaching system limits
+                if (current_memory > 8192) {  // 8GB limit
+                    std::cout << "Approaching memory limit, stopping test" << std::endl;
+                    break;
+                }
+            }
+        } catch (const std::bad_alloc& e) {
+            std::cout << "Out of memory at " << i << " orders" << std::endl;
+            hit_limit = true;
+            break;
+        }
+    }
+
+    size_t final_memory = getProcessMemoryMB();
+
+    std::cout << "\n=== Memory Exhaustion Results ===" << std::endl;
+    std::cout << "Orders submitted: " << orders_submitted << std::endl;
+    std::cout << "Final memory: " << final_memory << " MB" << std::endl;
+    std::cout << "Memory per order: " << (final_memory - initial_memory) * 1024.0 / orders_submitted << " KB" << std::endl;
+
+    // System should handle memory pressure gracefully
+    EXPECT_TRUE(order_manager.isHealthy()) << "System unhealthy after memory stress";
+}
+
+
+4.2 Connection Pool Exhaustion
+-------------------------------
+TEST(StressTest, ConnectionPoolExhaustionTest) {
+    ExchangeConnector connector;
+
+    const int max_connections = 100;
+    std::vector<Connection*> connections;
+
+    // Exhaust connection pool
+    for (int i = 0; i < max_connections + 50; ++i) {
+        Connection* conn = connector.getConnection();
+
+        if (conn) {
+            connections.push_back(conn);
+        } else {
+            std::cout << "Connection pool exhausted at " << i << " connections" << std::endl;
+            break;
+        }
+    }
+
+    std::cout << "Acquired " << connections.size() << " connections" << std::endl;
+
+    // Try to submit order when pool is exhausted
+    Order order = createTestOrder(1);
+    bool submitted = connector.submitOrder(order);
+
+    if (!submitted) {
+        std::cout << "Order submission failed (expected)" << std::endl;
+    }
+
+    // Release half the connections
+    for (size_t i = 0; i < connections.size() / 2; ++i) {
+        connector.releaseConnection(connections[i]);
+    }
+
+    // Should be able to submit now
+    submitted = connector.submitOrder(order);
+    EXPECT_TRUE(submitted) << "Order failed even after releasing connections";
+
+    // Cleanup
+    for (auto* conn : connections) {
+        connector.releaseConnection(conn);
+    }
+}
+
+
+4.3 Thread Pool Exhaustion
+---------------------------
+TEST(StressTest, ThreadPoolExhaustionTest) {
+    ThreadPool thread_pool(8);  // 8 worker threads
+
+    std::atomic<int> tasks_completed{0};
+    std::atomic<int> tasks_rejected{0};
+
+    // Submit more tasks than thread pool can handle
+    for (int i = 0; i < 10000; ++i) {
+        auto task = [&]() {
+            std::this_thread::sleep_for(milliseconds(100));
+            tasks_completed++;
+        };
+
+        if (!thread_pool.submit(task)) {
+            tasks_rejected++;
+        }
+    }
+
+    // Wait for completion
+    thread_pool.waitAll();
+
+    std::cout << "Tasks completed: " << tasks_completed << std::endl;
+    std::cout << "Tasks rejected: " << tasks_rejected << std::endl;
+
+    // Thread pool should handle queue gracefully
+    EXPECT_EQ(tasks_completed + tasks_rejected, 10000);
+}
+
+
+================================================================================
+5. EDGE CASE TESTING
+================================================================================
+
+5.1 Extreme Price Values
+-------------------------
+TEST(EdgeCaseTest, ExtremePriceValues) {
+    OrderManager order_manager;
+
+    // Test cases with extreme prices
+    std::vector<std::pair<double, bool>> test_cases = {
+        {0.0001, true},           // Very small price
+        {999999.99, true},        // Very large price
+        {0.0, false},             // Zero price (invalid)
+        {-100.0, false},          // Negative price (invalid)
+        {INFINITY, false},        // Infinite price (invalid)
+        {NAN, false}              // NaN price (invalid)
+    };
+
+    for (const auto& [price, should_succeed] : test_cases) {
+        Order order = createTestOrder(1);
+        order.price = price;
+
+        bool result = order_manager.submitOrder(order);
+
+        if (should_succeed) {
+            EXPECT_TRUE(result) << "Failed to handle valid extreme price: " << price;
+        } else {
+            EXPECT_FALSE(result) << "Accepted invalid price: " << price;
+        }
+    }
+}
+
+
+5.2 Extreme Quantities
+-----------------------
+TEST(EdgeCaseTest, ExtremeQuantities) {
+    OrderManager order_manager;
+
+    std::vector<std::pair<int, bool>> test_cases = {
+        {1, true},                // Minimum quantity
+        {1000000, true},          // Very large quantity
+        {0, false},               // Zero quantity (invalid)
+        {-100, false},            // Negative quantity (invalid)
+        {INT_MAX, false}          // Overflow risk
+    };
+
+    for (const auto& [quantity, should_succeed] : test_cases) {
+        Order order = createTestOrder(1);
+        order.quantity = quantity;
+
+        bool result = order_manager.submitOrder(order);
+
+        EXPECT_EQ(result, should_succeed)
+            << "Unexpected result for quantity: " << quantity;
+    }
+}
+
+
+5.3 Unicode and Special Characters
+-----------------------------------
+TEST(EdgeCaseTest, SpecialCharacterSymbols) {
+    OrderManager order_manager;
+
+    std::vector<std::string> test_symbols = {
+        "AAPL",                   // Normal
+        "BRK.A",                  // With dot
+        "BRK/B",                  // With slash
+        "SPX_2024",               // With underscore
+        "",                       // Empty (invalid)
+        "A",                      // Single char
+        "VERYLONGSYMBOLNAME",     // Very long
+        "AAPL\0HIDDEN",           // Null byte
+        "日本株",                  // Unicode
+        "TEST\n\r\t"              // Control characters
+    };
+
+    for (const auto& symbol : test_symbols) {
+        Order order = createTestOrder(1);
+        order.symbol = symbol;
+
+        bool result = order_manager.submitOrder(order);
+
+        // Log result
+        std::cout << "Symbol: \"" << symbol << "\" -> "
+                  << (result ? "ACCEPTED" : "REJECTED") << std::endl;
+    }
+}
+
+
+5.4 Race Conditions
+-------------------
+TEST(EdgeCaseTest, RaceConditionTest) {
+    OrderManager order_manager;
+
+    uint64_t order_id = 12345;
+
+    // Submit order
+    Order order = createTestOrder(order_id);
+    order_manager.submitOrder(order);
+
+    // Simultaneously try to cancel and modify the same order
+    std::atomic<bool> cancel_result{false};
+    std::atomic<bool> modify_result{false};
+
+    std::thread cancel_thread([&]() {
+        cancel_result = order_manager.cancelOrder(order_id);
+    });
+
+    std::thread modify_thread([&]() {
+        modify_result = order_manager.modifyOrder(order_id, 151.00, 200);
+    });
+
+    cancel_thread.join();
+    modify_thread.join();
+
+    // One should succeed, one should fail (or both fail if cancel won)
+    bool both_succeeded = cancel_result && modify_result;
+    EXPECT_FALSE(both_succeeded) << "Race condition: both cancel and modify succeeded";
+
+    std::cout << "Cancel: " << cancel_result << ", Modify: " << modify_result << std::endl;
+}
+
+
+================================================================================
+6. FAILURE MODE TESTING
+================================================================================
+
+6.1 Network Failure Simulation
+-------------------------------
+TEST(FailureTest, NetworkFailureHandling) {
+    auto connector = createExchangeConnector();
+
+    // Normal operation
+    Order order = createTestOrder(1);
+    bool result = connector->submitOrder(order);
+    EXPECT_TRUE(result) << "Failed in normal conditions";
+
+    // Simulate network failure
+    std::cout << "Simulating network failure..." << std::endl;
+    connector->simulateNetworkFailure();
+
+    // Try to submit order
+    Order order2 = createTestOrder(2);
+    result = connector->submitOrder(order2);
+    EXPECT_FALSE(result) << "Order succeeded during network failure";
+
+    // Check error handling
+    auto error = connector->getLastError();
+    EXPECT_FALSE(error.empty()) << "No error message during network failure";
+    std::cout << "Error: " << error << std::endl;
+
+    // Restore network
+    std::cout << "Restoring network..." << std::endl;
+    connector->restoreNetwork();
+
+    // Should work again
+    Order order3 = createTestOrder(3);
+    result = connector->submitOrder(order3);
+    EXPECT_TRUE(result) << "Failed after network restoration";
+}
+
+
+6.2 Exchange Timeout Handling
+------------------------------
+TEST(FailureTest, ExchangeTimeoutTest) {
+    auto connector = createExchangeConnector();
+    connector->setResponseTimeout(milliseconds(100));
+
+    // Simulate slow exchange
+    connector->simulateSlowResponse(seconds(5));
+
+    Order order = createTestOrder(1);
+
+    auto start = high_resolution_clock::now();
+    bool result = connector->submitOrder(order);
+    auto end = high_resolution_clock::now();
+
+    auto elapsed = duration_cast<milliseconds>(end - start).count();
+
+    EXPECT_FALSE(result) << "Order should have timed out";
+    EXPECT_LT(elapsed, 200) << "Timeout took too long";
+    EXPECT_EQ(connector->getLastError(), "Timeout");
+}
+
+
+6.3 Partial System Failure
+---------------------------
+TEST(FailureTest, PartialSystemFailureTest) {
+    auto system = createTradingSystem();
+
+    // Normal operation
+    system->submitOrder(createTestOrder(1));
+    EXPECT_TRUE(system->isHealthy());
+
+    // Fail one component (e.g., risk manager)
+    system->getRiskManager()->simulateFailure();
+
+    // System should continue but reject orders
+    bool result = system->submitOrder(createTestOrder(2));
+    EXPECT_FALSE(result) << "Order accepted despite risk manager failure";
+
+    // Other components should still work
+    Quote quote = generateRandomQuote();
+    system->processMarketData(quote);  // Should not throw
+
+    // Recover component
+    system->getRiskManager()->recover();
+
+    // Should work again
+    result = system->submitOrder(createTestOrder(3));
+    EXPECT_TRUE(result) << "System didn't recover properly";
+}
+
+
+================================================================================
+7. RECOVERY TESTING
+================================================================================
+
+7.1 Crash Recovery Test
+------------------------
+TEST(RecoveryTest, CrashRecoveryTest) {
+    // Initialize system and submit some orders
+    {
+        OrderManager order_manager("test_db.sqlite");
+
+        for (int i = 0; i < 1000; ++i) {
+            Order order = createTestOrder(i);
+            order_manager.submitOrder(order);
+        }
+
+        std::cout << "Pending orders: " << order_manager.getPendingOrderCount() << std::endl;
+
+        // Simulate crash (destructor won't be called properly)
+        std::exit(0);  // In real test, would kill process externally
+    }
+
+    // Restart and recover
+    {
+        OrderManager order_manager("test_db.sqlite");
+        order_manager.recoverFromCrash();
+
+        size_t recovered = order_manager.getPendingOrderCount();
+        std::cout << "Recovered orders: " << recovered << std::endl;
+
+        EXPECT_GT(recovered, 0) << "Failed to recover orders after crash";
+    }
+}
+
+
+7.2 Gradual Recovery Test
+--------------------------
+TEST(RecoveryTest, GradualRecoveryTest) {
+    auto system = createTradingSystem();
+
+    // Overload system
+    std::cout << "Overloading system..." << std::endl;
+    for (int i = 0; i < 1000000; ++i) {
+        system->submitOrder(createTestOrder(i));
+    }
+
+    // System likely degraded
+    auto health = system->getHealthMetrics();
+    std::cout << "Health score: " << health.score << std::endl;
+    std::cout << "Queue depth: " << health.queue_depth << std::endl;
+
+    // Stop new orders and let system drain
+    std::cout << "Draining queue..." << std::endl;
+    system->pauseNewOrders();
+
+    auto drain_start = high_resolution_clock::now();
+
+    while (system->getPendingOrderCount() > 0) {
+        std::this_thread::sleep_for(milliseconds(100));
+
+        if (duration_cast<seconds>(high_resolution_clock::now() - drain_start).count() > 60) {
+            FAIL() << "System failed to drain in 60 seconds";
+        }
+    }
+
+    auto drain_time = duration_cast<seconds>(high_resolution_clock::now() - drain_start).count();
+    std::cout << "Drained in " << drain_time << " seconds" << std::endl;
+
+    // Resume and verify recovery
+    system->resumeNewOrders();
+
+    Order test_order = createTestOrder(2000000);
+    auto start = high_resolution_clock::now();
+    bool result = system->submitOrder(test_order);
+    auto end = high_resolution_clock::now();
+
+    EXPECT_TRUE(result) << "System not recovered";
+    EXPECT_LT(duration_cast<microseconds>(end - start).count(), 100)
+        << "Performance not recovered";
+}
+
+
+================================================================================
+8. CHAOS ENGINEERING
+================================================================================
+
+8.1 Random Failure Injection
+-----------------------------
+class ChaosEngine {
+public:
+    ChaosEngine(double failure_probability)
+        : failure_prob_(failure_probability), rng_(std::random_device{}()) {}
+
+    bool shouldInjectFailure() {
+        return dist_(rng_) < failure_prob_;
+    }
+
+    void injectRandomFailure(TradingSystem* system) {
+        std::uniform_int_distribution<> failure_type(0, 4);
+
+        switch (failure_type(rng_)) {
+            case 0:
+                system->getExchange()->simulateNetworkFailure();
+                break;
+            case 1:
+                system->getMarketData()->simulateDataLoss();
+                break;
+            case 2:
+                system->getRiskManager()->simulateSlowResponse();
+                break;
+            case 3:
+                system->injectLatencySpike(milliseconds(100));
+                break;
+            case 4:
+                system->simulateMemoryPressure();
+                break;
+        }
+    }
+
+private:
+    double failure_prob_;
+    std::mt19937 rng_;
+    std::uniform_real_distribution<> dist_{0.0, 1.0};
+};
+
+TEST(ChaosTest, RandomFailureInjection) {
+    auto system = createTradingSystem();
+    ChaosEngine chaos(0.01);  // 1% failure rate
+
+    std::atomic<size_t> total_operations{0};
+    std::atomic<size_t> successful_operations{0};
+    std::atomic<size_t> failed_operations{0};
+
+    // Run for 60 seconds with random failures
+    auto test_start = high_resolution_clock::now();
+
+    while (duration_cast<seconds>(high_resolution_clock::now() - test_start).count() < 60) {
+        // Inject random failures
+        if (chaos.shouldInjectFailure()) {
+            chaos.injectRandomFailure(system.get());
+        }
+
+        // Try operations
+        Order order = generateRandomOrder();
+        if (system->submitOrder(order)) {
+            successful_operations++;
+        } else {
+            failed_operations++;
+        }
+
+        total_operations++;
+
+        std::this_thread::sleep_for(microseconds(100));
+    }
+
+    double success_rate = static_cast<double>(successful_operations) / total_operations;
+
+    std::cout << "Chaos Test Results:" << std::endl;
+    std::cout << "  Total operations: " << total_operations << std::endl;
+    std::cout << "  Success rate: " << success_rate * 100 << "%" << std::endl;
+
+    // System should remain stable despite chaos
+    EXPECT_GT(success_rate, 0.95) << "System not resilient to chaos";
+    EXPECT_TRUE(system->isHealthy()) << "System unhealthy after chaos test";
+}
+
+
+================================================================================
+9. LONG-RUNNING STRESS TESTS
+================================================================================
+
+9.1 24-Hour Endurance Test
+---------------------------
+TEST(LongRunning, DISABLED_24HourEnduranceTest) {
+    auto system = createTradingSystem();
+
+    const int test_duration_hours = 24;
+    auto test_start = high_resolution_clock::now();
+    auto test_end = test_start + hours(test_duration_hours);
+
+    std::atomic<size_t> total_orders{0};
+    std::atomic<size_t> total_quotes{0};
+    size_t initial_memory = getProcessMemoryMB();
+
+    std::cout << "Starting 24-hour endurance test..." << std::endl;
+
+    bool running = true;
+
+    // Order submission thread
+    std::thread order_thread([&]() {
+        while (running) {
+            Order order = generateRandomOrder();
+            system->submitOrder(order);
+            total_orders++;
+            std::this_thread::sleep_for(milliseconds(10));
+        }
+    });
+
+    // Market data thread
+    std::thread market_data_thread([&]() {
+        while (running) {
+            Quote quote = generateRandomQuote();
+            system->processMarketData(quote);
+            total_quotes++;
+            std::this_thread::sleep_for(microseconds(100));
+        }
+    });
+
+    // Monitoring thread
+    std::thread monitor_thread([&]() {
+        while (running) {
+            auto elapsed_hours = duration_cast<hours>(high_resolution_clock::now() - test_start).count();
+            size_t current_memory = getProcessMemoryMB();
+
+            std::cout << "T+" << elapsed_hours << "h: "
+                      << "Orders=" << total_orders << ", "
+                      << "Quotes=" << total_quotes << ", "
+                      << "Memory=" << current_memory << "MB" << std::endl;
+
+            std::this_thread::sleep_for(hours(1));
+        }
+    });
+
+    // Wait for test duration
+    std::this_thread::sleep_until(test_end);
+
+    running = false;
+    order_thread.join();
+    market_data_thread.join();
+    monitor_thread.join();
+
+    size_t final_memory = getProcessMemoryMB();
+    double memory_growth = static_cast<double>(final_memory - initial_memory) / initial_memory;
+
+    std::cout << "\n=== 24-Hour Test Results ===" << std::endl;
+    std::cout << "Total orders: " << total_orders << std::endl;
+    std::cout << "Total quotes: " << total_quotes << std::endl;
+    std::cout << "Initial memory: " << initial_memory << " MB" << std::endl;
+    std::cout << "Final memory: " << final_memory << " MB" << std::endl;
+    std::cout << "Memory growth: " << memory_growth * 100 << "%" << std::endl;
+
+    // Check for memory leaks
+    EXPECT_LT(memory_growth, 0.1) << "Significant memory growth (potential leak)";
+    EXPECT_TRUE(system->isHealthy()) << "System unhealthy after 24 hours";
+}
+
+
+================================================================================
+10. STRESS TEST REPORTING
+================================================================================
+
+10.1 Stress Test Report Generation
+-----------------------------------
+void generateStressTestReport(const std::vector<StressTestResults>& results) {
+    std::ofstream report("stress_test_report.html");
+
+    report << "<html><head><title>Stress Test Report</title>" << std::endl;
+    report << "<style>"
+           << "table { border-collapse: collapse; width: 100%; }"
+           << "th, td { border: 1px solid black; padding: 8px; text-align: left; }"
+           << ".pass { background-color: #90EE90; }"
+           << ".fail { background-color: #FFB6C1; }"
+           << "</style></head><body>" << std::endl;
+
+    report << "<h1>HFT System Stress Test Report</h1>" << std::endl;
+    report << "<p>Generated: " << getCurrentTimestamp() << "</p>" << std::endl;
+
+    report << "<table><tr>"
+           << "<th>Test Name</th>"
+           << "<th>Total Requests</th>"
+           << "<th>Success Rate</th>"
+           << "<th>P99 Latency</th>"
+           << "<th>Throughput</th>"
+           << "<th>Status</th>"
+           << "</tr>" << std::endl;
+
+    for (const auto& result : results) {
+        bool pass = result.success_rate > 0.95 && result.p99_latency_ns < 100000;
+        std::string status_class = pass ? "pass" : "fail";
+
+        report << "<tr class='" << status_class << "'>"
+               << "<td>" << result.test_name << "</td>"
+               << "<td>" << result.total_requests << "</td>"
+               << "<td>" << (result.success_rate * 100) << "%</td>"
+               << "<td>" << (result.p99_latency_ns / 1000.0) << " us</td>"
+               << "<td>" << result.throughput_qps << " QPS</td>"
+               << "<td>" << (pass ? "PASS" : "FAIL") << "</td>"
+               << "</tr>" << std::endl;
+    }
+
+    report << "</table></body></html>" << std::endl;
+}
+
+
+================================================================================
+END OF STRESS TESTING
+================================================================================

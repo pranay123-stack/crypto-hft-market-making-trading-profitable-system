@@ -1,0 +1,1368 @@
+================================================================================
+PRE-TRADE RISK CHECKS - HFT RISK MANAGEMENT SYSTEM
+================================================================================
+Version: 2.1.0
+Last Updated: 2025-11-25
+Author: HFT Risk Management Team
+Purpose: Ultra-low latency pre-trade risk validation framework
+
+================================================================================
+1. PRE-TRADE RISK CHECK FRAMEWORK
+================================================================================
+
+1.1 Overview and Requirements
+------------------------------
+
+Pre-trade risk checks are critical gating mechanisms that validate every
+order before submission to the market. Requirements:
+
+Performance Requirements:
+- Latency: < 5 microseconds per check
+- Throughput: > 1,000,000 checks/second
+- False reject rate: < 0.01%
+- Zero false accepts
+
+Functional Requirements:
+- Position limit validation
+- Order size validation
+- Price reasonableness checks
+- Notional exposure validation
+- Rate limiting
+- Duplicate order detection
+- Market hours validation
+- Instrument trading status
+- Account authorization
+- Regulatory compliance
+
+================================================================================
+2. C++ PRE-TRADE RISK ENGINE
+================================================================================
+
+2.1 Core Pre-Trade Risk Check Engine
+-------------------------------------
+
+```cpp
+// pretrade_risk_engine.hpp
+#ifndef PRETRADE_RISK_ENGINE_HPP
+#define PRETRADE_RISK_ENGINE_HPP
+
+#include <string>
+#include <unordered_map>
+#include <atomic>
+#include <memory>
+#include <chrono>
+#include <vector>
+#include <array>
+#include <shared_mutex>
+#include <cmath>
+
+namespace hft {
+namespace risk {
+
+// Risk check result
+enum class RiskCheckResult {
+    APPROVED,               // Order approved
+    REJECTED,               // Order rejected
+    PENDING,                // Requires manual approval
+    BYPASS                  // Risk check bypassed (emergency mode)
+};
+
+// Rejection reason codes
+enum class RejectionReason {
+    NONE = 0,
+    POSITION_LIMIT_EXCEEDED,
+    ORDER_SIZE_TOO_LARGE,
+    ORDER_SIZE_TOO_SMALL,
+    PRICE_OUT_OF_RANGE,
+    NOTIONAL_LIMIT_EXCEEDED,
+    RATE_LIMIT_EXCEEDED,
+    DUPLICATE_ORDER,
+    MARKET_CLOSED,
+    INSTRUMENT_HALTED,
+    UNAUTHORIZED_SYMBOL,
+    UNAUTHORIZED_ACCOUNT,
+    SELF_TRADE_RISK,
+    FAT_FINGER_DETECTED,
+    CIRCUIT_BREAKER_ACTIVE,
+    KILL_SWITCH_ENGAGED,
+    INSUFFICIENT_CAPITAL,
+    CREDIT_LIMIT_EXCEEDED,
+    REGULATORY_LIMIT_EXCEEDED,
+    INVALID_ORDER_PARAMETERS,
+    SYSTEM_ERROR
+};
+
+// Order for validation
+struct OrderRequest {
+    std::string order_id;
+    std::string symbol;
+    std::string account_id;
+    std::string strategy_id;
+
+    // Order details
+    char side;              // 'B' for buy, 'S' for sell
+    int64_t quantity;
+    double price;
+    char order_type;        // 'L' for limit, 'M' for market
+    char time_in_force;     // 'D' for day, 'I' for IOC, 'F' for FOK
+
+    // Metadata
+    uint64_t sequence_number;
+    std::chrono::nanoseconds timestamp;
+    int priority;           // Higher priority orders get faster checks
+
+    // Risk override flags
+    bool bypass_position_checks;
+    bool bypass_price_checks;
+    std::string override_reason;
+};
+
+// Risk check result
+struct RiskCheckResponse {
+    std::string order_id;
+    RiskCheckResult result;
+    RejectionReason rejection_reason;
+    std::string rejection_message;
+
+    // Performance metrics
+    std::chrono::nanoseconds check_latency;
+    uint32_t checks_performed;
+    uint32_t checks_failed;
+
+    // For approved orders
+    double approved_quantity;   // May be reduced
+    double approved_price;       // May be adjusted
+
+    std::chrono::nanoseconds response_timestamp;
+};
+
+// Pre-trade check configuration
+struct PreTradeCheckConfig {
+    // Position checks
+    bool enable_position_checks;
+    bool enable_notional_checks;
+    bool position_check_includes_pending;
+
+    // Price checks
+    bool enable_price_checks;
+    double max_price_deviation_pct;      // % from last traded price
+    double max_spread_crossing_pct;      // % allowed to cross spread
+    bool enable_price_collar;
+
+    // Size checks
+    bool enable_size_checks;
+    int64_t min_order_size;
+    int64_t max_order_size;
+    double max_order_value;
+
+    // Rate limiting
+    bool enable_rate_limiting;
+    uint32_t max_orders_per_second;
+    uint32_t max_orders_per_minute;
+    uint32_t max_cancels_per_second;
+
+    // Duplicate detection
+    bool enable_duplicate_detection;
+    std::chrono::milliseconds duplicate_window;
+
+    // Self-trade prevention
+    bool enable_self_trade_prevention;
+
+    // Fat finger detection
+    bool enable_fat_finger_detection;
+    double fat_finger_multiplier;       // Order size vs avg
+
+    // Market state checks
+    bool enable_market_state_checks;
+    bool allow_premarket_trading;
+    bool allow_postmarket_trading;
+
+    // Performance
+    std::chrono::microseconds max_check_latency;
+    bool enable_bypass_mode;            // Emergency bypass
+};
+
+// Performance statistics
+struct PreTradeStatistics {
+    std::atomic<uint64_t> total_checks{0};
+    std::atomic<uint64_t> total_approved{0};
+    std::atomic<uint64_t> total_rejected{0};
+    std::atomic<uint64_t> total_bypassed{0};
+
+    // Latency tracking
+    std::atomic<uint64_t> total_latency_ns{0};
+    std::atomic<uint64_t> min_latency_ns{UINT64_MAX};
+    std::atomic<uint64_t> max_latency_ns{0};
+
+    // Rejection reasons breakdown
+    std::array<std::atomic<uint64_t>, 32> rejection_counts;
+
+    void recordCheck(std::chrono::nanoseconds latency,
+                    RiskCheckResult result,
+                    RejectionReason reason) {
+        total_checks.fetch_add(1, std::memory_order_relaxed);
+
+        if (result == RiskCheckResult::APPROVED) {
+            total_approved.fetch_add(1, std::memory_order_relaxed);
+        } else if (result == RiskCheckResult::REJECTED) {
+            total_rejected.fetch_add(1, std::memory_order_relaxed);
+            rejection_counts[static_cast<size_t>(reason)].fetch_add(1,
+                std::memory_order_relaxed);
+        } else if (result == RiskCheckResult::BYPASS) {
+            total_bypassed.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        uint64_t lat_ns = latency.count();
+        total_latency_ns.fetch_add(lat_ns, std::memory_order_relaxed);
+
+        // Update min/max with atomic compare-exchange
+        uint64_t current_min = min_latency_ns.load(std::memory_order_relaxed);
+        while (lat_ns < current_min &&
+               !min_latency_ns.compare_exchange_weak(current_min, lat_ns)) {}
+
+        uint64_t current_max = max_latency_ns.load(std::memory_order_relaxed);
+        while (lat_ns > current_max &&
+               !max_latency_ns.compare_exchange_weak(current_max, lat_ns)) {}
+    }
+
+    double getAverageLatencyUs() const {
+        uint64_t total = total_checks.load();
+        if (total == 0) return 0.0;
+        return (double)total_latency_ns.load() / total / 1000.0;
+    }
+
+    double getApprovalRate() const {
+        uint64_t total = total_checks.load();
+        if (total == 0) return 0.0;
+        return (double)total_approved.load() / total * 100.0;
+    }
+};
+
+class PreTradeRiskEngine {
+public:
+    PreTradeRiskEngine(const PreTradeCheckConfig& config);
+    ~PreTradeRiskEngine();
+
+    // Main risk check entry point
+    RiskCheckResponse checkOrder(const OrderRequest& order);
+
+    // Individual check methods (can be called separately)
+    bool checkPositionLimits(const OrderRequest& order,
+                            std::string& rejection_msg);
+
+    bool checkOrderSize(const OrderRequest& order,
+                       std::string& rejection_msg);
+
+    bool checkPrice(const OrderRequest& order,
+                   double last_price,
+                   double bid_price,
+                   double ask_price,
+                   std::string& rejection_msg);
+
+    bool checkNotionalLimits(const OrderRequest& order,
+                            std::string& rejection_msg);
+
+    bool checkRateLimit(const OrderRequest& order,
+                       std::string& rejection_msg);
+
+    bool checkDuplicateOrder(const OrderRequest& order,
+                            std::string& rejection_msg);
+
+    bool checkMarketState(const OrderRequest& order,
+                         std::string& rejection_msg);
+
+    bool checkSelfTrade(const OrderRequest& order,
+                       std::string& rejection_msg);
+
+    bool checkFatFinger(const OrderRequest& order,
+                       std::string& rejection_msg);
+
+    bool checkAuthorization(const OrderRequest& order,
+                           std::string& rejection_msg);
+
+    // Configuration management
+    void updateConfig(const PreTradeCheckConfig& config);
+    PreTradeCheckConfig getConfig() const;
+
+    // State management
+    void updatePosition(const std::string& symbol,
+                       const std::string& account,
+                       int64_t quantity);
+
+    void updateMarketData(const std::string& symbol,
+                         double last_price,
+                         double bid_price,
+                         double ask_price);
+
+    void updateOrderBook(const std::string& symbol,
+                        const std::vector<std::pair<double, int64_t>>& bids,
+                        const std::vector<std::pair<double, int64_t>>& asks);
+
+    // System control
+    void enableBypassMode(const std::string& reason);
+    void disableBypassMode();
+    bool isBypassModeActive() const { return bypass_mode_.load(); }
+
+    void engageKillSwitch();
+    void disengageKillSwitch(const std::string& authorized_user);
+    bool isKillSwitchActive() const { return kill_switch_active_.load(); }
+
+    // Statistics and monitoring
+    PreTradeStatistics getStatistics() const { return statistics_; }
+    void resetStatistics();
+
+    std::vector<RiskCheckResponse> getRecentRejections(size_t count = 100) const;
+
+private:
+    // Internal helper methods
+    bool performAllChecks(const OrderRequest& order,
+                         RiskCheckResponse& response);
+
+    void recordRejection(const RiskCheckResponse& response);
+
+    RejectionReason mapToRejectionReason(const std::string& check_name);
+
+    // Position tracking
+    struct PositionInfo {
+        int64_t current_position;
+        int64_t pending_buys;
+        int64_t pending_sells;
+        double last_update_price;
+        std::chrono::nanoseconds last_update_time;
+    };
+
+    mutable std::shared_mutex position_mutex_;
+    std::unordered_map<std::string, PositionInfo> positions_;
+
+    // Market data cache
+    struct MarketData {
+        double last_price;
+        double bid_price;
+        double ask_price;
+        int64_t bid_size;
+        int64_t ask_size;
+        std::chrono::nanoseconds timestamp;
+        bool is_valid;
+    };
+
+    mutable std::shared_mutex market_data_mutex_;
+    std::unordered_map<std::string, MarketData> market_data_;
+
+    // Rate limiting state
+    struct RateLimitState {
+        std::deque<std::chrono::nanoseconds> order_timestamps;
+        std::deque<std::chrono::nanoseconds> cancel_timestamps;
+        mutable std::mutex mutex;
+    };
+
+    std::unordered_map<std::string, RateLimitState> rate_limits_;
+
+    // Recent orders for duplicate detection
+    struct RecentOrder {
+        std::string order_id;
+        std::string symbol;
+        int64_t quantity;
+        double price;
+        std::chrono::nanoseconds timestamp;
+    };
+
+    mutable std::shared_mutex recent_orders_mutex_;
+    std::deque<RecentOrder> recent_orders_;
+
+    // Configuration
+    PreTradeCheckConfig config_;
+    mutable std::shared_mutex config_mutex_;
+
+    // System state
+    std::atomic<bool> bypass_mode_{false};
+    std::atomic<bool> kill_switch_active_{false};
+
+    // Statistics
+    PreTradeStatistics statistics_;
+
+    // Recent rejections for analysis
+    mutable std::shared_mutex rejections_mutex_;
+    std::deque<RiskCheckResponse> recent_rejections_;
+    static constexpr size_t MAX_RECENT_REJECTIONS = 1000;
+};
+
+// Implementation
+inline RiskCheckResponse PreTradeRiskEngine::checkOrder(
+    const OrderRequest& order) {
+
+    auto start_time = std::chrono::high_resolution_clock::now();
+
+    RiskCheckResponse response;
+    response.order_id = order.order_id;
+    response.result = RiskCheckResult::APPROVED;
+    response.rejection_reason = RejectionReason::NONE;
+    response.approved_quantity = order.quantity;
+    response.approved_price = order.price;
+    response.checks_performed = 0;
+    response.checks_failed = 0;
+
+    // Check kill switch first
+    if (kill_switch_active_.load(std::memory_order_acquire)) {
+        response.result = RiskCheckResult::REJECTED;
+        response.rejection_reason = RejectionReason::KILL_SWITCH_ENGAGED;
+        response.rejection_message = "System kill switch is active";
+        goto finish_check;
+    }
+
+    // Check bypass mode
+    if (bypass_mode_.load(std::memory_order_acquire)) {
+        response.result = RiskCheckResult::BYPASS;
+        goto finish_check;
+    }
+
+    // Perform all risk checks
+    if (!performAllChecks(order, response)) {
+        goto finish_check;
+    }
+
+finish_check:
+    auto end_time = std::chrono::high_resolution_clock::now();
+    response.check_latency = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        end_time - start_time);
+    response.response_timestamp = std::chrono::duration_cast<
+        std::chrono::nanoseconds>(end_time.time_since_epoch());
+
+    // Record statistics
+    statistics_.recordCheck(response.check_latency,
+                           response.result,
+                           response.rejection_reason);
+
+    // Record rejection if applicable
+    if (response.result == RiskCheckResult::REJECTED) {
+        recordRejection(response);
+    }
+
+    return response;
+}
+
+inline bool PreTradeRiskEngine::performAllChecks(
+    const OrderRequest& order,
+    RiskCheckResponse& response) {
+
+    std::string rejection_msg;
+
+    // 1. Authorization check (fastest)
+    if (config_.enable_market_state_checks) {
+        response.checks_performed++;
+        if (!checkAuthorization(order, rejection_msg)) {
+            response.result = RiskCheckResult::REJECTED;
+            response.rejection_reason = RejectionReason::UNAUTHORIZED_SYMBOL;
+            response.rejection_message = rejection_msg;
+            response.checks_failed++;
+            return false;
+        }
+    }
+
+    // 2. Market state check
+    if (config_.enable_market_state_checks) {
+        response.checks_performed++;
+        if (!checkMarketState(order, rejection_msg)) {
+            response.result = RiskCheckResult::REJECTED;
+            response.rejection_reason = RejectionReason::MARKET_CLOSED;
+            response.rejection_message = rejection_msg;
+            response.checks_failed++;
+            return false;
+        }
+    }
+
+    // 3. Order size check
+    if (config_.enable_size_checks && !order.bypass_position_checks) {
+        response.checks_performed++;
+        if (!checkOrderSize(order, rejection_msg)) {
+            response.result = RiskCheckResult::REJECTED;
+            response.rejection_reason = RejectionReason::ORDER_SIZE_TOO_LARGE;
+            response.rejection_message = rejection_msg;
+            response.checks_failed++;
+            return false;
+        }
+    }
+
+    // 4. Price reasonableness check
+    if (config_.enable_price_checks && !order.bypass_price_checks) {
+        response.checks_performed++;
+        auto md_it = market_data_.find(order.symbol);
+        if (md_it != market_data_.end() && md_it->second.is_valid) {
+            const auto& md = md_it->second;
+            if (!checkPrice(order, md.last_price, md.bid_price,
+                          md.ask_price, rejection_msg)) {
+                response.result = RiskCheckResult::REJECTED;
+                response.rejection_reason = RejectionReason::PRICE_OUT_OF_RANGE;
+                response.rejection_message = rejection_msg;
+                response.checks_failed++;
+                return false;
+            }
+        }
+    }
+
+    // 5. Position limit check
+    if (config_.enable_position_checks && !order.bypass_position_checks) {
+        response.checks_performed++;
+        if (!checkPositionLimits(order, rejection_msg)) {
+            response.result = RiskCheckResult::REJECTED;
+            response.rejection_reason = RejectionReason::POSITION_LIMIT_EXCEEDED;
+            response.rejection_message = rejection_msg;
+            response.checks_failed++;
+            return false;
+        }
+    }
+
+    // 6. Notional limit check
+    if (config_.enable_notional_checks && !order.bypass_position_checks) {
+        response.checks_performed++;
+        if (!checkNotionalLimits(order, rejection_msg)) {
+            response.result = RiskCheckResult::REJECTED;
+            response.rejection_reason = RejectionReason::NOTIONAL_LIMIT_EXCEEDED;
+            response.rejection_message = rejection_msg;
+            response.checks_failed++;
+            return false;
+        }
+    }
+
+    // 7. Rate limit check
+    if (config_.enable_rate_limiting) {
+        response.checks_performed++;
+        if (!checkRateLimit(order, rejection_msg)) {
+            response.result = RiskCheckResult::REJECTED;
+            response.rejection_reason = RejectionReason::RATE_LIMIT_EXCEEDED;
+            response.rejection_message = rejection_msg;
+            response.checks_failed++;
+            return false;
+        }
+    }
+
+    // 8. Duplicate order check
+    if (config_.enable_duplicate_detection) {
+        response.checks_performed++;
+        if (!checkDuplicateOrder(order, rejection_msg)) {
+            response.result = RiskCheckResult::REJECTED;
+            response.rejection_reason = RejectionReason::DUPLICATE_ORDER;
+            response.rejection_message = rejection_msg;
+            response.checks_failed++;
+            return false;
+        }
+    }
+
+    // 9. Self-trade prevention
+    if (config_.enable_self_trade_prevention) {
+        response.checks_performed++;
+        if (!checkSelfTrade(order, rejection_msg)) {
+            response.result = RiskCheckResult::REJECTED;
+            response.rejection_reason = RejectionReason::SELF_TRADE_RISK;
+            response.rejection_message = rejection_msg;
+            response.checks_failed++;
+            return false;
+        }
+    }
+
+    // 10. Fat finger detection
+    if (config_.enable_fat_finger_detection) {
+        response.checks_performed++;
+        if (!checkFatFinger(order, rejection_msg)) {
+            response.result = RiskCheckResult::REJECTED;
+            response.rejection_reason = RejectionReason::FAT_FINGER_DETECTED;
+            response.rejection_message = rejection_msg;
+            response.checks_failed++;
+            return false;
+        }
+    }
+
+    return true;
+}
+
+inline bool PreTradeRiskEngine::checkOrderSize(
+    const OrderRequest& order,
+    std::string& rejection_msg) {
+
+    if (order.quantity < config_.min_order_size) {
+        rejection_msg = "Order size " + std::to_string(order.quantity) +
+                       " below minimum " + std::to_string(config_.min_order_size);
+        return false;
+    }
+
+    if (order.quantity > config_.max_order_size) {
+        rejection_msg = "Order size " + std::to_string(order.quantity) +
+                       " exceeds maximum " + std::to_string(config_.max_order_size);
+        return false;
+    }
+
+    // Check order value
+    double order_value = order.quantity * order.price;
+    if (order_value > config_.max_order_value) {
+        rejection_msg = "Order value $" + std::to_string(order_value) +
+                       " exceeds maximum $" + std::to_string(config_.max_order_value);
+        return false;
+    }
+
+    return true;
+}
+
+inline bool PreTradeRiskEngine::checkPrice(
+    const OrderRequest& order,
+    double last_price,
+    double bid_price,
+    double ask_price,
+    std::string& rejection_msg) {
+
+    if (order.order_type == 'M') {
+        // Market orders always pass price check
+        return true;
+    }
+
+    // Check against last traded price
+    if (last_price > 0) {
+        double price_deviation = std::abs(order.price - last_price) / last_price;
+        if (price_deviation > config_.max_price_deviation_pct / 100.0) {
+            rejection_msg = "Price " + std::to_string(order.price) +
+                          " deviates " + std::to_string(price_deviation * 100.0) +
+                          "% from last price " + std::to_string(last_price);
+            return false;
+        }
+    }
+
+    // Check spread crossing
+    if (bid_price > 0 && ask_price > 0) {
+        if (order.side == 'B') {
+            // Buy order crossing too far into ask
+            if (order.price > ask_price * (1.0 + config_.max_spread_crossing_pct / 100.0)) {
+                rejection_msg = "Buy price " + std::to_string(order.price) +
+                              " crosses spread too aggressively (ask: " +
+                              std::to_string(ask_price) + ")";
+                return false;
+            }
+        } else {
+            // Sell order crossing too far into bid
+            if (order.price < bid_price * (1.0 - config_.max_spread_crossing_pct / 100.0)) {
+                rejection_msg = "Sell price " + std::to_string(order.price) +
+                              " crosses spread too aggressively (bid: " +
+                              std::to_string(bid_price) + ")";
+                return false;
+            }
+        }
+    }
+
+    // Price collar check
+    if (config_.enable_price_collar) {
+        // Reference price (use last or mid)
+        double ref_price = last_price > 0 ? last_price :
+                          (bid_price + ask_price) / 2.0;
+
+        if (ref_price > 0) {
+            double lower_collar = ref_price * 0.95;  // 5% below
+            double upper_collar = ref_price * 1.05;  // 5% above
+
+            if (order.price < lower_collar || order.price > upper_collar) {
+                rejection_msg = "Price " + std::to_string(order.price) +
+                              " outside collar [" + std::to_string(lower_collar) +
+                              ", " + std::to_string(upper_collar) + "]";
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+inline bool PreTradeRiskEngine::checkRateLimit(
+    const OrderRequest& order,
+    std::string& rejection_msg) {
+
+    auto now = std::chrono::steady_clock::now();
+    auto key = order.account_id + "|" + order.symbol;
+
+    auto& rate_state = rate_limits_[key];
+    std::lock_guard<std::mutex> lock(rate_state.mutex);
+
+    // Add current order timestamp
+    auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        now.time_since_epoch());
+    rate_state.order_timestamps.push_back(now_ns);
+
+    // Remove timestamps older than 1 second
+    auto one_sec_ago = now_ns - std::chrono::seconds(1);
+    while (!rate_state.order_timestamps.empty() &&
+           rate_state.order_timestamps.front() < one_sec_ago) {
+        rate_state.order_timestamps.pop_front();
+    }
+
+    // Check rate limit
+    if (rate_state.order_timestamps.size() > config_.max_orders_per_second) {
+        rejection_msg = "Rate limit exceeded: " +
+                       std::to_string(rate_state.order_timestamps.size()) +
+                       " orders in last second (limit: " +
+                       std::to_string(config_.max_orders_per_second) + ")";
+        return false;
+    }
+
+    return true;
+}
+
+inline bool PreTradeRiskEngine::checkDuplicateOrder(
+    const OrderRequest& order,
+    std::string& rejection_msg) {
+
+    std::shared_lock<std::shared_mutex> lock(recent_orders_mutex_);
+
+    auto now = order.timestamp;
+    auto cutoff = now - config_.duplicate_window;
+
+    // Check for duplicate orders
+    for (const auto& recent : recent_orders_) {
+        if (recent.timestamp < cutoff) {
+            continue;
+        }
+
+        if (recent.symbol == order.symbol &&
+            recent.quantity == order.quantity &&
+            std::abs(recent.price - order.price) < 0.001) {
+
+            rejection_msg = "Duplicate order detected: similar order " +
+                          recent.order_id + " sent " +
+                          std::to_string(
+                              std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  now - recent.timestamp).count()) +
+                          "ms ago";
+            return false;
+        }
+    }
+
+    return true;
+}
+
+} // namespace risk
+} // namespace hft
+
+#endif // PRETRADE_RISK_ENGINE_HPP
+```
+
+================================================================================
+3. FAT FINGER DETECTION
+================================================================================
+
+3.1 Statistical Fat Finger Detection Algorithm
+-----------------------------------------------
+
+```cpp
+// fat_finger_detector.hpp
+
+namespace hft {
+namespace risk {
+
+class FatFingerDetector {
+public:
+    struct OrderStatistics {
+        double avg_order_size;
+        double std_order_size;
+        double avg_order_value;
+        double std_order_value;
+        int64_t max_recent_size;
+        double max_recent_value;
+        size_t sample_count;
+    };
+
+    // Check if order is potential fat finger
+    static bool detectFatFinger(
+        const OrderRequest& order,
+        const OrderStatistics& stats,
+        double sigma_threshold = 5.0) {
+
+        // Check order size anomaly
+        if (stats.sample_count > 10) {
+            double size_z_score = (order.quantity - stats.avg_order_size) /
+                                 (stats.std_order_size + 1.0);
+
+            if (size_z_score > sigma_threshold) {
+                return true;  // Order size is 5+ sigma above mean
+            }
+        }
+
+        // Check order value anomaly
+        double order_value = order.quantity * order.price;
+        if (stats.sample_count > 10) {
+            double value_z_score = (order_value - stats.avg_order_value) /
+                                  (stats.std_order_value + 1.0);
+
+            if (value_z_score > sigma_threshold) {
+                return true;  // Order value is 5+ sigma above mean
+            }
+        }
+
+        // Check against recent maximum
+        if (order.quantity > stats.max_recent_size * 10) {
+            return true;  // 10x larger than recent max
+        }
+
+        if (order_value > stats.max_recent_value * 10) {
+            return true;  // 10x larger value than recent max
+        }
+
+        // Digit pattern analysis (e.g., 1000000 vs intended 100000)
+        if (hasRepetitiveDigits(order.quantity, 4)) {
+            // Has 4+ consecutive zeros or repeated digit
+            return true;
+        }
+
+        return false;
+    }
+
+    // Update running statistics
+    static void updateStatistics(
+        OrderStatistics& stats,
+        const OrderRequest& order) {
+
+        double order_value = order.quantity * order.price;
+
+        if (stats.sample_count == 0) {
+            stats.avg_order_size = order.quantity;
+            stats.avg_order_value = order_value;
+            stats.std_order_size = 0.0;
+            stats.std_order_value = 0.0;
+            stats.max_recent_size = order.quantity;
+            stats.max_recent_value = order_value;
+            stats.sample_count = 1;
+            return;
+        }
+
+        // Update using Welford's online algorithm
+        size_t n = stats.sample_count + 1;
+
+        // Size statistics
+        double delta_size = order.quantity - stats.avg_order_size;
+        stats.avg_order_size += delta_size / n;
+        double delta2_size = order.quantity - stats.avg_order_size;
+        double m2_size = stats.std_order_size * stats.std_order_size *
+                        (n - 1) + delta_size * delta2_size;
+        stats.std_order_size = std::sqrt(m2_size / n);
+
+        // Value statistics
+        double delta_value = order_value - stats.avg_order_value;
+        stats.avg_order_value += delta_value / n;
+        double delta2_value = order_value - stats.avg_order_value;
+        double m2_value = stats.std_order_value * stats.std_order_value *
+                         (n - 1) + delta_value * delta2_value;
+        stats.std_order_value = std::sqrt(m2_value / n);
+
+        // Update maximums
+        stats.max_recent_size = std::max(stats.max_recent_size,
+                                        order.quantity);
+        stats.max_recent_value = std::max(stats.max_recent_value,
+                                         order_value);
+
+        stats.sample_count = n;
+
+        // Decay maximums over time
+        if (stats.sample_count % 100 == 0) {
+            stats.max_recent_size = static_cast<int64_t>(
+                stats.max_recent_size * 0.95);
+            stats.max_recent_value *= 0.95;
+        }
+    }
+
+private:
+    static bool hasRepetitiveDigits(int64_t number, int threshold) {
+        std::string num_str = std::to_string(number);
+        int consecutive_count = 1;
+        char last_digit = num_str[0];
+
+        for (size_t i = 1; i < num_str.size(); i++) {
+            if (num_str[i] == last_digit) {
+                consecutive_count++;
+                if (consecutive_count >= threshold) {
+                    return true;
+                }
+            } else {
+                consecutive_count = 1;
+                last_digit = num_str[i];
+            }
+        }
+
+        return false;
+    }
+};
+
+} // namespace risk
+} // namespace hft
+```
+
+================================================================================
+4. SELF-TRADE PREVENTION
+================================================================================
+
+4.1 Self-Trade Prevention Algorithm
+------------------------------------
+
+```cpp
+// self_trade_prevention.hpp
+
+namespace hft {
+namespace risk {
+
+class SelfTradePrevention {
+public:
+    struct OrderbookEntry {
+        std::string order_id;
+        std::string account_id;
+        char side;
+        double price;
+        int64_t quantity;
+        std::chrono::nanoseconds timestamp;
+    };
+
+    // Check if new order would trade against own orders
+    static bool wouldSelfTrade(
+        const OrderRequest& new_order,
+        const std::vector<OrderbookEntry>& own_orders) {
+
+        for (const auto& existing : own_orders) {
+            // Skip if same side
+            if (existing.side == new_order.side) {
+                continue;
+            }
+
+            // Check if prices would cross
+            bool would_cross = false;
+            if (new_order.side == 'B') {
+                // Buy order vs existing sell
+                would_cross = new_order.price >= existing.price;
+            } else {
+                // Sell order vs existing buy
+                would_cross = new_order.price <= existing.price;
+            }
+
+            if (would_cross) {
+                return true;  // Would self-trade
+            }
+        }
+
+        return false;
+    }
+
+    // Get allowed quantity after self-trade prevention
+    static int64_t getAllowedQuantity(
+        const OrderRequest& new_order,
+        const std::vector<OrderbookEntry>& own_orders,
+        bool cancel_old_orders = false) {
+
+        int64_t blocking_quantity = 0;
+
+        for (const auto& existing : own_orders) {
+            if (existing.side == new_order.side) {
+                continue;
+            }
+
+            bool would_cross = false;
+            if (new_order.side == 'B') {
+                would_cross = new_order.price >= existing.price;
+            } else {
+                would_cross = new_order.price <= existing.price;
+            }
+
+            if (would_cross) {
+                blocking_quantity += existing.quantity;
+            }
+        }
+
+        // New order can only fill up to blocking quantity
+        return std::max(0L, new_order.quantity - blocking_quantity);
+    }
+};
+
+} // namespace risk
+} // namespace hft
+```
+
+================================================================================
+5. CONFIGURATION PARAMETERS
+================================================================================
+
+5.1 Pre-Trade Risk Configuration File
+--------------------------------------
+
+```json
+{
+  "pretrade_risk_config": {
+    "global_settings": {
+      "enable_all_checks": true,
+      "max_check_latency_us": 5,
+      "enable_bypass_mode": false,
+      "bypass_requires_approval": true
+    },
+
+    "position_checks": {
+      "enable": true,
+      "include_pending_orders": true,
+      "cache_ttl_ms": 100
+    },
+
+    "size_checks": {
+      "enable": true,
+      "min_order_size": 1,
+      "max_order_size": 10000,
+      "max_order_value": 10000000.0,
+      "size_check_by_symbol": true
+    },
+
+    "price_checks": {
+      "enable": true,
+      "max_price_deviation_pct": 5.0,
+      "max_spread_crossing_pct": 2.0,
+      "enable_price_collar": true,
+      "collar_width_pct": 5.0,
+      "reference_price": "last_trade"
+    },
+
+    "notional_checks": {
+      "enable": true,
+      "max_order_notional": 5000000.0,
+      "max_daily_notional": 100000000.0
+    },
+
+    "rate_limiting": {
+      "enable": true,
+      "max_orders_per_second": 100,
+      "max_orders_per_minute": 5000,
+      "max_cancels_per_second": 200,
+      "rate_limit_by_symbol": true,
+      "rate_limit_by_account": true
+    },
+
+    "duplicate_detection": {
+      "enable": true,
+      "duplicate_window_ms": 1000,
+      "price_tolerance": 0.01,
+      "quantity_tolerance": 0
+    },
+
+    "self_trade_prevention": {
+      "enable": true,
+      "cancel_older_order": false,
+      "reduce_newer_order": true
+    },
+
+    "fat_finger_detection": {
+      "enable": true,
+      "sigma_threshold": 5.0,
+      "size_multiplier_threshold": 10.0,
+      "value_multiplier_threshold": 10.0,
+      "check_digit_patterns": true
+    },
+
+    "market_state_checks": {
+      "enable": true,
+      "allow_premarket": false,
+      "allow_postmarket": false,
+      "check_circuit_breakers": true,
+      "check_trading_halts": true
+    },
+
+    "symbol_authorization": {
+      "enable": true,
+      "use_whitelist": true,
+      "whitelist_path": "/config/allowed_symbols.txt"
+    },
+
+    "performance": {
+      "enable_statistics": true,
+      "statistics_window_seconds": 60,
+      "alert_on_slow_checks": true,
+      "slow_check_threshold_us": 10
+    }
+  }
+}
+```
+
+================================================================================
+6. OPTIMIZATION TECHNIQUES
+================================================================================
+
+6.1 Lock-Free Pre-Trade Checks
+-------------------------------
+
+```cpp
+// lock_free_checks.hpp
+
+namespace hft {
+namespace risk {
+
+// Lock-free counter for rate limiting
+class LockFreeRateLimit {
+public:
+    LockFreeRateLimit(size_t max_rate, std::chrono::milliseconds window)
+        : max_rate_(max_rate), window_(window) {
+        for (auto& slot : time_slots_) {
+            slot.timestamp.store(0);
+            slot.count.store(0);
+        }
+    }
+
+    bool tryAcquire() {
+        auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+        size_t slot_idx = (now / window_.count()) % NUM_SLOTS;
+
+        auto& slot = time_slots_[slot_idx];
+
+        // Reset slot if old
+        uint64_t expected_ts = slot.timestamp.load(std::memory_order_acquire);
+        uint64_t current_window = now / window_.count();
+        uint64_t slot_window = expected_ts / window_.count();
+
+        if (slot_window < current_window) {
+            // Try to reset slot
+            if (slot.timestamp.compare_exchange_strong(expected_ts, now)) {
+                slot.count.store(1, std::memory_order_release);
+                return true;
+            }
+        }
+
+        // Increment count
+        uint64_t count = slot.count.fetch_add(1, std::memory_order_acq_rel);
+        return count < max_rate_;
+    }
+
+private:
+    static constexpr size_t NUM_SLOTS = 64;  // Power of 2 for fast modulo
+
+    struct TimeSlot {
+        std::atomic<uint64_t> timestamp;
+        std::atomic<uint64_t> count;
+        char padding[64 - 2 * sizeof(std::atomic<uint64_t>)];  // Cache line padding
+    };
+
+    std::array<TimeSlot, NUM_SLOTS> time_slots_;
+    size_t max_rate_;
+    std::chrono::milliseconds window_;
+};
+
+// Cache-line aligned position tracking
+struct alignas(64) CacheLinePosition {
+    std::atomic<int64_t> position;
+    std::atomic<int64_t> pending_buys;
+    std::atomic<int64_t> pending_sells;
+    char padding[64 - 3 * sizeof(std::atomic<int64_t>)];
+};
+
+} // namespace risk
+} // namespace hft
+```
+
+================================================================================
+7. MONITORING AND ALERTING
+================================================================================
+
+7.1 Real-Time Risk Check Monitoring
+------------------------------------
+
+```cpp
+// risk_check_monitor.hpp
+
+namespace hft {
+namespace risk {
+
+class RiskCheckMonitor {
+public:
+    struct Alert {
+        enum class Type {
+            SLOW_CHECK,
+            HIGH_REJECTION_RATE,
+            BYPASS_MODE_ACTIVE,
+            KILL_SWITCH_ACTIVE,
+            UNUSUAL_REJECTION_PATTERN
+        };
+
+        Type type;
+        std::string message;
+        std::string details;
+        std::chrono::system_clock::time_point timestamp;
+        int severity;  // 1-5, 5 being most severe
+    };
+
+    void monitorPerformance(const PreTradeStatistics& stats) {
+        // Check average latency
+        double avg_latency_us = stats.getAverageLatencyUs();
+        if (avg_latency_us > 10.0) {
+            generateAlert(Alert::Type::SLOW_CHECK,
+                        "Pre-trade checks running slow",
+                        "Average latency: " + std::to_string(avg_latency_us) + "us",
+                        3);
+        }
+
+        // Check rejection rate
+        double rejection_rate = 100.0 - stats.getApprovalRate();
+        if (rejection_rate > 10.0) {
+            generateAlert(Alert::Type::HIGH_REJECTION_RATE,
+                        "High order rejection rate",
+                        "Rejection rate: " + std::to_string(rejection_rate) + "%",
+                        4);
+        }
+    }
+
+    void generateAlert(Alert::Type type,
+                      const std::string& message,
+                      const std::string& details,
+                      int severity) {
+        Alert alert;
+        alert.type = type;
+        alert.message = message;
+        alert.details = details;
+        alert.severity = severity;
+        alert.timestamp = std::chrono::system_clock::now();
+
+        // Log alert
+        logAlert(alert);
+
+        // Send notifications based on severity
+        if (severity >= 4) {
+            sendEmailAlert(alert);
+            sendSMSAlert(alert);
+        }
+    }
+
+private:
+    void logAlert(const Alert& alert) {
+        // Log to file/database
+    }
+
+    void sendEmailAlert(const Alert& alert) {
+        // Send email notification
+    }
+
+    void sendSMSAlert(const Alert& alert) {
+        // Send SMS notification
+    }
+};
+
+} // namespace risk
+} // namespace hft
+```
+
+================================================================================
+8. TESTING FRAMEWORK
+================================================================================
+
+8.1 Pre-Trade Risk Check Unit Tests
+------------------------------------
+
+```cpp
+// Unit tests for pre-trade risk checks
+
+TEST(PreTradeRiskEngine, RejectsOverSizedOrder) {
+    PreTradeCheckConfig config;
+    config.enable_size_checks = true;
+    config.max_order_size = 1000;
+
+    PreTradeRiskEngine engine(config);
+
+    OrderRequest order;
+    order.order_id = "TEST001";
+    order.symbol = "AAPL";
+    order.quantity = 2000;  // Exceeds limit
+    order.price = 150.0;
+    order.side = 'B';
+
+    auto response = engine.checkOrder(order);
+
+    EXPECT_EQ(response.result, RiskCheckResult::REJECTED);
+    EXPECT_EQ(response.rejection_reason, RejectionReason::ORDER_SIZE_TOO_LARGE);
+}
+
+TEST(PreTradeRiskEngine, AcceptsValidOrder) {
+    PreTradeCheckConfig config;
+    config.enable_size_checks = true;
+    config.max_order_size = 1000;
+    config.enable_price_checks = true;
+    config.max_price_deviation_pct = 5.0;
+
+    PreTradeRiskEngine engine(config);
+    engine.updateMarketData("AAPL", 150.0, 149.9, 150.1);
+
+    OrderRequest order;
+    order.order_id = "TEST002";
+    order.symbol = "AAPL";
+    order.quantity = 100;
+    order.price = 150.0;
+    order.side = 'B';
+
+    auto response = engine.checkOrder(order);
+
+    EXPECT_EQ(response.result, RiskCheckResult::APPROVED);
+    EXPECT_LT(response.check_latency.count(), 5000);  // < 5us
+}
+
+TEST(PreTradeRiskEngine, DetectsDuplicateOrder) {
+    PreTradeCheckConfig config;
+    config.enable_duplicate_detection = true;
+    config.duplicate_window = std::chrono::milliseconds(1000);
+
+    PreTradeRiskEngine engine(config);
+
+    OrderRequest order1;
+    order1.order_id = "TEST003";
+    order1.symbol = "AAPL";
+    order1.quantity = 100;
+    order1.price = 150.0;
+    order1.timestamp = std::chrono::nanoseconds(1000000000);
+
+    engine.checkOrder(order1);
+
+    // Send duplicate
+    OrderRequest order2 = order1;
+    order2.order_id = "TEST004";
+    order2.timestamp = std::chrono::nanoseconds(1000500000);  // 0.5ms later
+
+    auto response = engine.checkOrder(order2);
+
+    EXPECT_EQ(response.result, RiskCheckResult::REJECTED);
+    EXPECT_EQ(response.rejection_reason, RejectionReason::DUPLICATE_ORDER);
+}
+
+// Benchmark test
+TEST(PreTradeRiskEngine, PerformanceBenchmark) {
+    PreTradeCheckConfig config;
+    // Enable all checks
+    config.enable_position_checks = true;
+    config.enable_size_checks = true;
+    config.enable_price_checks = true;
+    config.enable_rate_limiting = true;
+    config.enable_duplicate_detection = true;
+
+    PreTradeRiskEngine engine(config);
+    engine.updateMarketData("AAPL", 150.0, 149.9, 150.1);
+
+    constexpr int NUM_CHECKS = 1000000;
+    auto start = std::chrono::high_resolution_clock::now();
+
+    for (int i = 0; i < NUM_CHECKS; i++) {
+        OrderRequest order;
+        order.order_id = "BENCH_" + std::to_string(i);
+        order.symbol = "AAPL";
+        order.quantity = 100;
+        order.price = 150.0;
+        order.side = (i % 2 == 0) ? 'B' : 'S';
+        order.timestamp = std::chrono::nanoseconds(i * 1000);
+
+        engine.checkOrder(order);
+    }
+
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(
+        end - start);
+
+    double checks_per_second = (double)NUM_CHECKS / duration.count() * 1e6;
+    double avg_latency_ns = (double)duration.count() * 1000.0 / NUM_CHECKS;
+
+    std::cout << "Performance: " << checks_per_second << " checks/sec\n";
+    std::cout << "Avg latency: " << avg_latency_ns << " ns\n";
+
+    // Assert performance targets
+    EXPECT_GT(checks_per_second, 1000000);  // > 1M checks/sec
+    EXPECT_LT(avg_latency_ns, 5000);         // < 5us per check
+}
+```
+
+================================================================================
+END OF PRE-TRADE RISK CHECKS DOCUMENTATION
+================================================================================

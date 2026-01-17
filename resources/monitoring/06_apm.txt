@@ -1,0 +1,1029 @@
+APPLICATION PERFORMANCE MONITORING (APM) FOR HFT SYSTEMS
+========================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Overview & APM Strategy
+2. Performance Profiling
+3. Memory Profiling & Leak Detection
+4. CPU Profiling & Hotspot Analysis
+5. Lock Contention Analysis
+6. Cache Performance Monitoring
+7. Network Performance Tracking
+8. Custom Performance Counters
+9. Continuous Profiling
+10. Performance Regression Detection
+11. Production Deployment
+
+============================================
+1. OVERVIEW & APM STRATEGY
+============================================
+
+APM Architecture for HFT:
+-------------------------
+┌───────────────────────────────────────────────────────────┐
+│                  Application Layer                         │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐   │
+│  │ Performance  │  │   Memory     │  │    Lock      │   │
+│  │  Counters    │  │   Profiler   │  │  Analyzer    │   │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘   │
+└─────────┼──────────────────┼──────────────────┼───────────┘
+          │                  │                  │
+          └──────────────────┼──────────────────┘
+                             │
+                    ┌────────▼────────┐
+                    │  APM Collector  │
+                    │  (perf, pprof)  │
+                    └────────┬────────┘
+                             │
+        ┌────────────────────┼────────────────────┐
+        │                    │                    │
+   ┌────▼─────┐      ┌──────▼──────┐     ┌──────▼──────┐
+   │CPU       │      │  Memory     │     │  Network    │
+   │Profile   │      │  Profile    │     │  Profile    │
+   └────┬─────┘      └──────┬──────┘     └──────┬──────┘
+        │                   │                    │
+        └───────────────────┼────────────────────┘
+                            │
+                     ┌──────▼──────┐
+                     │  Analysis   │
+                     │  Dashboard  │
+                     └─────────────┘
+
+Key Performance Indicators (KPIs):
+-----------------------------------
+1. LATENCY METRICS
+   - Order processing latency (p50, p95, p99, p99.9)
+   - Market data processing latency
+   - Network round-trip time
+   - Lock wait time
+
+2. THROUGHPUT METRICS
+   - Orders per second
+   - Market data messages per second
+   - Fill rate
+
+3. RESOURCE UTILIZATION
+   - CPU usage per core
+   - Memory allocation rate
+   - Cache hit/miss ratios
+   - Network bandwidth utilization
+
+4. EFFICIENCY METRICS
+   - CPU cycles per order
+   - Memory per order
+   - Lock contention ratio
+
+============================================
+2. PERFORMANCE PROFILING FRAMEWORK
+============================================
+
+Performance Counter Infrastructure:
+------------------------------------
+#include <atomic>
+#include <chrono>
+#include <map>
+#include <string>
+#include <mutex>
+#include <fstream>
+
+class PerformanceCounter {
+private:
+    std::atomic<uint64_t> count_{0};
+    std::atomic<uint64_t> total_{0};
+    std::atomic<uint64_t> min_{UINT64_MAX};
+    std::atomic<uint64_t> max_{0};
+
+    // Histogram buckets for latency distribution
+    static constexpr size_t NUM_BUCKETS = 20;
+    std::array<std::atomic<uint64_t>, NUM_BUCKETS> buckets_;
+    std::array<uint64_t, NUM_BUCKETS> bucket_boundaries_;
+
+public:
+    PerformanceCounter() {
+        // Initialize histogram buckets (exponential distribution)
+        // 1us, 2us, 5us, 10us, 20us, 50us, 100us, 200us, 500us, 1ms...
+        bucket_boundaries_ = {
+            1, 2, 5, 10, 20, 50, 100, 200, 500,
+            1000, 2000, 5000, 10000, 20000, 50000,
+            100000, 200000, 500000, 1000000, UINT64_MAX
+        };
+
+        for (auto& bucket : buckets_) {
+            bucket = 0;
+        }
+    }
+
+    void record(uint64_t value) {
+        count_.fetch_add(1, std::memory_order_relaxed);
+        total_.fetch_add(value, std::memory_order_relaxed);
+
+        // Update min
+        uint64_t current_min = min_.load(std::memory_order_relaxed);
+        while (value < current_min &&
+               !min_.compare_exchange_weak(current_min, value,
+                                          std::memory_order_relaxed)) {}
+
+        // Update max
+        uint64_t current_max = max_.load(std::memory_order_relaxed);
+        while (value > current_max &&
+               !max_.compare_exchange_weak(current_max, value,
+                                          std::memory_order_relaxed)) {}
+
+        // Update histogram
+        for (size_t i = 0; i < NUM_BUCKETS; ++i) {
+            if (value <= bucket_boundaries_[i]) {
+                buckets_[i].fetch_add(1, std::memory_order_relaxed);
+                break;
+            }
+        }
+    }
+
+    struct Statistics {
+        uint64_t count;
+        uint64_t total;
+        uint64_t min;
+        uint64_t max;
+        double mean;
+        std::map<uint64_t, uint64_t> histogram;
+        double p50;
+        double p95;
+        double p99;
+        double p999;
+    };
+
+    Statistics getStatistics() const {
+        Statistics stats;
+        stats.count = count_.load(std::memory_order_acquire);
+        stats.total = total_.load(std::memory_order_acquire);
+        stats.min = min_.load(std::memory_order_acquire);
+        stats.max = max_.load(std::memory_order_acquire);
+        stats.mean = stats.count > 0 ?
+            static_cast<double>(stats.total) / stats.count : 0.0;
+
+        // Build histogram
+        for (size_t i = 0; i < NUM_BUCKETS; ++i) {
+            uint64_t bucket_count = buckets_[i].load(std::memory_order_acquire);
+            if (bucket_count > 0) {
+                stats.histogram[bucket_boundaries_[i]] = bucket_count;
+            }
+        }
+
+        // Calculate percentiles
+        calculatePercentiles(stats);
+
+        return stats;
+    }
+
+    void reset() {
+        count_.store(0, std::memory_order_release);
+        total_.store(0, std::memory_order_release);
+        min_.store(UINT64_MAX, std::memory_order_release);
+        max_.store(0, std::memory_order_release);
+
+        for (auto& bucket : buckets_) {
+            bucket.store(0, std::memory_order_release);
+        }
+    }
+
+private:
+    void calculatePercentiles(Statistics& stats) const {
+        if (stats.count == 0) {
+            stats.p50 = stats.p95 = stats.p99 = stats.p999 = 0.0;
+            return;
+        }
+
+        uint64_t cumulative = 0;
+        uint64_t target_p50 = stats.count * 0.50;
+        uint64_t target_p95 = stats.count * 0.95;
+        uint64_t target_p99 = stats.count * 0.99;
+        uint64_t target_p999 = stats.count * 0.999;
+
+        bool found_p50 = false, found_p95 = false;
+        bool found_p99 = false, found_p999 = false;
+
+        for (size_t i = 0; i < NUM_BUCKETS; ++i) {
+            cumulative += buckets_[i].load(std::memory_order_acquire);
+
+            if (!found_p50 && cumulative >= target_p50) {
+                stats.p50 = bucket_boundaries_[i];
+                found_p50 = true;
+            }
+            if (!found_p95 && cumulative >= target_p95) {
+                stats.p95 = bucket_boundaries_[i];
+                found_p95 = true;
+            }
+            if (!found_p99 && cumulative >= target_p99) {
+                stats.p99 = bucket_boundaries_[i];
+                found_p99 = true;
+            }
+            if (!found_p999 && cumulative >= target_p999) {
+                stats.p999 = bucket_boundaries_[i];
+                found_p999 = true;
+            }
+        }
+    }
+};
+
+Performance Counter Registry:
+------------------------------
+class PerformanceRegistry {
+private:
+    static std::map<std::string, std::shared_ptr<PerformanceCounter>> counters_;
+    static std::mutex mutex_;
+
+public:
+    static std::shared_ptr<PerformanceCounter> getCounter(const std::string& name) {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        auto it = counters_.find(name);
+        if (it != counters_.end()) {
+            return it->second;
+        }
+
+        auto counter = std::make_shared<PerformanceCounter>();
+        counters_[name] = counter;
+        return counter;
+    }
+
+    static std::map<std::string, PerformanceCounter::Statistics> getAllStatistics() {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        std::map<std::string, PerformanceCounter::Statistics> all_stats;
+        for (const auto& [name, counter] : counters_) {
+            all_stats[name] = counter->getStatistics();
+        }
+
+        return all_stats;
+    }
+
+    static void exportToPrometheus(const std::string& filename) {
+        std::ofstream file(filename);
+        if (!file.is_open()) {
+            return;
+        }
+
+        auto all_stats = getAllStatistics();
+
+        for (const auto& [name, stats] : all_stats) {
+            // Export count
+            file << "# TYPE " << name << "_count counter\n";
+            file << name << "_count " << stats.count << "\n";
+
+            // Export total
+            file << "# TYPE " << name << "_total counter\n";
+            file << name << "_total " << stats.total << "\n";
+
+            // Export percentiles
+            file << "# TYPE " << name << "_latency summary\n";
+            file << name << "_latency{quantile=\"0.5\"} " << stats.p50 << "\n";
+            file << name << "_latency{quantile=\"0.95\"} " << stats.p95 << "\n";
+            file << name << "_latency{quantile=\"0.99\"} " << stats.p99 << "\n";
+            file << name << "_latency{quantile=\"0.999\"} " << stats.p999 << "\n";
+
+            // Export histogram
+            file << "# TYPE " << name << "_histogram histogram\n";
+            for (const auto& [bucket, count] : stats.histogram) {
+                file << name << "_histogram_bucket{le=\"" << bucket
+                     << "\"} " << count << "\n";
+            }
+            file << name << "_histogram_count " << stats.count << "\n";
+            file << name << "_histogram_sum " << stats.total << "\n";
+
+            file << "\n";
+        }
+
+        file.close();
+    }
+
+    static void reset() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto& [name, counter] : counters_) {
+            counter->reset();
+        }
+    }
+};
+
+std::map<std::string, std::shared_ptr<PerformanceCounter>>
+    PerformanceRegistry::counters_;
+std::mutex PerformanceRegistry::mutex_;
+
+RAII Performance Timer:
+-----------------------
+class PerformanceTimer {
+private:
+    std::string counter_name_;
+    std::chrono::high_resolution_clock::time_point start_;
+    std::shared_ptr<PerformanceCounter> counter_;
+
+public:
+    explicit PerformanceTimer(const std::string& counter_name)
+        : counter_name_(counter_name),
+          start_(std::chrono::high_resolution_clock::now()),
+          counter_(PerformanceRegistry::getCounter(counter_name)) {}
+
+    ~PerformanceTimer() {
+        auto end = std::chrono::high_resolution_clock::now();
+        auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            end - start_).count();
+
+        counter_->record(duration_us);
+    }
+
+    // Manual stop
+    void stop() {
+        auto end = std::chrono::high_resolution_clock::now();
+        auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            end - start_).count();
+
+        counter_->record(duration_us);
+    }
+};
+
+// Macro for easy performance measurement
+#define PERF_TIMER(name) \
+    PerformanceTimer __perf_timer_##__LINE__(name)
+
+#define PERF_SCOPE(name) \
+    PerformanceTimer __perf_scope_##__LINE__(name)
+
+Usage in Trading Engine:
+-------------------------
+class TradingEngine {
+public:
+    void processOrder(const Order& order) {
+        PERF_SCOPE("order.processing");
+
+        {
+            PERF_TIMER("order.validation");
+            validateOrder(order);
+        }
+
+        {
+            PERF_TIMER("order.risk_check");
+            checkRiskLimits(order);
+        }
+
+        {
+            PERF_TIMER("order.send_to_exchange");
+            sendToExchange(order);
+        }
+    }
+
+    void onMarketData(const MarketData& data) {
+        PERF_SCOPE("market_data.processing");
+
+        {
+            PERF_TIMER("market_data.parse");
+            parseMarketData(data);
+        }
+
+        {
+            PERF_TIMER("market_data.update_orderbook");
+            updateOrderbook(data);
+        }
+
+        {
+            PERF_TIMER("market_data.notify_strategies");
+            notifyStrategies(data);
+        }
+    }
+
+    // Periodic stats export
+    void exportPerformanceStats() {
+        auto stats = PerformanceRegistry::getAllStatistics();
+
+        for (const auto& [name, stat] : stats) {
+            std::cout << name << ":\n"
+                      << "  Count: " << stat.count << "\n"
+                      << "  Mean: " << stat.mean << "us\n"
+                      << "  P50: " << stat.p50 << "us\n"
+                      << "  P95: " << stat.p95 << "us\n"
+                      << "  P99: " << stat.p99 << "us\n"
+                      << "  P99.9: " << stat.p999 << "us\n"
+                      << "  Min: " << stat.min << "us\n"
+                      << "  Max: " << stat.max << "us\n\n";
+        }
+
+        // Export to Prometheus format
+        PerformanceRegistry::exportToPrometheus("/tmp/performance_metrics.prom");
+    }
+};
+
+============================================
+3. MEMORY PROFILING & LEAK DETECTION
+============================================
+
+Custom Memory Allocator with Tracking:
+---------------------------------------
+#include <cstdlib>
+#include <atomic>
+#include <unordered_map>
+#include <execinfo.h>
+
+class MemoryTracker {
+private:
+    struct AllocationInfo {
+        size_t size;
+        void* backtrace[32];
+        int backtrace_size;
+        std::chrono::steady_clock::time_point timestamp;
+    };
+
+    static std::atomic<size_t> total_allocated_;
+    static std::atomic<size_t> total_freed_;
+    static std::atomic<size_t> current_usage_;
+    static std::atomic<size_t> peak_usage_;
+    static std::atomic<size_t> allocation_count_;
+
+    static std::unordered_map<void*, AllocationInfo> allocations_;
+    static std::mutex mutex_;
+
+    static bool tracking_enabled_;
+
+public:
+    static void enable() {
+        tracking_enabled_ = true;
+    }
+
+    static void disable() {
+        tracking_enabled_ = false;
+    }
+
+    static void* trackAllocation(void* ptr, size_t size) {
+        if (!tracking_enabled_ || !ptr) {
+            return ptr;
+        }
+
+        total_allocated_.fetch_add(size, std::memory_order_relaxed);
+        current_usage_.fetch_add(size, std::memory_order_relaxed);
+        allocation_count_.fetch_add(1, std::memory_order_relaxed);
+
+        // Update peak usage
+        size_t current = current_usage_.load(std::memory_order_relaxed);
+        size_t peak = peak_usage_.load(std::memory_order_relaxed);
+        while (current > peak &&
+               !peak_usage_.compare_exchange_weak(peak, current,
+                                                  std::memory_order_relaxed)) {}
+
+        // Record allocation with backtrace
+        AllocationInfo info;
+        info.size = size;
+        info.timestamp = std::chrono::steady_clock::now();
+        info.backtrace_size = backtrace(info.backtrace, 32);
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            allocations_[ptr] = info;
+        }
+
+        return ptr;
+    }
+
+    static void trackDeallocation(void* ptr) {
+        if (!tracking_enabled_ || !ptr) {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        auto it = allocations_.find(ptr);
+        if (it != allocations_.end()) {
+            size_t size = it->second.size;
+            total_freed_.fetch_add(size, std::memory_order_relaxed);
+            current_usage_.fetch_sub(size, std::memory_order_relaxed);
+            allocations_.erase(it);
+        }
+    }
+
+    struct MemoryStats {
+        size_t total_allocated;
+        size_t total_freed;
+        size_t current_usage;
+        size_t peak_usage;
+        size_t allocation_count;
+        size_t active_allocations;
+    };
+
+    static MemoryStats getStats() {
+        MemoryStats stats;
+        stats.total_allocated = total_allocated_.load(std::memory_order_acquire);
+        stats.total_freed = total_freed_.load(std::memory_order_acquire);
+        stats.current_usage = current_usage_.load(std::memory_order_acquire);
+        stats.peak_usage = peak_usage_.load(std::memory_order_acquire);
+        stats.allocation_count = allocation_count_.load(std::memory_order_acquire);
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stats.active_allocations = allocations_.size();
+        }
+
+        return stats;
+    }
+
+    static std::vector<AllocationInfo> getLeaks() {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        std::vector<AllocationInfo> leaks;
+        auto now = std::chrono::steady_clock::now();
+
+        for (const auto& [ptr, info] : allocations_) {
+            auto age = std::chrono::duration_cast<std::chrono::seconds>(
+                now - info.timestamp).count();
+
+            // Consider allocations older than 60 seconds as potential leaks
+            if (age > 60) {
+                leaks.push_back(info);
+            }
+        }
+
+        return leaks;
+    }
+
+    static void printLeaks() {
+        auto leaks = getLeaks();
+
+        std::cout << "Potential memory leaks: " << leaks.size() << "\n\n";
+
+        for (const auto& leak : leaks) {
+            std::cout << "Leak: " << leak.size << " bytes\n";
+            std::cout << "Backtrace:\n";
+
+            char** symbols = backtrace_symbols(
+                const_cast<void**>(leak.backtrace), leak.backtrace_size);
+
+            for (int i = 0; i < leak.backtrace_size; ++i) {
+                std::cout << "  " << symbols[i] << "\n";
+            }
+
+            free(symbols);
+            std::cout << "\n";
+        }
+    }
+};
+
+std::atomic<size_t> MemoryTracker::total_allocated_{0};
+std::atomic<size_t> MemoryTracker::total_freed_{0};
+std::atomic<size_t> MemoryTracker::current_usage_{0};
+std::atomic<size_t> MemoryTracker::peak_usage_{0};
+std::atomic<size_t> MemoryTracker::allocation_count_{0};
+std::unordered_map<void*, MemoryTracker::AllocationInfo> MemoryTracker::allocations_;
+std::mutex MemoryTracker::mutex_;
+bool MemoryTracker::tracking_enabled_ = false;
+
+// Override global new/delete
+void* operator new(size_t size) {
+    void* ptr = malloc(size);
+    return MemoryTracker::trackAllocation(ptr, size);
+}
+
+void operator delete(void* ptr) noexcept {
+    MemoryTracker::trackDeallocation(ptr);
+    free(ptr);
+}
+
+void* operator new[](size_t size) {
+    void* ptr = malloc(size);
+    return MemoryTracker::trackAllocation(ptr, size);
+}
+
+void operator delete[](void* ptr) noexcept {
+    MemoryTracker::trackDeallocation(ptr);
+    free(ptr);
+}
+
+Memory Pool Profiling:
+----------------------
+template<typename T, size_t PoolSize>
+class ProfiledMemoryPool {
+private:
+    std::array<T, PoolSize> pool_;
+    std::atomic<size_t> allocated_{0};
+    std::atomic<size_t> deallocated_{0};
+    std::atomic<size_t> current_usage_{0};
+    std::atomic<size_t> peak_usage_{0};
+
+    std::bitset<PoolSize> free_slots_;
+    std::mutex mutex_;
+
+public:
+    ProfiledMemoryPool() {
+        free_slots_.set();  // All slots initially free
+    }
+
+    T* allocate() {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        for (size_t i = 0; i < PoolSize; ++i) {
+            if (free_slots_[i]) {
+                free_slots_[i] = false;
+
+                allocated_.fetch_add(1, std::memory_order_relaxed);
+                current_usage_.fetch_add(1, std::memory_order_relaxed);
+
+                size_t current = current_usage_.load(std::memory_order_relaxed);
+                size_t peak = peak_usage_.load(std::memory_order_relaxed);
+                while (current > peak &&
+                       !peak_usage_.compare_exchange_weak(peak, current,
+                                                          std::memory_order_relaxed)) {}
+
+                return &pool_[i];
+            }
+        }
+
+        return nullptr;  // Pool exhausted
+    }
+
+    void deallocate(T* ptr) {
+        if (!ptr) return;
+
+        size_t index = ptr - &pool_[0];
+        if (index >= PoolSize) return;
+
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        if (!free_slots_[index]) {
+            free_slots_[index] = true;
+            deallocated_.fetch_add(1, std::memory_order_relaxed);
+            current_usage_.fetch_sub(1, std::memory_order_relaxed);
+        }
+    }
+
+    struct PoolStats {
+        size_t total_allocated;
+        size_t total_deallocated;
+        size_t current_usage;
+        size_t peak_usage;
+        size_t pool_size;
+        double utilization;
+    };
+
+    PoolStats getStats() const {
+        PoolStats stats;
+        stats.total_allocated = allocated_.load(std::memory_order_acquire);
+        stats.total_deallocated = deallocated_.load(std::memory_order_acquire);
+        stats.current_usage = current_usage_.load(std::memory_order_acquire);
+        stats.peak_usage = peak_usage_.load(std::memory_order_acquire);
+        stats.pool_size = PoolSize;
+        stats.utilization = static_cast<double>(stats.current_usage) / PoolSize * 100.0;
+
+        return stats;
+    }
+};
+
+============================================
+4. CPU PROFILING & HOTSPOT ANALYSIS
+============================================
+
+Linux Perf Integration:
+------------------------
+class PerfProfiler {
+public:
+    static void startProfiling(const std::string& output_file = "perf.data") {
+        std::string cmd = "perf record -F 999 -g -p " +
+                         std::to_string(getpid()) +
+                         " -o " + output_file + " &";
+        system(cmd.c_str());
+    }
+
+    static void stopProfiling() {
+        system("pkill -SIGINT perf");
+    }
+
+    static void generateFlameGraph(const std::string& perf_file = "perf.data",
+                                   const std::string& output_svg = "flamegraph.svg") {
+        std::string cmd =
+            "perf script -i " + perf_file + " | "
+            "stackcollapse-perf.pl | "
+            "flamegraph.pl > " + output_svg;
+        system(cmd.c_str());
+    }
+};
+
+Google pprof Integration:
+--------------------------
+#include <gperftools/profiler.h>
+#include <gperftools/heap-profiler.h>
+
+class GPerfProfiler {
+public:
+    // CPU profiling
+    static void startCPUProfiling(const std::string& filename) {
+        ProfilerStart(filename.c_str());
+    }
+
+    static void stopCPUProfiling() {
+        ProfilerStop();
+    }
+
+    // Heap profiling
+    static void startHeapProfiling(const std::string& prefix) {
+        HeapProfilerStart(prefix.c_str());
+    }
+
+    static void stopHeapProfiling() {
+        HeapProfilerStop();
+    }
+
+    static void dumpHeapProfile(const std::string& reason) {
+        HeapProfilerDump(reason.c_str());
+    }
+};
+
+// Usage with RAII
+class ScopedCPUProfile {
+private:
+    std::string filename_;
+
+public:
+    explicit ScopedCPUProfile(const std::string& filename)
+        : filename_(filename) {
+        GPerfProfiler::startCPUProfiling(filename_);
+    }
+
+    ~ScopedCPUProfile() {
+        GPerfProfiler::stopCPUProfiling();
+    }
+};
+
+// Macro for profiling scopes
+#define PROFILE_CPU(name) \
+    ScopedCPUProfile __cpu_profile_##__LINE__(name)
+
+Instruction-Level Profiling:
+-----------------------------
+#include <linux/perf_event.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+class InstructionProfiler {
+private:
+    int fd_cycles_;
+    int fd_instructions_;
+    int fd_cache_misses_;
+    int fd_branch_misses_;
+
+public:
+    InstructionProfiler() {
+        fd_cycles_ = setupPerfEvent(PERF_COUNT_HW_CPU_CYCLES);
+        fd_instructions_ = setupPerfEvent(PERF_COUNT_HW_INSTRUCTIONS);
+        fd_cache_misses_ = setupPerfEvent(PERF_COUNT_HW_CACHE_MISSES);
+        fd_branch_misses_ = setupPerfEvent(PERF_COUNT_HW_BRANCH_MISSES);
+    }
+
+    ~InstructionProfiler() {
+        close(fd_cycles_);
+        close(fd_instructions_);
+        close(fd_cache_misses_);
+        close(fd_branch_misses_);
+    }
+
+    struct Metrics {
+        uint64_t cycles;
+        uint64_t instructions;
+        uint64_t cache_misses;
+        uint64_t branch_misses;
+        double ipc;  // Instructions per cycle
+    };
+
+    Metrics measure() {
+        Metrics m;
+        read(fd_cycles_, &m.cycles, sizeof(uint64_t));
+        read(fd_instructions_, &m.instructions, sizeof(uint64_t));
+        read(fd_cache_misses_, &m.cache_misses, sizeof(uint64_t));
+        read(fd_branch_misses_, &m.branch_misses, sizeof(uint64_t));
+
+        m.ipc = m.cycles > 0 ?
+            static_cast<double>(m.instructions) / m.cycles : 0.0;
+
+        return m;
+    }
+
+    void reset() {
+        ioctl(fd_cycles_, PERF_EVENT_IOC_RESET, 0);
+        ioctl(fd_instructions_, PERF_EVENT_IOC_RESET, 0);
+        ioctl(fd_cache_misses_, PERF_EVENT_IOC_RESET, 0);
+        ioctl(fd_branch_misses_, PERF_EVENT_IOC_RESET, 0);
+    }
+
+private:
+    int setupPerfEvent(uint64_t config) {
+        struct perf_event_attr pe;
+        memset(&pe, 0, sizeof(struct perf_event_attr));
+
+        pe.type = PERF_TYPE_HARDWARE;
+        pe.size = sizeof(struct perf_event_attr);
+        pe.config = config;
+        pe.disabled = 0;
+        pe.exclude_kernel = 1;
+        pe.exclude_hv = 1;
+
+        int fd = syscall(__NR_perf_event_open, &pe, 0, -1, -1, 0);
+        if (fd < 0) {
+            throw std::runtime_error("Failed to open perf event");
+        }
+
+        return fd;
+    }
+};
+
+// Usage
+void processOrder(const Order& order) {
+    InstructionProfiler profiler;
+    profiler.reset();
+
+    // Process order
+    validateOrder(order);
+    sendToExchange(order);
+
+    auto metrics = profiler.measure();
+
+    std::cout << "Cycles: " << metrics.cycles << "\n"
+              << "Instructions: " << metrics.instructions << "\n"
+              << "IPC: " << metrics.ipc << "\n"
+              << "Cache misses: " << metrics.cache_misses << "\n"
+              << "Branch misses: " << metrics.branch_misses << "\n";
+}
+
+============================================
+5. LOCK CONTENTION ANALYSIS
+============================================
+
+Lock Profiler:
+---------------
+#include <mutex>
+#include <chrono>
+#include <map>
+
+class LockProfiler {
+private:
+    struct LockStats {
+        std::atomic<uint64_t> lock_count{0};
+        std::atomic<uint64_t> contention_count{0};
+        std::atomic<uint64_t> total_wait_time_us{0};
+        std::atomic<uint64_t> total_hold_time_us{0};
+    };
+
+    static std::map<std::string, LockStats> lock_stats_;
+    static std::mutex stats_mutex_;
+
+public:
+    class ProfiledMutex {
+    private:
+        std::string name_;
+        std::mutex mutex_;
+        LockStats& stats_;
+
+    public:
+        explicit ProfiledMutex(const std::string& name)
+            : name_(name),
+              stats_(getLockStats(name)) {}
+
+        class ScopedLock {
+        private:
+            ProfiledMutex& mutex_;
+            std::chrono::high_resolution_clock::time_point lock_start_;
+            std::chrono::high_resolution_clock::time_point lock_acquired_;
+
+        public:
+            explicit ScopedLock(ProfiledMutex& mutex)
+                : mutex_(mutex),
+                  lock_start_(std::chrono::high_resolution_clock::now()) {
+
+                bool contended = !mutex_.mutex_.try_lock();
+                if (contended) {
+                    mutex_.mutex_.lock();
+                    mutex_.stats_.contention_count.fetch_add(1,
+                        std::memory_order_relaxed);
+                }
+
+                lock_acquired_ = std::chrono::high_resolution_clock::now();
+
+                auto wait_time_us = std::chrono::duration_cast<
+                    std::chrono::microseconds>(
+                        lock_acquired_ - lock_start_).count();
+
+                mutex_.stats_.lock_count.fetch_add(1, std::memory_order_relaxed);
+                mutex_.stats_.total_wait_time_us.fetch_add(wait_time_us,
+                    std::memory_order_relaxed);
+            }
+
+            ~ScopedLock() {
+                auto now = std::chrono::high_resolution_clock::now();
+                auto hold_time_us = std::chrono::duration_cast<
+                    std::chrono::microseconds>(now - lock_acquired_).count();
+
+                mutex_.stats_.total_hold_time_us.fetch_add(hold_time_us,
+                    std::memory_order_relaxed);
+
+                mutex_.mutex_.unlock();
+            }
+
+            ScopedLock(const ScopedLock&) = delete;
+            ScopedLock& operator=(const ScopedLock&) = delete;
+        };
+
+        ScopedLock lock() {
+            return ScopedLock(*this);
+        }
+    };
+
+    struct LockStatistics {
+        std::string name;
+        uint64_t lock_count;
+        uint64_t contention_count;
+        double contention_rate;
+        double avg_wait_time_us;
+        double avg_hold_time_us;
+    };
+
+    static std::vector<LockStatistics> getAllStats() {
+        std::lock_guard<std::mutex> lock(stats_mutex_);
+
+        std::vector<LockStatistics> all_stats;
+
+        for (const auto& [name, stats] : lock_stats_) {
+            LockStatistics s;
+            s.name = name;
+            s.lock_count = stats.lock_count.load(std::memory_order_acquire);
+            s.contention_count = stats.contention_count.load(std::memory_order_acquire);
+            s.contention_rate = s.lock_count > 0 ?
+                static_cast<double>(s.contention_count) / s.lock_count * 100.0 : 0.0;
+
+            uint64_t total_wait = stats.total_wait_time_us.load(std::memory_order_acquire);
+            uint64_t total_hold = stats.total_hold_time_us.load(std::memory_order_acquire);
+
+            s.avg_wait_time_us = s.lock_count > 0 ?
+                static_cast<double>(total_wait) / s.lock_count : 0.0;
+            s.avg_hold_time_us = s.lock_count > 0 ?
+                static_cast<double>(total_hold) / s.lock_count : 0.0;
+
+            all_stats.push_back(s);
+        }
+
+        return all_stats;
+    }
+
+    static void printStats() {
+        auto all_stats = getAllStats();
+
+        std::cout << "Lock Contention Statistics:\n\n";
+
+        for (const auto& stats : all_stats) {
+            std::cout << "Lock: " << stats.name << "\n"
+                      << "  Lock count: " << stats.lock_count << "\n"
+                      << "  Contention count: " << stats.contention_count << "\n"
+                      << "  Contention rate: " << stats.contention_rate << "%\n"
+                      << "  Avg wait time: " << stats.avg_wait_time_us << "us\n"
+                      << "  Avg hold time: " << stats.avg_hold_time_us << "us\n\n";
+        }
+    }
+
+private:
+    static LockStats& getLockStats(const std::string& name) {
+        std::lock_guard<std::mutex> lock(stats_mutex_);
+        return lock_stats_[name];
+    }
+};
+
+std::map<std::string, LockProfiler::LockStats> LockProfiler::lock_stats_;
+std::mutex LockProfiler::stats_mutex_;
+
+// Usage
+class OrderBook {
+private:
+    LockProfiler::ProfiledMutex mutex_{"orderbook_mutex"};
+    std::map<double, Order> bids_;
+    std::map<double, Order> asks_;
+
+public:
+    void addOrder(const Order& order) {
+        auto lock = mutex_.lock();
+
+        if (order.side == "buy") {
+            bids_[order.price] = order;
+        } else {
+            asks_[order.price] = order;
+        }
+    }
+};
+
+Production Deployment:
+----------------------
+#!/bin/bash
+
+# Enable APM monitoring
+
+# Start performance monitoring daemon
+./apm_daemon --enable-cpu-profiling \
+             --enable-memory-profiling \
+             --export-interval=60 \
+             --output-dir=/var/lib/hft/apm &
+
+# Export performance stats every minute
+while true; do
+    sleep 60
+    curl http://localhost:8080/apm/stats > /var/lib/hft/apm/stats_$(date +%s).json
+done
+
+echo "APM monitoring started"

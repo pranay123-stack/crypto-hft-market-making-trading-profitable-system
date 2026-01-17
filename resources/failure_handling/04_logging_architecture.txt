@@ -1,0 +1,737 @@
+================================================================================
+                       LOGGING ARCHITECTURE DESIGN
+                  Structured Logging for HFT Systems
+================================================================================
+
+DOCUMENT: Logging Architecture and Design Patterns
+VERSION: 2.1.0
+LAST UPDATED: 2025-11-26
+SCOPE: HFT System Logging Infrastructure
+
+================================================================================
+                          TABLE OF CONTENTS
+================================================================================
+
+1. Logging Philosophy & Requirements
+2. Log Level Taxonomy
+3. Structured Logging Design
+4. Asynchronous Logging Patterns
+5. Performance Considerations
+6. Log Storage & Retention
+7. Log Format Standards
+8. Regulatory Compliance
+9. Code Examples
+
+================================================================================
+            1. LOGGING PHILOSOPHY & REQUIREMENTS
+================================================================================
+
+CORE LOGGING PRINCIPLES:
+------------------------
+
+1. LOG EVERYTHING THAT MATTERS
+   - All state changes
+   - All external interactions
+   - All errors and exceptions
+   - All performance metrics
+   - All business transactions
+
+2. NEVER BLOCK CRITICAL PATH
+   - Async logging for hot paths
+   - Lock-free data structures
+   - Pre-allocated buffers
+   - Fail-safe fallback mechanisms
+
+3. STRUCTURE FOR QUERYABILITY
+   - Machine-readable formats (JSON)
+   - Consistent field names
+   - Rich context in every log
+   - Correlation IDs for tracing
+
+4. OPTIMIZE FOR FORENSICS
+   - Nanosecond timestamps
+   - Thread/CPU affinity tracking
+   - Stack traces on errors
+   - System state snapshots
+
+LATENCY BUDGET FOR LOGGING:
+---------------------------
+
+Operation                  P50        P99        P99.9      Max
+--------------------------------------------------------------------------------
+Async log write           < 1μs      < 5μs      < 10μs     < 50μs
+Sync log write            < 100μs    < 500μs    < 1ms      < 10ms
+Log flush                 < 1ms      < 10ms     < 100ms    < 1s
+Log rotation              < 10ms     < 100ms    < 1s       < 5s
+
+HOT PATH LOGGING:
+- Use async logging exclusively
+- Log only ERROR and CRITICAL levels
+- Defer verbose logging to background threads
+
+WARM PATH LOGGING:
+- Can use sync or async
+- Log WARN, ERROR, CRITICAL
+- Include contextual INFO for debugging
+
+COLD PATH LOGGING:
+- Full sync logging acceptable
+- All levels including DEBUG, TRACE
+- Extensive context and metadata
+
+LOGGING OVERHEAD TARGETS:
+-------------------------
+
+System Component       CPU Overhead    Memory Overhead    I/O Overhead
+--------------------------------------------------------------------------------
+Trading Engine        < 0.5%          < 50MB             < 10 MB/s
+Risk Manager          < 1.0%          < 100MB            < 20 MB/s
+Market Data Handler   < 2.0%          < 200MB            < 100 MB/s
+Strategy Manager      < 1.0%          < 100MB            < 50 MB/s
+
+TOTAL SYSTEM:         < 3.0%          < 500MB            < 200 MB/s
+
+================================================================================
+                       2. LOG LEVEL TAXONOMY
+================================================================================
+
+LOG LEVEL DEFINITIONS:
+----------------------
+
+TRACE (Level 0):
+- Purpose: Ultra-detailed execution flow
+- Use Case: Deep debugging, development only
+- Example: Function entry/exit, loop iterations
+- Production: DISABLED
+- Performance Impact: Very High
+
+DEBUG (Level 1):
+- Purpose: Detailed diagnostic information
+- Use Case: Troubleshooting specific issues
+- Example: Variable values, intermediate calculations
+- Production: Conditional (can be enabled selectively)
+- Performance Impact: High
+
+INFO (Level 2):
+- Purpose: General informational messages
+- Use Case: Normal operation milestones
+- Example: Connection established, order submitted
+- Production: ENABLED
+- Performance Impact: Medium
+
+WARN (Level 3):
+- Purpose: Warning about potential issues
+- Use Case: Degraded conditions, retries
+- Example: High latency, approaching limits
+- Production: ENABLED
+- Performance Impact: Low
+
+ERROR (Level 4):
+- Purpose: Error conditions that don't stop operation
+- Use Case: Recoverable failures
+- Example: Order rejection, API error
+- Production: ENABLED
+- Performance Impact: Very Low
+
+CRITICAL (Level 5):
+- Purpose: Critical failures requiring immediate attention
+- Use Case: System-threatening conditions
+- Example: Exchange disconnect, circuit breaker trip
+- Production: ENABLED
+- Performance Impact: Negligible
+
+FATAL (Level 6):
+- Purpose: Unrecoverable errors, system shutdown
+- Use Case: Corruption, catastrophic failures
+- Example: Database corruption, memory exhaustion
+- Production: ENABLED
+- Performance Impact: None (system stopping)
+
+LOG LEVEL CONFIGURATION:
+------------------------
+
+Environment         Levels Enabled              Rationale
+--------------------------------------------------------------------------------
+Development         ALL                         Maximum visibility
+Testing             DEBUG and above             Detailed troubleshooting
+Staging             INFO and above              Production-like
+Production (Normal) INFO and above              Balanced observability
+Production (Debug)  DEBUG (selective)           Targeted debugging
+Emergency           WARN and above only         Reduce overhead
+
+DYNAMIC LOG LEVEL CONTROL:
+---------------------------
+
+// Runtime log level adjustment
+class LogLevelController {
+public:
+    void set_component_level(const std::string& component,
+                            LogLevel level) {
+        logger_registry_[component]->set_level(level);
+        
+        logger_.info("Log level changed", {
+            {"component", component},
+            {"new_level", to_string(level)}
+        });
+    }
+    
+    void enable_debug_window(std::chrono::seconds duration) {
+        // Temporarily enable DEBUG logging
+        auto original_level = global_log_level_;
+        global_log_level_ = LogLevel::DEBUG;
+        
+        logger_.warn("Debug logging enabled", {
+            {"duration_seconds", duration.count()}
+        });
+        
+        // Schedule return to normal
+        timer_.schedule([this, original_level]() {
+            global_log_level_ = original_level;
+            logger_.info("Debug logging disabled");
+        }, duration);
+    }
+    
+    void enable_trace_for_order(const std::string& order_id) {
+        // Enable TRACE logging for specific order
+        trace_filters_[order_id] = true;
+        
+        logger_.info("Trace enabled for order", {
+            {"order_id", order_id}
+        });
+    }
+};
+
+================================================================================
+                   3. STRUCTURED LOGGING DESIGN
+================================================================================
+
+3.1 JSON LOGGING FORMAT
+-----------------------
+
+STANDARD LOG ENTRY STRUCTURE:
+
+{
+  "timestamp": "2025-11-26T10:20:35.123456789Z",
+  "level": "ERROR",
+  "logger": "trading_engine.order_manager",
+  "thread_id": 12345,
+  "thread_name": "order_processor_1",
+  "cpu_id": 3,
+  "process_id": 67890,
+  "hostname": "hft-prod-01",
+  "message": "Order execution failed",
+  "context": {
+    "order_id": "ORD-20251126-001234",
+    "symbol": "AAPL",
+    "quantity": 100,
+    "price": 150.25,
+    "error_code": 2101,
+    "error_message": "Insufficient buying power",
+    "exchange": "NASDAQ",
+    "strategy_id": "MM-TECH-01",
+    "account_id": "ACC-12345"
+  },
+  "correlation_id": "550e8400-e29b-41d4-a716-446655440000",
+  "parent_span_id": "7f8a9b0c1d2e3f4g",
+  "span_id": "1a2b3c4d5e6f7g8h",
+  "metrics": {
+    "latency_us": 125,
+    "queue_depth": 45
+  },
+  "stack_trace": "..."
+}
+
+FIELD DEFINITIONS:
+------------------
+
+MANDATORY FIELDS (always present):
+- timestamp: ISO 8601 with nanosecond precision, UTC
+- level: Log level (TRACE, DEBUG, INFO, WARN, ERROR, CRITICAL, FATAL)
+- logger: Logger name (component hierarchy)
+- thread_id: OS thread ID
+- message: Human-readable description
+
+OPTIONAL STANDARD FIELDS:
+- thread_name: Named thread for readability
+- cpu_id: CPU core the thread was running on
+- process_id: OS process ID
+- hostname: Machine hostname
+- context: Business/technical context (flexible schema)
+- correlation_id: UUID for request tracing
+- parent_span_id: Distributed tracing parent
+- span_id: Distributed tracing current span
+- metrics: Performance metrics
+- stack_trace: Stack trace for errors
+- tags: Classification tags
+
+3.2 CONTEXT ENRICHMENT
+----------------------
+
+AUTOMATIC CONTEXT:
+
+class ContextEnricher {
+private:
+    thread_local static ContextMap thread_context_;
+    
+public:
+    // Set context that persists for thread duration
+    static void set_thread_context(const std::string& key,
+                                   const std::string& value) {
+        thread_context_[key] = value;
+    }
+    
+    // Scoped context (RAII)
+    class ScopedContext {
+    public:
+        ScopedContext(const std::string& key, const std::string& value)
+            : key_(key) {
+            ContextEnricher::set_thread_context(key_, value);
+        }
+        
+        ~ScopedContext() {
+            ContextEnricher::thread_context_.erase(key_);
+        }
+        
+    private:
+        std::string key_;
+    };
+    
+    static ContextMap get_current_context() {
+        return thread_context_;
+    }
+};
+
+// Usage example:
+void process_order(const Order& order) {
+    // Set context for all logs in this scope
+    ContextEnricher::ScopedContext order_ctx("order_id", order.id);
+    ContextEnricher::ScopedContext symbol_ctx("symbol", order.symbol);
+    
+    logger_.info("Processing order");  // Automatically includes order_id, symbol
+    
+    if (!validate_order(order)) {
+        logger_.error("Order validation failed");  // Still has context
+        return;
+    }
+    
+    submit_to_exchange(order);
+}
+
+3.3 CORRELATION IDs
+-------------------
+
+PURPOSE: Track related events across distributed system
+
+class CorrelationIdManager {
+public:
+    // Generate new correlation ID for new request
+    static std::string generate() {
+        boost::uuids::uuid uuid = boost::uuids::random_generator()();
+        return boost::uuids::to_string(uuid);
+    }
+    
+    // Set correlation ID for current thread
+    static void set_current(const std::string& correlation_id) {
+        thread_local_correlation_id_ = correlation_id;
+    }
+    
+    // Get correlation ID for current thread
+    static std::string get_current() {
+        if (thread_local_correlation_id_.empty()) {
+            thread_local_correlation_id_ = generate();
+        }
+        return thread_local_correlation_id_;
+    }
+    
+private:
+    thread_local static std::string thread_local_correlation_id_;
+};
+
+// Usage:
+void handle_new_order(const OrderRequest& request) {
+    // Set correlation ID for entire request chain
+    CorrelationIdManager::set_current(request.correlation_id);
+    
+    logger_.info("New order received");  // correlation_id auto-included
+    
+    validate_order(request);  // All logs will have same correlation_id
+    submit_order(request);
+    notify_clients(request);
+}
+
+================================================================================
+                  4. ASYNCHRONOUS LOGGING PATTERNS
+================================================================================
+
+4.1 LOCK-FREE ASYNC LOGGER
+---------------------------
+
+ARCHITECTURE:
+
+    [Producer Threads]
+           |
+           v
+    +---------------+
+    | SPSC Queue    | (Lock-free, per-thread)
+    +---------------+
+           |
+           v
+    [Consumer Thread]
+           |
+           v
+    +---------------+
+    | Buffer Pool   |
+    +---------------+
+           |
+           v
+    [Disk I/O]
+
+IMPLEMENTATION:
+
+namespace hft::logging {
+
+template<size_t BufferSize = 1024 * 1024>
+class AsyncLogger {
+private:
+    // Lock-free single-producer-single-consumer queue
+    struct LogMessage {
+        char data[BufferSize];
+        size_t length;
+        LogLevel level;
+        std::chrono::system_clock::time_point timestamp;
+    };
+    
+    using MessageQueue = boost::lockfree::spsc_queue<
+        LogMessage*,
+        boost::lockfree::capacity<10000>
+    >;
+    
+    // Per-thread queue (no contention)
+    thread_local static MessageQueue* thread_queue_;
+    
+    // Consumer thread
+    std::thread consumer_thread_;
+    std::atomic<bool> running_{true};
+    
+    // Pre-allocated message pool
+    std::vector<LogMessage*> message_pool_;
+    std::atomic<size_t> pool_index_{0};
+    
+public:
+    void initialize() {
+        // Pre-allocate message pool
+        message_pool_.resize(100000);
+        for (auto& msg : message_pool_) {
+            msg = new LogMessage();
+        }
+        
+        // Start consumer thread
+        consumer_thread_ = std::thread([this]() {
+            consume_loop();
+        });
+        
+        // Pin consumer to specific CPU
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(CONSUMER_CPU_ID, &cpuset);
+        pthread_setaffinity_np(consumer_thread_.native_handle(),
+                              sizeof(cpuset), &cpuset);
+    }
+    
+    void log(LogLevel level, const std::string& message,
+            const ContextMap& context = {}) {
+        // Get thread-local queue (lazy initialization)
+        if (thread_queue_ == nullptr) {
+            thread_queue_ = new MessageQueue();
+            register_thread_queue(thread_queue_);
+        }
+        
+        // Get pre-allocated message from pool
+        LogMessage* msg = acquire_message();
+        if (msg == nullptr) {
+            // Pool exhausted - drop log (don't block!)
+            dropped_messages_++;
+            return;
+        }
+        
+        // Format message
+        msg->timestamp = std::chrono::system_clock::now();
+        msg->level = level;
+        msg->length = format_message(msg->data, BufferSize,
+                                     level, message, context);
+        
+        // Push to queue (lock-free)
+        if (!thread_queue_->push(msg)) {
+            // Queue full - drop log
+            dropped_messages_++;
+            release_message(msg);
+        }
+    }
+    
+private:
+    void consume_loop() {
+        std::vector<LogMessage*> batch;
+        batch.reserve(1000);
+        
+        while (running_) {
+            // Collect batch of messages
+            batch.clear();
+            
+            for (auto* queue : all_thread_queues_) {
+                LogMessage* msg;
+                while (queue->pop(msg)) {
+                    batch.push_back(msg);
+                    
+                    if (batch.size() >= 1000) {
+                        break;  // Process batch
+                    }
+                }
+            }
+            
+            if (!batch.empty()) {
+                // Write batch to disk
+                write_batch(batch);
+                
+                // Return messages to pool
+                for (auto* msg : batch) {
+                    release_message(msg);
+                }
+            } else {
+                // No messages - brief sleep
+                std::this_thread::sleep_for(std::chrono::microseconds(10));
+            }
+        }
+    }
+    
+    void write_batch(const std::vector<LogMessage*>& batch) {
+        // Combine all messages into single buffer
+        std::vector<char> combined_buffer;
+        combined_buffer.reserve(BufferSize * batch.size());
+        
+        for (const auto* msg : batch) {
+            combined_buffer.insert(combined_buffer.end(),
+                                 msg->data,
+                                 msg->data + msg->length);
+        }
+        
+        // Single write syscall
+        ssize_t written = write(log_fd_,
+                               combined_buffer.data(),
+                               combined_buffer.size());
+        
+        if (written != static_cast<ssize_t>(combined_buffer.size())) {
+            // Write failed - emergency fallback
+            emergency_fallback(batch);
+        }
+        
+        bytes_written_ += written;
+    }
+    
+    LogMessage* acquire_message() {
+        // Lock-free message acquisition
+        size_t index = pool_index_.fetch_add(1, std::memory_order_relaxed);
+        
+        if (index >= message_pool_.size()) {
+            pool_index_.store(0);  // Wrap around
+            return nullptr;  // Pool exhausted
+        }
+        
+        return message_pool_[index];
+    }
+    
+    void release_message(LogMessage* msg) {
+        // Message returned to pool (will be reused)
+        // No actual deallocation needed
+    }
+    
+    size_t format_message(char* buffer, size_t buffer_size,
+                         LogLevel level,
+                         const std::string& message,
+                         const ContextMap& context) {
+        // Fast JSON formatting (custom implementation)
+        // Avoid allocations, use stack buffer
+        
+        char* ptr = buffer;
+        char* end = buffer + buffer_size;
+        
+        // Opening brace
+        *ptr++ = '{';
+        
+        // Timestamp
+        ptr = append_field(ptr, end, "timestamp",
+                          format_timestamp_fast());
+        *ptr++ = ',';
+        
+        // Level
+        ptr = append_field(ptr, end, "level", to_string(level));
+        *ptr++ = ',';
+        
+        // Message
+        ptr = append_field(ptr, end, "message", message);
+        
+        // Context
+        if (!context.empty()) {
+            *ptr++ = ',';
+            ptr = append_object(ptr, end, "context", context);
+        }
+        
+        // Auto-context
+        auto auto_ctx = ContextEnricher::get_current_context();
+        if (!auto_ctx.empty()) {
+            for (const auto& [key, value] : auto_ctx) {
+                *ptr++ = ',';
+                ptr = append_field(ptr, end, key, value);
+            }
+        }
+        
+        // Correlation ID
+        auto corr_id = CorrelationIdManager::get_current();
+        if (!corr_id.empty()) {
+            *ptr++ = ',';
+            ptr = append_field(ptr, end, "correlation_id", corr_id);
+        }
+        
+        // Closing brace and newline
+        *ptr++ = '}';
+        *ptr++ = '\n';
+        
+        return ptr - buffer;
+    }
+};
+
+} // namespace hft::logging
+
+4.2 BATCHING AND BUFFERING
+---------------------------
+
+BUFFER MANAGEMENT:
+
+class BufferManager {
+private:
+    struct Buffer {
+        char* data;
+        size_t size;
+        size_t used{0};
+        std::chrono::steady_clock::time_point last_flush;
+    };
+    
+    static constexpr size_t BUFFER_SIZE = 4 * 1024 * 1024;  // 4MB
+    static constexpr auto MAX_BUFFER_AGE = std::chrono::milliseconds(100);
+    
+    std::array<Buffer, 4> buffers_;  // Double buffering x2
+    std::atomic<size_t> current_buffer_{0};
+    
+public:
+    void initialize() {
+        for (auto& buffer : buffers_) {
+            buffer.data = static_cast<char*>(
+                aligned_alloc(4096, BUFFER_SIZE)
+            );
+            buffer.size = BUFFER_SIZE;
+            buffer.used = 0;
+        }
+    }
+    
+    void append(const char* data, size_t length) {
+        auto& buffer = get_current_buffer();
+        
+        // Check if buffer has space
+        if (buffer.used + length > buffer.size) {
+            // Buffer full - flush and switch
+            flush_buffer(buffer);
+            switch_buffer();
+        }
+        
+        // Append to buffer
+        memcpy(buffer.data + buffer.used, data, length);
+        buffer.used += length;
+        
+        // Check age-based flush
+        auto age = std::chrono::steady_clock::now() - buffer.last_flush;
+        if (age > MAX_BUFFER_AGE) {
+            flush_buffer(buffer);
+        }
+    }
+    
+private:
+    void flush_buffer(Buffer& buffer) {
+        if (buffer.used == 0) return;
+        
+        // Write to disk
+        ssize_t written = write(log_fd_, buffer.data, buffer.used);
+        
+        if (written != static_cast<ssize_t>(buffer.used)) {
+            handle_write_error();
+        }
+        
+        // Reset buffer
+        buffer.used = 0;
+        buffer.last_flush = std::chrono::steady_clock::now();
+    }
+    
+    void switch_buffer() {
+        current_buffer_ = (current_buffer_ + 1) % buffers_.size();
+    }
+};
+
+================================================================================
+                    5. PERFORMANCE CONSIDERATIONS
+================================================================================
+
+5.1 ZERO-COPY LOGGING
+----------------------
+
+// Avoid string allocations in hot path
+class ZeroCopyLogger {
+public:
+    // Use string views (no allocation)
+    void log(std::string_view message) {
+        // Direct write to buffer, no copy
+        buffer_.append(message.data(), message.size());
+    }
+    
+    // Format directly into buffer
+    template<typename... Args>
+    void log_format(const char* format, Args&&... args) {
+        // Use fmt library's vformat_to (no allocation)
+        fmt::vformat_to(
+            std::back_inserter(buffer_),
+            format,
+            fmt::make_format_args(std::forward<Args>(args)...)
+        );
+    }
+};
+
+5.2 CACHE-LINE OPTIMIZATION
+----------------------------
+
+// Align log structures to cache lines
+struct alignas(64) CacheLineAlignedLogEntry {
+    std::atomic<uint64_t> sequence_number;
+    uint64_t timestamp_ns;
+    uint32_t thread_id;
+    uint16_t level;
+    uint16_t message_length;
+    char message[48];  // Fits in single cache line
+};
+
+5.3 MEMORY BARRIERS
+-------------------
+
+class OrderedLogger {
+public:
+    void log_critical_event(const Event& event) {
+        // Ensure all prior writes are visible
+        std::atomic_thread_fence(std::memory_order_release);
+        
+        // Log event
+        write_log_entry(event);
+        
+        // Ensure log write completes before continuing
+        std::atomic_thread_fence(std::memory_order_acquire);
+    }
+};
+
+================================================================================
+                              END OF DOCUMENT
+================================================================================

@@ -1,0 +1,958 @@
+================================================================================
+DAILY OPTIMIZATION
+Before Next Day Optimizations and Parameter Tuning
+================================================================================
+
+VERSION: 1.0
+DOCUMENT: Daily Parameter Optimization and System Tuning
+LAST UPDATED: 2025-11-26
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+
+1. Overview
+2. Parameter Optimization Framework
+3. Walk-Forward Analysis
+4. Grid Search Optimization
+5. Bayesian Optimization
+6. Genetic Algorithm Optimization
+7. Performance Evaluation
+8. Complete Implementation
+
+================================================================================
+1. OVERVIEW
+================================================================================
+
+The Daily Optimization system analyzes trading performance and automatically
+tunes strategy parameters to improve performance for the next trading day.
+
+KEY FEATURES:
+-------------
+- Automated parameter optimization
+- Multiple optimization algorithms
+- Walk-forward validation
+- Out-of-sample testing
+- Overfitting detection
+- Parameter stability analysis
+- Adaptive parameter ranges
+- Multi-objective optimization
+
+OPTIMIZATION OBJECTIVES:
+------------------------
+- Maximize Sharpe ratio
+- Minimize drawdown
+- Maximize profit factor
+- Minimize volatility
+- Maximize win rate
+- Minimize transaction costs
+
+================================================================================
+2. PARAMETER OPTIMIZATION FRAMEWORK
+================================================================================
+
+2.1 PARAMETER DEFINITIONS
+--------------------------
+
+struct ParameterDefinition {
+    std::string name;
+    enum class Type {
+        INTEGER,
+        FLOAT,
+        BOOLEAN,
+        CATEGORICAL
+    } type;
+
+    // Range for numeric parameters
+    double min_value;
+    double max_value;
+    double step_size;
+
+    // Categorical options
+    std::vector<std::string> categories;
+
+    // Constraints
+    bool log_scale;  // Use logarithmic scale for search
+    std::function<bool(double)> is_valid;  // Custom validation
+
+    ParameterDefinition()
+        : type(Type::FLOAT), min_value(0), max_value(1),
+          step_size(0.1), log_scale(false) {}
+};
+
+struct ParameterSet {
+    std::unordered_map<std::string, double> numeric_params;
+    std::unordered_map<std::string, std::string> categorical_params;
+    std::unordered_map<std::string, bool> boolean_params;
+
+    double get(const std::string& name, double default_val = 0.0) const {
+        auto it = numeric_params.find(name);
+        return it != numeric_params.end() ? it->second : default_val;
+    }
+
+    void set(const std::string& name, double value) {
+        numeric_params[name] = value;
+    }
+
+    bool operator==(const ParameterSet& other) const {
+        return numeric_params == other.numeric_params &&
+               categorical_params == other.categorical_params &&
+               boolean_params == other.boolean_params;
+    }
+};
+
+struct OptimizationResult {
+    ParameterSet parameters;
+    double objective_value;
+    double sharpe_ratio;
+    double total_return;
+    double max_drawdown;
+    double win_rate;
+
+    // Validation scores
+    double in_sample_score;
+    double out_of_sample_score;
+    double stability_score;
+
+    bool is_overfitted;
+
+    OptimizationResult()
+        : objective_value(0), sharpe_ratio(0), total_return(0),
+          max_drawdown(0), win_rate(0), in_sample_score(0),
+          out_of_sample_score(0), stability_score(0),
+          is_overfitted(false) {}
+};
+
+2.2 OBJECTIVE FUNCTION
+-----------------------
+
+class ObjectiveFunction {
+public:
+    enum class Goal {
+        MAXIMIZE_SHARPE,
+        MAXIMIZE_RETURN,
+        MINIMIZE_DRAWDOWN,
+        MAXIMIZE_PROFIT_FACTOR,
+        MULTI_OBJECTIVE
+    };
+
+    explicit ObjectiveFunction(Goal goal = Goal::MAXIMIZE_SHARPE)
+        : goal_(goal) {}
+
+    double evaluate(const ParameterSet& params,
+                   const SimulationResults& results) {
+        switch (goal_) {
+            case Goal::MAXIMIZE_SHARPE:
+                return calculateSharpeRatio(results);
+
+            case Goal::MAXIMIZE_RETURN:
+                return calculateTotalReturn(results);
+
+            case Goal::MINIMIZE_DRAWDOWN:
+                return -calculateMaxDrawdown(results);  // Negative for minimization
+
+            case Goal::MAXIMIZE_PROFIT_FACTOR:
+                return calculateProfitFactor(results);
+
+            case Goal::MULTI_OBJECTIVE:
+                return calculateMultiObjective(results);
+        }
+
+        return 0.0;
+    }
+
+private:
+    Goal goal_;
+
+    double calculateSharpeRatio(const SimulationResults& results) {
+        if (results.daily_returns.empty()) return 0.0;
+
+        double mean = std::accumulate(results.daily_returns.begin(),
+                                     results.daily_returns.end(), 0.0) /
+                     results.daily_returns.size();
+
+        double sq_sum = 0.0;
+        for (double ret : results.daily_returns) {
+            sq_sum += (ret - mean) * (ret - mean);
+        }
+        double std_dev = std::sqrt(sq_sum / results.daily_returns.size());
+
+        if (std_dev == 0) return 0.0;
+        return mean / std_dev * std::sqrt(252.0);
+    }
+
+    double calculateTotalReturn(const SimulationResults& results) {
+        if (results.final_capital == 0 || results.initial_capital == 0) {
+            return 0.0;
+        }
+        return (results.final_capital - results.initial_capital) /
+               results.initial_capital;
+    }
+
+    double calculateMaxDrawdown(const SimulationResults& results) {
+        double cumulative = 0.0;
+        double peak = 0.0;
+        double max_dd = 0.0;
+
+        for (double ret : results.daily_returns) {
+            cumulative += ret;
+            peak = std::max(peak, cumulative);
+            double drawdown = peak - cumulative;
+            max_dd = std::max(max_dd, drawdown);
+        }
+
+        return max_dd;
+    }
+
+    double calculateProfitFactor(const SimulationResults& results) {
+        double total_profit = 0.0;
+        double total_loss = 0.0;
+
+        for (const auto& trade : results.trades) {
+            if (trade.realized_pnl > 0) {
+                total_profit += trade.realized_pnl;
+            } else {
+                total_loss += std::abs(trade.realized_pnl);
+            }
+        }
+
+        if (total_loss == 0) return total_profit > 0 ? 1000.0 : 0.0;
+        return total_profit / total_loss;
+    }
+
+    double calculateMultiObjective(const SimulationResults& results) {
+        // Weighted combination of multiple objectives
+        double sharpe = calculateSharpeRatio(results);
+        double returns = calculateTotalReturn(results);
+        double dd = calculateMaxDrawdown(results);
+        double pf = calculateProfitFactor(results);
+
+        // Weights
+        const double w_sharpe = 0.4;
+        const double w_return = 0.3;
+        const double w_dd = 0.2;
+        const double w_pf = 0.1;
+
+        // Normalize to [0, 1] range
+        double norm_sharpe = std::tanh(sharpe / 3.0);  // Assume good Sharpe is ~3
+        double norm_return = std::tanh(returns * 10.0);  // Assume good return is ~10%
+        double norm_dd = 1.0 - std::tanh(dd * 20.0);   // Assume 5% DD is ok
+        double norm_pf = std::tanh(pf / 2.0);          // Assume PF of 2 is good
+
+        return w_sharpe * norm_sharpe + w_return * norm_return +
+               w_dd * norm_dd + w_pf * norm_pf;
+    }
+};
+
+================================================================================
+3. WALK-FORWARD ANALYSIS
+================================================================================
+
+3.1 WALK-FORWARD OPTIMIZER
+---------------------------
+
+class WalkForwardOptimizer {
+public:
+    struct Config {
+        size_t in_sample_days;          // Training period
+        size_t out_of_sample_days;      // Testing period
+        size_t step_days;               // How much to advance window
+        size_t min_trades_required;     // Minimum trades for valid result
+
+        Config()
+            : in_sample_days(20), out_of_sample_days(5),
+              step_days(5), min_trades_required(10) {}
+    };
+
+    WalkForwardOptimizer(const Config& config,
+                        std::shared_ptr<IOptimizer> optimizer)
+        : config_(config), optimizer_(optimizer) {}
+
+    struct WalkForwardResults {
+        std::vector<OptimizationResult> in_sample_results;
+        std::vector<OptimizationResult> out_of_sample_results;
+
+        double avg_in_sample_score;
+        double avg_out_of_sample_score;
+        double degradation_ratio;  // OOS / IS score
+
+        bool is_robust;  // True if degradation < threshold
+
+        WalkForwardResults()
+            : avg_in_sample_score(0), avg_out_of_sample_score(0),
+              degradation_ratio(0), is_robust(false) {}
+    };
+
+    WalkForwardResults run(const std::vector<MarketData>& historical_data,
+                          IStrategy& strategy,
+                          const std::vector<ParameterDefinition>& param_defs) {
+        WalkForwardResults wf_results;
+
+        size_t total_days = historical_data.size();
+        size_t current_pos = 0;
+
+        while (current_pos + config_.in_sample_days + config_.out_of_sample_days <= total_days) {
+            // Extract in-sample data
+            auto is_start = historical_data.begin() + current_pos;
+            auto is_end = is_start + config_.in_sample_days;
+            std::vector<MarketData> in_sample_data(is_start, is_end);
+
+            // Optimize on in-sample data
+            auto best_params = optimizer_->optimize(in_sample_data, strategy, param_defs);
+
+            // Test on out-of-sample data
+            auto oos_start = is_end;
+            auto oos_end = oos_start + config_.out_of_sample_days;
+            std::vector<MarketData> out_of_sample_data(oos_start, oos_end);
+
+            // Apply best parameters and evaluate
+            strategy.setParameters(best_params.parameters);
+            auto oos_result = evaluateStrategy(strategy, out_of_sample_data);
+
+            wf_results.in_sample_results.push_back(best_params);
+            wf_results.out_of_sample_results.push_back(oos_result);
+
+            // Advance window
+            current_pos += config_.step_days;
+        }
+
+        // Calculate aggregate statistics
+        calculateAggregateStats(wf_results);
+
+        return wf_results;
+    }
+
+private:
+    Config config_;
+    std::shared_ptr<IOptimizer> optimizer_;
+
+    OptimizationResult evaluateStrategy(IStrategy& strategy,
+                                       const std::vector<MarketData>& data) {
+        // Run backtest with given parameters
+        SimulationEngine sim;
+        // ... setup simulation ...
+
+        auto results = sim.run();
+
+        OptimizationResult opt_result;
+        opt_result.parameters = strategy.getParameters();
+
+        ObjectiveFunction obj_func(ObjectiveFunction::Goal::MAXIMIZE_SHARPE);
+        opt_result.objective_value = obj_func.evaluate(opt_result.parameters, results);
+        opt_result.sharpe_ratio = calculateSharpeRatio(results);
+        opt_result.total_return = calculateTotalReturn(results);
+
+        return opt_result;
+    }
+
+    void calculateAggregateStats(WalkForwardResults& results) {
+        double is_sum = 0.0;
+        double oos_sum = 0.0;
+
+        for (size_t i = 0; i < results.in_sample_results.size(); ++i) {
+            is_sum += results.in_sample_results[i].objective_value;
+            oos_sum += results.out_of_sample_results[i].objective_value;
+        }
+
+        size_t n = results.in_sample_results.size();
+        results.avg_in_sample_score = is_sum / n;
+        results.avg_out_of_sample_score = oos_sum / n;
+
+        if (results.avg_in_sample_score > 0) {
+            results.degradation_ratio = results.avg_out_of_sample_score /
+                                       results.avg_in_sample_score;
+
+            // Consider robust if OOS performance is at least 70% of IS
+            results.is_robust = results.degradation_ratio >= 0.7;
+        }
+    }
+
+    double calculateSharpeRatio(const SimulationResults& results) {
+        // Implementation
+        return 0.0;
+    }
+
+    double calculateTotalReturn(const SimulationResults& results) {
+        // Implementation
+        return 0.0;
+    }
+};
+
+================================================================================
+4. GRID SEARCH OPTIMIZATION
+================================================================================
+
+4.1 GRID SEARCH OPTIMIZER
+--------------------------
+
+class GridSearchOptimizer : public IOptimizer {
+public:
+    OptimizationResult optimize(
+        const std::vector<MarketData>& data,
+        IStrategy& strategy,
+        const std::vector<ParameterDefinition>& param_defs) override {
+
+        std::vector<ParameterSet> parameter_grid = generateGrid(param_defs);
+
+        OptimizationResult best_result;
+        best_result.objective_value = std::numeric_limits<double>::lowest();
+
+        std::cout << "Grid search: evaluating " << parameter_grid.size()
+                 << " parameter combinations..." << std::endl;
+
+        // Parallel evaluation
+        #pragma omp parallel for
+        for (size_t i = 0; i < parameter_grid.size(); ++i) {
+            const auto& params = parameter_grid[i];
+
+            // Evaluate this parameter set
+            auto result = evaluateParameterSet(params, data, strategy);
+
+            #pragma omp critical
+            {
+                if (result.objective_value > best_result.objective_value) {
+                    best_result = result;
+                    std::cout << "New best: " << result.objective_value << std::endl;
+                }
+            }
+        }
+
+        return best_result;
+    }
+
+private:
+    std::vector<ParameterSet> generateGrid(
+        const std::vector<ParameterDefinition>& param_defs) {
+
+        std::vector<ParameterSet> grid;
+
+        if (param_defs.empty()) {
+            return grid;
+        }
+
+        // Recursive grid generation
+        ParameterSet current;
+        generateGridRecursive(param_defs, 0, current, grid);
+
+        return grid;
+    }
+
+    void generateGridRecursive(
+        const std::vector<ParameterDefinition>& param_defs,
+        size_t index,
+        ParameterSet& current,
+        std::vector<ParameterSet>& grid) {
+
+        if (index >= param_defs.size()) {
+            grid.push_back(current);
+            return;
+        }
+
+        const auto& param_def = param_defs[index];
+
+        if (param_def.type == ParameterDefinition::Type::FLOAT ||
+            param_def.type == ParameterDefinition::Type::INTEGER) {
+
+            double value = param_def.min_value;
+            while (value <= param_def.max_value) {
+                current.numeric_params[param_def.name] = value;
+
+                generateGridRecursive(param_defs, index + 1, current, grid);
+
+                if (param_def.log_scale) {
+                    value *= (1.0 + param_def.step_size);
+                } else {
+                    value += param_def.step_size;
+                }
+            }
+        } else if (param_def.type == ParameterDefinition::Type::CATEGORICAL) {
+            for (const auto& category : param_def.categories) {
+                current.categorical_params[param_def.name] = category;
+                generateGridRecursive(param_defs, index + 1, current, grid);
+            }
+        }
+    }
+
+    OptimizationResult evaluateParameterSet(
+        const ParameterSet& params,
+        const std::vector<MarketData>& data,
+        IStrategy& strategy) {
+
+        // Set parameters
+        strategy.setParameters(params);
+
+        // Run backtest
+        SimulationEngine sim;
+        // ... setup simulation with data ...
+        auto results = sim.run();
+
+        // Evaluate
+        OptimizationResult opt_result;
+        opt_result.parameters = params;
+
+        ObjectiveFunction obj_func;
+        opt_result.objective_value = obj_func.evaluate(params, results);
+
+        return opt_result;
+    }
+};
+
+================================================================================
+5. BAYESIAN OPTIMIZATION
+================================================================================
+
+5.1 BAYESIAN OPTIMIZER
+-----------------------
+
+class BayesianOptimizer : public IOptimizer {
+public:
+    struct Config {
+        size_t n_initial_points;    // Random exploration points
+        size_t n_iterations;        // Total iterations
+        double exploration_factor;  // UCB exploration parameter
+
+        Config() : n_initial_points(10), n_iterations(100),
+                  exploration_factor(2.0) {}
+    };
+
+    explicit BayesianOptimizer(const Config& config)
+        : config_(config), rng_(std::random_device{}()) {}
+
+    OptimizationResult optimize(
+        const std::vector<MarketData>& data,
+        IStrategy& strategy,
+        const std::vector<ParameterDefinition>& param_defs) override {
+
+        // Initialize with random points
+        std::vector<std::pair<ParameterSet, double>> observations;
+
+        for (size_t i = 0; i < config_.n_initial_points; ++i) {
+            ParameterSet params = sampleRandomParameters(param_defs);
+            double score = evaluateParameterSet(params, data, strategy).objective_value;
+            observations.push_back({params, score});
+        }
+
+        // Bayesian optimization loop
+        for (size_t iter = config_.n_initial_points;
+             iter < config_.n_iterations; ++iter) {
+
+            // Fit Gaussian Process surrogate model
+            auto gp_model = fitGaussianProcess(observations, param_defs);
+
+            // Find next point to evaluate using acquisition function
+            ParameterSet next_params = selectNextPoint(gp_model, param_defs,
+                                                      observations);
+
+            // Evaluate
+            double score = evaluateParameterSet(next_params, data,
+                                               strategy).objective_value;
+
+            observations.push_back({next_params, score});
+
+            std::cout << "Iteration " << iter << " - Score: " << score << std::endl;
+        }
+
+        // Return best observed point
+        auto best = std::max_element(observations.begin(), observations.end(),
+            [](const auto& a, const auto& b) {
+                return a.second < b.second;
+            });
+
+        OptimizationResult result;
+        result.parameters = best->first;
+        result.objective_value = best->second;
+
+        return result;
+    }
+
+private:
+    Config config_;
+    std::mt19937_64 rng_;
+
+    struct GaussianProcess {
+        // Simplified GP model
+        std::vector<std::pair<ParameterSet, double>> training_points;
+
+        double predict(const ParameterSet& params) const {
+            // Use RBF kernel for prediction
+            double sum = 0.0;
+            double weight_sum = 0.0;
+
+            for (const auto& [train_params, value] : training_points) {
+                double distance = calculateDistance(params, train_params);
+                double weight = std::exp(-distance);
+                sum += weight * value;
+                weight_sum += weight;
+            }
+
+            return weight_sum > 0 ? sum / weight_sum : 0.0;
+        }
+
+        double predictUncertainty(const ParameterSet& params) const {
+            // Estimate uncertainty based on distance to nearest points
+            double min_distance = std::numeric_limits<double>::max();
+
+            for (const auto& [train_params, value] : training_points) {
+                double distance = calculateDistance(params, train_params);
+                min_distance = std::min(min_distance, distance);
+            }
+
+            return min_distance;
+        }
+
+    private:
+        double calculateDistance(const ParameterSet& a,
+                                const ParameterSet& b) const {
+            double dist = 0.0;
+
+            for (const auto& [name, value] : a.numeric_params) {
+                double diff = value - b.get(name);
+                dist += diff * diff;
+            }
+
+            return std::sqrt(dist);
+        }
+    };
+
+    GaussianProcess fitGaussianProcess(
+        const std::vector<std::pair<ParameterSet, double>>& observations,
+        const std::vector<ParameterDefinition>& param_defs) {
+
+        GaussianProcess gp;
+        gp.training_points = observations;
+        return gp;
+    }
+
+    ParameterSet selectNextPoint(
+        const GaussianProcess& gp_model,
+        const std::vector<ParameterDefinition>& param_defs,
+        const std::vector<std::pair<ParameterSet, double>>& observations) {
+
+        // Use Upper Confidence Bound (UCB) acquisition function
+        ParameterSet best_params;
+        double best_ucb = std::numeric_limits<double>::lowest();
+
+        // Sample random candidates
+        for (size_t i = 0; i < 1000; ++i) {
+            ParameterSet params = sampleRandomParameters(param_defs);
+
+            double mean = gp_model.predict(params);
+            double uncertainty = gp_model.predictUncertainty(params);
+
+            double ucb = mean + config_.exploration_factor * uncertainty;
+
+            if (ucb > best_ucb) {
+                best_ucb = ucb;
+                best_params = params;
+            }
+        }
+
+        return best_params;
+    }
+
+    ParameterSet sampleRandomParameters(
+        const std::vector<ParameterDefinition>& param_defs) {
+
+        ParameterSet params;
+
+        for (const auto& param_def : param_defs) {
+            if (param_def.type == ParameterDefinition::Type::FLOAT) {
+                std::uniform_real_distribution<double> dist(
+                    param_def.min_value, param_def.max_value);
+                params.numeric_params[param_def.name] = dist(rng_);
+            } else if (param_def.type == ParameterDefinition::Type::INTEGER) {
+                std::uniform_int_distribution<int> dist(
+                    static_cast<int>(param_def.min_value),
+                    static_cast<int>(param_def.max_value));
+                params.numeric_params[param_def.name] = dist(rng_);
+            }
+        }
+
+        return params;
+    }
+
+    OptimizationResult evaluateParameterSet(
+        const ParameterSet& params,
+        const std::vector<MarketData>& data,
+        IStrategy& strategy) {
+
+        strategy.setParameters(params);
+
+        SimulationEngine sim;
+        // ... setup and run simulation ...
+        auto results = sim.run();
+
+        OptimizationResult opt_result;
+        opt_result.parameters = params;
+
+        ObjectiveFunction obj_func;
+        opt_result.objective_value = obj_func.evaluate(params, results);
+
+        return opt_result;
+    }
+};
+
+================================================================================
+6. GENETIC ALGORITHM OPTIMIZATION
+================================================================================
+
+6.1 GENETIC ALGORITHM
+---------------------
+
+class GeneticAlgorithmOptimizer : public IOptimizer {
+public:
+    struct Config {
+        size_t population_size;
+        size_t num_generations;
+        double mutation_rate;
+        double crossover_rate;
+        size_t elite_size;  // Best individuals to keep
+
+        Config() : population_size(50), num_generations(100),
+                  mutation_rate(0.1), crossover_rate(0.8),
+                  elite_size(5) {}
+    };
+
+    explicit GeneticAlgorithmOptimizer(const Config& config)
+        : config_(config), rng_(std::random_device{}()) {}
+
+    OptimizationResult optimize(
+        const std::vector<MarketData>& data,
+        IStrategy& strategy,
+        const std::vector<ParameterDefinition>& param_defs) override {
+
+        // Initialize population
+        std::vector<Individual> population = initializePopulation(param_defs);
+
+        // Evolve
+        for (size_t gen = 0; gen < config_.num_generations; ++gen) {
+            // Evaluate fitness
+            evaluatePopulation(population, data, strategy);
+
+            // Sort by fitness
+            std::sort(population.begin(), population.end(),
+                [](const Individual& a, const Individual& b) {
+                    return a.fitness > b.fitness;
+                });
+
+            std::cout << "Generation " << gen << " - Best fitness: "
+                     << population[0].fitness << std::endl;
+
+            // Create next generation
+            std::vector<Individual> next_generation;
+
+            // Keep elite
+            for (size_t i = 0; i < config_.elite_size; ++i) {
+                next_generation.push_back(population[i]);
+            }
+
+            // Breed new individuals
+            while (next_generation.size() < config_.population_size) {
+                Individual parent1 = selectParent(population);
+                Individual parent2 = selectParent(population);
+
+                Individual offspring = crossover(parent1, parent2);
+                mutate(offspring, param_defs);
+
+                next_generation.push_back(offspring);
+            }
+
+            population = next_generation;
+        }
+
+        // Return best individual
+        evaluatePopulation(population, data, strategy);
+        std::sort(population.begin(), population.end(),
+            [](const Individual& a, const Individual& b) {
+                return a.fitness > b.fitness;
+            });
+
+        OptimizationResult result;
+        result.parameters = population[0].parameters;
+        result.objective_value = population[0].fitness;
+
+        return result;
+    }
+
+private:
+    Config config_;
+    std::mt19937_64 rng_;
+
+    struct Individual {
+        ParameterSet parameters;
+        double fitness;
+
+        Individual() : fitness(0.0) {}
+    };
+
+    std::vector<Individual> initializePopulation(
+        const std::vector<ParameterDefinition>& param_defs) {
+
+        std::vector<Individual> population;
+
+        for (size_t i = 0; i < config_.population_size; ++i) {
+            Individual ind;
+
+            for (const auto& param_def : param_defs) {
+                if (param_def.type == ParameterDefinition::Type::FLOAT) {
+                    std::uniform_real_distribution<double> dist(
+                        param_def.min_value, param_def.max_value);
+                    ind.parameters.numeric_params[param_def.name] = dist(rng_);
+                }
+            }
+
+            population.push_back(ind);
+        }
+
+        return population;
+    }
+
+    void evaluatePopulation(std::vector<Individual>& population,
+                          const std::vector<MarketData>& data,
+                          IStrategy& strategy) {
+
+        for (auto& individual : population) {
+            strategy.setParameters(individual.parameters);
+
+            SimulationEngine sim;
+            // ... run simulation ...
+            auto results = sim.run();
+
+            ObjectiveFunction obj_func;
+            individual.fitness = obj_func.evaluate(individual.parameters, results);
+        }
+    }
+
+    Individual selectParent(const std::vector<Individual>& population) {
+        // Tournament selection
+        const size_t tournament_size = 3;
+        std::uniform_int_distribution<size_t> dist(0, population.size() - 1);
+
+        Individual best = population[dist(rng_)];
+
+        for (size_t i = 1; i < tournament_size; ++i) {
+            const Individual& candidate = population[dist(rng_)];
+            if (candidate.fitness > best.fitness) {
+                best = candidate;
+            }
+        }
+
+        return best;
+    }
+
+    Individual crossover(const Individual& parent1, const Individual& parent2) {
+        Individual offspring;
+
+        std::uniform_real_distribution<double> dist(0.0, 1.0);
+
+        for (const auto& [name, value] : parent1.parameters.numeric_params) {
+            if (dist(rng_) < config_.crossover_rate) {
+                offspring.parameters.numeric_params[name] = value;
+            } else {
+                offspring.parameters.numeric_params[name] =
+                    parent2.parameters.get(name);
+            }
+        }
+
+        return offspring;
+    }
+
+    void mutate(Individual& individual,
+               const std::vector<ParameterDefinition>& param_defs) {
+
+        std::uniform_real_distribution<double> dist(0.0, 1.0);
+
+        for (const auto& param_def : param_defs) {
+            if (dist(rng_) < config_.mutation_rate) {
+                // Mutate this parameter
+                std::uniform_real_distribution<double> param_dist(
+                    param_def.min_value, param_def.max_value);
+
+                individual.parameters.numeric_params[param_def.name] =
+                    param_dist(rng_);
+            }
+        }
+    }
+};
+
+================================================================================
+8. COMPLETE IMPLEMENTATION - USAGE EXAMPLE
+================================================================================
+
+#include "daily_optimization.hpp"
+#include <iostream>
+
+int main() {
+    using namespace hft::simulation;
+
+    // Define parameters to optimize
+    std::vector<ParameterDefinition> param_defs;
+
+    ParameterDefinition lookback;
+    lookback.name = "lookback_period";
+    lookback.type = ParameterDefinition::Type::INTEGER;
+    lookback.min_value = 50;
+    lookback.max_value = 200;
+    lookback.step_size = 10;
+    param_defs.push_back(lookback);
+
+    ParameterDefinition threshold;
+    threshold.name = "entry_threshold";
+    threshold.type = ParameterDefinition::Type::FLOAT;
+    threshold.min_value = 1.0;
+    threshold.max_value = 3.0;
+    threshold.step_size = 0.1;
+    param_defs.push_back(threshold);
+
+    // Load historical data
+    std::vector<MarketData> historical_data;
+    // ... load data ...
+
+    // Create strategy
+    MomentumStrategy strategy;
+
+    // Run optimization
+    std::cout << "Starting daily optimization..." << std::endl;
+
+    // Option 1: Grid search
+    GridSearchOptimizer grid_optimizer;
+    auto grid_result = grid_optimizer.optimize(historical_data, strategy, param_defs);
+
+    std::cout << "Grid search best parameters:" << std::endl;
+    std::cout << "  Lookback: " << grid_result.parameters.get("lookback_period") << std::endl;
+    std::cout << "  Threshold: " << grid_result.parameters.get("entry_threshold") << std::endl;
+    std::cout << "  Objective: " << grid_result.objective_value << std::endl;
+
+    // Option 2: Bayesian optimization
+    BayesianOptimizer::Config bayes_config;
+    bayes_config.n_initial_points = 10;
+    bayes_config.n_iterations = 50;
+
+    BayesianOptimizer bayes_optimizer(bayes_config);
+    auto bayes_result = bayes_optimizer.optimize(historical_data, strategy, param_defs);
+
+    std::cout << "\nBayesian optimization best parameters:" << std::endl;
+    std::cout << "  Objective: " << bayes_result.objective_value << std::endl;
+
+    // Option 3: Walk-forward validation
+    WalkForwardOptimizer::Config wf_config;
+    wf_config.in_sample_days = 20;
+    wf_config.out_of_sample_days = 5;
+
+    auto grid_opt = std::make_shared<GridSearchOptimizer>();
+    WalkForwardOptimizer wf_optimizer(wf_config, grid_opt);
+
+    auto wf_results = wf_optimizer.run(historical_data, strategy, param_defs);
+
+    std::cout << "\nWalk-forward results:" << std::endl;
+    std::cout << "  Avg in-sample: " << wf_results.avg_in_sample_score << std::endl;
+    std::cout << "  Avg out-of-sample: " << wf_results.avg_out_of_sample_score << std::endl;
+    std::cout << "  Degradation ratio: " << wf_results.degradation_ratio << std::endl;
+    std::cout << "  Robust: " << (wf_results.is_robust ? "Yes" : "No") << std::endl;
+
+    return 0;
+}
+
+================================================================================
+END OF DOCUMENT
+================================================================================

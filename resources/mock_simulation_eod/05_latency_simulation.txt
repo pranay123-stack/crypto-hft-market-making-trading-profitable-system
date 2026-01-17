@@ -1,0 +1,932 @@
+================================================================================
+LATENCY SIMULATION
+Network Latency and Processing Delay Modeling
+================================================================================
+
+VERSION: 1.0
+DOCUMENT: Comprehensive Latency and Delay Simulation
+LAST UPDATED: 2025-11-26
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+
+1. Overview
+2. Latency Types and Sources
+3. Network Latency Modeling
+4. Processing Delay Simulation
+5. Jitter and Packet Loss
+6. Queue Delay Modeling
+7. Complete Implementation
+8. Realistic Latency Profiles
+
+================================================================================
+1. OVERVIEW
+================================================================================
+
+The Latency Simulation module provides comprehensive modeling of all delays
+in a trading system, from network transmission to order processing. This is
+critical for realistic backtesting and system optimization.
+
+KEY COMPONENTS:
+---------------
+- Network latency (one-way and round-trip)
+- Exchange processing delays
+- Strategy computation time
+- Operating system scheduling delays
+- Hardware latency (NIC, PCIe)
+- Queue waiting times
+- Clock synchronization errors
+
+LATENCY BUDGET (TYPICAL HFT SYSTEM):
+-------------------------------------
+Component                   Latency      % of Total
+- Market data receipt       150 μs       30%
+- Strategy calculation      50 μs        10%
+- Order construction        20 μs        4%
+- OS network stack          30 μs        6%
+- NIC transmission          10 μs        2%
+- Network propagation       150 μs       30%
+- Exchange processing       90 μs        18%
+TOTAL:                      500 μs       100%
+
+================================================================================
+2. LATENCY TYPES AND SOURCES
+================================================================================
+
+2.1 LATENCY TAXONOMY
+--------------------
+
+enum class LatencyType : uint8_t {
+    // Network latencies
+    NETWORK_PROPAGATION,    // Physical transmission time
+    NETWORK_JITTER,         // Variation in network delay
+    NETWORK_QUEUING,        // Router/switch queuing
+
+    // Processing latencies
+    STRATEGY_COMPUTE,       // Strategy algorithm execution
+    ORDER_CONSTRUCTION,     // Order message creation
+    RISK_CHECK,             // Risk management validation
+
+    // System latencies
+    OS_SCHEDULING,          // OS thread scheduling
+    CONTEXT_SWITCH,         // CPU context switch
+    MEMORY_LATENCY,         // RAM access time
+    CACHE_MISS,             // CPU cache miss
+
+    // Hardware latencies
+    NIC_PROCESSING,         // Network card processing
+    PCIE_TRANSFER,          // PCIe bus transfer
+    KERNEL_BYPASS,          // Kernel bypass overhead
+
+    // Exchange latencies
+    EXCHANGE_GATEWAY,       // Exchange gateway processing
+    EXCHANGE_MATCHING,      // Order matching engine
+    EXCHANGE_MARKET_DATA    // Market data dissemination
+};
+
+struct LatencyComponent {
+    LatencyType type;
+    uint64_t base_latency_ns;
+    uint64_t std_dev_ns;
+    double probability;         // Probability of occurrence
+
+    LatencyComponent()
+        : type(LatencyType::NETWORK_PROPAGATION),
+          base_latency_ns(0), std_dev_ns(0), probability(1.0) {}
+
+    LatencyComponent(LatencyType t, uint64_t base, uint64_t std_dev,
+                    double prob = 1.0)
+        : type(t), base_latency_ns(base), std_dev_ns(std_dev),
+          probability(prob) {}
+};
+
+2.2 LATENCY MEASUREMENT
+------------------------
+
+struct LatencyMeasurement {
+    uint64_t timestamp_ns;
+    LatencyType type;
+    uint64_t measured_latency_ns;
+    char symbol[16];
+    uint64_t message_id;
+
+    // Breakdown
+    std::vector<std::pair<LatencyType, uint64_t>> breakdown;
+
+    double getPercentile(const std::vector<uint64_t>& latencies,
+                        double percentile) const {
+        if (latencies.empty()) return 0.0;
+
+        auto sorted = latencies;
+        std::sort(sorted.begin(), sorted.end());
+
+        size_t idx = static_cast<size_t>(percentile * sorted.size());
+        idx = std::min(idx, sorted.size() - 1);
+
+        return sorted[idx];
+    }
+};
+
+================================================================================
+3. NETWORK LATENCY MODELING
+================================================================================
+
+3.1 NETWORK PATH SIMULATOR
+---------------------------
+
+class NetworkPathSimulator {
+public:
+    struct PathConfig {
+        double distance_km;             // Physical distance
+        double fiber_speed_c;           // % of speed of light (0.67 typical)
+        size_t num_hops;                // Number of routers/switches
+        uint64_t hop_processing_ns;     // Processing at each hop
+        uint64_t base_jitter_ns;        // Base jitter amount
+        double congestion_probability;  // Probability of congestion
+        uint64_t congestion_delay_ns;   // Additional delay when congested
+    };
+
+    explicit NetworkPathSimulator(const PathConfig& config)
+        : config_(config), rng_(std::random_device{}()) {
+        calculateBaseLatency();
+    }
+
+    uint64_t simulateOneWayLatency(uint64_t timestamp_ns) {
+        // Propagation delay (based on distance)
+        uint64_t propagation = base_propagation_ns_;
+
+        // Hop processing
+        uint64_t hop_delay = config_.num_hops * config_.hop_processing_ns;
+
+        // Jitter (normal distribution)
+        std::normal_distribution<double> jitter_dist(0.0,
+            config_.base_jitter_ns / 3.0);
+        int64_t jitter = static_cast<int64_t>(jitter_dist(rng_));
+        jitter = std::max(int64_t{0}, jitter);
+
+        // Congestion
+        uint64_t congestion = 0;
+        std::uniform_real_distribution<double> congestion_dist(0.0, 1.0);
+        if (congestion_dist(rng_) < config_.congestion_probability) {
+            congestion = config_.congestion_delay_ns;
+        }
+
+        // Time-of-day effects
+        double tod_multiplier = getTimeOfDayMultiplier(timestamp_ns);
+
+        uint64_t total = propagation + hop_delay + jitter + congestion;
+        return static_cast<uint64_t>(total * tod_multiplier);
+    }
+
+    uint64_t simulateRoundTripLatency(uint64_t timestamp_ns) {
+        // Simulate both directions (may have different characteristics)
+        uint64_t outbound = simulateOneWayLatency(timestamp_ns);
+        uint64_t inbound = simulateOneWayLatency(timestamp_ns + outbound);
+        return outbound + inbound;
+    }
+
+    // Get percentile latencies for SLA monitoring
+    struct LatencyPercentiles {
+        uint64_t p50_ns;
+        uint64_t p95_ns;
+        uint64_t p99_ns;
+        uint64_t p999_ns;
+        uint64_t max_ns;
+    };
+
+    LatencyPercentiles calculatePercentiles(size_t num_samples = 10000) {
+        std::vector<uint64_t> samples;
+        samples.reserve(num_samples);
+
+        uint64_t current_time = getCurrentTimeNs();
+        for (size_t i = 0; i < num_samples; ++i) {
+            samples.push_back(simulateOneWayLatency(current_time));
+            current_time += 1000000;  // 1ms apart
+        }
+
+        std::sort(samples.begin(), samples.end());
+
+        LatencyPercentiles percentiles;
+        percentiles.p50_ns = samples[num_samples * 50 / 100];
+        percentiles.p95_ns = samples[num_samples * 95 / 100];
+        percentiles.p99_ns = samples[num_samples * 99 / 100];
+        percentiles.p999_ns = samples[num_samples * 999 / 1000];
+        percentiles.max_ns = samples.back();
+
+        return percentiles;
+    }
+
+private:
+    PathConfig config_;
+    std::mt19937_64 rng_;
+    uint64_t base_propagation_ns_;
+
+    void calculateBaseLatency() {
+        // Speed of light in fiber: ~2/3 of c
+        // c = 299,792,458 m/s
+        // Distance / (c * fiber_speed_factor)
+
+        const double SPEED_OF_LIGHT_KM_PER_SEC = 299792.458;
+        double effective_speed = SPEED_OF_LIGHT_KM_PER_SEC * config_.fiber_speed_c;
+
+        // Round-trip time
+        double latency_sec = config_.distance_km / effective_speed;
+        base_propagation_ns_ = static_cast<uint64_t>(latency_sec * 1e9);
+    }
+
+    double getTimeOfDayMultiplier(uint64_t timestamp_ns) {
+        // Simulate varying network conditions throughout the day
+        uint64_t seconds_of_day = (timestamp_ns / 1000000000) % 86400;
+
+        // Market hours (9:30 AM - 4:00 PM ET): 34200 - 57600 seconds
+        if (seconds_of_day >= 34200 && seconds_of_day <= 57600) {
+            // Higher latency during market hours
+            return 1.3;
+        } else if (seconds_of_day >= 32400 && seconds_of_day < 34200) {
+            // Pre-market: moderate
+            return 1.1;
+        } else {
+            // Off-hours: lower latency
+            return 0.9;
+        }
+    }
+
+    uint64_t getCurrentTimeNs() const {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch()
+        ).count();
+    }
+};
+
+3.2 REALISTIC NETWORK CONFIGURATIONS
+-------------------------------------
+
+// Co-located in same data center
+NetworkPathSimulator::PathConfig createColocatedPath() {
+    NetworkPathSimulator::PathConfig config;
+    config.distance_km = 0.1;           // 100 meters
+    config.fiber_speed_c = 0.67;
+    config.num_hops = 2;                // Direct connection
+    config.hop_processing_ns = 500;     // Switch latency
+    config.base_jitter_ns = 100;        // Very low jitter
+    config.congestion_probability = 0.001;
+    config.congestion_delay_ns = 5000;  // 5 μs
+    return config;
+}
+
+// Same city
+NetworkPathSimulator::PathConfig createMetroPath() {
+    NetworkPathSimulator::PathConfig config;
+    config.distance_km = 10.0;          // 10 km
+    config.fiber_speed_c = 0.67;
+    config.num_hops = 5;
+    config.hop_processing_ns = 1000;
+    config.base_jitter_ns = 500;
+    config.congestion_probability = 0.01;
+    config.congestion_delay_ns = 10000; // 10 μs
+    return config;
+}
+
+// Cross-country (NY to Chicago)
+NetworkPathSimulator::PathConfig createLongHaulPath() {
+    NetworkPathSimulator::PathConfig config;
+    config.distance_km = 1200.0;        // ~1200 km
+    config.fiber_speed_c = 0.67;
+    config.num_hops = 15;
+    config.hop_processing_ns = 2000;
+    config.base_jitter_ns = 2000;       // 2 μs
+    config.congestion_probability = 0.05;
+    config.congestion_delay_ns = 50000; // 50 μs
+    return config;
+}
+
+// Microwave (NY to Chicago)
+NetworkPathSimulator::PathConfig createMicrowavePath() {
+    NetworkPathSimulator::PathConfig config;
+    config.distance_km = 1150.0;        // Shorter path
+    config.fiber_speed_c = 1.0;         // Speed of light in air
+    config.num_hops = 8;                // Fewer hops
+    config.hop_processing_ns = 500;
+    config.base_jitter_ns = 1000;
+    config.congestion_probability = 0.02;
+    config.congestion_delay_ns = 20000;
+    return config;
+}
+
+================================================================================
+4. PROCESSING DELAY SIMULATION
+================================================================================
+
+4.1 PROCESSING LATENCY MODEL
+-----------------------------
+
+class ProcessingLatencySimulator {
+public:
+    struct ProcessingConfig {
+        // CPU characteristics
+        double cpu_clock_ghz;           // CPU frequency
+        size_t num_cores;
+        size_t cache_size_kb;
+
+        // Processing characteristics
+        uint64_t base_processing_ns;
+        uint64_t cache_miss_penalty_ns;
+        double cache_miss_probability;
+
+        // OS scheduling
+        uint64_t context_switch_ns;
+        double context_switch_probability;
+        uint64_t os_scheduling_quantum_ns;
+
+        // Load-dependent
+        double system_load;             // 0.0 - 1.0
+        uint64_t load_penalty_factor;   // Multiplier for high load
+    };
+
+    explicit ProcessingLatencySimulator(const ProcessingConfig& config)
+        : config_(config), rng_(std::random_device{}()) {}
+
+    uint64_t simulateStrategyLatency(size_t instruction_count,
+                                    size_t memory_accesses) {
+        // Base CPU execution time
+        double cycles_per_instruction = 0.5;  // Modern CPUs
+        double total_cycles = instruction_count * cycles_per_instruction;
+        double ns_per_cycle = 1.0 / config_.cpu_clock_ghz;
+        uint64_t cpu_time = static_cast<uint64_t>(total_cycles * ns_per_cycle);
+
+        // Memory access time
+        uint64_t memory_time = simulateMemoryAccesses(memory_accesses);
+
+        // Cache misses
+        uint64_t cache_penalty = 0;
+        std::uniform_real_distribution<double> dist(0.0, 1.0);
+        for (size_t i = 0; i < memory_accesses; ++i) {
+            if (dist(rng_) < config_.cache_miss_probability) {
+                cache_penalty += config_.cache_miss_penalty_ns;
+            }
+        }
+
+        // Context switch overhead
+        uint64_t context_switch_penalty = 0;
+        if (dist(rng_) < config_.context_switch_probability) {
+            context_switch_penalty = config_.context_switch_ns;
+        }
+
+        // System load factor
+        double load_factor = 1.0 + config_.system_load * config_.load_penalty_factor;
+
+        uint64_t total = cpu_time + memory_time + cache_penalty +
+                        context_switch_penalty;
+
+        return static_cast<uint64_t>(total * load_factor);
+    }
+
+    uint64_t simulateOrderConstructionLatency() {
+        // Order construction is relatively deterministic
+        std::normal_distribution<double> dist(config_.base_processing_ns,
+                                             config_.base_processing_ns * 0.1);
+        return std::max(0.0, dist(rng_));
+    }
+
+    uint64_t simulateRiskCheckLatency(size_t num_checks) {
+        // Each risk check has some base cost
+        const uint64_t BASE_CHECK_NS = 1000;  // 1 μs per check
+
+        uint64_t total = num_checks * BASE_CHECK_NS;
+
+        // Add database lookup latency if needed
+        std::uniform_real_distribution<double> dist(0.0, 1.0);
+        if (dist(rng_) < 0.1) {  // 10% require DB lookup
+            total += 50000;  // 50 μs for DB query
+        }
+
+        return total;
+    }
+
+private:
+    ProcessingConfig config_;
+    std::mt19937_64 rng_;
+
+    uint64_t simulateMemoryAccesses(size_t count) {
+        // L1 cache: ~1 ns
+        // L2 cache: ~3 ns
+        // L3 cache: ~12 ns
+        // RAM: ~100 ns
+
+        const uint64_t L1_LATENCY_NS = 1;
+        const uint64_t L2_LATENCY_NS = 3;
+        const uint64_t L3_LATENCY_NS = 12;
+        const uint64_t RAM_LATENCY_NS = 100;
+
+        uint64_t total = 0;
+        std::uniform_real_distribution<double> dist(0.0, 1.0);
+
+        for (size_t i = 0; i < count; ++i) {
+            double rand = dist(rng_);
+
+            if (rand < 0.7) {           // 70% L1 hit
+                total += L1_LATENCY_NS;
+            } else if (rand < 0.9) {    // 20% L2 hit
+                total += L2_LATENCY_NS;
+            } else if (rand < 0.98) {   // 8% L3 hit
+                total += L3_LATENCY_NS;
+            } else {                     // 2% RAM access
+                total += RAM_LATENCY_NS;
+            }
+        }
+
+        return total;
+    }
+};
+
+4.2 HARDWARE LATENCY SIMULATION
+--------------------------------
+
+class HardwareLatencySimulator {
+public:
+    struct HardwareConfig {
+        // NIC (Network Interface Card)
+        uint64_t nic_processing_ns;     // NIC processing time
+        uint64_t kernel_bypass_ns;      // Kernel bypass overhead (DPDK, etc.)
+        bool use_kernel_bypass;
+
+        // PCIe
+        uint64_t pcie_gen;              // PCIe generation (3, 4, 5)
+        uint64_t pcie_lanes;            // Number of lanes
+        uint64_t pcie_latency_ns;       // PCIe transfer latency
+
+        // DMA
+        uint64_t dma_setup_ns;          // DMA setup overhead
+        uint64_t dma_transfer_per_kb;   // ns per KB transferred
+    };
+
+    explicit HardwareLatencySimulator(const HardwareConfig& config)
+        : config_(config) {}
+
+    uint64_t simulateNICReceive(size_t packet_size_bytes) {
+        uint64_t total = config_.nic_processing_ns;
+
+        // Kernel bypass reduces latency significantly
+        if (!config_.use_kernel_bypass) {
+            total += 5000;  // Kernel stack overhead: ~5 μs
+        } else {
+            total += config_.kernel_bypass_ns;
+        }
+
+        // PCIe transfer
+        total += simulatePCIeTransfer(packet_size_bytes);
+
+        return total;
+    }
+
+    uint64_t simulateNICTransmit(size_t packet_size_bytes) {
+        uint64_t total = config_.nic_processing_ns;
+
+        if (!config_.use_kernel_bypass) {
+            total += 8000;  // Kernel stack overhead for TX: ~8 μs
+        } else {
+            total += config_.kernel_bypass_ns;
+        }
+
+        total += simulatePCIeTransfer(packet_size_bytes);
+
+        return total;
+    }
+
+private:
+    HardwareConfig config_;
+
+    uint64_t simulatePCIeTransfer(size_t bytes) {
+        size_t kb = (bytes + 1023) / 1024;
+        return config_.pcie_latency_ns + kb * config_.dma_transfer_per_kb;
+    }
+};
+
+================================================================================
+5. JITTER AND PACKET LOSS
+================================================================================
+
+5.1 JITTER SIMULATOR
+--------------------
+
+class JitterSimulator {
+public:
+    enum class JitterModel {
+        GAUSSIAN,       // Normal distribution
+        UNIFORM,        // Uniform distribution
+        PARETO,         // Heavy-tailed (realistic for network jitter)
+        BIMODAL         // Two distinct modes
+    };
+
+    struct JitterConfig {
+        JitterModel model;
+        double mean_ns;
+        double std_dev_ns;
+
+        // For Pareto model
+        double alpha;           // Shape parameter
+        double scale;          // Scale parameter
+
+        // For bimodal
+        double mode1_prob;
+        double mode1_mean;
+        double mode2_mean;
+    };
+
+    explicit JitterSimulator(const JitterConfig& config)
+        : config_(config), rng_(std::random_device{}()) {}
+
+    int64_t simulateJitter() {
+        switch (config_.model) {
+            case JitterModel::GAUSSIAN:
+                return simulateGaussianJitter();
+
+            case JitterModel::UNIFORM:
+                return simulateUniformJitter();
+
+            case JitterModel::PARETO:
+                return simulateParetoJitter();
+
+            case JitterModel::BIMODAL:
+                return simulateBimodalJitter();
+        }
+        return 0;
+    }
+
+private:
+    JitterConfig config_;
+    std::mt19937_64 rng_;
+
+    int64_t simulateGaussianJitter() {
+        std::normal_distribution<double> dist(config_.mean_ns, config_.std_dev_ns);
+        return static_cast<int64_t>(dist(rng_));
+    }
+
+    int64_t simulateUniformJitter() {
+        double range = config_.std_dev_ns * std::sqrt(3.0);  // For same variance
+        std::uniform_real_distribution<double> dist(
+            config_.mean_ns - range,
+            config_.mean_ns + range
+        );
+        return static_cast<int64_t>(dist(rng_));
+    }
+
+    int64_t simulateParetoJitter() {
+        // Pareto distribution (heavy-tailed)
+        std::uniform_real_distribution<double> uniform(0.0, 1.0);
+        double u = uniform(rng_);
+
+        double pareto = config_.scale / std::pow(u, 1.0 / config_.alpha);
+        return static_cast<int64_t>(config_.mean_ns + pareto);
+    }
+
+    int64_t simulateBimodalJitter() {
+        std::uniform_real_distribution<double> uniform(0.0, 1.0);
+
+        if (uniform(rng_) < config_.mode1_prob) {
+            std::normal_distribution<double> dist(config_.mode1_mean,
+                                                 config_.std_dev_ns);
+            return static_cast<int64_t>(dist(rng_));
+        } else {
+            std::normal_distribution<double> dist(config_.mode2_mean,
+                                                 config_.std_dev_ns * 2);
+            return static_cast<int64_t>(dist(rng_));
+        }
+    }
+};
+
+5.2 PACKET LOSS SIMULATOR
+--------------------------
+
+class PacketLossSimulator {
+public:
+    struct LossConfig {
+        double loss_rate;               // Base packet loss rate
+        double burst_loss_probability;  // Probability of burst loss
+        size_t burst_length;            // Average burst length
+
+        // Gilbert-Elliott model (realistic packet loss)
+        double good_to_bad_prob;        // P(Good -> Bad)
+        double bad_to_good_prob;        // P(Bad -> Good)
+        double loss_in_bad_state;       // Loss rate in bad state
+    };
+
+    explicit PacketLossSimulator(const LossConfig& config)
+        : config_(config), rng_(std::random_device{}()),
+          in_bad_state_(false) {}
+
+    bool shouldDropPacket() {
+        updateState();
+
+        std::uniform_real_distribution<double> dist(0.0, 1.0);
+
+        if (in_bad_state_) {
+            return dist(rng_) < config_.loss_in_bad_state;
+        } else {
+            return dist(rng_) < config_.loss_rate;
+        }
+    }
+
+private:
+    LossConfig config_;
+    std::mt19937_64 rng_;
+    bool in_bad_state_;
+
+    void updateState() {
+        // Gilbert-Elliott two-state model
+        std::uniform_real_distribution<double> dist(0.0, 1.0);
+
+        if (in_bad_state_) {
+            if (dist(rng_) < config_.bad_to_good_prob) {
+                in_bad_state_ = false;
+            }
+        } else {
+            if (dist(rng_) < config_.good_to_bad_prob) {
+                in_bad_state_ = true;
+            }
+        }
+    }
+};
+
+================================================================================
+6. QUEUE DELAY MODELING
+================================================================================
+
+6.1 QUEUING SIMULATOR (M/M/1 Model)
+------------------------------------
+
+class QueuingSimulator {
+public:
+    struct QueueConfig {
+        double arrival_rate;            // Messages per second
+        double service_rate;            // Messages per second
+        size_t max_queue_size;          // Queue capacity
+        uint64_t service_time_ns;       // Base service time
+    };
+
+    explicit QueuingSimulator(const QueueConfig& config)
+        : config_(config), queue_size_(0) {
+        // Utilization factor
+        rho_ = config_.arrival_rate / config_.service_rate;
+        if (rho_ >= 1.0) {
+            std::cerr << "Warning: System unstable (rho >= 1.0)" << std::endl;
+        }
+    }
+
+    uint64_t simulateQueuingDelay() {
+        // M/M/1 queue: Exponential inter-arrival and service times
+        std::exponential_distribution<double> service_dist(config_.service_rate);
+
+        double service_time_sec = service_dist(rng_);
+        uint64_t service_time_ns = static_cast<uint64_t>(service_time_sec * 1e9);
+
+        // Queue waiting time (average)
+        double avg_wait_sec = rho_ / (config_.service_rate * (1.0 - rho_));
+        uint64_t wait_ns = static_cast<uint64_t>(avg_wait_sec * 1e9);
+
+        return wait_ns + service_time_ns;
+    }
+
+    double getAverageQueueLength() const {
+        return rho_ / (1.0 - rho_);
+    }
+
+    double getAverageWaitTime() const {
+        return rho_ / (config_.service_rate * (1.0 - rho_));
+    }
+
+private:
+    QueueConfig config_;
+    std::mt19937_64 rng_;
+    double rho_;            // Utilization factor
+    size_t queue_size_;
+};
+
+================================================================================
+7. COMPLETE IMPLEMENTATION
+================================================================================
+
+File: include/latency_simulator.hpp
+
+#ifndef LATENCY_SIMULATOR_HPP
+#define LATENCY_SIMULATOR_HPP
+
+#include "simulation_engine.hpp"
+#include <random>
+#include <vector>
+#include <unordered_map>
+
+namespace hft {
+namespace simulation {
+
+class ComprehensiveLatencySimulator : public ISimulationComponent {
+public:
+    struct SystemLatencyProfile {
+        NetworkPathSimulator::PathConfig network_config;
+        ProcessingLatencySimulator::ProcessingConfig processing_config;
+        HardwareLatencySimulator::HardwareConfig hardware_config;
+        JitterSimulator::JitterConfig jitter_config;
+        PacketLossSimulator::LossConfig loss_config;
+    };
+
+    explicit ComprehensiveLatencySimulator(const SystemLatencyProfile& profile);
+
+    // ISimulationComponent interface
+    void initialize(SimulationContext& ctx) override;
+    void start() override;
+    void stop() override;
+    void shutdown() override;
+    void onEvent(const IEvent& event) override;
+    void onTimerTick(uint64_t timestamp_ns) override;
+    ComponentState getState() const override;
+    std::string getName() const override { return "LatencySimulator"; }
+
+    // Latency injection
+    uint64_t injectMarketDataLatency(uint64_t base_timestamp);
+    uint64_t injectOrderLatency(uint64_t base_timestamp);
+    uint64_t injectFillLatency(uint64_t base_timestamp);
+
+    // Statistics
+    struct LatencyStats {
+        uint64_t total_messages{0};
+        uint64_t dropped_packets{0};
+
+        double avg_network_latency_ns{0.0};
+        double avg_processing_latency_ns{0.0};
+        double avg_total_latency_ns{0.0};
+
+        uint64_t p50_latency_ns{0};
+        uint64_t p95_latency_ns{0};
+        uint64_t p99_latency_ns{0};
+        uint64_t max_latency_ns{0};
+    };
+
+    const LatencyStats& getStats() const { return stats_; }
+    void resetStats();
+
+private:
+    SystemLatencyProfile profile_;
+    ComponentState state_;
+
+    std::unique_ptr<NetworkPathSimulator> network_sim_;
+    std::unique_ptr<ProcessingLatencySimulator> processing_sim_;
+    std::unique_ptr<HardwareLatencySimulator> hardware_sim_;
+    std::unique_ptr<JitterSimulator> jitter_sim_;
+    std::unique_ptr<PacketLossSimulator> packet_loss_sim_;
+
+    LatencyStats stats_;
+    std::vector<uint64_t> latency_samples_;
+
+    void recordLatency(uint64_t latency_ns);
+    void updateStats();
+};
+
+} // namespace simulation
+} // namespace hft
+
+#endif // LATENCY_SIMULATOR_HPP
+
+================================================================================
+8. REALISTIC LATENCY PROFILES
+================================================================================
+
+8.1 CO-LOCATED TRADING SYSTEM
+------------------------------
+
+ComprehensiveLatencySimulator::SystemLatencyProfile createColocatedProfile() {
+    ComprehensiveLatencySimulator::SystemLatencyProfile profile;
+
+    // Network: Direct connection in same datacenter
+    profile.network_config = createColocatedPath();
+
+    // Processing: High-end server
+    profile.processing_config.cpu_clock_ghz = 4.0;
+    profile.processing_config.num_cores = 16;
+    profile.processing_config.cache_size_kb = 32768;
+    profile.processing_config.base_processing_ns = 5000;        // 5 μs
+    profile.processing_config.cache_miss_penalty_ns = 100;
+    profile.processing_config.cache_miss_probability = 0.01;
+    profile.processing_config.context_switch_ns = 5000;
+    profile.processing_config.context_switch_probability = 0.001;
+    profile.processing_config.system_load = 0.3;
+    profile.processing_config.load_penalty_factor = 0.5;
+
+    // Hardware: FPGA NIC with kernel bypass
+    profile.hardware_config.nic_processing_ns = 500;            // 0.5 μs
+    profile.hardware_config.kernel_bypass_ns = 200;
+    profile.hardware_config.use_kernel_bypass = true;
+    profile.hardware_config.pcie_gen = 4;
+    profile.hardware_config.pcie_lanes = 16;
+    profile.hardware_config.pcie_latency_ns = 300;
+    profile.hardware_config.dma_setup_ns = 100;
+    profile.hardware_config.dma_transfer_per_kb = 50;
+
+    // Jitter: Very low, Gaussian
+    profile.jitter_config.model = JitterSimulator::JitterModel::GAUSSIAN;
+    profile.jitter_config.mean_ns = 0;
+    profile.jitter_config.std_dev_ns = 100;                     // 100 ns
+
+    // Packet loss: Extremely rare
+    profile.loss_config.loss_rate = 0.00001;                    // 0.001%
+    profile.loss_config.burst_loss_probability = 0.0001;
+    profile.loss_config.burst_length = 2;
+    profile.loss_config.good_to_bad_prob = 0.0001;
+    profile.loss_config.bad_to_good_prob = 0.5;
+    profile.loss_config.loss_in_bad_state = 0.1;
+
+    return profile;
+}
+
+8.2 REMOTE TRADING SYSTEM
+--------------------------
+
+ComprehensiveLatencySimulator::SystemLatencyProfile createRemoteProfile() {
+    ComprehensiveLatencySimulator::SystemLatencyProfile profile;
+
+    // Network: Long-haul fiber
+    profile.network_config = createLongHaulPath();
+
+    // Processing: Regular server
+    profile.processing_config.cpu_clock_ghz = 3.0;
+    profile.processing_config.num_cores = 8;
+    profile.processing_config.cache_size_kb = 16384;
+    profile.processing_config.base_processing_ns = 10000;       // 10 μs
+    profile.processing_config.cache_miss_penalty_ns = 150;
+    profile.processing_config.cache_miss_probability = 0.05;
+    profile.processing_config.context_switch_ns = 10000;
+    profile.processing_config.context_switch_probability = 0.01;
+    profile.processing_config.system_load = 0.6;
+    profile.processing_config.load_penalty_factor = 1.0;
+
+    // Hardware: Standard NIC
+    profile.hardware_config.nic_processing_ns = 2000;           // 2 μs
+    profile.hardware_config.kernel_bypass_ns = 0;
+    profile.hardware_config.use_kernel_bypass = false;
+    profile.hardware_config.pcie_gen = 3;
+    profile.hardware_config.pcie_lanes = 8;
+    profile.hardware_config.pcie_latency_ns = 1000;
+    profile.hardware_config.dma_setup_ns = 500;
+    profile.hardware_config.dma_transfer_per_kb = 200;
+
+    // Jitter: Moderate, Pareto (heavy-tailed)
+    profile.jitter_config.model = JitterSimulator::JitterModel::PARETO;
+    profile.jitter_config.mean_ns = 0;
+    profile.jitter_config.std_dev_ns = 2000;                    // 2 μs
+    profile.jitter_config.alpha = 1.5;
+    profile.jitter_config.scale = 1000;
+
+    // Packet loss: Rare but possible
+    profile.loss_config.loss_rate = 0.0001;                     // 0.01%
+    profile.loss_config.burst_loss_probability = 0.001;
+    profile.loss_config.burst_length = 5;
+    profile.loss_config.good_to_bad_prob = 0.001;
+    profile.loss_config.bad_to_good_prob = 0.2;
+    profile.loss_config.loss_in_bad_state = 0.2;
+
+    return profile;
+}
+
+================================================================================
+USAGE EXAMPLE
+================================================================================
+
+#include "latency_simulator.hpp"
+#include <iostream>
+
+int main() {
+    using namespace hft::simulation;
+
+    // Create co-located profile
+    auto profile = createColocatedProfile();
+
+    ComprehensiveLatencySimulator sim(profile);
+
+    // Simulate market data latency
+    uint64_t base_time = 1704110400000000000ULL;
+
+    std::cout << "Simulating latencies..." << std::endl;
+    for (int i = 0; i < 10; ++i) {
+        uint64_t latency = sim.injectMarketDataLatency(base_time);
+        std::cout << "Market data latency: " << latency / 1000.0 << " μs"
+                 << std::endl;
+        base_time += 1000000;  // 1ms apart
+    }
+
+    // Print statistics
+    const auto& stats = sim.getStats();
+    std::cout << "\nLatency Statistics:" << std::endl;
+    std::cout << "Average total: " << stats.avg_total_latency_ns / 1000.0
+             << " μs" << std::endl;
+    std::cout << "P50: " << stats.p50_latency_ns / 1000.0 << " μs" << std::endl;
+    std::cout << "P95: " << stats.p95_latency_ns / 1000.0 << " μs" << std::endl;
+    std::cout << "P99: " << stats.p99_latency_ns / 1000.0 << " μs" << std::endl;
+    std::cout << "Max: " << stats.max_latency_ns / 1000.0 << " μs" << std::endl;
+    std::cout << "Dropped packets: " << stats.dropped_packets << std::endl;
+
+    return 0;
+}
+
+================================================================================
+END OF DOCUMENT
+================================================================================

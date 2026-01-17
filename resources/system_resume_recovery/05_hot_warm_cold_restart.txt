@@ -1,0 +1,1937 @@
+================================================================================
+HOT, WARM, AND COLD RESTART STRATEGIES FOR HFT SYSTEMS
+================================================================================
+
+Author: HFT System Architecture Team
+Last Updated: 2025-11-25
+Version: 1.0
+Category: System Resume & Recovery
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+
+1. Overview of Restart Types
+2. Hot Restart: Failover to Backup (<5 sec, zero downtime)
+3. Warm Restart: Quick Recovery from Checkpoint (<5 min)
+4. Cold Restart: Full Initialization from Scratch (<30 min)
+5. When to Use Each Type
+6. Detailed Procedures for Each
+7. State Synchronization for Hot Restart
+8. Performance Comparison
+9. Architecture for Each Type
+10. Best Practices & Checklists
+
+================================================================================
+1. OVERVIEW OF RESTART TYPES
+================================================================================
+
+1.1 RESTART TYPE COMPARISON
+----------------------------
+
++------------------+-------------+-----------+------------+---------------+
+| Type             | Downtime    | Data Loss | Complexity | Use Case      |
++------------------+-------------+-----------+------------+---------------+
+| Hot Restart      | <5 seconds  | None      | Very High  | Production    |
+| Warm Restart     | <5 minutes  | Minimal   | Medium     | Maintenance   |
+| Cold Restart     | <30 minutes | Acceptable| Low        | Major Updates |
++------------------+-------------+-----------+------------+---------------+
+
+1.2 DOWNTIME IMPACT ON HFT
+---------------------------
+
+Every second of downtime costs money:
+
+Example: Market maker with 0.5% daily volume
+- 1 second downtime = $X in missed opportunities
+- 1 minute downtime = 60 * $X
+- 5 minutes downtime = 300 * $X
+
+Plus:
+- Loss of queue priority on exchanges
+- Widened spreads from competitors
+- Reputational damage
+- Potential regulatory scrutiny
+
+1.3 RECOVERY TIME OBJECTIVE (RTO)
+----------------------------------
+
+RTO = Maximum acceptable downtime
+
+Typical RTO targets:
+- Tier 1 strategies (high-frequency): RTO < 5 seconds (HOT)
+- Tier 2 strategies (medium-frequency): RTO < 5 minutes (WARM)
+- Tier 3 strategies (low-frequency): RTO < 30 minutes (COLD)
+
+1.4 RECOVERY POINT OBJECTIVE (RPO)
+-----------------------------------
+
+RPO = Maximum acceptable data loss
+
+Typical RPO targets:
+- Critical systems: RPO = 0 (no data loss acceptable)
+- Important systems: RPO < 1 minute
+- Non-critical systems: RPO < 15 minutes
+
+================================================================================
+2. HOT RESTART: FAILOVER TO BACKUP (<5 SEC, ZERO DOWNTIME)
+================================================================================
+
+2.1 HOT RESTART OVERVIEW
+-------------------------
+
+Concept: Seamless failover from primary to backup system
+Goal: Zero perceived downtime
+Mechanism: Hot standby continuously synchronized
+
+Key Requirements:
+- Backup system always running
+- Real-time state replication
+- Automatic failover detection
+- Sub-second cutover time
+
+2.2 HOT RESTART ARCHITECTURE
+-----------------------------
+
+                    ┌──────────────┐
+                    │   Load       │
+                    │   Balancer   │
+                    └──────┬───────┘
+                           │
+              ┌────────────┴────────────┐
+              │                         │
+         ┌────▼────┐               ┌────▼────┐
+         │ Primary │               │ Backup  │
+         │ System  │◄─────sync────►│ System  │
+         └────┬────┘               └────┬────┘
+              │                         │
+         ┌────▼─────────────────────────▼────┐
+         │    Shared State (Redis/RAFT)      │
+         └────────────────────────────────────┘
+                           │
+              ┌────────────┴────────────┐
+              │                         │
+         ┌────▼────┐               ┌────▼────┐
+         │Exchange │               │Exchange │
+         │  FIX    │               │  FIX    │
+         └─────────┘               └─────────┘
+
+2.3 STATE REPLICATION MECHANISMS
+---------------------------------
+
+Option 1: Synchronous Replication
+----------------------------------
+Every state change written to both primary and backup
+
+Pros: Zero data loss
+Cons: Adds latency (1-2 microseconds)
+
+void update_position(const string& symbol, int64_t qty) {
+    // Write to primary
+    primary_state_->set_position(symbol, qty);
+
+    // Synchronously replicate to backup
+    backup_state_->set_position(symbol, qty);
+
+    // Both must succeed
+}
+
+Option 2: Asynchronous Replication with Sequence Numbers
+---------------------------------------------------------
+Primary updates immediately, backup catches up
+
+Pros: No latency impact
+Cons: Potential data loss (small window)
+
+class AsyncReplicator {
+private:
+    struct StateUpdate {
+        uint64_t sequence_num;
+        timestamp_t timestamp;
+        StateUpdateType type;
+        string key;
+        string value;
+    };
+
+    std::atomic<uint64_t> sequence_counter_{0};
+    lockfree_queue<StateUpdate> update_queue_;
+
+public:
+    void replicate_update(StateUpdateType type, const string& key,
+                         const string& value) {
+        StateUpdate update{
+            .sequence_num = sequence_counter_++,
+            .timestamp = now_utc(),
+            .type = type,
+            .key = key,
+            .value = value
+        };
+
+        // Queue for async replication
+        update_queue_.push(update);
+
+        // Background thread will send to backup
+    }
+
+    void replication_thread() {
+        while (running_) {
+            StateUpdate update;
+            if (update_queue_.pop(update)) {
+                send_to_backup(update);
+            }
+        }
+    }
+};
+
+Option 3: Shared State (Redis/RAFT)
+------------------------------------
+Both systems read/write to shared state store
+
+Pros: Simple failover, guaranteed consistency
+Cons: Network latency, single point of failure (mitigated by clustering)
+
+class SharedStateManager {
+private:
+    redis::RedisCluster* redis_;
+
+public:
+    void set_position(const string& symbol, int64_t qty) {
+        string key = "position:" + symbol;
+        redis_->set(key, std::to_string(qty));
+    }
+
+    int64_t get_position(const string& symbol) {
+        string key = "position:" + symbol;
+        auto value = redis_->get(key);
+        return std::stoll(value);
+    }
+
+    // Use Redis Pub/Sub for real-time notifications
+    void subscribe_to_updates(const string& pattern) {
+        redis_->psubscribe(pattern, [this](const string& channel,
+                                           const string& message) {
+            handle_state_update(channel, message);
+        });
+    }
+};
+
+2.4 FAILOVER DETECTION
+-----------------------
+
+Mechanism 1: Heartbeat
+----------------------
+Primary sends heartbeat every 100ms
+If 3 consecutive heartbeats missed (300ms) -> Failover
+
+class HeartbeatMonitor {
+private:
+    std::atomic<timestamp_t> last_heartbeat_;
+    std::chrono::milliseconds timeout_{300};
+
+public:
+    void record_heartbeat() {
+        last_heartbeat_ = now_utc();
+    }
+
+    bool is_primary_healthy() {
+        auto now = now_utc();
+        auto elapsed = now - last_heartbeat_.load();
+        return elapsed < timeout_;
+    }
+
+    void monitor_thread() {
+        while (running_) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+            if (!is_primary_healthy()) {
+                LOG_CRITICAL("Primary heartbeat timeout detected!");
+                trigger_failover();
+            }
+        }
+    }
+};
+
+Mechanism 2: Health Checks
+---------------------------
+Periodic health checks of critical components
+
+bool check_system_health() {
+    // Check market data feed
+    if (!market_data_->is_current()) return false;
+
+    // Check exchange connections
+    if (!exchange_gateway_->is_connected()) return false;
+
+    // Check risk system
+    if (!risk_manager_->is_responding()) return false;
+
+    // Check order processing
+    if (order_processing_lag_ > std::chrono::seconds(1)) return false;
+
+    return true;
+}
+
+Mechanism 3: External Monitor (Watchdog)
+-----------------------------------------
+Independent process monitors both primary and backup
+
+#!/bin/bash
+# watchdog.sh
+
+PRIMARY_HOST="10.0.0.10"
+BACKUP_HOST="10.0.0.11"
+HEALTH_PORT=9090
+
+while true; do
+    # Check primary health
+    PRIMARY_HEALTH=$(curl -s -o /dev/null -w "%{http_code}" \
+        http://$PRIMARY_HOST:$HEALTH_PORT/health)
+
+    if [ "$PRIMARY_HEALTH" != "200" ]; then
+        echo "[ALERT] Primary system unhealthy, initiating failover"
+
+        # Trigger failover
+        curl -X POST http://$BACKUP_HOST:9090/promote-to-primary
+
+        # Update load balancer
+        curl -X POST http://load-balancer:8080/set-primary \
+            -d "host=$BACKUP_HOST"
+
+        # Alert ops team
+        send_alert "FAILOVER" "Primary failed, failed over to backup"
+    fi
+
+    sleep 1
+done
+
+2.5 FAILOVER PROCEDURE
+-----------------------
+
+Automatic Failover Steps (sub-second):
+---------------------------------------
+1. Detect primary failure (300ms)
+2. Backup promotes itself to primary (100ms)
+3. Update load balancer / DNS (100ms)
+4. Resume processing (immediate)
+
+class FailoverManager {
+private:
+    enum SystemRole { PRIMARY, BACKUP };
+    std::atomic<SystemRole> current_role_{BACKUP};
+    std::atomic<bool> is_active_{false};
+
+public:
+    void promote_to_primary() {
+        LOG_CRITICAL("=== PROMOTING TO PRIMARY ===");
+
+        auto start_time = now_utc();
+
+        // Step 1: Change role
+        current_role_ = PRIMARY;
+
+        // Step 2: Verify state is current
+        verify_state_sync();
+
+        // Step 3: Take over exchange connections
+        takeover_exchange_sessions();
+
+        // Step 4: Start processing
+        is_active_ = true;
+        start_trading_engine();
+
+        // Step 5: Update external systems
+        notify_load_balancer();
+
+        auto end_time = now_utc();
+        auto duration_ms = duration_cast<milliseconds>(end_time - start_time);
+
+        LOG_CRITICAL("=== PROMOTION COMPLETE in {} ms ===", duration_ms.count());
+
+        // Alert
+        send_alert("FAILOVER_COMPLETE",
+                  format("Backup promoted to primary in {} ms",
+                         duration_ms.count()));
+    }
+
+private:
+    void verify_state_sync() {
+        // Ensure we have latest state
+        auto primary_seq = get_last_sequence_number_from_primary();
+        auto local_seq = get_local_sequence_number();
+
+        if (primary_seq > local_seq) {
+            LOG_WARN("State slightly behind: primary={}, local={}",
+                    primary_seq, local_seq);
+
+            // Catch up (should be very fast if replication was working)
+            catchup_state(local_seq, primary_seq);
+        }
+    }
+
+    void takeover_exchange_sessions() {
+        // For FIX connections, we can either:
+        // 1. Use shared session IDs (both systems use same credentials)
+        // 2. Quick reconnect with backup credentials
+
+        for (auto& exchange : exchanges_) {
+            // Already connected in backup mode, just start sending orders
+            exchange->set_active(true);
+        }
+    }
+};
+
+2.6 HOT RESTART TESTING
+------------------------
+
+Test failover regularly:
+
+#!/bin/bash
+# test_failover.sh
+
+echo "=== Testing Hot Failover ==="
+
+# Step 1: Verify both systems running
+echo "Checking primary..."
+curl http://primary:9090/health || exit 1
+
+echo "Checking backup..."
+curl http://backup:9090/health || exit 1
+
+# Step 2: Simulate primary failure
+echo "Simulating primary failure..."
+ssh primary "sudo killall -9 trading_engine"
+
+# Step 3: Wait for failover
+echo "Waiting for automatic failover..."
+START=$(date +%s)
+
+while true; do
+    BACKUP_STATUS=$(curl -s http://backup:9090/role)
+    if [ "$BACKUP_STATUS" == "PRIMARY" ]; then
+        END=$(date +%s)
+        DURATION=$((END - START))
+        echo "Failover completed in ${DURATION} seconds"
+        break
+    fi
+
+    if [ $((END - START)) -gt 10 ]; then
+        echo "[ERROR] Failover did not complete in 10 seconds!"
+        exit 1
+    fi
+
+    sleep 0.1
+done
+
+# Step 4: Verify trading resumed
+echo "Verifying trading resumed..."
+curl http://backup:9090/trading-status
+
+echo "=== Failover Test Complete ==="
+
+2.7 HOT RESTART LIMITATIONS
+----------------------------
+
+Challenges:
+-----------
+1. Cost: Running duplicate infrastructure 24/7
+2. Complexity: Keeping systems perfectly synchronized
+3. Split-brain: Both systems think they're primary
+4. Network partitions: Systems can't communicate
+5. Subtle bugs: Bugs that only manifest in failover
+
+Split-Brain Prevention:
+-----------------------
+Use distributed consensus (RAFT, Paxos) to elect leader:
+
+class LeaderElection {
+private:
+    RaftNode* raft_;
+
+public:
+    bool am_i_leader() {
+        return raft_->get_leader_id() == raft_->get_my_id();
+    }
+
+    void election_loop() {
+        while (running_) {
+            if (am_i_leader()) {
+                // I'm primary, process orders
+                trading_engine_->set_active(true);
+            } else {
+                // I'm backup, stay passive
+                trading_engine_->set_active(false);
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    }
+};
+
+================================================================================
+3. WARM RESTART: QUICK RECOVERY FROM CHECKPOINT (<5 MIN)
+================================================================================
+
+3.1 WARM RESTART OVERVIEW
+--------------------------
+
+Concept: Start from recent checkpoint, replay recent activity
+Goal: Quick recovery without full initialization
+Mechanism: Periodic checkpoints + incremental logs
+
+Use case:
+- Planned maintenance
+- Software updates
+- Recovery from non-critical failures
+
+3.2 CHECKPOINT STRATEGY
+------------------------
+
+Checkpoint frequency: Every 1-5 minutes
+
+What to checkpoint:
+-------------------
+1. All positions (symbol -> quantity, avg_price)
+2. Open orders (order_id -> order_details)
+3. Risk state (used_capital, position_limits)
+4. Strategy state (signals, indicators)
+5. Configuration (active symbols, parameters)
+
+Checkpoint format:
+------------------
+{
+  "timestamp": "2025-11-25T10:30:00.123Z",
+  "sequence_number": 123456789,
+  "positions": {
+    "AAPL": {"quantity": 1000, "avg_price": 150.5},
+    "MSFT": {"quantity": -500, "avg_price": 380.2}
+  },
+  "open_orders": [
+    {"order_id": 12345, "symbol": "AAPL", "side": "BUY", ...},
+    ...
+  ],
+  "risk_state": {
+    "used_capital": 1500000,
+    "daily_pnl": 25000
+  },
+  "strategy_state": {
+    "sma_50": 151.2,
+    "sma_200": 148.9,
+    ...
+  }
+}
+
+3.3 CHECKPOINT IMPLEMENTATION
+------------------------------
+
+class CheckpointManager {
+private:
+    std::chrono::minutes checkpoint_interval_{5};
+    std::thread checkpoint_thread_;
+    std::atomic<uint64_t> sequence_number_{0};
+
+public:
+    void start_checkpointing() {
+        checkpoint_thread_ = std::thread([this]() {
+            checkpoint_loop();
+        });
+    }
+
+private:
+    void checkpoint_loop() {
+        while (running_) {
+            std::this_thread::sleep_for(checkpoint_interval_);
+
+            try {
+                auto checkpoint = create_checkpoint();
+                save_checkpoint(checkpoint);
+                LOG_INFO("Checkpoint {} saved", checkpoint.sequence_number);
+            }
+            catch (const std::exception& ex) {
+                LOG_ERROR("Checkpoint failed: {}", ex.what());
+            }
+        }
+    }
+
+    Checkpoint create_checkpoint() {
+        Checkpoint cp;
+        cp.timestamp = now_utc();
+        cp.sequence_number = sequence_number_++;
+
+        // Snapshot positions
+        cp.positions = position_manager_->get_all_positions();
+
+        // Snapshot open orders
+        cp.open_orders = order_manager_->get_open_orders();
+
+        // Snapshot risk state
+        cp.risk_state = risk_manager_->get_state();
+
+        // Snapshot strategy state
+        cp.strategy_state = strategy_->get_state();
+
+        return cp;
+    }
+
+    void save_checkpoint(const Checkpoint& cp) {
+        // Save to disk
+        string filename = format("/var/lib/trading/checkpoints/cp_{}.json",
+                                cp.sequence_number);
+
+        std::ofstream file(filename);
+        file << to_json(cp);
+        file.close();
+
+        // Also save to database
+        db_->save_checkpoint(cp);
+
+        // Keep only last N checkpoints
+        cleanup_old_checkpoints(10);
+    }
+};
+
+3.4 WARM RESTART PROCEDURE
+---------------------------
+
+Step 1: Load Latest Checkpoint
+-------------------------------
+auto checkpoint = load_latest_checkpoint();
+LOG_INFO("Loaded checkpoint from {}", format_timestamp(checkpoint.timestamp));
+
+Step 2: Restore Positions
+--------------------------
+for (const auto& [symbol, pos] : checkpoint.positions) {
+    position_manager_->set_position(symbol, pos.quantity, pos.avg_price);
+}
+
+Step 3: Reconcile with Exchange
+--------------------------------
+// Critical: Verify checkpoint is still accurate
+for (const auto& [symbol, pos] : checkpoint.positions) {
+    auto exchange_pos = exchange_->get_position(symbol);
+
+    if (pos.quantity != exchange_pos.quantity) {
+        LOG_WARN("Position diverged for {}: checkpoint={}, exchange={}",
+                symbol, pos.quantity, exchange_pos.quantity);
+
+        // Trust exchange
+        position_manager_->set_position(symbol, exchange_pos.quantity,
+                                       exchange_pos.avg_price);
+    }
+}
+
+Step 4: Recover Open Orders
+----------------------------
+for (const auto& order : checkpoint.open_orders) {
+    auto exchange_status = exchange_->get_order_status(order.order_id);
+
+    switch (exchange_status.state) {
+    case OrderState::FILLED:
+        // Order filled after checkpoint
+        LOG_INFO("Order {} filled after checkpoint", order.order_id);
+        process_fill(exchange_status.fill_details);
+        break;
+
+    case OrderState::CANCELLED:
+        // Order cancelled
+        LOG_INFO("Order {} cancelled after checkpoint", order.order_id);
+        mark_order_cancelled(order.order_id);
+        break;
+
+    case OrderState::OPEN:
+    case OrderState::PARTIAL_FILL:
+        // Order still active, restore to order book
+        LOG_INFO("Restoring active order {}", order.order_id);
+        order_manager_->restore_order(order);
+        break;
+
+    case OrderState::REJECTED:
+        LOG_WARN("Order {} rejected", order.order_id);
+        mark_order_rejected(order.order_id);
+        break;
+    }
+}
+
+Step 5: Replay Recent Activity
+-------------------------------
+// Replay orders/fills that happened after checkpoint
+auto recent_fills = exchange_->get_fills_since(checkpoint.timestamp);
+
+for (const auto& fill : recent_fills) {
+    if (!was_fill_processed(fill.fill_id)) {
+        LOG_INFO("Replaying fill: {}", fill.fill_id);
+        process_fill(fill);
+    }
+}
+
+Step 6: Restore Strategy State
+-------------------------------
+strategy_->restore_state(checkpoint.strategy_state);
+
+Step 7: Validate & Resume
+--------------------------
+if (validate_system_state()) {
+    LOG_INFO("Warm restart complete, resuming trading");
+    trading_engine_->start();
+} else {
+    LOG_ERROR("State validation failed, cannot resume trading");
+    halt_system();
+}
+
+3.5 WARM RESTART COMPLETE IMPLEMENTATION
+-----------------------------------------
+
+class WarmRestartManager {
+public:
+    bool perform_warm_restart() {
+        LOG_INFO("=== Starting Warm Restart ===");
+        auto start_time = now_utc();
+
+        try {
+            // Step 1: Load checkpoint
+            auto checkpoint = load_latest_checkpoint();
+            if (!checkpoint.has_value()) {
+                LOG_ERROR("No checkpoint found, falling back to cold restart");
+                return false;
+            }
+
+            LOG_INFO("Using checkpoint from {} (seq: {})",
+                    format_timestamp(checkpoint->timestamp),
+                    checkpoint->sequence_number);
+
+            // Step 2: Restore positions
+            restore_positions(*checkpoint);
+
+            // Step 3: Restore orders
+            restore_orders(*checkpoint);
+
+            // Step 4: Reconcile with exchange
+            reconcile_with_exchange(*checkpoint);
+
+            // Step 5: Restore risk state
+            restore_risk_state(*checkpoint);
+
+            // Step 6: Restore strategy state
+            restore_strategy_state(*checkpoint);
+
+            // Step 7: Replay recent activity
+            replay_since_checkpoint(*checkpoint);
+
+            // Step 8: Validate
+            if (!validate_state()) {
+                LOG_ERROR("State validation failed");
+                return false;
+            }
+
+            auto end_time = now_utc();
+            auto duration = duration_cast<seconds>(end_time - start_time);
+
+            LOG_INFO("=== Warm Restart Complete in {} seconds ===",
+                    duration.count());
+
+            return true;
+        }
+        catch (const std::exception& ex) {
+            LOG_ERROR("Warm restart failed: {}", ex.what());
+            return false;
+        }
+    }
+
+private:
+    void replay_since_checkpoint(const Checkpoint& cp) {
+        LOG_INFO("Replaying activity since checkpoint...");
+
+        // Get all fills since checkpoint
+        auto fills = exchange_->get_fills_since(cp.timestamp);
+        LOG_INFO("Found {} fills to replay", fills.size());
+
+        for (const auto& fill : fills) {
+            // Check if already processed (in checkpoint)
+            bool already_processed = false;
+            for (const auto& order : cp.open_orders) {
+                if (order.order_id == fill.order_id &&
+                    order.filled_quantity >= fill.cumulative_quantity) {
+                    already_processed = true;
+                    break;
+                }
+            }
+
+            if (!already_processed) {
+                LOG_DEBUG("Replaying fill: order_id={}, qty={}, price={}",
+                         fill.order_id, fill.quantity, fill.price);
+                process_fill(fill);
+            }
+        }
+
+        LOG_INFO("Replay complete");
+    }
+
+    bool validate_state() {
+        LOG_INFO("Validating system state...");
+
+        // Validate positions
+        auto symbols = get_all_active_symbols();
+        for (const auto& symbol : symbols) {
+            auto internal = position_manager_->get_position(symbol);
+            auto exchange = exchange_->get_position(symbol);
+
+            if (internal.quantity != exchange.quantity) {
+                LOG_ERROR("Position mismatch for {}: internal={}, exchange={}",
+                         symbol, internal.quantity, exchange.quantity);
+                return false;
+            }
+        }
+
+        // Validate open orders
+        auto internal_orders = order_manager_->get_open_orders();
+        for (const auto& order : internal_orders) {
+            auto exchange_status = exchange_->get_order_status(order.order_id);
+
+            if (exchange_status.state == OrderState::FILLED ||
+                exchange_status.state == OrderState::CANCELLED) {
+                LOG_ERROR("Order {} state mismatch", order.order_id);
+                return false;
+            }
+        }
+
+        // Validate risk limits
+        if (!risk_manager_->validate_limits()) {
+            LOG_ERROR("Risk limit validation failed");
+            return false;
+        }
+
+        LOG_INFO("State validation passed");
+        return true;
+    }
+};
+
+3.6 INCREMENTAL LOGGING FOR WARM RESTART
+-----------------------------------------
+
+Between checkpoints, log all state changes for replay:
+
+class IncrementalLogger {
+private:
+    std::ofstream log_file_;
+    std::mutex log_mutex_;
+
+public:
+    void log_position_update(const string& symbol, int64_t qty, double price) {
+        std::lock_guard<std::mutex> lock(log_mutex_);
+        log_file_ << format("{},{},{},{},{}\n",
+                           now_utc().count(),
+                           "POSITION",
+                           symbol,
+                           qty,
+                           price);
+    }
+
+    void log_order_event(const OrderEvent& event) {
+        std::lock_guard<std::mutex> lock(log_mutex_);
+        log_file_ << format("{},{},{}\n",
+                           now_utc().count(),
+                           "ORDER",
+                           to_json(event));
+    }
+
+    void log_fill(const Fill& fill) {
+        std::lock_guard<std::mutex> lock(log_mutex_);
+        log_file_ << format("{},{},{}\n",
+                           now_utc().count(),
+                           "FILL",
+                           to_json(fill));
+    }
+
+    void flush() {
+        std::lock_guard<std::mutex> lock(log_mutex_);
+        log_file_.flush();
+    }
+};
+
+// Replay incremental log
+void replay_incremental_log(const Checkpoint& cp) {
+    string log_file = get_log_file_for_checkpoint(cp);
+    std::ifstream file(log_file);
+
+    string line;
+    while (std::getline(file, line)) {
+        auto parts = split(line, ',');
+        timestamp_t ts = std::stoll(parts[0]);
+
+        // Only replay events after checkpoint
+        if (ts <= cp.timestamp.count()) continue;
+
+        string event_type = parts[1];
+
+        if (event_type == "POSITION") {
+            string symbol = parts[2];
+            int64_t qty = std::stoll(parts[3]);
+            double price = std::stod(parts[4]);
+            position_manager_->set_position(symbol, qty, price);
+        }
+        else if (event_type == "FILL") {
+            Fill fill = parse_fill(parts[2]);
+            process_fill(fill);
+        }
+        // ... handle other event types
+    }
+}
+
+================================================================================
+4. COLD RESTART: FULL INITIALIZATION FROM SCRATCH (<30 MIN)
+================================================================================
+
+4.1 COLD RESTART OVERVIEW
+--------------------------
+
+Concept: Start from zero, rebuild all state
+Goal: Full recovery with comprehensive validation
+Mechanism: Query all data from authoritative sources
+
+Use case:
+- Major system updates
+- Database corruption
+- No valid checkpoint available
+- Testing/development
+
+4.2 COLD RESTART PROCEDURE
+---------------------------
+
+Step 1: Initialize Infrastructure (5-10 min)
+---------------------------------------------
+- Start databases
+- Connect to exchanges
+- Initialize market data feeds
+- Load configuration
+
+Step 2: Recover Positions from Exchange (5 min)
+------------------------------------------------
+for exchange in exchanges:
+    positions = exchange.get_all_positions()
+    for symbol, pos in positions:
+        position_manager.set_position(symbol, pos.quantity, pos.avg_price)
+
+Step 3: Recover Open Orders (2 min)
+------------------------------------
+for exchange in exchanges:
+    orders = exchange.get_all_orders(state=OPEN)
+    for order in orders:
+        order_manager.restore_order(order)
+
+Step 4: Rebuild Trade History (5-10 min)
+-----------------------------------------
+# Query last 24 hours of fills
+fills = exchange.get_fills(since=now() - 24*hours)
+for fill in fills:
+    trade_history.add(fill)
+
+Step 5: Reconcile Everything (5 min)
+-------------------------------------
+- Run full position reconciliation
+- Verify all orders match exchange
+- Check risk limits
+
+Step 6: Initialize Strategies (2-5 min)
+----------------------------------------
+- Load historical data for indicators
+- Calculate initial signals
+- Warm up machine learning models
+
+Step 7: Validate & Start (1 min)
+---------------------------------
+- Run health checks
+- Validate all connections
+- Start trading
+
+4.3 COLD RESTART IMPLEMENTATION
+--------------------------------
+
+class ColdRestartManager {
+public:
+    bool perform_cold_restart() {
+        LOG_INFO("=== Starting Cold Restart ===");
+        auto start_time = now_utc();
+
+        try {
+            // Step 1: Initialize infrastructure
+            if (!initialize_infrastructure()) {
+                LOG_ERROR("Infrastructure initialization failed");
+                return false;
+            }
+
+            // Step 2: Recover positions
+            if (!recover_positions_from_exchange()) {
+                LOG_ERROR("Position recovery failed");
+                return false;
+            }
+
+            // Step 3: Recover orders
+            if (!recover_orders_from_exchange()) {
+                LOG_ERROR("Order recovery failed");
+                return false;
+            }
+
+            // Step 4: Rebuild trade history
+            if (!rebuild_trade_history()) {
+                LOG_ERROR("Trade history rebuild failed");
+                return false;
+            }
+
+            // Step 5: Reconcile
+            if (!full_reconciliation()) {
+                LOG_ERROR("Reconciliation failed");
+                return false;
+            }
+
+            // Step 6: Initialize strategies
+            if (!initialize_strategies()) {
+                LOG_ERROR("Strategy initialization failed");
+                return false;
+            }
+
+            // Step 7: Validate
+            if (!validate_system()) {
+                LOG_ERROR("System validation failed");
+                return false;
+            }
+
+            auto end_time = now_utc();
+            auto duration = duration_cast<minutes>(end_time - start_time);
+
+            LOG_INFO("=== Cold Restart Complete in {} minutes ===",
+                    duration.count());
+
+            return true;
+        }
+        catch (const std::exception& ex) {
+            LOG_ERROR("Cold restart failed: {}", ex.what());
+            return false;
+        }
+    }
+
+private:
+    bool initialize_infrastructure() {
+        LOG_INFO("Initializing infrastructure...");
+
+        // Start databases
+        if (!database_->connect()) {
+            LOG_ERROR("Database connection failed");
+            return false;
+        }
+
+        // Connect to exchanges
+        for (auto& exchange : exchanges_) {
+            if (!exchange->connect()) {
+                LOG_ERROR("Exchange connection failed: {}",
+                         exchange->get_name());
+                return false;
+            }
+        }
+
+        // Initialize market data
+        if (!market_data_->start()) {
+            LOG_ERROR("Market data initialization failed");
+            return false;
+        }
+
+        // Load configuration
+        config_->load();
+
+        LOG_INFO("Infrastructure initialized");
+        return true;
+    }
+
+    bool recover_positions_from_exchange() {
+        LOG_INFO("Recovering positions from exchange...");
+
+        for (auto& exchange : exchanges_) {
+            try {
+                auto positions = exchange->get_all_positions();
+                LOG_INFO("Retrieved {} positions from {}",
+                        positions.size(), exchange->get_name());
+
+                for (const auto& pos : positions) {
+                    position_manager_->set_position(
+                        pos.symbol,
+                        pos.quantity,
+                        pos.avg_price
+                    );
+
+                    LOG_DEBUG("Restored position: {} = {}",
+                             pos.symbol, pos.quantity);
+                }
+            }
+            catch (const std::exception& ex) {
+                LOG_ERROR("Failed to recover positions from {}: {}",
+                         exchange->get_name(), ex.what());
+                return false;
+            }
+        }
+
+        LOG_INFO("Position recovery complete");
+        return true;
+    }
+
+    bool recover_orders_from_exchange() {
+        LOG_INFO("Recovering open orders from exchange...");
+
+        for (auto& exchange : exchanges_) {
+            try {
+                auto orders = exchange->get_all_orders(OrderState::OPEN);
+                LOG_INFO("Retrieved {} open orders from {}",
+                        orders.size(), exchange->get_name());
+
+                for (const auto& order : orders) {
+                    order_manager_->restore_order(order);
+                    LOG_DEBUG("Restored order: id={}, symbol={}, qty={}",
+                             order.order_id, order.symbol, order.quantity);
+                }
+            }
+            catch (const std::exception& ex) {
+                LOG_ERROR("Failed to recover orders from {}: {}",
+                         exchange->get_name(), ex.what());
+                return false;
+            }
+        }
+
+        LOG_INFO("Order recovery complete");
+        return true;
+    }
+
+    bool rebuild_trade_history() {
+        LOG_INFO("Rebuilding trade history...");
+
+        // Query last 24 hours
+        auto since = now_utc() - std::chrono::hours(24);
+
+        for (auto& exchange : exchanges_) {
+            try {
+                auto fills = exchange->get_fills_since(since);
+                LOG_INFO("Retrieved {} fills from {}",
+                        fills.size(), exchange->get_name());
+
+                for (const auto& fill : fills) {
+                    trade_history_->add(fill);
+                }
+            }
+            catch (const std::exception& ex) {
+                LOG_ERROR("Failed to rebuild trade history from {}: {}",
+                         exchange->get_name(), ex.what());
+                return false;
+            }
+        }
+
+        LOG_INFO("Trade history rebuilt");
+        return true;
+    }
+
+    bool initialize_strategies() {
+        LOG_INFO("Initializing strategies...");
+
+        // Load historical data (e.g., last 200 bars for indicators)
+        for (const auto& symbol : config_->get_active_symbols()) {
+            auto bars = market_data_->get_historical_bars(symbol, 200);
+            strategy_->feed_historical_data(symbol, bars);
+        }
+
+        // Warm up indicators
+        strategy_->initialize();
+
+        LOG_INFO("Strategies initialized");
+        return true;
+    }
+};
+
+4.4 COLD RESTART OPTIMIZATION
+------------------------------
+
+Parallelize recovery:
+
+bool recover_positions_parallel() {
+    std::vector<std::future<bool>> futures;
+
+    for (auto& exchange : exchanges_) {
+        futures.push_back(std::async(std::launch::async,
+            [&exchange, this]() {
+                return recover_positions_from_single_exchange(exchange);
+            }
+        ));
+    }
+
+    bool all_success = true;
+    for (auto& future : futures) {
+        if (!future.get()) {
+            all_success = false;
+        }
+    }
+
+    return all_success;
+}
+
+4.5 COLD RESTART BASH SCRIPT
+-----------------------------
+
+#!/bin/bash
+# cold_restart.sh
+
+set -e
+
+echo "=== Starting Cold Restart ==="
+START_TIME=$(date +%s)
+
+# Step 1: Stop existing processes
+echo "[1/7] Stopping existing processes..."
+systemctl stop trading-engine
+sleep 2
+
+# Step 2: Clear stale state (optional)
+echo "[2/7] Clearing stale state..."
+redis-cli FLUSHDB
+
+# Step 3: Start infrastructure
+echo "[3/7] Starting infrastructure..."
+systemctl start postgresql
+systemctl start redis
+sleep 5
+
+# Step 4: Start trading engine in recovery mode
+echo "[4/7] Starting trading engine in recovery mode..."
+/opt/trading/bin/trading_engine --mode=cold_restart &
+ENGINE_PID=$!
+
+# Step 5: Wait for recovery to complete
+echo "[5/7] Waiting for recovery..."
+while true; do
+    STATUS=$(curl -s http://localhost:9090/restart-status || echo "PENDING")
+    echo "Status: $STATUS"
+
+    if [ "$STATUS" == "COMPLETE" ]; then
+        break
+    elif [ "$STATUS" == "FAILED" ]; then
+        echo "[ERROR] Cold restart failed!"
+        kill $ENGINE_PID
+        exit 1
+    fi
+
+    sleep 5
+done
+
+# Step 6: Validate system
+echo "[6/7] Validating system..."
+/opt/trading/bin/validate_system.sh
+
+# Step 7: Start trading
+echo "[7/7] Starting trading..."
+curl -X POST http://localhost:9090/start-trading
+
+END_TIME=$(date +%s)
+DURATION=$((END_TIME - START_TIME))
+
+echo "=== Cold Restart Complete in ${DURATION} seconds ==="
+
+================================================================================
+5. WHEN TO USE EACH TYPE
+================================================================================
+
+5.1 DECISION MATRIX
+-------------------
+
+Scenario: Hardware Failure
+---------------------------
+- Use: HOT RESTART
+- Reason: Immediate failover required, no time for recovery
+- RTO: <5 seconds
+
+Scenario: Planned Maintenance (software update)
+------------------------------------------------
+- Use: WARM RESTART
+- Reason: Can take checkpoint before shutdown, quick recovery
+- RTO: <5 minutes
+
+Scenario: Database Corruption
+------------------------------
+- Use: COLD RESTART
+- Reason: Need to rebuild from authoritative source
+- RTO: <30 minutes
+
+Scenario: End of Day Restart
+-----------------------------
+- Use: COLD RESTART
+- Reason: No positions, fresh start for next day
+- RTO: Can be slower, non-trading hours
+
+Scenario: Network Partition
+----------------------------
+- Use: HOT RESTART
+- Reason: Automatic failover to backup with network access
+- RTO: <5 seconds
+
+Scenario: Exchange API Change
+------------------------------
+- Use: WARM RESTART (if compatible) or COLD RESTART
+- Reason: Need to reinitialize connections
+- RTO: <5-30 minutes depending on changes
+
+Scenario: Configuration Change
+-------------------------------
+- Use: WARM RESTART
+- Reason: Reload config, reuse existing state
+- RTO: <5 minutes
+
+5.2 DECISION FLOWCHART
+----------------------
+
+                    [System Failure Detected]
+                              |
+                              v
+                    Is backup available and synced?
+                         /           \
+                       YES             NO
+                       /                 \
+                      v                   v
+                 HOT RESTART      Is checkpoint recent (<5 min)?
+                 (<5 sec)              /           \
+                                     YES             NO
+                                     /                 \
+                                    v                   v
+                              WARM RESTART         COLD RESTART
+                              (<5 min)             (<30 min)
+
+5.3 COST-BENEFIT ANALYSIS
+--------------------------
+
+Hot Restart:
+-----------
+Costs:
+- High: Duplicate infrastructure running 24/7
+- High: Complex synchronization logic
+- Medium: Testing and maintenance overhead
+
+Benefits:
+- Critical: Sub-second failover
+- High: Zero data loss
+- High: Minimal market impact
+
+ROI: Positive for high-frequency, high-volume strategies
+
+Warm Restart:
+------------
+Costs:
+- Medium: Checkpoint infrastructure and storage
+- Low: Incremental logging overhead
+- Low: Testing overhead
+
+Benefits:
+- High: Quick recovery (<5 min)
+- High: Minimal data loss
+- Medium: Acceptable market impact
+
+ROI: Positive for most production HFT systems
+
+Cold Restart:
+------------
+Costs:
+- Low: Minimal additional infrastructure
+- Low: Simple implementation
+
+Benefits:
+- Medium: Reliable recovery (always works)
+- Low: Longer downtime
+- Low: Potential data loss
+
+ROI: Suitable for non-critical systems or non-trading hours
+
+================================================================================
+6. DETAILED PROCEDURES FOR EACH
+================================================================================
+
+6.1 HOT RESTART DETAILED PROCEDURE
+-----------------------------------
+
+Pre-Requisites:
+--------------
+- Backup system running and healthy
+- State replication operational (lag <100ms)
+- Heartbeat monitoring active
+- Load balancer configured for failover
+
+Procedure:
+----------
+1. Monitor primary system health (continuous)
+2. Detect failure (heartbeat timeout or health check fail)
+3. Backup promotes itself to primary (automated)
+4. Load balancer routes traffic to new primary (automated)
+5. Alert operations team (automated)
+6. Investigate primary failure (manual)
+7. Fix primary system (manual)
+8. Re-sync primary with new primary (manual)
+9. Failback to original primary (manual, optional)
+
+Automation Script:
+------------------
+See section 2.4 for watchdog script
+
+6.2 WARM RESTART DETAILED PROCEDURE
+------------------------------------
+
+Pre-Requisites:
+--------------
+- Recent checkpoint available (<5 min old)
+- Incremental logs available
+- Exchange APIs accessible
+- Database operational
+
+Procedure:
+----------
+1. Stop trading engine gracefully
+   - Stop accepting new orders
+   - Wait for open orders to complete (timeout: 30 sec)
+   - Take final checkpoint
+
+2. Shutdown system
+   - Close exchange connections
+   - Stop market data feeds
+   - Flush logs to disk
+
+3. Perform maintenance/update (if applicable)
+
+4. Start system in recovery mode
+   - Load configuration
+   - Connect to databases
+   - DO NOT start trading yet
+
+5. Load latest checkpoint
+   - Verify checksum
+   - Load positions, orders, risk state
+
+6. Reconcile with exchange
+   - Query current positions
+   - Compare with checkpoint
+   - Resolve discrepancies (trust exchange)
+
+7. Replay incremental logs
+   - Process fills that happened during downtime
+   - Update positions accordingly
+
+8. Validate system state
+   - Run full health checks
+   - Verify all connections
+   - Check risk limits
+
+9. Resume trading
+   - Start market data feeds
+   - Enable order routing
+   - Alert operations team
+
+Automation Script:
+------------------
+See section 3.5 for implementation
+
+6.3 COLD RESTART DETAILED PROCEDURE
+------------------------------------
+
+Pre-Requisites:
+--------------
+- Exchange APIs accessible
+- Database accessible (or can be rebuilt)
+- Configuration files available
+
+Procedure:
+----------
+1. Initialize infrastructure
+   - Start databases
+   - Start message queues
+   - Start monitoring
+
+2. Connect to exchanges
+   - Establish FIX sessions
+   - Login to REST APIs
+   - Subscribe to market data
+
+3. Query current positions
+   - Get positions from each exchange
+   - Aggregate across exchanges
+   - Verify totals make sense
+
+4. Query open orders
+   - Get all active orders
+   - Restore to order management system
+   - Verify quantities match positions
+
+5. Rebuild trade history
+   - Query last 24 hours of fills
+   - Reconstruct position changes
+   - Verify final positions match current
+
+6. Initialize risk system
+   - Calculate current exposure
+   - Set risk limits
+   - Validate limits not breached
+
+7. Initialize strategies
+   - Load historical data for indicators
+   - Calculate initial signals
+   - Warm up ML models (if applicable)
+
+8. Full system validation
+   - Run all health checks
+   - Verify all components operational
+   - Check connectivity
+
+9. Start trading (cautiously)
+   - Start with reduced size
+   - Monitor closely for 15 minutes
+   - Gradually increase to normal size
+
+Automation Script:
+------------------
+See section 4.3 and 4.5
+
+================================================================================
+7. STATE SYNCHRONIZATION FOR HOT RESTART
+================================================================================
+
+7.1 SYNCHRONIZATION APPROACHES
+-------------------------------
+
+Approach 1: Primary Push
+-------------------------
+Primary pushes all state changes to backup
+
+Pros: Backup always current
+Cons: Network overhead, primary performance impact
+
+Approach 2: Backup Pull
+------------------------
+Backup periodically queries primary for state
+
+Pros: No impact on primary
+Cons: Backup may be stale, higher recovery time
+
+Approach 3: Shared State Store
+-------------------------------
+Both read/write to shared database/cache
+
+Pros: Guaranteed consistency, simple failover
+Cons: Network latency, shared component can fail
+
+Approach 4: Hybrid
+-------------------
+Critical state pushed (positions, orders)
+Non-critical state pulled (indicators, signals)
+
+Pros: Balance of consistency and performance
+Cons: More complex logic
+
+7.2 STATE SYNCHRONIZATION IMPLEMENTATION
+-----------------------------------------
+
+Using Redis Pub/Sub for real-time sync:
+
+class StateSynchronizer {
+private:
+    redis::RedisClient* redis_;
+    std::thread sync_thread_;
+
+public:
+    // Primary: Publish state changes
+    void publish_position_update(const string& symbol, int64_t qty) {
+        json update = {
+            {"type", "position"},
+            {"symbol", symbol},
+            {"quantity", qty},
+            {"timestamp", now_utc().count()}
+        };
+
+        redis_->publish("state_updates", update.dump());
+    }
+
+    // Backup: Subscribe to state changes
+    void subscribe_to_updates() {
+        sync_thread_ = std::thread([this]() {
+            redis_->subscribe("state_updates", [this](const string& message) {
+                handle_state_update(message);
+            });
+        });
+    }
+
+private:
+    void handle_state_update(const string& message) {
+        auto update = json::parse(message);
+        string type = update["type"];
+
+        if (type == "position") {
+            string symbol = update["symbol"];
+            int64_t qty = update["quantity"];
+            position_manager_->set_position(symbol, qty);
+        }
+        else if (type == "order") {
+            // Handle order updates
+        }
+        // ... other update types
+    }
+};
+
+7.3 SYNCHRONIZATION VERIFICATION
+---------------------------------
+
+Periodically verify sync is working:
+
+class SyncMonitor {
+private:
+    std::chrono::milliseconds max_lag_{500};  // 500ms max
+
+public:
+    void monitor_sync_lag() {
+        while (running_) {
+            auto primary_ts = get_primary_last_update_timestamp();
+            auto backup_ts = get_backup_last_update_timestamp();
+
+            auto lag = primary_ts - backup_ts;
+
+            if (lag > max_lag_) {
+                LOG_ERROR("Backup sync lag: {} ms", lag.count());
+                alert_ops_team("Backup sync lag too high");
+            }
+
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+    }
+};
+
+================================================================================
+8. PERFORMANCE COMPARISON
+================================================================================
+
+8.1 RESTART TIME COMPARISON
+----------------------------
+
+Metric: Time to Resume Trading
+-------------------------------
+
+Hot Restart:
+- Detection: 300ms (3 missed heartbeats)
+- Promotion: 100ms
+- Resume: 0ms (already connected)
+- Total: 400ms (~0.5 seconds)
+
+Warm Restart:
+- Shutdown: 30 seconds (graceful)
+- Load checkpoint: 10 seconds
+- Reconcile: 60 seconds
+- Validate: 30 seconds
+- Resume: 10 seconds
+- Total: 140 seconds (~2-3 minutes)
+
+Cold Restart:
+- Infrastructure: 300 seconds (5 min)
+- Recover positions: 120 seconds (2 min)
+- Recover orders: 60 seconds (1 min)
+- Rebuild history: 300 seconds (5 min)
+- Initialize strategies: 180 seconds (3 min)
+- Validate: 60 seconds (1 min)
+- Total: 1020 seconds (~17 minutes)
+
+8.2 DATA LOSS COMPARISON
+-------------------------
+
+Hot Restart:
+- Data Loss: 0 (if sync working)
+- Worst Case: Last 100ms of updates (if sync broken)
+
+Warm Restart:
+- Data Loss: 0 (if checkpoint recent + logs intact)
+- Worst Case: Last 5 minutes (if checkpoint old)
+
+Cold Restart:
+- Data Loss: None for positions/orders (from exchange)
+- Possible Loss: Strategy state, indicators
+
+8.3 RESOURCE USAGE COMPARISON
+------------------------------
+
+Hot Restart:
+- CPU: 200% (two systems running)
+- Memory: 200% (two systems)
+- Network: +20% (sync traffic)
+- Storage: +10% (duplicate logs)
+
+Warm Restart:
+- CPU: 100% (single system)
+- Memory: 100%
+- Network: 100%
+- Storage: +30% (checkpoints + logs)
+
+Cold Restart:
+- CPU: 100%
+- Memory: 100%
+- Network: 100%
+- Storage: +10% (logs only)
+
+================================================================================
+9. ARCHITECTURE FOR EACH TYPE
+================================================================================
+
+9.1 HOT RESTART ARCHITECTURE
+-----------------------------
+
+                Load Balancer (Keepalived + HAProxy)
+                        |
+        +---------------+---------------+
+        |                               |
+   Primary System                  Backup System
+        |                               |
+        +------------ SYNC -------------+
+        |      (Redis/RAFT/Custom)      |
+        |                               |
+   +----+----+                     +----+----+
+   |         |                     |         |
+Trading   Market                Trading   Market
+Engine    Data                  Engine    Data
+   |         |                     |         |
+   +----+----+                     +----+----+
+        |                               |
+        +------------ FIX --------------+
+                      |
+                  Exchanges
+
+Key Components:
+--------------
+1. Load Balancer: Routes traffic to active primary
+2. Heartbeat: Detects primary failure
+3. State Sync: Keeps backup current
+4. Shared Session: Both can use same FIX sessions
+
+9.2 WARM RESTART ARCHITECTURE
+------------------------------
+
+                Trading System
+                      |
+        +-------------+-------------+
+        |                           |
+   Checkpoint                  Incremental
+   Manager                     Logger
+        |                           |
+        v                           v
+   Checkpoint Store           Log Files
+   (every 5 min)              (continuous)
+        |                           |
+        +-------------+-------------+
+                      |
+                  Recovery
+                  Manager
+                      |
+        +-------------+-------------+
+        |             |             |
+    Load         Reconcile      Replay
+    Checkpoint   w/ Exchange    Logs
+
+Key Components:
+--------------
+1. Checkpoint Manager: Periodic snapshots
+2. Incremental Logger: Continuous event log
+3. Recovery Manager: Orchestrates restart
+4. Reconciliation Engine: Validates state
+
+9.3 COLD RESTART ARCHITECTURE
+------------------------------
+
+                Trading System
+                      |
+                 Cold Start
+                  Manager
+                      |
+        +-------------+-------------+
+        |             |             |
+    Query         Query          Query
+    Positions     Orders         Fills
+        |             |             |
+    Exchange      Exchange       Exchange
+    Position API  Order API      Fill API
+        |             |             |
+        +-------------+-------------+
+                      |
+                 Aggregate &
+                 Validate
+                      |
+              Rebuild Internal
+                   State
+                      |
+               Initialize
+                Strategies
+                      |
+                  Ready
+
+Key Components:
+--------------
+1. Cold Start Manager: Orchestrates recovery
+2. Exchange APIs: Source of truth
+3. State Rebuild: Reconstruct from APIs
+4. Validation: Ensure consistency
+
+================================================================================
+10. BEST PRACTICES & CHECKLISTS
+================================================================================
+
+10.1 GENERAL RESTART BEST PRACTICES
+------------------------------------
+
+1. Always have multiple restart strategies
+   - Primary: Hot restart for critical systems
+   - Backup: Warm restart if hot fails
+   - Fallback: Cold restart always works
+
+2. Test restarts regularly
+   - Monthly hot restart drill
+   - Weekly warm restart test
+   - Daily cold restart in dev/staging
+
+3. Monitor restart performance
+   - Track time to recover
+   - Measure data loss
+   - Identify bottlenecks
+
+4. Document everything
+   - Runbooks for each restart type
+   - Lessons learned from incidents
+   - Update procedures after each test
+
+5. Automate as much as possible
+   - Automatic failover (hot)
+   - Semi-automatic recovery (warm)
+   - Scripted procedures (cold)
+
+6. Have rollback plans
+   - Can you go back to old version?
+   - Can you restore from backup?
+   - What if restart fails midway?
+
+10.2 HOT RESTART CHECKLIST
+---------------------------
+
+Pre-Deployment:
+[ ] Backup system deployed and running
+[ ] State synchronization tested and working
+[ ] Heartbeat monitoring configured
+[ ] Failover tested successfully
+[ ] Load balancer configured
+[ ] Split-brain protection enabled
+[ ] Documentation updated
+[ ] Team trained on failover procedures
+
+During Operation:
+[ ] Monitor sync lag (<100ms)
+[ ] Check backup health regularly
+[ ] Verify heartbeats arriving
+[ ] Test failover monthly
+[ ] Review failover logs
+
+Post-Failover:
+[ ] Investigate primary failure
+[ ] Fix primary system
+[ ] Re-sync primary
+[ ] Consider failback
+[ ] Document incident
+[ ] Update monitoring/alerts
+
+10.3 WARM RESTART CHECKLIST
+----------------------------
+
+Pre-Restart:
+[ ] Verify checkpoint is recent (<5 min)
+[ ] Verify incremental logs intact
+[ ] Check exchange API status
+[ ] Schedule restart during low-volume period
+[ ] Notify stakeholders
+[ ] Prepare rollback plan
+
+During Restart:
+[ ] Stop trading gracefully
+[ ] Take final checkpoint
+[ ] Shutdown cleanly
+[ ] Perform maintenance/update
+[ ] Start in recovery mode
+[ ] Load checkpoint
+[ ] Reconcile with exchange
+[ ] Replay logs
+[ ] Validate state
+
+Post-Restart:
+[ ] Verify positions correct
+[ ] Check open orders
+[ ] Monitor P&L
+[ ] Watch for errors
+[ ] Document any issues
+[ ] Update procedures if needed
+
+10.4 COLD RESTART CHECKLIST
+----------------------------
+
+Pre-Restart:
+[ ] Backup current state (if possible)
+[ ] Verify exchange APIs accessible
+[ ] Check database is available
+[ ] Review configuration files
+[ ] Schedule during non-trading hours
+[ ] Notify stakeholders
+
+During Restart:
+[ ] Initialize infrastructure
+[ ] Connect to exchanges
+[ ] Query positions
+[ ] Query open orders
+[ ] Rebuild trade history
+[ ] Reconcile everything
+[ ] Initialize strategies
+[ ] Full system validation
+[ ] Start trading cautiously
+
+Post-Restart:
+[ ] Monitor closely for 1 hour
+[ ] Verify positions match exchange
+[ ] Check P&L calculations
+[ ] Review logs for errors
+[ ] Gradually increase to normal operation
+[ ] Document recovery time
+[ ] Update procedures
+
+10.5 TROUBLESHOOTING GUIDE
+---------------------------
+
+Problem: Hot failover takes too long (>5 sec)
+Solution:
+- Check network latency between primary/backup
+- Verify heartbeat frequency adequate
+- Review failover detection logic
+- Optimize state synchronization
+
+Problem: Warm restart fails to load checkpoint
+Solution:
+- Verify checkpoint file integrity (checksum)
+- Check disk space
+- Review checkpoint format version
+- Fall back to earlier checkpoint
+
+Problem: Cold restart positions don't match exchange
+Solution:
+- Query exchange multiple times (API glitch?)
+- Check for pending settlements
+- Review recent corporate actions
+- Contact exchange support if persistent
+
+Problem: State synchronization lag too high
+Solution:
+- Check network bandwidth
+- Reduce sync frequency (less critical data)
+- Compress sync messages
+- Upgrade network infrastructure
+
+Problem: Failover causes duplicate orders
+Solution:
+- Implement proper idempotency
+- Use exchange order IDs not internal IDs
+- Add duplicate detection logic
+- Test failover more thoroughly
+
+================================================================================
+END OF DOCUMENT
+================================================================================

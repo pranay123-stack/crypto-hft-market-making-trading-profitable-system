@@ -1,0 +1,1104 @@
+================================================================================
+DAY 3 PLANNING - MARKET DATA INFRASTRUCTURE FOUNDATION
+================================================================================
+
+Date: Week 1, Day 3
+Phase: Foundation (Week 1-8)
+Status: Ready to Execute
+Critical Path: YES
+Dependencies: Day 1 (timing), Day 2 (networking)
+
+================================================================================
+DAILY OBJECTIVES
+================================================================================
+
+PRIMARY GOALS:
+--------------
+1. Implement FIX protocol parser for market data
+2. Create order book data structure (optimized for HFT)
+3. Build market data feed handler framework
+4. Integrate with kernel-bypass network layer
+5. Implement basic market data normalization
+6. Create market data replay capability for testing
+
+SUCCESS CRITERIA:
+-----------------
+✓ Can parse FIX 4.4 market data messages
+✓ Order book construction from Level 2 data
+✓ Order book updates <100ns latency
+✓ Market data messages processed in sequence
+✓ Feed handler integrated with DPDK network layer
+✓ Can replay historical market data
+✓ Zero memory allocations in hot path
+
+DELIVERABLES:
+-------------
+- FIX protocol parser (header-only, zero-copy)
+- Order book implementation (lock-free)
+- Feed handler framework
+- Market data normalization layer
+- Market data replay tool
+- Unit tests for all components
+- Performance benchmarks
+
+================================================================================
+HOUR-BY-HOUR SCHEDULE
+================================================================================
+
+08:00 - 08:15 | DAILY STANDUP
+------------------------------
+1. Review Day 2 completion (system optimization, kernel-bypass)
+2. Confirm all blockers resolved
+3. Day 3 task assignments
+4. Q&A
+
+08:15 - 10:30 | FIX PROTOCOL IMPLEMENTATION
+--------------------------------------------
+Responsible: Senior C++ Developer 1, Senior C++ Developer 2
+
+Understanding FIX Protocol:
+- Financial Information eXchange (FIX) protocol
+- Industry standard for financial messaging
+- Tag-value pairs separated by SOH (0x01)
+- Example: "8=FIX.4.4|9=100|35=D|..." (| represents SOH)
+
+Key FIX Message Types for Market Data:
+- W: Market Data Snapshot/Full Refresh (Level 2)
+- X: Market Data Incremental Refresh (updates)
+- 0: Heartbeat
+- A: Logon
+- 5: Logout
+
+1. Create FIX Parser Header (60 min)
+
+   File: include/market_data/fix_parser.hpp
+
+   ```cpp
+   #ifndef HFT_MARKET_DATA_FIX_PARSER_HPP
+   #define HFT_MARKET_DATA_FIX_PARSER_HPP
+
+   #include <cstdint>
+   #include <cstring>
+   #include <string_view>
+   #include <array>
+
+   namespace hft {
+   namespace market_data {
+
+   constexpr char SOH = 0x01;  // Start of Header
+
+   // Common FIX tags
+   enum class FixTag : uint32_t {
+       BeginString = 8,
+       BodyLength = 9,
+       MsgType = 35,
+       MsgSeqNum = 34,
+       SenderCompID = 49,
+       TargetCompID = 56,
+       SendingTime = 52,
+       Symbol = 55,
+       SecurityID = 48,
+       MDEntryType = 269,
+       MDEntryPx = 270,
+       MDEntrySize = 271,
+       MDUpdateAction = 279,
+       NoMDEntries = 268,
+       CheckSum = 10
+   };
+
+   // Message types
+   enum class MsgType : char {
+       Heartbeat = '0',
+       Logon = 'A',
+       Logout = '5',
+       MarketDataSnapshot = 'W',
+       MarketDataIncrementalRefresh = 'X'
+   };
+
+   // MD Entry types
+   enum class MDEntryType : char {
+       Bid = '0',
+       Ask = '1',
+       Trade = '2'
+   };
+
+   // MD Update actions
+   enum class MDUpdateAction : char {
+       New = '0',
+       Change = '1',
+       Delete = '2'
+   };
+
+   // Zero-copy FIX field
+   struct FixField {
+       uint32_t tag;
+       const char* value;
+       uint32_t length;
+
+       std::string_view as_string_view() const {
+           return std::string_view(value, length);
+       }
+
+       int64_t as_int() const {
+           int64_t result = 0;
+           bool negative = (value[0] == '-');
+           size_t start = negative ? 1 : 0;
+
+           for (size_t i = start; i < length; ++i) {
+               result = result * 10 + (value[i] - '0');
+           }
+
+           return negative ? -result : result;
+       }
+
+       double as_double() const {
+           // Simple implementation, optimize later
+           char temp[32];
+           std::memcpy(temp, value, std::min(length, 31u));
+           temp[std::min(length, 31u)] = '\0';
+           return std::atof(temp);
+       }
+   };
+
+   // FIX message (zero-copy view into buffer)
+   class FixMessage {
+   public:
+       FixMessage() = default;
+
+       bool parse(const char* data, size_t length) {
+           field_count_ = 0;
+           const char* ptr = data;
+           const char* end = data + length;
+
+           while (ptr < end && field_count_ < MAX_FIELDS) {
+               // Parse tag
+               uint32_t tag = 0;
+               while (ptr < end && *ptr != '=') {
+                   tag = tag * 10 + (*ptr - '0');
+                   ++ptr;
+               }
+
+               if (ptr >= end) break;
+               ++ptr;  // Skip '='
+
+               // Parse value
+               const char* value_start = ptr;
+               while (ptr < end && *ptr != SOH) {
+                   ++ptr;
+               }
+
+               uint32_t value_length = ptr - value_start;
+
+               // Store field
+               fields_[field_count_].tag = tag;
+               fields_[field_count_].value = value_start;
+               fields_[field_count_].length = value_length;
+               ++field_count_;
+
+               if (ptr < end) ++ptr;  // Skip SOH
+           }
+
+           return field_count_ > 0;
+       }
+
+       const FixField* find_field(uint32_t tag) const {
+           for (size_t i = 0; i < field_count_; ++i) {
+               if (fields_[i].tag == tag) {
+                   return &fields_[i];
+               }
+           }
+           return nullptr;
+       }
+
+       MsgType get_msg_type() const {
+           const FixField* field = find_field(static_cast<uint32_t>(FixTag::MsgType));
+           return field ? static_cast<MsgType>(field->value[0]) : MsgType::Heartbeat;
+       }
+
+       size_t field_count() const { return field_count_; }
+
+       const FixField& operator[](size_t index) const {
+           return fields_[index];
+       }
+
+   private:
+       static constexpr size_t MAX_FIELDS = 256;
+       std::array<FixField, MAX_FIELDS> fields_;
+       size_t field_count_ = 0;
+   };
+
+   // Market data entry (from Level 2)
+   struct MDEntry {
+       MDEntryType type;
+       double price;
+       double size;
+       uint64_t timestamp_ns;
+   };
+
+   // Parse market data snapshot (MsgType W)
+   inline bool parse_market_data_snapshot(
+       const FixMessage& msg,
+       MDEntry* entries,
+       size_t& entry_count,
+       size_t max_entries)
+   {
+       const FixField* no_md_entries = msg.find_field(static_cast<uint32_t>(FixTag::NoMDEntries));
+       if (!no_md_entries) return false;
+
+       size_t num_entries = no_md_entries->as_int();
+       entry_count = std::min(num_entries, max_entries);
+
+       // Simplified: In real implementation, need to parse repeating groups properly
+       size_t entry_idx = 0;
+       MDEntryType current_type = MDEntryType::Bid;
+       double current_price = 0.0;
+       double current_size = 0.0;
+
+       for (size_t i = 0; i < msg.field_count() && entry_idx < entry_count; ++i) {
+           const FixField& field = msg[i];
+
+           switch (field.tag) {
+               case static_cast<uint32_t>(FixTag::MDEntryType):
+                   current_type = static_cast<MDEntryType>(field.value[0]);
+                   break;
+
+               case static_cast<uint32_t>(FixTag::MDEntryPx):
+                   current_price = field.as_double();
+                   break;
+
+               case static_cast<uint32_t>(FixTag::MDEntrySize):
+                   current_size = field.as_double();
+
+                   // Complete entry
+                   entries[entry_idx].type = current_type;
+                   entries[entry_idx].price = current_price;
+                   entries[entry_idx].size = current_size;
+                   entries[entry_idx].timestamp_ns = 0;  // Set from recv timestamp
+                   ++entry_idx;
+                   break;
+           }
+       }
+
+       return entry_idx > 0;
+   }
+
+   } // namespace market_data
+   } // namespace hft
+
+   #endif // HFT_MARKET_DATA_FIX_PARSER_HPP
+   ```
+
+2. Create FIX Parser Tests (45 min)
+
+   File: test/unit/test_fix_parser.cpp
+
+   ```cpp
+   #include "market_data/fix_parser.hpp"
+   #include <iostream>
+   #include <cassert>
+   #include <cstring>
+
+   using namespace hft::market_data;
+
+   void test_parse_simple_message() {
+       // Create FIX message: 8=FIX.4.4|35=0|49=SENDER|56=TARGET|10=123|
+       char msg[256];
+       int len = snprintf(msg, sizeof(msg),
+                          "8=FIX.4.4%c35=0%c49=SENDER%c56=TARGET%c10=123%c",
+                          SOH, SOH, SOH, SOH, SOH);
+
+       FixMessage fix_msg;
+       bool result = fix_msg.parse(msg, len);
+
+       assert(result);
+       assert(fix_msg.field_count() == 5);
+
+       const FixField* msg_type = fix_msg.find_field(35);
+       assert(msg_type != nullptr);
+       assert(msg_type->as_string_view() == "0");
+
+       std::cout << "✓ test_parse_simple_message passed\n";
+   }
+
+   void test_parse_market_data() {
+       // Simplified market data snapshot
+       char msg[512];
+       int len = snprintf(msg, sizeof(msg),
+                          "8=FIX.4.4%c35=W%c55=AAPL%c268=2%c"
+                          "269=0%c270=150.25%c271=100%c"  // Bid
+                          "269=1%c270=150.30%c271=200%c"  // Ask
+                          "10=123%c",
+                          SOH, SOH, SOH, SOH,
+                          SOH, SOH, SOH,
+                          SOH, SOH, SOH,
+                          SOH);
+
+       FixMessage fix_msg;
+       bool result = fix_msg.parse(msg, len);
+       assert(result);
+       assert(fix_msg.get_msg_type() == MsgType::MarketDataSnapshot);
+
+       MDEntry entries[10];
+       size_t entry_count = 0;
+
+       bool parsed = parse_market_data_snapshot(fix_msg, entries, entry_count, 10);
+       assert(parsed);
+       assert(entry_count == 2);
+
+       assert(entries[0].type == MDEntryType::Bid);
+       assert(entries[0].price == 150.25);
+       assert(entries[0].size == 100.0);
+
+       assert(entries[1].type == MDEntryType::Ask);
+       assert(entries[1].price == 150.30);
+       assert(entries[1].size == 200.0);
+
+       std::cout << "✓ test_parse_market_data passed\n";
+   }
+
+   int main() {
+       std::cout << "=== FIX Parser Unit Tests ===\n";
+       test_parse_simple_message();
+       test_parse_market_data();
+       std::cout << "All FIX parser tests passed!\n";
+       return 0;
+   }
+   ```
+
+3. FIX Parser Benchmark (30 min)
+
+   File: benchmarks/fix_parser_benchmark.cpp
+
+   ```cpp
+   #include "market_data/fix_parser.hpp"
+   #include "core/timing.hpp"
+   #include <iostream>
+   #include <vector>
+   #include <algorithm>
+
+   using namespace hft::market_data;
+   using namespace hft::core;
+
+   int main() {
+       // Create sample FIX message
+       char msg[512];
+       int len = snprintf(msg, sizeof(msg),
+                          "8=FIX.4.4%c35=W%c55=AAPL%c268=10%c"
+                          "269=0%c270=150.25%c271=100%c"
+                          "269=0%c270=150.24%c271=150%c"
+                          "269=0%c270=150.23%c271=200%c"
+                          "269=0%c270=150.22%c271=120%c"
+                          "269=0%c270=150.21%c271=180%c"
+                          "269=1%c270=150.26%c271=110%c"
+                          "269=1%c270=150.27%c271=160%c"
+                          "269=1%c270=150.28%c271=210%c"
+                          "269=1%c270=150.29%c271=130%c"
+                          "269=1%c270=150.30%c271=190%c"
+                          "10=123%c",
+                          SOH, SOH, SOH, SOH,
+                          SOH, SOH, SOH,
+                          SOH, SOH, SOH,
+                          SOH, SOH, SOH,
+                          SOH, SOH, SOH,
+                          SOH, SOH, SOH,
+                          SOH, SOH, SOH,
+                          SOH, SOH, SOH,
+                          SOH, SOH, SOH,
+                          SOH, SOH, SOH,
+                          SOH, SOH, SOH,
+                          SOH);
+
+       constexpr size_t iterations = 1'000'000;
+       std::vector<uint64_t> latencies;
+       latencies.reserve(iterations);
+
+       // Warmup
+       for (int i = 0; i < 1000; ++i) {
+           FixMessage fix_msg;
+           fix_msg.parse(msg, len);
+       }
+
+       // Benchmark parsing
+       for (size_t i = 0; i < iterations; ++i) {
+           uint64_t start = rdtscp();
+
+           FixMessage fix_msg;
+           fix_msg.parse(msg, len);
+
+           uint64_t end = rdtscp();
+           latencies.push_back(end - start);
+       }
+
+       std::sort(latencies.begin(), latencies.end());
+
+       std::cout << "\n=== FIX Parser Performance ===\n";
+       std::cout << "Message length: " << len << " bytes\n";
+       std::cout << "Iterations: " << iterations << "\n";
+       std::cout << "Min:    " << latencies.front() << " cycles\n";
+       std::cout << "Median: " << latencies[iterations / 2] << " cycles\n";
+       std::cout << "P99:    " << latencies[static_cast<size_t>(iterations * 0.99)] << " cycles\n";
+       std::cout << "Max:    " << latencies.back() << " cycles\n";
+
+       return 0;
+   }
+   ```
+
+Checkpoint #1 (10:30):
+- [ ] FIX parser compiles
+- [ ] Unit tests pass
+- [ ] Benchmark shows <500ns parse time
+
+10:30 - 10:45 | BREAK
+----------------------
+
+10:45 - 12:30 | ORDER BOOK IMPLEMENTATION
+------------------------------------------
+Responsible: Senior C++ Developer 2, Technical Lead
+
+Goal: Create ultra-low latency order book structure
+
+Key Requirements:
+- Lock-free updates
+- Cache-friendly memory layout
+- Sub-100ns update latency
+- Support Level 2 (price levels with sizes)
+- SIMD-friendly data structure
+
+1. Order Book Data Structure (60 min)
+
+   File: include/market_data/order_book.hpp
+
+   ```cpp
+   #ifndef HFT_MARKET_DATA_ORDER_BOOK_HPP
+   #define HFT_MARKET_DATA_ORDER_BOOK_HPP
+
+   #include <cstdint>
+   #include <array>
+   #include <algorithm>
+
+   namespace hft {
+   namespace market_data {
+
+   // Price level in order book
+   struct PriceLevel {
+       double price;
+       double size;
+       uint32_t order_count;
+       uint32_t padding;  // Align to 24 bytes
+
+       PriceLevel() : price(0.0), size(0.0), order_count(0), padding(0) {}
+
+       bool is_empty() const { return size == 0.0; }
+   };
+
+   // Order book for a single instrument
+   // Optimized for:
+   // - Cache locality (contiguous arrays)
+   // - Fast updates (O(1) for top levels)
+   // - Minimal memory allocations
+   template<size_t MaxLevels = 10>
+   class OrderBook {
+   public:
+       OrderBook() : sequence_number_(0), last_update_ns_(0) {
+           bids_.fill(PriceLevel{});
+           asks_.fill(PriceLevel{});
+       }
+
+       // Update bid level
+       void update_bid(double price, double size, uint32_t order_count = 1) {
+           // Find insertion point (bids sorted descending)
+           size_t insert_pos = 0;
+           while (insert_pos < MaxLevels && bids_[insert_pos].price > price) {
+               ++insert_pos;
+           }
+
+           if (insert_pos < MaxLevels) {
+               // Exact price match - update
+               if (bids_[insert_pos].price == price) {
+                   if (size == 0.0) {
+                       // Delete: shift levels up
+                       for (size_t i = insert_pos; i < MaxLevels - 1; ++i) {
+                           bids_[i] = bids_[i + 1];
+                       }
+                       bids_[MaxLevels - 1] = PriceLevel{};
+                   } else {
+                       // Update size
+                       bids_[insert_pos].size = size;
+                       bids_[insert_pos].order_count = order_count;
+                   }
+               } else if (size > 0.0) {
+                   // Insert new level: shift levels down
+                   for (size_t i = MaxLevels - 1; i > insert_pos; --i) {
+                       bids_[i] = bids_[i - 1];
+                   }
+                   bids_[insert_pos].price = price;
+                   bids_[insert_pos].size = size;
+                   bids_[insert_pos].order_count = order_count;
+               }
+           }
+
+           ++sequence_number_;
+       }
+
+       // Update ask level
+       void update_ask(double price, double size, uint32_t order_count = 1) {
+           // Find insertion point (asks sorted ascending)
+           size_t insert_pos = 0;
+           while (insert_pos < MaxLevels && asks_[insert_pos].price < price
+                  && asks_[insert_pos].price != 0.0) {
+               ++insert_pos;
+           }
+
+           if (insert_pos < MaxLevels) {
+               // Exact price match - update
+               if (asks_[insert_pos].price == price) {
+                   if (size == 0.0) {
+                       // Delete: shift levels up
+                       for (size_t i = insert_pos; i < MaxLevels - 1; ++i) {
+                           asks_[i] = asks_[i + 1];
+                       }
+                       asks_[MaxLevels - 1] = PriceLevel{};
+                   } else {
+                       // Update size
+                       asks_[insert_pos].size = size;
+                       asks_[insert_pos].order_count = order_count;
+                   }
+               } else if (size > 0.0) {
+                   // Insert new level: shift levels down
+                   for (size_t i = MaxLevels - 1; i > insert_pos; --i) {
+                       asks_[i] = asks_[i - 1];
+                   }
+                   asks_[insert_pos].price = price;
+                   asks_[insert_pos].size = size;
+                   asks_[insert_pos].order_count = order_count;
+               }
+           }
+
+           ++sequence_number_;
+       }
+
+       // Accessors
+       const PriceLevel& best_bid() const { return bids_[0]; }
+       const PriceLevel& best_ask() const { return asks_[0]; }
+
+       double bid_price(size_t level) const {
+           return level < MaxLevels ? bids_[level].price : 0.0;
+       }
+
+       double ask_price(size_t level) const {
+           return level < MaxLevels ? asks_[level].price : 0.0;
+       }
+
+       double bid_size(size_t level) const {
+           return level < MaxLevels ? bids_[level].size : 0.0;
+       }
+
+       double ask_size(size_t level) const {
+           return level < MaxLevels ? asks_[level].size : 0.0;
+       }
+
+       double mid_price() const {
+           if (bids_[0].price > 0.0 && asks_[0].price > 0.0) {
+               return (bids_[0].price + asks_[0].price) / 2.0;
+           }
+           return 0.0;
+       }
+
+       double spread() const {
+           if (bids_[0].price > 0.0 && asks_[0].price > 0.0) {
+               return asks_[0].price - bids_[0].price;
+           }
+           return 0.0;
+       }
+
+       uint64_t sequence_number() const { return sequence_number_; }
+       uint64_t last_update_ns() const { return last_update_ns_; }
+       void set_last_update_ns(uint64_t ns) { last_update_ns_ = ns; }
+
+       // Clear all levels
+       void clear() {
+           bids_.fill(PriceLevel{});
+           asks_.fill(PriceLevel{});
+           sequence_number_ = 0;
+       }
+
+   private:
+       std::array<PriceLevel, MaxLevels> bids_;  // Sorted descending
+       std::array<PriceLevel, MaxLevels> asks_;  // Sorted ascending
+       uint64_t sequence_number_;
+       uint64_t last_update_ns_;
+   };
+
+   } // namespace market_data
+   } // namespace hft
+
+   #endif // HFT_MARKET_DATA_ORDER_BOOK_HPP
+   ```
+
+2. Order Book Tests (30 min)
+
+   File: test/unit/test_order_book.cpp
+
+   ```cpp
+   #include "market_data/order_book.hpp"
+   #include <iostream>
+   #include <cassert>
+   #include <cmath>
+
+   using namespace hft::market_data;
+
+   void test_basic_updates() {
+       OrderBook<10> book;
+
+       // Add bid levels
+       book.update_bid(100.0, 50.0);
+       book.update_bid(99.5, 100.0);
+       book.update_bid(99.0, 75.0);
+
+       assert(book.best_bid().price == 100.0);
+       assert(book.best_bid().size == 50.0);
+       assert(book.bid_price(1) == 99.5);
+       assert(book.bid_price(2) == 99.0);
+
+       // Add ask levels
+       book.update_ask(100.5, 60.0);
+       book.update_ask(101.0, 110.0);
+       book.update_ask(101.5, 80.0);
+
+       assert(book.best_ask().price == 100.5);
+       assert(book.best_ask().size == 60.0);
+       assert(book.ask_price(1) == 101.0);
+       assert(book.ask_price(2) == 101.5);
+
+       // Calculate spread
+       double spread = book.spread();
+       assert(std::abs(spread - 0.5) < 0.001);
+
+       double mid = book.mid_price();
+       assert(std::abs(mid - 100.25) < 0.001);
+
+       std::cout << "✓ test_basic_updates passed\n";
+   }
+
+   void test_level_deletion() {
+       OrderBook<10> book;
+
+       book.update_bid(100.0, 50.0);
+       book.update_bid(99.5, 100.0);
+       book.update_bid(99.0, 75.0);
+
+       // Delete middle level
+       book.update_bid(99.5, 0.0);
+
+       assert(book.best_bid().price == 100.0);
+       assert(book.bid_price(1) == 99.0);  // Shifted up
+       assert(book.bid_price(2) == 0.0);   // Empty
+
+       std::cout << "✓ test_level_deletion passed\n";
+   }
+
+   void test_level_insertion() {
+       OrderBook<10> book;
+
+       book.update_bid(100.0, 50.0);
+       book.update_bid(98.0, 75.0);
+
+       // Insert in middle
+       book.update_bid(99.0, 100.0);
+
+       assert(book.best_bid().price == 100.0);
+       assert(book.bid_price(1) == 99.0);  // Inserted
+       assert(book.bid_price(2) == 98.0);  // Shifted down
+
+       std::cout << "✓ test_level_insertion passed\n";
+   }
+
+   int main() {
+       std::cout << "=== Order Book Unit Tests ===\n";
+       test_basic_updates();
+       test_level_deletion();
+       test_level_insertion();
+       std::cout << "All order book tests passed!\n";
+       return 0;
+   }
+   ```
+
+3. Order Book Benchmark (15 min)
+
+   File: benchmarks/order_book_benchmark.cpp
+
+   ```cpp
+   #include "market_data/order_book.hpp"
+   #include "core/timing.hpp"
+   #include <iostream>
+   #include <vector>
+   #include <algorithm>
+   #include <numeric>
+
+   using namespace hft::market_data;
+   using namespace hft::core;
+
+   int main() {
+       OrderBook<10> book;
+
+       // Initialize with 5 levels each side
+       for (int i = 0; i < 5; ++i) {
+           book.update_bid(100.0 - i * 0.1, 100.0 + i * 10);
+           book.update_ask(100.5 + i * 0.1, 100.0 + i * 10);
+       }
+
+       constexpr size_t iterations = 1'000'000;
+       std::vector<uint64_t> latencies;
+       latencies.reserve(iterations);
+
+       // Benchmark bid updates
+       for (size_t i = 0; i < iterations; ++i) {
+           uint64_t start = rdtscp();
+
+           double price = 100.0 + (i % 10) * 0.01;
+           double size = 100.0 + (i % 100);
+           book.update_bid(price, size);
+
+           uint64_t end = rdtscp();
+           latencies.push_back(end - start);
+       }
+
+       std::sort(latencies.begin(), latencies.end());
+
+       double mean = std::accumulate(latencies.begin(), latencies.end(), 0.0) / iterations;
+
+       std::cout << "\n=== Order Book Update Performance ===\n";
+       std::cout << "Iterations: " << iterations << "\n";
+       std::cout << "Min:    " << latencies.front() << " cycles\n";
+       std::cout << "Median: " << latencies[iterations / 2] << " cycles\n";
+       std::cout << "Mean:   " << mean << " cycles\n";
+       std::cout << "P99:    " << latencies[static_cast<size_t>(iterations * 0.99)] << " cycles\n";
+       std::cout << "P99.9:  " << latencies[static_cast<size_t>(iterations * 0.999)] << " cycles\n";
+       std::cout << "Max:    " << latencies.back() << " cycles\n";
+
+       // At 3GHz, 100 cycles = 33ns
+       std::cout << "\n✓ Target: <100ns (<300 cycles @ 3GHz)\n";
+
+       return 0;
+   }
+   ```
+
+Checkpoint #2 (12:30):
+- [ ] Order book compiles
+- [ ] Unit tests pass
+- [ ] Benchmark shows <300 cycles (target <100ns)
+
+12:30 - 13:30 | LUNCH BREAK
+----------------------------
+
+13:30 - 15:30 | FEED HANDLER FRAMEWORK
+---------------------------------------
+Responsible: Senior C++ Developer 3, Networking Specialist
+
+Goal: Integrate FIX parser + Order Book + Network layer
+
+1. Feed Handler Interface (40 min)
+
+   File: include/market_data/feed_handler.hpp
+
+   ```cpp
+   #ifndef HFT_MARKET_DATA_FEED_HANDLER_HPP
+   #define HFT_MARKET_DATA_FEED_HANDLER_HPP
+
+   #include "market_data/fix_parser.hpp"
+   #include "market_data/order_book.hpp"
+   #include "core/timing.hpp"
+   #include <cstdint>
+   #include <functional>
+   #include <unordered_map>
+   #include <string>
+
+   namespace hft {
+   namespace market_data {
+
+   // Callback for market data updates
+   using MarketDataCallback = std::function<void(
+       const std::string& symbol,
+       const OrderBook<10>& book,
+       uint64_t recv_timestamp_ns
+   )>;
+
+   // Feed handler for FIX market data
+   class FeedHandler {
+   public:
+       FeedHandler() = default;
+
+       // Register callback for market data updates
+       void register_callback(MarketDataCallback callback) {
+           callback_ = std::move(callback);
+       }
+
+       // Subscribe to symbol
+       void subscribe(const std::string& symbol) {
+           order_books_[symbol] = OrderBook<10>();
+       }
+
+       // Unsubscribe from symbol
+       void unsubscribe(const std::string& symbol) {
+           order_books_.erase(symbol);
+       }
+
+       // Process incoming market data message
+       void on_message(const char* data, size_t length, uint64_t recv_timestamp_ns) {
+           // Parse FIX message
+           FixMessage msg;
+           if (!msg.parse(data, length)) {
+               // Parse failed, log error
+               return;
+           }
+
+           // Handle based on message type
+           MsgType msg_type = msg.get_msg_type();
+
+           if (msg_type == MsgType::MarketDataSnapshot ||
+               msg_type == MsgType::MarketDataIncrementalRefresh) {
+
+               // Extract symbol
+               const FixField* symbol_field = msg.find_field(
+                   static_cast<uint32_t>(FixTag::Symbol));
+
+               if (!symbol_field) return;
+
+               std::string symbol = std::string(symbol_field->as_string_view());
+
+               // Find or create order book
+               auto it = order_books_.find(symbol);
+               if (it == order_books_.end()) {
+                   // Not subscribed, ignore
+                   return;
+               }
+
+               OrderBook<10>& book = it->second;
+               book.set_last_update_ns(recv_timestamp_ns);
+
+               // Parse and apply updates
+               MDEntry entries[20];
+               size_t entry_count = 0;
+
+               if (parse_market_data_snapshot(msg, entries, entry_count, 20)) {
+                   for (size_t i = 0; i < entry_count; ++i) {
+                       const MDEntry& entry = entries[i];
+
+                       if (entry.type == MDEntryType::Bid) {
+                           book.update_bid(entry.price, entry.size);
+                       } else if (entry.type == MDEntryType::Ask) {
+                           book.update_ask(entry.price, entry.size);
+                       }
+                   }
+
+                   // Notify callback
+                   if (callback_) {
+                       callback_(symbol, book, recv_timestamp_ns);
+                   }
+               }
+           }
+           // Handle other message types (heartbeat, etc.)
+       }
+
+       // Get order book for symbol
+       const OrderBook<10>* get_order_book(const std::string& symbol) const {
+           auto it = order_books_.find(symbol);
+           return (it != order_books_.end()) ? &it->second : nullptr;
+       }
+
+   private:
+       std::unordered_map<std::string, OrderBook<10>> order_books_;
+       MarketDataCallback callback_;
+   };
+
+   } // namespace market_data
+   } // namespace hft
+
+   #endif // HFT_MARKET_DATA_FEED_HANDLER_HPP
+   ```
+
+2. Feed Handler Test (30 min)
+
+   File: test/integration/test_feed_handler.cpp
+
+3. Market Data Replay Tool (50 min)
+
+   File: tools/market_data_replay.cpp
+
+   ```cpp
+   #include "market_data/feed_handler.hpp"
+   #include <fstream>
+   #include <iostream>
+   #include <string>
+
+   using namespace hft::market_data;
+
+   int main(int argc, char* argv[]) {
+       if (argc < 2) {
+           std::cerr << "Usage: " << argv[0] << " <market_data_file>\n";
+           return 1;
+       }
+
+       FeedHandler handler;
+
+       // Subscribe to symbols
+       handler.subscribe("AAPL");
+       handler.subscribe("MSFT");
+
+       // Register callback
+       handler.register_callback([](const std::string& symbol,
+                                     const OrderBook<10>& book,
+                                     uint64_t timestamp) {
+           std::cout << symbol << " | "
+                     << "Bid: " << book.best_bid().price
+                     << " (" << book.best_bid().size << ") | "
+                     << "Ask: " << book.best_ask().price
+                     << " (" << book.best_ask().size << ") | "
+                     << "Spread: " << book.spread() << "\n";
+       });
+
+       // Read and replay market data
+       std::ifstream file(argv[1], std::ios::binary);
+       if (!file) {
+           std::cerr << "Cannot open file: " << argv[1] << "\n";
+           return 1;
+       }
+
+       std::string line;
+       uint64_t msg_count = 0;
+
+       while (std::getline(file, line)) {
+           // Assume each line is a FIX message
+           handler.on_message(line.data(), line.size(), msg_count++);
+       }
+
+       std::cout << "Replayed " << msg_count << " messages\n";
+       return 0;
+   }
+   ```
+
+Checkpoint #3 (15:30):
+- [ ] Feed handler compiles
+- [ ] Integration test passes
+- [ ] Replay tool functional
+
+15:30 - 15:45 | BREAK
+----------------------
+
+15:45 - 17:15 | BUILD, TEST, AND DOCUMENTATION
+-----------------------------------------------
+
+1. Update CMake (20 min)
+2. Build and run all tests (20 min)
+3. Performance validation (30 min)
+4. Documentation (25 min)
+
+5. Commit Day 3 Work (20 min)
+
+   ```bash
+   git add .
+   git commit -m "Day 3: Market data infrastructure
+
+   FIX Protocol:
+   - Zero-copy FIX 4.4 parser implementation
+   - Support for market data messages (W, X)
+   - Parser performance: <500ns per message
+
+   Order Book:
+   - Lock-free order book implementation
+   - Support for Level 2 market data
+   - Update latency: <100ns per operation
+   - Cache-friendly data structure
+
+   Feed Handler:
+   - Integrated FIX parser + order book
+   - Symbol subscription management
+   - Market data callbacks for strategies
+
+   Tools:
+   - Market data replay capability
+   - Performance benchmarks for all components
+
+   Test Coverage:
+   - Unit tests for FIX parser
+   - Unit tests for order book
+   - Integration tests for feed handler
+   "
+
+   git tag -a v0.1.0-day3 -m "Day 3: Market data foundation"
+   ```
+
+Checkpoint #4 (17:15):
+- [ ] All code compiles
+- [ ] All tests pass
+- [ ] Performance targets met
+- [ ] Documentation complete
+
+17:15 - 17:30 | DAILY RETROSPECTIVE
+------------------------------------
+
+Day 4 Preview:
+- Order management system (OMS) core
+- Order lifecycle management
+- Position tracking
+- Integration with market data
+
+================================================================================
+SUCCESS METRICS
+================================================================================
+
+PERFORMANCE TARGETS:
+--------------------
+✓ FIX parsing: <500 nanoseconds
+✓ Order book update: <100 nanoseconds
+✓ End-to-end (network -> order book): <2 microseconds
+✓ Memory allocations in hot path: ZERO
+
+QUALITY TARGETS:
+----------------
+✓ Unit test coverage: >80%
+✓ All tests passing: 100%
+✓ Zero compiler warnings
+✓ Static analysis clean
+
+FUNCTIONAL TARGETS:
+-------------------
+✓ Can parse real FIX market data
+✓ Order book accurately reflects market
+✓ Multiple symbols supported
+✓ Market data replay working
+
+================================================================================
+DELIVERABLES CHECKLIST
+================================================================================
+
+CODE:
+-----
+[ ] include/market_data/fix_parser.hpp
+[ ] include/market_data/order_book.hpp
+[ ] include/market_data/feed_handler.hpp
+[ ] test/unit/test_fix_parser.cpp
+[ ] test/unit/test_order_book.cpp
+[ ] test/integration/test_feed_handler.cpp
+[ ] benchmarks/fix_parser_benchmark.cpp
+[ ] benchmarks/order_book_benchmark.cpp
+[ ] tools/market_data_replay.cpp
+
+DOCUMENTATION:
+--------------
+[ ] docs/fix_protocol_guide.md
+[ ] docs/order_book_design.md
+[ ] docs/day3_performance_results.txt
+[ ] planning/day3_completion_report.txt
+
+================================================================================
+SIGN-OFF
+================================================================================
+
+Technical Lead: _________________ Date: _______ Time: _______
+
+DAY 3 STATUS: [ ] SUCCESS  [ ] PARTIAL  [ ] BLOCKED
+
+================================================================================
+END OF DAY 3 PLANNING
+================================================================================

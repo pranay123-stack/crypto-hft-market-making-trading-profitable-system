@@ -1,0 +1,684 @@
+================================================================================
+EXCHANGE SDKs AND API LIBRARIES INSTALLATION
+================================================================================
+
+OVERVIEW
+--------
+Installation of exchange-specific SDKs, API wrappers, and connectivity libraries:
+- FIX Protocol Libraries (QuickFIX)
+- Binance C++ connector
+- Coinbase Advanced Trade API
+- Kraken API wrapper
+- Custom REST/WebSocket clients
+- Order routing libraries
+
+PREREQUISITES
+-------------
+- Completed: 04_networking_libraries.txt
+- libcurl, Boost.Beast, WebSocket++ installed
+- OpenSSL installed
+- nlohmann/json or simdjson for JSON parsing
+
+FIX PROTOCOL - QUICKFIX
+========================
+
+QuickFIX/C++ Installation:
+-------------------------
+# Install dependencies
+sudo apt install -y libxml2-dev
+
+cd /tmp
+git clone https://github.com/quickfix/quickfix.git
+cd quickfix
+
+./bootstrap
+./configure \
+    --prefix=/usr/local \
+    --with-mysql=no \
+    --with-postgresql=no \
+    CXXFLAGS="-O3 -march=native -std=c++17"
+
+make -j $(nproc)
+sudo make install
+sudo ldconfig
+
+QuickFIX Configuration Example:
+------------------------------
+cat > /tmp/fix_client.cfg << 'EOF'
+[DEFAULT]
+FileStorePath=store
+FileLogPath=log
+ConnectionType=initiator
+ReconnectInterval=5
+HeartBtInt=30
+SocketConnectPort=9876
+SocketConnectHost=fix.exchange.com
+StartTime=00:00:00
+EndTime=23:59:59
+UseDataDictionary=Y
+DataDictionary=FIX44.xml
+ValidateFieldsOutOfOrder=N
+ValidateFieldsHaveValues=N
+ValidateUserDefinedFields=N
+
+[SESSION]
+BeginString=FIX.4.4
+SenderCompID=YOUR_SENDER_ID
+TargetCompID=EXCHANGE_TARGET_ID
+ResetOnLogon=Y
+ResetOnLogout=Y
+ResetOnDisconnect=Y
+EOF
+
+QuickFIX C++ Example:
+--------------------
+#include "quickfix/Application.h"
+#include "quickfix/MessageCracker.h"
+#include "quickfix/Session.h"
+#include "quickfix/SessionSettings.h"
+#include "quickfix/FileStore.h"
+#include "quickfix/FileLog.h"
+#include "quickfix/SocketInitiator.h"
+#include "quickfix/fix44/NewOrderSingle.h"
+#include "quickfix/fix44/ExecutionReport.h"
+
+class HFTFixApplication : public FIX::Application,
+                          public FIX::MessageCracker {
+public:
+    void onCreate(const FIX::SessionID& sessionID) override {
+        std::cout << "Session created: " << sessionID << std::endl;
+    }
+
+    void onLogon(const FIX::SessionID& sessionID) override {
+        std::cout << "Logged on: " << sessionID << std::endl;
+    }
+
+    void onLogout(const FIX::SessionID& sessionID) override {
+        std::cout << "Logged out: " << sessionID << std::endl;
+    }
+
+    void toAdmin(FIX::Message& message, const FIX::SessionID&) override {
+        // Add authentication if required
+    }
+
+    void toApp(FIX::Message& message, const FIX::SessionID&)
+        throw(FIX::DoNotSend) override {
+        crack(message, sessionID);
+    }
+
+    void fromAdmin(const FIX::Message& message, const FIX::SessionID&)
+        throw(FIX::FieldNotFound, FIX::IncorrectDataFormat,
+              FIX::IncorrectTagValue, FIX::RejectLogon) override {}
+
+    void fromApp(const FIX::Message& message, const FIX::SessionID& sessionID)
+        throw(FIX::FieldNotFound, FIX::IncorrectDataFormat,
+              FIX::IncorrectTagValue, FIX::UnsupportedMessageType) override {
+        crack(message, sessionID);
+    }
+
+    void onMessage(const FIX44::ExecutionReport& report,
+                   const FIX::SessionID& sessionID) {
+        // Handle execution report
+        std::cout << "Execution Report received" << std::endl;
+    }
+
+    void sendOrder(const FIX::SessionID& sessionID,
+                   const std::string& symbol,
+                   char side,
+                   double price,
+                   int quantity) {
+        FIX44::NewOrderSingle order;
+        order.set(FIX::ClOrdID(generate_order_id()));
+        order.set(FIX::Symbol(symbol));
+        order.set(FIX::Side(side));
+        order.set(FIX::OrdType(FIX::OrdType_LIMIT));
+        order.set(FIX::Price(price));
+        order.set(FIX::OrderQty(quantity));
+        order.set(FIX::TimeInForce(FIX::TimeInForce_DAY));
+
+        FIX::Session::sendToTarget(order, sessionID);
+    }
+
+private:
+    std::string generate_order_id() {
+        static uint64_t counter = 0;
+        return "ORD" + std::to_string(++counter);
+    }
+};
+
+
+BINANCE C++ CONNECTOR
+=====================
+
+Custom Binance REST Client:
+---------------------------
+cat > /tmp/binance_client.hpp << 'EOF'
+#pragma once
+#include <curl/curl.h>
+#include <nlohmann/json.hpp>
+#include <openssl/hmac.h>
+#include <string>
+#include <sstream>
+#include <iomanip>
+
+class BinanceClient {
+private:
+    std::string api_key;
+    std::string api_secret;
+    std::string base_url = "https://api.binance.com";
+    CURL* curl;
+
+    static size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* userp) {
+        ((std::string*)userp)->append((char*)contents, size * nmemb);
+        return size * nmemb;
+    }
+
+    std::string hmac_sha256(const std::string& data) {
+        unsigned char hash[EVP_MAX_MD_SIZE];
+        unsigned int hash_len;
+
+        HMAC(EVP_sha256(),
+             api_secret.c_str(), api_secret.length(),
+             (unsigned char*)data.c_str(), data.length(),
+             hash, &hash_len);
+
+        std::stringstream ss;
+        for(unsigned int i = 0; i < hash_len; ++i) {
+            ss << std::hex << std::setw(2) << std::setfill('0')
+               << (int)hash[i];
+        }
+        return ss.str();
+    }
+
+    nlohmann::json request(const std::string& method,
+                           const std::string& endpoint,
+                           const std::string& params = "",
+                           bool signed = false) {
+        std::string url = base_url + endpoint;
+        std::string query_string = params;
+
+        if (signed) {
+            auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()
+            ).count();
+
+            query_string += (query_string.empty() ? "" : "&");
+            query_string += "timestamp=" + std::to_string(timestamp);
+
+            std::string signature = hmac_sha256(query_string);
+            query_string += "&signature=" + signature;
+        }
+
+        if (!query_string.empty()) {
+            url += "?" + query_string;
+        }
+
+        std::string response_data;
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_data);
+
+        struct curl_slist* headers = nullptr;
+        headers = curl_slist_append(headers, ("X-MBX-APIKEY: " + api_key).c_str());
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+        if (method == "POST") {
+            curl_easy_setopt(curl, CURLOPT_POST, 1L);
+        } else if (method == "DELETE") {
+            curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
+        }
+
+        CURLcode res = curl_easy_perform(curl);
+        curl_slist_free_all(headers);
+
+        if (res != CURLE_OK) {
+            throw std::runtime_error(curl_easy_strerror(res));
+        }
+
+        return nlohmann::json::parse(response_data);
+    }
+
+public:
+    BinanceClient(const std::string& key, const std::string& secret)
+        : api_key(key), api_secret(secret) {
+        curl = curl_easy_init();
+        curl_easy_setopt(curl, CURLOPT_TCP_NODELAY, 1L);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 3000L);
+    }
+
+    ~BinanceClient() {
+        if (curl) curl_easy_cleanup(curl);
+    }
+
+    nlohmann::json get_ticker(const std::string& symbol) {
+        return request("GET", "/api/v3/ticker/price", "symbol=" + symbol);
+    }
+
+    nlohmann::json get_orderbook(const std::string& symbol, int limit = 10) {
+        return request("GET", "/api/v3/depth",
+                      "symbol=" + symbol + "&limit=" + std::to_string(limit));
+    }
+
+    nlohmann::json place_limit_order(const std::string& symbol,
+                                     const std::string& side,
+                                     double quantity,
+                                     double price) {
+        std::stringstream ss;
+        ss << "symbol=" << symbol
+           << "&side=" << side
+           << "&type=LIMIT"
+           << "&timeInForce=GTC"
+           << "&quantity=" << std::fixed << std::setprecision(8) << quantity
+           << "&price=" << std::fixed << std::setprecision(2) << price;
+
+        return request("POST", "/api/v3/order", ss.str(), true);
+    }
+
+    nlohmann::json cancel_order(const std::string& symbol, uint64_t order_id) {
+        return request("DELETE", "/api/v3/order",
+                      "symbol=" + symbol + "&orderId=" + std::to_string(order_id),
+                      true);
+    }
+
+    nlohmann::json get_account() {
+        return request("GET", "/api/v3/account", "", true);
+    }
+};
+EOF
+
+Binance WebSocket Client:
+-------------------------
+cat > /tmp/binance_websocket.hpp << 'EOF'
+#pragma once
+#include <boost/beast/core.hpp>
+#include <boost/beast/ssl.hpp>
+#include <boost/beast/websocket.hpp>
+#include <boost/beast/websocket/ssl.hpp>
+#include <boost/asio/connect.hpp>
+#include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/ssl/stream.hpp>
+#include <nlohmann/json.hpp>
+#include <functional>
+#include <thread>
+
+namespace beast = boost::beast;
+namespace http = beast::http;
+namespace websocket = beast::websocket;
+namespace net = boost::asio;
+namespace ssl = boost::asio::ssl;
+using tcp = boost::asio::ip::tcp;
+
+class BinanceWebSocket {
+private:
+    net::io_context ioc;
+    ssl::context ctx{ssl::context::tlsv12_client};
+    tcp::resolver resolver{ioc};
+    websocket::stream<beast::ssl_stream<tcp::socket>> ws{ioc, ctx};
+    beast::flat_buffer buffer;
+    std::thread io_thread;
+    std::function<void(const nlohmann::json&)> message_handler;
+
+public:
+    BinanceWebSocket() {
+        ctx.set_verify_mode(ssl::verify_none);
+    }
+
+    void connect(const std::string& stream) {
+        std::string host = "stream.binance.com";
+        std::string port = "9443";
+        std::string path = "/ws/" + stream;
+
+        auto const results = resolver.resolve(host, port);
+        auto ep = net::connect(get_lowest_layer(ws), results);
+
+        SSL_set_tlsext_host_name(ws.next_layer().native_handle(), host.c_str());
+        ws.next_layer().handshake(ssl::stream_base::client);
+
+        ws.set_option(websocket::stream_base::timeout::suggested(beast::role_type::client));
+        ws.set_option(websocket::stream_base::decorator(
+            [](websocket::request_type& req) {
+                req.set(http::field::user_agent, "BinanceHFT/1.0");
+            }));
+
+        ws.handshake(host, path);
+
+        // Start reading in separate thread
+        io_thread = std::thread([this]() {
+            this->read_loop();
+        });
+    }
+
+    void set_message_handler(std::function<void(const nlohmann::json&)> handler) {
+        message_handler = handler;
+    }
+
+    void subscribe_trades(const std::string& symbol) {
+        connect(symbol + "@trade");
+    }
+
+    void subscribe_orderbook(const std::string& symbol) {
+        connect(symbol + "@depth");
+    }
+
+    void subscribe_ticker(const std::string& symbol) {
+        connect(symbol + "@ticker");
+    }
+
+private:
+    void read_loop() {
+        while (true) {
+            try {
+                buffer.clear();
+                ws.read(buffer);
+                std::string data = beast::buffers_to_string(buffer.data());
+                auto json = nlohmann::json::parse(data);
+
+                if (message_handler) {
+                    message_handler(json);
+                }
+            } catch (const std::exception& e) {
+                std::cerr << "WebSocket error: " << e.what() << std::endl;
+                break;
+            }
+        }
+    }
+
+public:
+    ~BinanceWebSocket() {
+        try {
+            ws.close(websocket::close_code::normal);
+        } catch (...) {}
+        if (io_thread.joinable()) {
+            io_thread.join();
+        }
+    }
+};
+EOF
+
+
+COINBASE ADVANCED TRADE API
+============================
+
+Coinbase REST Client:
+--------------------
+cat > /tmp/coinbase_client.hpp << 'EOF'
+#pragma once
+#include <curl/curl.h>
+#include <nlohmann/json.hpp>
+#include <openssl/hmac.h>
+#include <string>
+#include <chrono>
+#include <sstream>
+#include <iomanip>
+
+class CoinbaseClient {
+private:
+    std::string api_key;
+    std::string api_secret;
+    std::string base_url = "https://api.coinbase.com";
+    CURL* curl;
+
+    static size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* userp) {
+        ((std::string*)userp)->append((char*)contents, size * nmemb);
+        return size * nmemb;
+    }
+
+    std::string base64_decode(const std::string& encoded) {
+        // Implementation omitted for brevity
+        return encoded;
+    }
+
+    std::string create_signature(const std::string& timestamp,
+                                const std::string& method,
+                                const std::string& request_path,
+                                const std::string& body = "") {
+        std::string message = timestamp + method + request_path + body;
+        std::string decoded_secret = base64_decode(api_secret);
+
+        unsigned char hash[EVP_MAX_MD_SIZE];
+        unsigned int hash_len;
+
+        HMAC(EVP_sha256(),
+             decoded_secret.c_str(), decoded_secret.length(),
+             (unsigned char*)message.c_str(), message.length(),
+             hash, &hash_len);
+
+        return std::string((char*)hash, hash_len);
+    }
+
+public:
+    CoinbaseClient(const std::string& key, const std::string& secret)
+        : api_key(key), api_secret(secret) {
+        curl = curl_easy_init();
+    }
+
+    nlohmann::json get_products() {
+        return request("GET", "/api/v3/brokerage/products");
+    }
+
+    nlohmann::json place_order(const std::string& product_id,
+                              const std::string& side,
+                              const std::string& order_type,
+                              double size,
+                              double price) {
+        nlohmann::json order_data = {
+            {"product_id", product_id},
+            {"side", side},
+            {"order_configuration", {
+                {"limit_limit_gtc", {
+                    {"base_size", std::to_string(size)},
+                    {"limit_price", std::to_string(price)}
+                }}
+            }}
+        };
+
+        return request("POST", "/api/v3/brokerage/orders", order_data.dump());
+    }
+
+    nlohmann::json request(const std::string& method,
+                          const std::string& endpoint,
+                          const std::string& body = "") {
+        auto timestamp = std::to_string(
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()
+            ).count()
+        );
+
+        std::string signature = create_signature(timestamp, method, endpoint, body);
+
+        std::string url = base_url + endpoint;
+        std::string response_data;
+
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_data);
+
+        struct curl_slist* headers = nullptr;
+        headers = curl_slist_append(headers, ("CB-ACCESS-KEY: " + api_key).c_str());
+        headers = curl_slist_append(headers, ("CB-ACCESS-SIGN: " + signature).c_str());
+        headers = curl_slist_append(headers, ("CB-ACCESS-TIMESTAMP: " + timestamp).c_str());
+        headers = curl_slist_append(headers, "Content-Type: application/json");
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+        if (method == "POST") {
+            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
+        }
+
+        curl_easy_perform(curl);
+        curl_slist_free_all(headers);
+
+        return nlohmann::json::parse(response_data);
+    }
+
+    ~CoinbaseClient() {
+        if (curl) curl_easy_cleanup(curl);
+    }
+};
+EOF
+
+
+KRAKEN API WRAPPER
+==================
+
+Kraken REST Client:
+------------------
+cat > /tmp/kraken_client.hpp << 'EOF'
+#pragma once
+#include <curl/curl.h>
+#include <nlohmann/json.hpp>
+#include <openssl/hmac.h>
+#include <openssl/sha.h>
+#include <string>
+#include <sstream>
+
+class KrakenClient {
+private:
+    std::string api_key;
+    std::string api_secret;
+    std::string base_url = "https://api.kraken.com";
+    CURL* curl;
+
+    static size_t WriteCallback(void* contents, size_t size, size_t nmemb, void* userp) {
+        ((std::string*)userp)->append((char*)contents, size * nmemb);
+        return size * nmemb;
+    }
+
+public:
+    KrakenClient(const std::string& key, const std::string& secret)
+        : api_key(key), api_secret(secret) {
+        curl = curl_easy_init();
+        curl_easy_setopt(curl, CURLOPT_TCP_NODELAY, 1L);
+    }
+
+    nlohmann::json get_ticker(const std::string& pair) {
+        return public_request("/0/public/Ticker", "pair=" + pair);
+    }
+
+    nlohmann::json get_orderbook(const std::string& pair, int count = 10) {
+        return public_request("/0/public/Depth",
+                             "pair=" + pair + "&count=" + std::to_string(count));
+    }
+
+    nlohmann::json add_order(const std::string& pair,
+                            const std::string& type,
+                            const std::string& ordertype,
+                            double volume,
+                            double price) {
+        std::stringstream ss;
+        ss << "pair=" << pair
+           << "&type=" << type
+           << "&ordertype=" << ordertype
+           << "&volume=" << volume
+           << "&price=" << price;
+
+        return private_request("/0/private/AddOrder", ss.str());
+    }
+
+    nlohmann::json cancel_order(const std::string& txid) {
+        return private_request("/0/private/CancelOrder", "txid=" + txid);
+    }
+
+private:
+    nlohmann::json public_request(const std::string& endpoint,
+                                  const std::string& params = "") {
+        std::string url = base_url + endpoint;
+        if (!params.empty()) {
+            url += "?" + params;
+        }
+
+        std::string response_data;
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_data);
+
+        curl_easy_perform(curl);
+        return nlohmann::json::parse(response_data);
+    }
+
+    nlohmann::json private_request(const std::string& endpoint,
+                                   const std::string& params) {
+        // Implementation with HMAC-SHA512 signature
+        // Omitted for brevity - see Kraken API docs
+        return nlohmann::json();
+    }
+
+public:
+    ~KrakenClient() {
+        if (curl) curl_easy_cleanup(curl);
+    }
+};
+EOF
+
+
+JSON PARSING LIBRARIES
+======================
+
+nlohmann/json (Easy to use):
+----------------------------
+vcpkg install nlohmann-json:x64-linux-hft
+
+# CMake:
+find_package(nlohmann_json REQUIRED)
+target_link_libraries(your_target nlohmann_json::nlohmann_json)
+
+simdjson (Ultra-fast):
+---------------------
+vcpkg install simdjson:x64-linux-hft
+
+# Example usage:
+#include <simdjson.h>
+
+simdjson::dom::parser parser;
+simdjson::dom::element doc = parser.parse(json_string);
+double price = doc["price"].get_double();
+
+
+COMPILATION EXAMPLE
+===================
+
+CMakeLists.txt for Exchange Connectors:
+---------------------------------------
+cmake_minimum_required(VERSION 3.28)
+project(ExchangeConnectors CXX)
+
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -march=native")
+
+find_package(CURL REQUIRED)
+find_package(OpenSSL REQUIRED)
+find_package(Boost REQUIRED COMPONENTS system)
+find_package(nlohmann_json REQUIRED)
+
+add_executable(binance_client binance_example.cpp)
+target_link_libraries(binance_client
+    CURL::libcurl
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    Boost::system
+    nlohmann_json::nlohmann_json
+)
+
+Build:
+-----
+mkdir build && cd build
+cmake -GNinja ..
+ninja
+
+
+VERIFICATION
+============
+
+Test API Connections:
+--------------------
+# Test Binance API
+curl -X GET "https://api.binance.com/api/v3/ping"
+
+# Test Coinbase API
+curl -X GET "https://api.coinbase.com/api/v3/brokerage/time"
+
+# Test Kraken API
+curl -X GET "https://api.kraken.com/0/public/Time"
+
+================================================================================
+Next: 07_troubleshooting.txt
+================================================================================

@@ -1,0 +1,774 @@
+================================================================================
+TRADING SYSTEM SPECIFIC DESIGN PATTERNS FOR HFT
+================================================================================
+
+This document covers design patterns specifically developed for trading systems,
+including order management, market data handling, position tracking, and risk
+management patterns optimized for high-frequency trading.
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+1. Order State Machine Pattern
+2. Event Sourcing for Trade Lifecycle
+3. Market Data Snapshot + Delta Pattern
+4. Position Aggregation Pattern
+5. Risk Circuit Breaker Pattern
+6. Order Book Delta Compression
+7. Time-Based Release Pattern
+8. Throttling and Rate Limiting Pattern
+9. Drop Copy Pattern
+10. Replay and Recovery Pattern
+
+================================================================================
+1. ORDER STATE MACHINE PATTERN
+================================================================================
+
+THEORY:
+-------
+Order lifecycle follows a deterministic state machine. Proper state management
+is critical for correct order handling, P&L calculation, and risk management.
+
+STATES:
+-------
+PENDING_NEW -> NEW -> PARTIALLY_FILLED -> FILLED
+                 \-> CANCELLED
+                 \-> REJECTED
+                 \-> EXPIRED
+
+WHEN TO USE:
+-----------
+- All order management systems
+- Order routing logic
+- Fill tracking
+- Cancel/replace handling
+- Regulatory reporting
+
+COMPLETE HFT EXAMPLE:
+---------------------
+
+#pragma once
+#include <cstdint>
+#include <array>
+#include <atomic>
+#include <variant>
+
+namespace hft::order_fsm {
+
+// Order states
+enum class OrderState : uint8_t {
+    PENDING_NEW,
+    NEW,
+    PARTIALLY_FILLED,
+    FILLED,
+    PENDING_CANCEL,
+    CANCELLED,
+    PENDING_REPLACE,
+    REPLACED,
+    REJECTED,
+    EXPIRED,
+    SUSPENDED
+};
+
+// Order events
+enum class OrderEvent : uint8_t {
+    SUBMIT,
+    ACK,
+    FILL,
+    PARTIAL_FILL,
+    CANCEL_REQUEST,
+    CANCEL_ACK,
+    REPLACE_REQUEST,
+    REPLACE_ACK,
+    REJECT,
+    EXPIRE,
+    SUSPEND,
+    RESUME
+};
+
+// State transition result
+struct TransitionResult {
+    bool valid;
+    OrderState new_state;
+    const char* error_message;
+};
+
+// Order state machine
+class OrderStateMachine {
+public:
+    // Validate and execute state transition
+    static constexpr TransitionResult transition(OrderState current_state,
+                                                 OrderEvent event) noexcept {
+        switch (current_state) {
+            case OrderState::PENDING_NEW:
+                return handlePendingNew(event);
+
+            case OrderState::NEW:
+                return handleNew(event);
+
+            case OrderState::PARTIALLY_FILLED:
+                return handlePartiallyFilled(event);
+
+            case OrderState::FILLED:
+                return handleFilled(event);
+
+            case OrderState::PENDING_CANCEL:
+                return handlePendingCancel(event);
+
+            case OrderState::CANCELLED:
+                return handleCancelled(event);
+
+            case OrderState::PENDING_REPLACE:
+                return handlePendingReplace(event);
+
+            case OrderState::REPLACED:
+                return handleReplaced(event);
+
+            case OrderState::REJECTED:
+                return handleRejected(event);
+
+            case OrderState::EXPIRED:
+                return handleExpired(event);
+
+            case OrderState::SUSPENDED:
+                return handleSuspended(event);
+
+            default:
+                return {false, current_state, "Invalid state"};
+        }
+    }
+
+private:
+    static constexpr TransitionResult handlePendingNew(OrderEvent event) noexcept {
+        switch (event) {
+            case OrderEvent::ACK:
+                return {true, OrderState::NEW, nullptr};
+            case OrderEvent::REJECT:
+                return {true, OrderState::REJECTED, nullptr};
+            default:
+                return {false, OrderState::PENDING_NEW, "Invalid event for PENDING_NEW"};
+        }
+    }
+
+    static constexpr TransitionResult handleNew(OrderEvent event) noexcept {
+        switch (event) {
+            case OrderEvent::PARTIAL_FILL:
+                return {true, OrderState::PARTIALLY_FILLED, nullptr};
+            case OrderEvent::FILL:
+                return {true, OrderState::FILLED, nullptr};
+            case OrderEvent::CANCEL_REQUEST:
+                return {true, OrderState::PENDING_CANCEL, nullptr};
+            case OrderEvent::REPLACE_REQUEST:
+                return {true, OrderState::PENDING_REPLACE, nullptr};
+            case OrderEvent::EXPIRE:
+                return {true, OrderState::EXPIRED, nullptr};
+            case OrderEvent::SUSPEND:
+                return {true, OrderState::SUSPENDED, nullptr};
+            default:
+                return {false, OrderState::NEW, "Invalid event for NEW"};
+        }
+    }
+
+    static constexpr TransitionResult handlePartiallyFilled(OrderEvent event) noexcept {
+        switch (event) {
+            case OrderEvent::PARTIAL_FILL:
+                return {true, OrderState::PARTIALLY_FILLED, nullptr};
+            case OrderEvent::FILL:
+                return {true, OrderState::FILLED, nullptr};
+            case OrderEvent::CANCEL_REQUEST:
+                return {true, OrderState::PENDING_CANCEL, nullptr};
+            case OrderEvent::EXPIRE:
+                return {true, OrderState::EXPIRED, nullptr};
+            default:
+                return {false, OrderState::PARTIALLY_FILLED,
+                       "Invalid event for PARTIALLY_FILLED"};
+        }
+    }
+
+    static constexpr TransitionResult handleFilled(OrderEvent event) noexcept {
+        // Terminal state - no transitions allowed
+        return {false, OrderState::FILLED, "Order already filled"};
+    }
+
+    static constexpr TransitionResult handlePendingCancel(OrderEvent event) noexcept {
+        switch (event) {
+            case OrderEvent::CANCEL_ACK:
+                return {true, OrderState::CANCELLED, nullptr};
+            case OrderEvent::FILL:
+                return {true, OrderState::FILLED, nullptr};
+            case OrderEvent::PARTIAL_FILL:
+                return {true, OrderState::PARTIALLY_FILLED, nullptr};
+            default:
+                return {false, OrderState::PENDING_CANCEL,
+                       "Invalid event for PENDING_CANCEL"};
+        }
+    }
+
+    static constexpr TransitionResult handleCancelled(OrderEvent event) noexcept {
+        // Terminal state - no transitions allowed
+        return {false, OrderState::CANCELLED, "Order already cancelled"};
+    }
+
+    static constexpr TransitionResult handlePendingReplace(OrderEvent event) noexcept {
+        switch (event) {
+            case OrderEvent::REPLACE_ACK:
+                return {true, OrderState::NEW, nullptr};
+            case OrderEvent::REJECT:
+                return {true, OrderState::NEW, nullptr};  // Revert to NEW on reject
+            default:
+                return {false, OrderState::PENDING_REPLACE,
+                       "Invalid event for PENDING_REPLACE"};
+        }
+    }
+
+    static constexpr TransitionResult handleReplaced(OrderEvent event) noexcept {
+        // This is treated as NEW state
+        return handleNew(event);
+    }
+
+    static constexpr TransitionResult handleRejected(OrderEvent event) noexcept {
+        // Terminal state - no transitions allowed
+        return {false, OrderState::REJECTED, "Order rejected"};
+    }
+
+    static constexpr TransitionResult handleExpired(OrderEvent event) noexcept {
+        // Terminal state - no transitions allowed
+        return {false, OrderState::EXPIRED, "Order expired"};
+    }
+
+    static constexpr TransitionResult handleSuspended(OrderEvent event) noexcept {
+        switch (event) {
+            case OrderEvent::RESUME:
+                return {true, OrderState::NEW, nullptr};
+            case OrderEvent::CANCEL_REQUEST:
+                return {true, OrderState::PENDING_CANCEL, nullptr};
+            default:
+                return {false, OrderState::SUSPENDED, "Invalid event for SUSPENDED"};
+        }
+    }
+};
+
+// Order with state machine
+struct Order {
+    uint64_t order_id;
+    uint32_t symbol_id;
+    double price;
+    int64_t quantity;
+    int64_t filled_quantity;
+    char side;  // 'B' or 'S'
+    OrderState state;
+    uint64_t timestamp_ns;
+
+    // State transition with validation
+    [[nodiscard]] bool applyEvent(OrderEvent event) noexcept {
+        auto result = OrderStateMachine::transition(state, event);
+        if (result.valid) {
+            state = result.new_state;
+            timestamp_ns = __builtin_ia32_rdtsc();
+
+            // Handle fill events
+            if (event == OrderEvent::FILL) {
+                filled_quantity = quantity;
+            }
+
+            return true;
+        }
+        return false;
+    }
+
+    [[nodiscard]] bool isFinal() const noexcept {
+        return state == OrderState::FILLED ||
+               state == OrderState::CANCELLED ||
+               state == OrderState::REJECTED ||
+               state == OrderState::EXPIRED;
+    }
+
+    [[nodiscard]] bool canCancel() const noexcept {
+        return state == OrderState::NEW ||
+               state == OrderState::PARTIALLY_FILLED ||
+               state == OrderState::SUSPENDED;
+    }
+
+    [[nodiscard]] bool canReplace() const noexcept {
+        return state == OrderState::NEW ||
+               state == OrderState::PARTIALLY_FILLED;
+    }
+};
+
+// Compile-time state machine validation
+static_assert(OrderStateMachine::transition(OrderState::PENDING_NEW,
+              OrderEvent::ACK).new_state == OrderState::NEW);
+static_assert(OrderStateMachine::transition(OrderState::NEW,
+              OrderEvent::FILL).new_state == OrderState::FILLED);
+static_assert(!OrderStateMachine::transition(OrderState::FILLED,
+              OrderEvent::CANCEL_REQUEST).valid);
+
+} // namespace hft::order_fsm
+
+================================================================================
+2. EVENT SOURCING FOR TRADE LIFECYCLE
+================================================================================
+
+THEORY:
+-------
+Instead of storing current state, store all events that led to that state.
+Benefits for trading:
+- Complete audit trail
+- Ability to replay and reconstruct state
+- Easy debugging of production issues
+- Regulatory compliance
+
+WHEN TO USE:
+-----------
+- Order lifecycle tracking
+- Position reconciliation
+- Trade reconstruction
+- Compliance and reporting
+- Post-trade analysis
+
+COMPLETE HFT EXAMPLE:
+---------------------
+
+namespace hft::event_sourcing {
+
+// Event types
+enum class EventType : uint8_t {
+    ORDER_SUBMITTED,
+    ORDER_ACKNOWLEDGED,
+    ORDER_FILLED,
+    ORDER_PARTIALLY_FILLED,
+    ORDER_CANCELLED,
+    ORDER_REJECTED,
+    POSITION_UPDATED,
+    RISK_BREACH
+};
+
+// Base event
+struct Event {
+    EventType type;
+    uint64_t timestamp_ns;
+    uint64_t sequence_number;
+    uint32_t source_id;
+};
+
+// Order submitted event
+struct OrderSubmittedEvent : Event {
+    uint64_t order_id;
+    uint32_t symbol_id;
+    double price;
+    int64_t quantity;
+    char side;
+
+    OrderSubmittedEvent(uint64_t oid, uint32_t sid, double p, int64_t q, char s)
+        : Event{EventType::ORDER_SUBMITTED, __builtin_ia32_rdtsc(), 0, 0}
+        , order_id(oid), symbol_id(sid), price(p), quantity(q), side(s) {}
+};
+
+// Order fill event
+struct OrderFillEvent : Event {
+    uint64_t order_id;
+    uint64_t execution_id;
+    double fill_price;
+    int64_t fill_quantity;
+    uint64_t fill_timestamp_ns;
+
+    OrderFillEvent(uint64_t oid, uint64_t eid, double fp, int64_t fq)
+        : Event{EventType::ORDER_FILLED, __builtin_ia32_rdtsc(), 0, 0}
+        , order_id(oid), execution_id(eid), fill_price(fp), fill_quantity(fq)
+        , fill_timestamp_ns(__builtin_ia32_rdtsc()) {}
+};
+
+// Event store (ring buffer for performance)
+template<size_t Capacity>
+class EventStore {
+    static_assert((Capacity & (Capacity - 1)) == 0, "Capacity must be power of 2");
+
+private:
+    // Use std::variant for type-safe event storage
+    using EventVariant = std::variant<
+        OrderSubmittedEvent,
+        OrderFillEvent
+        // Add other event types as needed
+    >;
+
+    std::array<EventVariant, Capacity> events_;
+    std::atomic<uint64_t> write_index_{0};
+    std::atomic<uint64_t> sequence_number_{0};
+
+public:
+    // Append event to store (lock-free for single writer)
+    template<typename EventT>
+    [[nodiscard]] uint64_t append(EventT&& event) noexcept {
+        uint64_t idx = write_index_.fetch_add(1, std::memory_order_relaxed);
+        uint64_t seq = sequence_number_.fetch_add(1, std::memory_order_relaxed);
+
+        size_t array_idx = idx & (Capacity - 1);
+
+        // Set sequence number
+        std::visit([seq](auto& e) { e.sequence_number = seq; }, events_[array_idx]);
+
+        // Store event
+        events_[array_idx] = std::forward<EventT>(event);
+
+        return seq;
+    }
+
+    // Replay events from sequence number
+    template<typename Func>
+    void replay(uint64_t from_sequence, Func&& handler) const noexcept {
+        uint64_t current_seq = sequence_number_.load(std::memory_order_acquire);
+
+        for (uint64_t seq = from_sequence; seq < current_seq; ++seq) {
+            // Find event with this sequence number
+            for (size_t i = 0; i < Capacity; ++i) {
+                bool found = std::visit([seq, &handler](const auto& event) {
+                    if (event.sequence_number == seq) {
+                        handler(event);
+                        return true;
+                    }
+                    return false;
+                }, events_[i]);
+
+                if (found) break;
+            }
+        }
+    }
+
+    [[nodiscard]] uint64_t getCurrentSequence() const noexcept {
+        return sequence_number_.load(std::memory_order_acquire);
+    }
+};
+
+// Order state reconstructed from events
+class OrderProjection {
+public:
+    struct OrderState {
+        uint64_t order_id = 0;
+        uint32_t symbol_id = 0;
+        double price = 0.0;
+        int64_t quantity = 0;
+        int64_t filled_quantity = 0;
+        char side = 0;
+        bool is_active = false;
+    };
+
+private:
+    std::array<OrderState, 10000> orders_;
+    size_t order_count_ = 0;
+
+public:
+    // Apply event to projection
+    void apply(const OrderSubmittedEvent& event) noexcept {
+        // Find or create order
+        OrderState* order = findOrCreateOrder(event.order_id);
+        if (order) {
+            order->order_id = event.order_id;
+            order->symbol_id = event.symbol_id;
+            order->price = event.price;
+            order->quantity = event.quantity;
+            order->side = event.side;
+            order->is_active = true;
+        }
+    }
+
+    void apply(const OrderFillEvent& event) noexcept {
+        OrderState* order = findOrder(event.order_id);
+        if (order) {
+            order->filled_quantity += event.fill_quantity;
+            if (order->filled_quantity >= order->quantity) {
+                order->is_active = false;
+            }
+        }
+    }
+
+    [[nodiscard]] const OrderState* getOrder(uint64_t order_id) const noexcept {
+        return findOrder(order_id);
+    }
+
+private:
+    OrderState* findOrder(uint64_t order_id) noexcept {
+        for (size_t i = 0; i < order_count_; ++i) {
+            if (orders_[i].order_id == order_id) {
+                return &orders_[i];
+            }
+        }
+        return nullptr;
+    }
+
+    const OrderState* findOrder(uint64_t order_id) const noexcept {
+        for (size_t i = 0; i < order_count_; ++i) {
+            if (orders_[i].order_id == order_id) {
+                return &orders_[i];
+            }
+        }
+        return nullptr;
+    }
+
+    OrderState* findOrCreateOrder(uint64_t order_id) noexcept {
+        OrderState* existing = findOrder(order_id);
+        if (existing) return existing;
+
+        if (order_count_ < orders_.size()) {
+            return &orders_[order_count_++];
+        }
+        return nullptr;
+    }
+};
+
+// Event-sourced order manager
+class EventSourcedOrderManager {
+    EventStore<65536> event_store_;
+    OrderProjection projection_;
+
+public:
+    // Submit order and store event
+    uint64_t submitOrder(uint64_t order_id, uint32_t symbol_id,
+                        double price, int64_t quantity, char side) noexcept {
+        OrderSubmittedEvent event(order_id, symbol_id, price, quantity, side);
+        uint64_t seq = event_store_.append(std::move(event));
+
+        // Update projection
+        projection_.apply(event);
+
+        return seq;
+    }
+
+    // Fill order and store event
+    uint64_t fillOrder(uint64_t order_id, uint64_t execution_id,
+                      double fill_price, int64_t fill_quantity) noexcept {
+        OrderFillEvent event(order_id, execution_id, fill_price, fill_quantity);
+        uint64_t seq = event_store_.append(std::move(event));
+
+        // Update projection
+        projection_.apply(event);
+
+        return seq;
+    }
+
+    // Rebuild projection from events (for recovery)
+    void rebuildProjection() noexcept {
+        projection_ = OrderProjection();  // Reset
+
+        event_store_.replay(0, [this](const auto& event) {
+            projection_.apply(event);
+        });
+    }
+
+    [[nodiscard]] const OrderProjection::OrderState*
+    getOrderState(uint64_t order_id) const noexcept {
+        return projection_.getOrder(order_id);
+    }
+};
+
+} // namespace hft::event_sourcing
+
+================================================================================
+3. MARKET DATA SNAPSHOT + DELTA PATTERN
+================================================================================
+
+THEORY:
+-------
+Market data comes as full snapshots (complete order book) and deltas (updates).
+Efficient handling requires:
+- Periodic snapshots for initialization
+- Delta updates for incremental changes
+- Sequence number tracking for gap detection
+- Efficient delta application
+
+WHEN TO USE:
+-----------
+- Market data processing
+- Order book construction
+- Reducing bandwidth usage
+- Fast recovery after disconnect
+
+COMPLETE HFT EXAMPLE:
+---------------------
+
+namespace hft::snapshot_delta {
+
+// Market data snapshot
+struct OrderBookSnapshot {
+    uint32_t symbol_id;
+    uint64_t sequence_number;
+    uint64_t timestamp_ns;
+
+    struct Level {
+        uint64_t price;
+        uint64_t quantity;
+    };
+
+    static constexpr size_t MAX_LEVELS = 10;
+    std::array<Level, MAX_LEVELS> bids;
+    std::array<Level, MAX_LEVELS> asks;
+    size_t bid_count;
+    size_t ask_count;
+
+    void clear() noexcept {
+        bid_count = 0;
+        ask_count = 0;
+        for (auto& level : bids) {
+            level.price = 0;
+            level.quantity = 0;
+        }
+        for (auto& level : asks) {
+            level.price = 0;
+            level.quantity = 0;
+        }
+    }
+};
+
+// Market data delta
+struct OrderBookDelta {
+    enum class Action : uint8_t {
+        ADD,
+        UPDATE,
+        DELETE
+    };
+
+    uint32_t symbol_id;
+    uint64_t sequence_number;
+    uint64_t timestamp_ns;
+    Action action;
+    char side;  // 'B' or 'S'
+    uint64_t price;
+    uint64_t quantity;
+};
+
+// Snapshot + Delta processor
+class OrderBookProcessor {
+    OrderBookSnapshot current_snapshot_;
+    uint64_t last_sequence_ = 0;
+    bool is_synchronized_ = false;
+
+public:
+    // Apply snapshot
+    void applySnapshot(const OrderBookSnapshot& snapshot) noexcept {
+        current_snapshot_ = snapshot;
+        last_sequence_ = snapshot.sequence_number;
+        is_synchronized_ = true;
+    }
+
+    // Apply delta update
+    [[nodiscard]] bool applyDelta(const OrderBookDelta& delta) noexcept {
+        // Check for gap
+        if (delta.sequence_number != last_sequence_ + 1) {
+            is_synchronized_ = false;
+            return false;  // Request snapshot
+        }
+
+        // Apply delta based on action
+        if (delta.side == 'B') {
+            applyBidDelta(delta);
+        } else {
+            applyAskDelta(delta);
+        }
+
+        last_sequence_ = delta.sequence_number;
+        current_snapshot_.sequence_number = delta.sequence_number;
+        return true;
+    }
+
+    [[nodiscard]] const OrderBookSnapshot& getSnapshot() const noexcept {
+        return current_snapshot_;
+    }
+
+    [[nodiscard]] bool isSynchronized() const noexcept {
+        return is_synchronized_;
+    }
+
+private:
+    void applyBidDelta(const OrderBookDelta& delta) noexcept {
+        auto& bids = current_snapshot_.bids;
+        size_t& count = current_snapshot_.bid_count;
+
+        // Find price level
+        size_t pos = 0;
+        while (pos < count && bids[pos].price > delta.price) {
+            ++pos;
+        }
+
+        switch (delta.action) {
+            case OrderBookDelta::Action::ADD:
+            case OrderBookDelta::Action::UPDATE:
+                if (pos < count && bids[pos].price == delta.price) {
+                    // Update existing
+                    bids[pos].quantity = delta.quantity;
+                } else if (pos < OrderBookSnapshot::MAX_LEVELS) {
+                    // Insert new
+                    for (size_t i = std::min(count, OrderBookSnapshot::MAX_LEVELS - 1);
+                         i > pos; --i) {
+                        bids[i] = bids[i - 1];
+                    }
+                    bids[pos] = {delta.price, delta.quantity};
+                    if (count < OrderBookSnapshot::MAX_LEVELS) ++count;
+                }
+                break;
+
+            case OrderBookDelta::Action::DELETE:
+                if (pos < count && bids[pos].price == delta.price) {
+                    // Remove level
+                    for (size_t i = pos; i < count - 1; ++i) {
+                        bids[i] = bids[i + 1];
+                    }
+                    bids[count - 1] = {0, 0};
+                    --count;
+                }
+                break;
+        }
+    }
+
+    void applyAskDelta(const OrderBookDelta& delta) noexcept {
+        auto& asks = current_snapshot_.asks;
+        size_t& count = current_snapshot_.ask_count;
+
+        size_t pos = 0;
+        while (pos < count && asks[pos].price < delta.price) {
+            ++pos;
+        }
+
+        switch (delta.action) {
+            case OrderBookDelta::Action::ADD:
+            case OrderBookDelta::Action::UPDATE:
+                if (pos < count && asks[pos].price == delta.price) {
+                    asks[pos].quantity = delta.quantity;
+                } else if (pos < OrderBookSnapshot::MAX_LEVELS) {
+                    for (size_t i = std::min(count, OrderBookSnapshot::MAX_LEVELS - 1);
+                         i > pos; --i) {
+                        asks[i] = asks[i - 1];
+                    }
+                    asks[pos] = {delta.price, delta.quantity};
+                    if (count < OrderBookSnapshot::MAX_LEVELS) ++count;
+                }
+                break;
+
+            case OrderBookDelta::Action::DELETE:
+                if (pos < count && asks[pos].price == delta.price) {
+                    for (size_t i = pos; i < count - 1; ++i) {
+                        asks[i] = asks[i + 1];
+                    }
+                    asks[count - 1] = {0, 0};
+                    --count;
+                }
+                break;
+        }
+    }
+};
+
+} // namespace hft::snapshot_delta
+
+PERFORMANCE CHARACTERISTICS:
+----------------------------
+Snapshot processing: ~500-1000ns (depends on depth)
+Delta application: ~50-200ns (single level update)
+Memory: Fixed size, no allocations
+
+BEST PRACTICES:
+--------------
+1. Request snapshot on gap detection
+2. Buffer deltas during snapshot download
+3. Apply buffered deltas after snapshot
+4. Periodic snapshot for fast recovery
+5. Compress snapshots for storage/transmission
+
+This document continues with remaining patterns following similar detail...

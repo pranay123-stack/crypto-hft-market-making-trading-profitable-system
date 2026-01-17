@@ -1,0 +1,1481 @@
+================================================================================
+                    HFT LATENCY DEBUGGING GUIDE
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Theory and Common Latency Issues in HFT
+2. Latency Measurement Tools
+3. Tail Latency Analysis
+4. Jitter Detection and Measurement
+5. Outlier Investigation
+6. Step-by-Step Debugging Workflows
+7. Real HFT C++ Code Examples
+8. Debugging Commands and Interpretation
+9. Solutions and Fixes
+10. Best Practices for Low-Latency HFT
+
+================================================================================
+1. THEORY AND COMMON LATENCY ISSUES IN HFT
+================================================================================
+
+OVERVIEW
+--------
+In HFT systems, latency is measured in microseconds (µs) or nanoseconds (ns).
+Even small latency increases can result in:
+- Lost arbitrage opportunities
+- Adverse selection
+- Inability to react to market movements
+- Regulatory compliance issues
+
+LATENCY COMPONENTS IN HFT
+--------------------------
+
+Total Latency = Network + Processing + System
+
+1. NETWORK LATENCY
+   - Physical distance (speed of light)
+   - Switch/router processing
+   - NIC processing
+   - Kernel network stack
+   Typical: 10-100µs for co-located systems
+
+2. PROCESSING LATENCY
+   - Order book updates
+   - Strategy calculations
+   - Risk checks
+   - Order generation
+   Typical: 1-50µs for optimized code
+
+3. SYSTEM LATENCY
+   - Context switches
+   - Page faults
+   - Cache misses
+   - Memory allocation
+   - System calls
+   Typical: Should be < 1µs, spikes can be milliseconds
+
+TYPES OF LATENCY PROBLEMS
+--------------------------
+
+A) TAIL LATENCY
+   - 99th percentile >> median
+   - Occasional very slow operations
+   - Impacts reliability more than speed
+
+B) JITTER
+   - Inconsistent latency
+   - High variance in timing
+   - Makes latency unpredictable
+
+C) OUTLIERS
+   - Rare extreme latency events
+   - Can be 100-1000x normal latency
+   - Often caused by system events
+
+D) LATENCY DRIFT
+   - Gradual increase over time
+   - Usually indicates resource exhaustion
+   - Memory leaks, cache pollution
+
+COMMON ROOT CAUSES
+------------------
+
+1. CPU Issues
+   - Frequency scaling
+   - Turbo boost instability
+   - Thermal throttling
+   - SMT/Hyper-threading interference
+
+2. Memory Issues
+   - NUMA remote access
+   - TLB misses
+   - Cache line bouncing
+   - Page faults
+
+3. Kernel Issues
+   - Context switches
+   - System call overhead
+   - Interrupt handling
+   - Kernel preemption
+
+4. I/O Issues
+   - Disk I/O blocking
+   - Network buffer full
+   - Excessive logging
+   - Synchronous writes
+
+================================================================================
+2. LATENCY MEASUREMENT TOOLS
+================================================================================
+
+HARDWARE TIMESTAMPING
+---------------------
+
+Most accurate method: NIC hardware timestamps
+Accuracy: < 100ns
+
+Code example:
+```cpp
+#include <linux/net_tstamp.h>
+#include <linux/sockios.h>
+
+int enable_hw_timestamps(int sockfd, const char* iface) {
+    struct hwtstamp_config hw_config;
+    hw_config.tx_type = HWTSTAMP_TX_ON;
+    hw_config.rx_filter = HWTSTAMP_FILTER_ALL;
+
+    struct ifreq ifr;
+    strncpy(ifr.ifr_name, iface, IFNAMSIZ);
+    ifr.ifr_data = reinterpret_cast<char*>(&hw_config);
+
+    if (ioctl(sockfd, SIOCSHWTSTAMP, &ifr) < 0) {
+        return -1;
+    }
+
+    int flags = SOF_TIMESTAMPING_RX_HARDWARE |
+                SOF_TIMESTAMPING_TX_HARDWARE |
+                SOF_TIMESTAMPING_RAW_HARDWARE;
+
+    return setsockopt(sockfd, SOL_SOCKET, SO_TIMESTAMPING,
+                     &flags, sizeof(flags));
+}
+```
+
+RDTSC (CPU TIMESTAMP COUNTER)
+------------------------------
+
+High resolution, low overhead
+Accuracy: ~1ns on modern CPUs
+
+Code example:
+```cpp
+#include <x86intrin.h>
+
+inline uint64_t rdtsc() {
+    return __rdtsc();
+}
+
+inline uint64_t rdtscp(unsigned int* aux) {
+    return __rdtscp(aux);
+}
+
+// Calibrate RDTSC to nanoseconds
+double calibrate_rdtsc() {
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    uint64_t tsc_start = rdtsc();
+
+    // Busy wait for ~100ms
+    volatile long dummy = 0;
+    for (int i = 0; i < 100000000; ++i) {
+        dummy += i;
+    }
+
+    uint64_t tsc_end = rdtsc();
+    clock_gettime(CLOCK_MONOTONIC, &end);
+
+    uint64_t ns = (end.tv_sec - start.tv_sec) * 1000000000ULL +
+                  (end.tv_nsec - start.tv_nsec);
+    uint64_t tsc_delta = tsc_end - tsc_start;
+
+    return (double)ns / tsc_delta;  // ns per cycle
+}
+```
+
+CLOCK_GETTIME
+--------------
+
+Good accuracy, moderate overhead
+Accuracy: ~30-100ns per call
+
+```cpp
+#include <time.h>
+
+uint64_t get_timestamp_ns() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+// Measure function latency
+template<typename Func>
+uint64_t measure_latency(Func&& func) {
+    uint64_t start = get_timestamp_ns();
+    func();
+    uint64_t end = get_timestamp_ns();
+    return end - start;
+}
+```
+
+PERF TOOLS
+----------
+
+1. perf stat - High-level statistics
+```bash
+perf stat -e cycles,instructions,cache-misses,branch-misses ./program
+```
+
+2. perf record - Detailed profiling
+```bash
+perf record -g -F 9999 ./program
+perf report --stdio
+```
+
+3. perf probe - Dynamic tracing
+```bash
+perf probe --add 'process_order'
+perf record -e probe:process_order -aR
+```
+
+FTRACE
+------
+
+Kernel function tracing
+```bash
+echo function_graph > /sys/kernel/debug/tracing/current_tracer
+echo process_order > /sys/kernel/debug/tracing/set_ftrace_filter
+echo 1 > /sys/kernel/debug/tracing/tracing_on
+cat /sys/kernel/debug/tracing/trace
+```
+
+INTEL VTune
+-----------
+
+Commercial profiler with excellent latency analysis
+- Microarchitecture exploration
+- Memory access analysis
+- Threading analysis
+
+================================================================================
+3. TAIL LATENCY ANALYSIS
+================================================================================
+
+UNDERSTANDING TAIL LATENCY
+---------------------------
+
+Tail latency = High percentile latency (P99, P99.9, P99.99)
+
+Example distribution:
+- P50 (median): 5µs
+- P99: 25µs (5x median)
+- P99.9: 500µs (100x median!)
+- Max: 50ms (10,000x median!!)
+
+In HFT, tail latency often matters more than average latency because:
+- Trading opportunities are time-sensitive
+- Cannot afford to miss any opportunity
+- Consistency is crucial
+
+MEASURING TAIL LATENCY
+-----------------------
+
+```cpp
+#include <vector>
+#include <algorithm>
+#include <cmath>
+
+class LatencyHistogram {
+    std::vector<uint64_t> samples;
+    size_t max_samples;
+
+    // HDR histogram buckets (logarithmic)
+    static constexpr size_t NUM_BUCKETS = 1000;
+    std::array<uint64_t, NUM_BUCKETS> buckets{};
+    uint64_t count = 0;
+
+public:
+    LatencyHistogram(size_t max = 10000000) : max_samples(max) {
+        samples.reserve(max_samples);
+    }
+
+    void record(uint64_t latency_ns) {
+        // Store sample
+        if (samples.size() < max_samples) {
+            samples.push_back(latency_ns);
+        }
+
+        // Update HDR histogram
+        size_t bucket = latency_to_bucket(latency_ns);
+        buckets[bucket]++;
+        count++;
+    }
+
+    struct Statistics {
+        uint64_t min;
+        uint64_t max;
+        double mean;
+        double stddev;
+        uint64_t p50;
+        uint64_t p90;
+        uint64_t p95;
+        uint64_t p99;
+        uint64_t p999;
+        uint64_t p9999;
+    };
+
+    Statistics compute_stats() {
+        if (samples.empty()) return {};
+
+        std::sort(samples.begin(), samples.end());
+
+        Statistics stats;
+        stats.min = samples.front();
+        stats.max = samples.back();
+
+        // Mean and standard deviation
+        uint64_t sum = 0;
+        for (uint64_t s : samples) sum += s;
+        stats.mean = (double)sum / samples.size();
+
+        double variance = 0;
+        for (uint64_t s : samples) {
+            double diff = s - stats.mean;
+            variance += diff * diff;
+        }
+        stats.stddev = std::sqrt(variance / samples.size());
+
+        // Percentiles
+        stats.p50 = percentile(50.0);
+        stats.p90 = percentile(90.0);
+        stats.p95 = percentile(95.0);
+        stats.p99 = percentile(99.0);
+        stats.p999 = percentile(99.9);
+        stats.p9999 = percentile(99.99);
+
+        return stats;
+    }
+
+    uint64_t percentile(double pct) const {
+        if (samples.empty()) return 0;
+        size_t idx = (samples.size() * pct) / 100.0;
+        if (idx >= samples.size()) idx = samples.size() - 1;
+        return samples[idx];
+    }
+
+    void print_report() {
+        auto stats = compute_stats();
+
+        std::cout << "=== Latency Report ===\n"
+                  << "Samples: " << samples.size() << "\n"
+                  << "Min:    " << stats.min << " ns\n"
+                  << "Mean:   " << (uint64_t)stats.mean << " ns\n"
+                  << "Stddev: " << (uint64_t)stats.stddev << " ns\n"
+                  << "P50:    " << stats.p50 << " ns\n"
+                  << "P90:    " << stats.p90 << " ns ("
+                  << (stats.p90 / stats.p50) << "x median)\n"
+                  << "P95:    " << stats.p95 << " ns ("
+                  << (stats.p95 / stats.p50) << "x median)\n"
+                  << "P99:    " << stats.p99 << " ns ("
+                  << (stats.p99 / stats.p50) << "x median)\n"
+                  << "P99.9:  " << stats.p999 << " ns ("
+                  << (stats.p999 / stats.p50) << "x median)\n"
+                  << "P99.99: " << stats.p9999 << " ns ("
+                  << (stats.p9999 / stats.p50) << "x median)\n"
+                  << "Max:    " << stats.max << " ns ("
+                  << (stats.max / stats.p50) << "x median)\n";
+    }
+
+private:
+    size_t latency_to_bucket(uint64_t latency_ns) {
+        if (latency_ns == 0) return 0;
+        // Logarithmic bucketing
+        double log_val = std::log2(latency_ns);
+        size_t bucket = (size_t)(log_val * 10);
+        return std::min(bucket, NUM_BUCKETS - 1);
+    }
+};
+```
+
+IDENTIFYING TAIL LATENCY CAUSES
+--------------------------------
+
+Common causes and detection:
+
+1. GARBAGE COLLECTION / MEMORY ALLOCATION
+   Detection: Correlate spikes with allocation events
+   ```cpp
+   void* operator new(size_t size) {
+       uint64_t start = rdtsc();
+       void* ptr = malloc(size);
+       uint64_t end = rdtsc();
+       if (end - start > THRESHOLD) {
+           log_allocation_spike(end - start, size);
+       }
+       return ptr;
+   }
+   ```
+
+2. CONTEXT SWITCHES
+   Detection: Use perf or /proc/[pid]/status
+   ```bash
+   perf stat -e context-switches,cs ./program
+   ```
+
+3. CPU FREQUENCY SCALING
+   Detection: Monitor CPU frequency during spike
+   ```bash
+   perf stat -e 'power:cpu_frequency' -a -I 1000
+   ```
+
+4. NUMA EFFECTS
+   Detection: Check NUMA node access patterns
+   ```bash
+   numastat -p $(pidof program)
+   ```
+
+5. KERNEL INTERRUPTS
+   Detection: High interrupt count during spike
+   ```bash
+   watch -n 1 'cat /proc/interrupts'
+   ```
+
+================================================================================
+4. JITTER DETECTION AND MEASUREMENT
+================================================================================
+
+WHAT IS JITTER?
+---------------
+
+Jitter = Variance in latency
+High jitter = Unpredictable performance
+
+Example:
+- Low jitter: 10µs, 11µs, 10µs, 11µs, 10µs (stddev ~0.5µs)
+- High jitter: 10µs, 50µs, 5µs, 100µs, 8µs (stddev ~40µs)
+
+MEASURING JITTER
+----------------
+
+```cpp
+class JitterAnalyzer {
+    std::vector<uint64_t> latencies;
+    std::vector<uint64_t> inter_arrival_times;
+    uint64_t last_timestamp = 0;
+
+public:
+    void record_event(uint64_t latency_ns) {
+        latencies.push_back(latency_ns);
+
+        uint64_t now = get_timestamp_ns();
+        if (last_timestamp != 0) {
+            inter_arrival_times.push_back(now - last_timestamp);
+        }
+        last_timestamp = now;
+    }
+
+    struct JitterStats {
+        double latency_mean;
+        double latency_stddev;
+        double latency_cv;  // Coefficient of variation
+        double inter_arrival_mean;
+        double inter_arrival_stddev;
+        double inter_arrival_cv;
+    };
+
+    JitterStats compute_jitter() {
+        JitterStats stats;
+
+        // Latency jitter
+        auto [lat_mean, lat_stddev] = mean_stddev(latencies);
+        stats.latency_mean = lat_mean;
+        stats.latency_stddev = lat_stddev;
+        stats.latency_cv = lat_stddev / lat_mean;  // CV = stddev/mean
+
+        // Inter-arrival jitter
+        auto [ia_mean, ia_stddev] = mean_stddev(inter_arrival_times);
+        stats.inter_arrival_mean = ia_mean;
+        stats.inter_arrival_stddev = ia_stddev;
+        stats.inter_arrival_cv = ia_stddev / ia_mean;
+
+        return stats;
+    }
+
+    void print_jitter_report() {
+        auto stats = compute_jitter();
+
+        std::cout << "=== Jitter Analysis ===\n"
+                  << "Latency:\n"
+                  << "  Mean:   " << stats.latency_mean << " ns\n"
+                  << "  Stddev: " << stats.latency_stddev << " ns\n"
+                  << "  CV:     " << stats.latency_cv << "\n"
+                  << "Inter-arrival:\n"
+                  << "  Mean:   " << stats.inter_arrival_mean << " ns\n"
+                  << "  Stddev: " << stats.inter_arrival_stddev << " ns\n"
+                  << "  CV:     " << stats.inter_arrival_cv << "\n";
+
+        // Interpretation
+        if (stats.latency_cv > 0.5) {
+            std::cout << "WARNING: High latency jitter (CV > 0.5)\n";
+        }
+        if (stats.inter_arrival_cv > 0.3) {
+            std::cout << "WARNING: High inter-arrival jitter (CV > 0.3)\n";
+        }
+    }
+
+private:
+    std::pair<double, double> mean_stddev(const std::vector<uint64_t>& data) {
+        if (data.empty()) return {0, 0};
+
+        double sum = 0;
+        for (uint64_t v : data) sum += v;
+        double mean = sum / data.size();
+
+        double variance = 0;
+        for (uint64_t v : data) {
+            double diff = v - mean;
+            variance += diff * diff;
+        }
+        double stddev = std::sqrt(variance / data.size());
+
+        return {mean, stddev};
+    }
+};
+```
+
+JITTER ROOT CAUSES
+------------------
+
+1. INTERRUPT COALESCING
+   Problem: NIC batches packets, causing irregular delivery
+   Solution: Disable coalescing
+   ```bash
+   sudo ethtool -C eth0 rx-usecs 0 rx-frames 1
+   ```
+
+2. SCHEDULER QUANTUM
+   Problem: Process scheduled irregularly
+   Solution: Use SCHED_FIFO or SCHED_DEADLINE
+   ```cpp
+   struct sched_param param;
+   param.sched_priority = 99;
+   sched_setscheduler(0, SCHED_FIFO, &param);
+   ```
+
+3. POWER MANAGEMENT
+   Problem: CPU frequency changes unpredictably
+   Solution: Disable frequency scaling
+   ```bash
+   echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+   ```
+
+4. MEMORY ALLOCATION
+   Problem: Unpredictable allocation times
+   Solution: Pre-allocate all memory
+   ```cpp
+   std::vector<Order> orders;
+   orders.reserve(1000000);  // Pre-allocate
+   ```
+
+================================================================================
+5. OUTLIER INVESTIGATION
+================================================================================
+
+DETECTING OUTLIERS
+------------------
+
+Outlier definition: Latency > (Median + k * IQR)
+where IQR = P75 - P25, typically k = 1.5 or 3.0
+
+```cpp
+class OutlierDetector {
+    std::vector<uint64_t> samples;
+
+public:
+    void add_sample(uint64_t latency_ns) {
+        samples.push_back(latency_ns);
+    }
+
+    struct OutlierInfo {
+        uint64_t value;
+        uint64_t timestamp;
+        std::string context;
+    };
+
+    std::vector<OutlierInfo> find_outliers(double k = 3.0) {
+        if (samples.size() < 10) return {};
+
+        std::vector<uint64_t> sorted = samples;
+        std::sort(sorted.begin(), sorted.end());
+
+        size_t n = sorted.size();
+        uint64_t q1 = sorted[n / 4];
+        uint64_t q3 = sorted[3 * n / 4];
+        uint64_t iqr = q3 - q1;
+
+        uint64_t upper_fence = q3 + k * iqr;
+        uint64_t lower_fence = q1 - k * iqr;
+
+        std::vector<OutlierInfo> outliers;
+        for (size_t i = 0; i < samples.size(); ++i) {
+            if (samples[i] > upper_fence || samples[i] < lower_fence) {
+                outliers.push_back({samples[i], i, ""});
+            }
+        }
+
+        return outliers;
+    }
+
+    void print_outliers() {
+        auto outliers = find_outliers();
+
+        std::cout << "Found " << outliers.size() << " outliers:\n";
+        for (const auto& o : outliers) {
+            std::cout << "  " << o.timestamp << ": " << o.value << " ns\n";
+        }
+    }
+};
+```
+
+CAPTURING OUTLIER CONTEXT
+--------------------------
+
+When outlier occurs, capture:
+- CPU frequency at that moment
+- Number of context switches
+- System call count
+- Interrupt count
+- Memory allocation events
+
+```cpp
+class OutlierContextCapture {
+    struct Context {
+        uint64_t timestamp;
+        uint64_t latency;
+        unsigned int cpu_mhz;
+        uint64_t ctx_switches;
+        uint64_t page_faults;
+        uint64_t interrupts;
+    };
+
+    std::vector<Context> outlier_contexts;
+
+public:
+    void check_and_capture(uint64_t latency_ns, uint64_t threshold_ns) {
+        if (latency_ns <= threshold_ns) return;
+
+        Context ctx;
+        ctx.timestamp = get_timestamp_ns();
+        ctx.latency = latency_ns;
+        ctx.cpu_mhz = read_cpu_frequency();
+        ctx.ctx_switches = read_ctx_switches();
+        ctx.page_faults = read_page_faults();
+        ctx.interrupts = read_interrupt_count();
+
+        outlier_contexts.push_back(ctx);
+
+        // Log immediately
+        std::cerr << "OUTLIER DETECTED: " << latency_ns << " ns\n"
+                  << "  CPU MHz: " << ctx.cpu_mhz << "\n"
+                  << "  Ctx switches: " << ctx.ctx_switches << "\n"
+                  << "  Page faults: " << ctx.page_faults << "\n"
+                  << "  Interrupts: " << ctx.interrupts << "\n";
+    }
+
+private:
+    unsigned int read_cpu_frequency() {
+        // Read from /proc/cpuinfo or /sys
+        std::ifstream f("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq");
+        unsigned int khz = 0;
+        f >> khz;
+        return khz / 1000;
+    }
+
+    uint64_t read_ctx_switches() {
+        std::ifstream f("/proc/self/status");
+        std::string line;
+        while (std::getline(f, line)) {
+            if (line.find("voluntary_ctxt_switches") == 0) {
+                return std::stoull(line.substr(line.find(':') + 1));
+            }
+        }
+        return 0;
+    }
+
+    uint64_t read_page_faults() {
+        std::ifstream f("/proc/self/stat");
+        std::string dummy;
+        uint64_t minflt, majflt;
+        f >> dummy >> dummy >> dummy >> dummy >> dummy
+          >> dummy >> dummy >> dummy >> dummy >> minflt
+          >> dummy >> majflt;
+        return minflt + majflt;
+    }
+
+    uint64_t read_interrupt_count() {
+        std::ifstream f("/proc/interrupts");
+        std::string line;
+        uint64_t total = 0;
+        while (std::getline(f, line)) {
+            // Parse and sum interrupt counts
+            // Simplified - real implementation would parse correctly
+        }
+        return total;
+    }
+};
+```
+
+AUTOMATED OUTLIER ANALYSIS
+---------------------------
+
+```cpp
+class AutomatedOutlierAnalysis {
+public:
+    enum class CauseCategory {
+        UNKNOWN,
+        CPU_FREQUENCY,
+        CONTEXT_SWITCH,
+        PAGE_FAULT,
+        INTERRUPT,
+        MEMORY_ALLOCATION,
+        LOCK_CONTENTION
+    };
+
+    struct Analysis {
+        CauseCategory primary_cause;
+        std::string description;
+        std::vector<std::string> recommendations;
+    };
+
+    Analysis analyze_outlier(const OutlierContextCapture::Context& before,
+                            const OutlierContextCapture::Context& during) {
+        Analysis result;
+
+        // Check CPU frequency change
+        if (during.cpu_mhz < before.cpu_mhz * 0.8) {
+            result.primary_cause = CauseCategory::CPU_FREQUENCY;
+            result.description = "CPU frequency dropped during outlier";
+            result.recommendations.push_back("Set CPU governor to 'performance'");
+            result.recommendations.push_back("Disable C-states");
+            return result;
+        }
+
+        // Check context switches
+        if (during.ctx_switches > before.ctx_switches + 5) {
+            result.primary_cause = CauseCategory::CONTEXT_SWITCH;
+            result.description = "High context switch rate during outlier";
+            result.recommendations.push_back("Use SCHED_FIFO scheduler");
+            result.recommendations.push_back("Isolate CPUs with isolcpus");
+            return result;
+        }
+
+        // Check page faults
+        if (during.page_faults > before.page_faults) {
+            result.primary_cause = CauseCategory::PAGE_FAULT;
+            result.description = "Page fault occurred during outlier";
+            result.recommendations.push_back("Lock memory with mlockall()");
+            result.recommendations.push_back("Pre-fault all pages at startup");
+            return result;
+        }
+
+        // Check interrupts
+        if (during.interrupts > before.interrupts + 100) {
+            result.primary_cause = CauseCategory::INTERRUPT;
+            result.description = "High interrupt rate during outlier";
+            result.recommendations.push_back("Pin IRQs to dedicated CPUs");
+            result.recommendations.push_back("Use IRQ affinity to avoid trading CPUs");
+            return result;
+        }
+
+        result.primary_cause = CauseCategory::UNKNOWN;
+        result.description = "Could not identify root cause";
+        return result;
+    }
+};
+```
+
+================================================================================
+6. STEP-BY-STEP DEBUGGING WORKFLOWS
+================================================================================
+
+WORKFLOW 1: INVESTIGATING P99 LATENCY SPIKE
+--------------------------------------------
+
+Step 1: Measure and Quantify
+```cpp
+LatencyHistogram hist;
+// ... collect samples ...
+auto stats = hist.compute_stats();
+
+if (stats.p99 > stats.p50 * 10) {
+    std::cout << "P99 is 10x median - investigate!\n";
+}
+```
+
+Step 2: Profile with perf
+```bash
+# Profile during spike
+perf record -g -F 9999 -p $(pidof program) -- sleep 60
+perf report --stdio --no-children | head -50
+```
+
+Step 3: Check System Events
+```bash
+# Context switches
+perf stat -e context-switches -p $(pidof program) -- sleep 10
+
+# Page faults
+perf stat -e page-faults -p $(pidof program) -- sleep 10
+
+# CPU migrations
+perf stat -e migrations -p $(pidof program) -- sleep 10
+```
+
+Step 4: Monitor CPU Frequency
+```bash
+watch -n 1 'grep MHz /proc/cpuinfo'
+```
+
+Step 5: Add Instrumentation
+```cpp
+#define INSTRUMENT_OUTLIER 1
+
+void process_order() {
+    uint64_t start = rdtsc();
+
+    // ... actual work ...
+
+    uint64_t end = rdtsc();
+    uint64_t cycles = end - start;
+
+    if (cycles > OUTLIER_THRESHOLD_CYCLES) {
+        capture_outlier_context(cycles);
+    }
+}
+```
+
+Step 6: Analyze Results and Fix
+- If CPU frequency: Disable scaling
+- If context switches: Use SCHED_FIFO
+- If page faults: Lock memory
+- If cache misses: Improve data locality
+
+WORKFLOW 2: REDUCING JITTER
+----------------------------
+
+Step 1: Measure Baseline Jitter
+```cpp
+JitterAnalyzer jitter;
+// ... run workload ...
+auto stats = jitter.compute_jitter();
+std::cout << "Baseline CV: " << stats.latency_cv << "\n";
+```
+
+Step 2: Apply System Tuning
+```bash
+# Set performance governor
+echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+
+# Disable C-states
+sudo cpupower idle-set -D 0
+
+# Isolate CPUs
+# Edit /etc/default/grub: isolcpus=2-7
+# sudo update-grub && reboot
+
+# Set realtime scheduler
+chrt -f 99 ./program
+```
+
+Step 3: Measure Again
+```cpp
+JitterAnalyzer jitter_after;
+// ... run workload ...
+auto stats_after = jitter_after.compute_jitter();
+std::cout << "After tuning CV: " << stats_after.latency_cv << "\n";
+std::cout << "Improvement: "
+          << (stats.latency_cv - stats_after.latency_cv) / stats.latency_cv * 100
+          << "%\n";
+```
+
+Step 4: Application-Level Tuning
+```cpp
+// Pin thread to CPU
+cpu_set_t cpuset;
+CPU_ZERO(&cpuset);
+CPU_SET(2, &cpuset);
+pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+
+// Lock memory
+mlockall(MCL_CURRENT | MCL_FUTURE);
+
+// Pre-fault stack
+char dummy[1024*1024];
+memset(dummy, 0, sizeof(dummy));
+```
+
+WORKFLOW 3: HUNTING MICROSECOND-LEVEL OUTLIERS
+-----------------------------------------------
+
+Step 1: Continuous Monitoring
+```cpp
+OutlierDetector detector;
+OutlierContextCapture capture;
+
+while (running) {
+    uint64_t start = rdtsc();
+    process_tick();
+    uint64_t end = rdtsc();
+
+    uint64_t cycles = end - start;
+    uint64_t ns = cycles * ns_per_cycle;
+
+    detector.add_sample(ns);
+    capture.check_and_capture(ns, THRESHOLD_NS);
+}
+```
+
+Step 2: Kernel Tracing During Outlier
+```bash
+# Enable tracing
+echo 1 > /sys/kernel/debug/tracing/events/sched/enable
+echo 1 > /sys/kernel/debug/tracing/events/irq/enable
+
+# Set trigger to capture trace on outlier
+# (This would be done programmatically)
+
+# Examine trace
+cat /sys/kernel/debug/tracing/trace
+```
+
+Step 3: Hardware PMU Analysis
+```bash
+# Sample PMU events
+perf record -e cycles,instructions,cache-misses,branch-misses \
+            -c 10000 -p $(pidof program) -- sleep 30
+perf script > pmu_samples.txt
+```
+
+Step 4: Correlate with Application Events
+```cpp
+// When outlier detected, log application state
+void on_outlier(uint64_t latency) {
+    std::cerr << "OUTLIER: " << latency << " ns\n"
+              << "  Order queue depth: " << order_queue.size() << "\n"
+              << "  Market data queue: " << md_queue.size() << "\n"
+              << "  Active positions: " << position_count << "\n"
+              << "  Memory used: " << get_memory_usage() << "\n";
+}
+```
+
+================================================================================
+7. REAL HFT C++ CODE EXAMPLES
+================================================================================
+
+EXAMPLE 1: HIGH-RESOLUTION LATENCY TRACKER
+-------------------------------------------
+
+```cpp
+#include <x86intrin.h>
+#include <array>
+#include <atomic>
+
+class HighResolutionLatencyTracker {
+    static constexpr size_t MAX_SAMPLES = 10000000;
+
+    struct Sample {
+        uint64_t tsc_start;
+        uint64_t tsc_end;
+        uint16_t event_type;
+        uint16_t cpu_id;
+    } __attribute__((packed));
+
+    alignas(64) std::atomic<size_t> write_index{0};
+    std::array<Sample, MAX_SAMPLES> samples;
+    double tsc_to_ns = 0;
+
+public:
+    HighResolutionLatencyTracker() {
+        tsc_to_ns = calibrate_tsc();
+    }
+
+    // Very fast - just store TSC values
+    void record_start(uint16_t event_type) {
+        unsigned int aux;
+        uint64_t tsc = __rdtscp(&aux);
+        uint16_t cpu = aux & 0xFFF;
+
+        size_t idx = write_index.fetch_add(1, std::memory_order_relaxed);
+        if (idx < MAX_SAMPLES) {
+            samples[idx].tsc_start = tsc;
+            samples[idx].event_type = event_type;
+            samples[idx].cpu_id = cpu;
+        }
+    }
+
+    void record_end(size_t idx) {
+        unsigned int aux;
+        uint64_t tsc = __rdtscp(&aux);
+
+        if (idx < MAX_SAMPLES) {
+            samples[idx].tsc_end = tsc;
+        }
+    }
+
+    void analyze() {
+        size_t count = std::min(write_index.load(), MAX_SAMPLES);
+
+        std::cout << "Collected " << count << " samples\n";
+
+        // Convert to nanoseconds and analyze
+        std::vector<uint64_t> latencies;
+        latencies.reserve(count);
+
+        for (size_t i = 0; i < count; ++i) {
+            uint64_t cycles = samples[i].tsc_end - samples[i].tsc_start;
+            uint64_t ns = cycles * tsc_to_ns;
+            latencies.push_back(ns);
+        }
+
+        std::sort(latencies.begin(), latencies.end());
+
+        std::cout << "P50: " << latencies[count/2] << " ns\n"
+                  << "P99: " << latencies[count*99/100] << " ns\n"
+                  << "P99.9: " << latencies[count*999/1000] << " ns\n"
+                  << "Max: " << latencies.back() << " ns\n";
+    }
+
+private:
+    double calibrate_tsc() {
+        // Calibration code from earlier
+        struct timespec start, end;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        uint64_t tsc_start = __rdtsc();
+
+        usleep(100000);  // 100ms
+
+        uint64_t tsc_end = __rdtsc();
+        clock_gettime(CLOCK_MONOTONIC, &end);
+
+        uint64_t ns = (end.tv_sec - start.tv_sec) * 1000000000ULL +
+                      (end.tv_nsec - start.tv_nsec);
+        uint64_t tsc_delta = tsc_end - tsc_start;
+
+        return (double)ns / tsc_delta;
+    }
+};
+```
+
+EXAMPLE 2: CRITICAL PATH INSTRUMENTATION
+-----------------------------------------
+
+```cpp
+class CriticalPathTracker {
+    enum class Checkpoint {
+        RECV_START,
+        RECV_END,
+        PARSE_START,
+        PARSE_END,
+        STRATEGY_START,
+        STRATEGY_END,
+        ORDER_START,
+        ORDER_END,
+        SEND_START,
+        SEND_END,
+        NUM_CHECKPOINTS
+    };
+
+    struct PathTrace {
+        std::array<uint64_t, (size_t)Checkpoint::NUM_CHECKPOINTS> timestamps;
+    };
+
+    PathTrace current_trace;
+
+public:
+    void checkpoint(Checkpoint cp) {
+        current_trace.timestamps[(size_t)cp] = rdtsc();
+    }
+
+    void analyze_path() {
+        auto& ts = current_trace.timestamps;
+
+        uint64_t recv_time = ts[(size_t)Checkpoint::RECV_END] -
+                            ts[(size_t)Checkpoint::RECV_START];
+        uint64_t parse_time = ts[(size_t)Checkpoint::PARSE_END] -
+                             ts[(size_t)Checkpoint::PARSE_START];
+        uint64_t strategy_time = ts[(size_t)Checkpoint::STRATEGY_END] -
+                                ts[(size_t)Checkpoint::STRATEGY_START];
+        uint64_t order_time = ts[(size_t)Checkpoint::ORDER_END] -
+                             ts[(size_t)Checkpoint::ORDER_START];
+        uint64_t send_time = ts[(size_t)Checkpoint::SEND_END] -
+                            ts[(size_t)Checkpoint::SEND_START];
+
+        uint64_t total = ts[(size_t)Checkpoint::SEND_END] -
+                        ts[(size_t)Checkpoint::RECV_START];
+
+        std::cout << "Critical Path Breakdown:\n"
+                  << "  Recv:     " << recv_time << " cycles ("
+                  << (recv_time * 100 / total) << "%)\n"
+                  << "  Parse:    " << parse_time << " cycles ("
+                  << (parse_time * 100 / total) << "%)\n"
+                  << "  Strategy: " << strategy_time << " cycles ("
+                  << (strategy_time * 100 / total) << "%)\n"
+                  << "  Order:    " << order_time << " cycles ("
+                  << (order_time * 100 / total) << "%)\n"
+                  << "  Send:     " << send_time << " cycles ("
+                  << (send_time * 100 / total) << "%)\n"
+                  << "  TOTAL:    " << total << " cycles\n";
+    }
+};
+
+// Usage
+CriticalPathTracker tracker;
+
+void process_market_data(const uint8_t* data, size_t len) {
+    tracker.checkpoint(CriticalPathTracker::Checkpoint::RECV_START);
+    // receive data
+    tracker.checkpoint(CriticalPathTracker::Checkpoint::RECV_END);
+
+    tracker.checkpoint(CriticalPathTracker::Checkpoint::PARSE_START);
+    // parse data
+    tracker.checkpoint(CriticalPathTracker::Checkpoint::PARSE_END);
+
+    tracker.checkpoint(CriticalPathTracker::Checkpoint::STRATEGY_START);
+    // run strategy
+    tracker.checkpoint(CriticalPathTracker::Checkpoint::STRATEGY_END);
+
+    tracker.checkpoint(CriticalPathTracker::Checkpoint::ORDER_START);
+    // generate order
+    tracker.checkpoint(CriticalPathTracker::Checkpoint::ORDER_END);
+
+    tracker.checkpoint(CriticalPathTracker::Checkpoint::SEND_START);
+    // send order
+    tracker.checkpoint(CriticalPathTracker::Checkpoint::SEND_END);
+
+    tracker.analyze_path();
+}
+```
+
+EXAMPLE 3: ADAPTIVE LATENCY MONITORING
+---------------------------------------
+
+```cpp
+class AdaptiveLatencyMonitor {
+    double baseline_p99 = 0;
+    double current_p99 = 0;
+    LatencyHistogram recent_samples;
+    std::atomic<bool> alert_raised{false};
+
+    static constexpr double DEGRADATION_THRESHOLD = 1.5;  // 50% increase
+
+public:
+    void establish_baseline() {
+        // Run for calibration period
+        std::cout << "Establishing baseline...\n";
+        // ... collect samples ...
+        auto stats = recent_samples.compute_stats();
+        baseline_p99 = stats.p99;
+        std::cout << "Baseline P99: " << baseline_p99 << " ns\n";
+    }
+
+    void record_and_check(uint64_t latency_ns) {
+        recent_samples.record(latency_ns);
+
+        // Periodically check for degradation
+        static size_t check_counter = 0;
+        if (++check_counter % 10000 == 0) {
+            auto stats = recent_samples.compute_stats();
+            current_p99 = stats.p99;
+
+            if (current_p99 > baseline_p99 * DEGRADATION_THRESHOLD) {
+                if (!alert_raised.exchange(true)) {
+                    std::cerr << "ALERT: Latency degradation detected!\n"
+                              << "  Baseline P99: " << baseline_p99 << " ns\n"
+                              << "  Current P99:  " << current_p99 << " ns\n"
+                              << "  Degradation:  "
+                              << ((current_p99 / baseline_p99 - 1) * 100)
+                              << "%\n";
+
+                    // Trigger detailed profiling
+                    trigger_detailed_profiling();
+                }
+            } else {
+                alert_raised.store(false);
+            }
+        }
+    }
+
+private:
+    void trigger_detailed_profiling() {
+        // Could trigger perf record, enable detailed logging, etc.
+        system("perf record -g -p $(pidof trading_engine) -o /tmp/spike.data -- sleep 5 &");
+    }
+};
+```
+
+================================================================================
+8. DEBUGGING COMMANDS AND INTERPRETATION
+================================================================================
+
+PERF COMMANDS FOR LATENCY
+--------------------------
+
+1. Basic profiling:
+```bash
+perf record -g -F 9999 ./program
+perf report --stdio --no-children
+```
+
+2. Sample specific event:
+```bash
+perf record -e cycles:pp -c 10000 ./program
+perf script > samples.txt
+```
+
+3. Annotate source:
+```bash
+perf record ./program
+perf annotate --stdio
+```
+
+4. Monitor events live:
+```bash
+perf stat -e cycles,instructions,cache-misses,branch-misses -I 1000 ./program
+```
+
+FTRACE COMMANDS
+---------------
+
+1. Enable function tracing:
+```bash
+echo function > /sys/kernel/debug/tracing/current_tracer
+echo 1 > /sys/kernel/debug/tracing/tracing_on
+```
+
+2. Trace specific function:
+```bash
+echo process_order > /sys/kernel/debug/tracing/set_ftrace_filter
+cat /sys/kernel/debug/tracing/trace
+```
+
+3. Function graph:
+```bash
+echo function_graph > /sys/kernel/debug/tracing/current_tracer
+cat /sys/kernel/debug/tracing/trace
+```
+
+SYSTEM TUNING COMMANDS
+-----------------------
+
+1. CPU governor:
+```bash
+# Show current
+cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+
+# Set performance
+echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+```
+
+2. Disable C-states:
+```bash
+sudo cpupower idle-set -D 0
+```
+
+3. Set CPU affinity:
+```bash
+taskset -c 2-7 ./program
+```
+
+4. Set scheduler:
+```bash
+chrt -f 99 ./program  # SCHED_FIFO priority 99
+```
+
+5. Lock memory:
+```bash
+ulimit -l unlimited
+```
+
+================================================================================
+9. SOLUTIONS AND FIXES
+================================================================================
+
+SOLUTION 1: FIX P99 LATENCY DUE TO MEMORY ALLOCATION
+-----------------------------------------------------
+
+Problem: Occasional malloc() calls cause microsecond spikes
+
+Before:
+```cpp
+void process_order() {
+    auto* order = new Order();  // Allocation spike!
+    // ...
+    delete order;
+}
+```
+
+After:
+```cpp
+ObjectPool<Order, 10000> order_pool;
+
+void process_order() {
+    Order* order = order_pool.allocate();  // No system call
+    // ...
+    order_pool.deallocate(order);
+}
+```
+
+SOLUTION 2: FIX JITTER DUE TO CPU FREQUENCY SCALING
+----------------------------------------------------
+
+Problem: CPU frequency changes cause unpredictable latency
+
+Detection:
+```bash
+watch -n 1 'grep MHz /proc/cpuinfo'
+```
+
+Fix:
+```bash
+# Disable frequency scaling
+echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+
+# Disable turbo boost
+echo 1 | sudo tee /sys/devices/system/cpu/intel_pstate/no_turbo
+
+# Or use specific frequency
+echo 3000000 | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_setspeed
+```
+
+SOLUTION 3: FIX OUTLIERS DUE TO CONTEXT SWITCHES
+-------------------------------------------------
+
+Problem: Occasional context switches cause millisecond spikes
+
+Detection:
+```bash
+perf stat -e context-switches -p $(pidof program) -- sleep 10
+```
+
+Fix:
+```cpp
+// Use SCHED_FIFO
+struct sched_param param;
+param.sched_priority = 99;
+if (sched_setscheduler(0, SCHED_FIFO, &param) != 0) {
+    perror("sched_setscheduler");
+}
+
+// Pin to specific CPU
+cpu_set_t cpuset;
+CPU_ZERO(&cpuset);
+CPU_SET(2, &cpuset);
+pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+```
+
+System-level:
+```bash
+# Isolate CPUs
+# Edit /etc/default/grub:
+GRUB_CMDLINE_LINUX="isolcpus=2-7 nohz_full=2-7 rcu_nocbs=2-7"
+sudo update-grub
+reboot
+```
+
+SOLUTION 4: FIX TAIL LATENCY DUE TO CACHE MISSES
+-------------------------------------------------
+
+Problem: Data structure layout causes cache misses
+
+Detection:
+```bash
+perf stat -e cache-misses,cache-references ./program
+# High miss rate indicates problem
+```
+
+Fix:
+```cpp
+// Before: Poor cache locality
+struct Order {
+    uint64_t id;
+    std::string symbol;  // Heap allocation!
+    double price;
+    uint32_t quantity;
+    // ... many fields ...
+};
+
+// After: Cache-friendly layout
+struct Order {
+    // Hot fields first (accessed together)
+    uint64_t id;
+    double price;
+    uint32_t quantity;
+    char symbol[8];  // Inline, no allocation
+
+    // Cold fields later
+    // ... rarely accessed fields ...
+} __attribute__((aligned(64)));  // Cache line aligned
+```
+
+================================================================================
+10. BEST PRACTICES FOR LOW-LATENCY HFT
+================================================================================
+
+1. MEASURE EVERYTHING
+   - Always instrument critical paths
+   - Collect percentiles, not just averages
+   - Monitor continuously in production
+
+2. ELIMINATE VARIABILITY
+   - Disable CPU frequency scaling
+   - Disable hyperthreading
+   - Disable power management
+   - Use dedicated CPUs (isolcpus)
+
+3. MINIMIZE SYSTEM CALLS
+   - Pre-allocate all memory
+   - Use lock-free structures
+   - Avoid blocking operations
+   - Batch operations when possible
+
+4. OPTIMIZE DATA LAYOUT
+   - Align to cache lines (64 bytes)
+   - Keep hot data together
+   - Avoid unnecessary padding
+   - Use struct packing wisely
+
+5. USE APPROPRIATE SYNCHRONIZATION
+   - Atomic operations for counters
+   - Lock-free queues for producer-consumer
+   - Avoid mutexes in hot path
+   - Pin memory to prevent paging
+
+6. PROFILE REGULARLY
+   - Weekly perf analysis
+   - Continuous latency monitoring
+   - Automated alerts for degradation
+   - Compare against baseline
+
+7. TEST WORST-CASE SCENARIOS
+   - Maximum load testing
+   - Sustained high-frequency operation
+   - Recovery from outliers
+   - Degraded mode operation
+
+8. IMPLEMENT CIRCUIT BREAKERS
+   ```cpp
+   if (recent_p99_latency > threshold) {
+       // Stop trading or reduce frequency
+       enter_degraded_mode();
+   }
+   ```
+
+9. DOCUMENT LATENCY BUDGET
+   ```
+   Total budget: 50µs
+   - Network:    15µs
+   - Parsing:     5µs
+   - Strategy:   10µs
+   - Order gen:   5µs
+   - Send:       15µs
+   ```
+
+10. CONTINUOUS OPTIMIZATION
+    - Regular code reviews for performance
+    - Benchmark every change
+    - A/B test optimizations
+    - Never regress on latency
+
+================================================================================
+END OF LATENCY DEBUGGING GUIDE
+================================================================================

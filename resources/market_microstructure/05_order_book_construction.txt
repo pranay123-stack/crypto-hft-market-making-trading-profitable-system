@@ -1,0 +1,882 @@
+================================================================================
+ORDER BOOK CONSTRUCTION FROM MARKET DATA FEEDS
+High-Frequency Trading System Documentation
+================================================================================
+
+TABLE OF CONTENTS
+--------------------------------------------------------------------------------
+1. Introduction to Order Book Construction
+2. Market Data Feed Types
+3. Message Processing Pipeline
+4. Incremental Book Building
+5. C++ Implementation
+6. Snapshot and Recovery
+7. Data Validation and Integrity
+8. Performance Optimization
+9. Cross-Venue Book Construction
+10. Real-World Implementation
+
+================================================================================
+1. INTRODUCTION TO ORDER BOOK CONSTRUCTION
+================================================================================
+
+Order book construction is the process of building and maintaining an accurate
+representation of the limit order book from market data feeds. This is
+fundamental for HFT systems that need:
+
+- Real-time view of market depth
+- Accurate price discovery
+- Order placement decisions
+- Market making strategies
+- Statistical arbitrage signals
+
+Key Challenges:
+1. High message rates (1M+ messages/second)
+2. Sub-microsecond processing requirements
+3. Handling missing or out-of-order messages
+4. Book snapshot recovery
+5. Multiple venue synchronization
+6. Data validation and error handling
+
+Message Flow:
+Exchange Matching Engine
+    ↓
+Market Data Gateway
+    ↓
+Network (Multicast/TCP)
+    ↓
+Feed Handler (Parser)
+    ↓
+Order Book Constructor
+    ↓
+Trading Strategy
+
+Latency Budget:
+- Network: 10-50 μs
+- Parser: 1-5 μs per message
+- Book Update: 1-10 μs
+- Strategy: 10-50 μs
+Total: 22-115 μs target
+
+================================================================================
+2. MARKET DATA FEED TYPES
+================================================================================
+
+2.1 LEVEL 1 (TOP-OF-BOOK)
+--------------------------
+Basic quote data: Best bid/ask prices and sizes.
+
+Structure:
+- Symbol
+- Best Bid Price
+- Best Bid Size
+- Best Ask Price
+- Best Ask Size
+- Last Trade Price
+- Last Trade Size
+- Timestamp
+
+Latency: Low (small messages)
+Use Case: Simple strategies, retail platforms
+
+2.2 LEVEL 2 (FULL DEPTH)
+-------------------------
+Complete order book with all price levels.
+
+Incremental Updates:
+- Add Order: New order enters book
+- Modify Order: Change size/price
+- Delete Order: Cancel order
+- Trade: Execution occurred
+
+Snapshot Messages:
+- Periodic full book state
+- Used for recovery/initialization
+
+Data Volume: High (100K-1M msg/sec per symbol)
+Use Case: HFT, market making, depth analysis
+
+2.3 LEVEL 3 (ORDER-LEVEL)
+--------------------------
+Individual order identifiers and modifications.
+
+Additional Information:
+- Order ID
+- Participant ID (sometimes)
+- Order attributes (IOC, FOK, etc.)
+- Detailed modification history
+
+Access: Typically restricted to market makers
+Use Case: Queue position tracking, order flow analysis
+
+2.4 TRADE DATA
+--------------
+Executed trades (separate from order book).
+
+Structure:
+- Symbol
+- Trade Price
+- Trade Size
+- Trade Time
+- Buyer/Seller Indicator (if available)
+- Trade Conditions
+
+Used For:
+- VWAP calculation
+- Volume analysis
+- Trade classification
+- Market impact estimation
+
+================================================================================
+3. MESSAGE PROCESSING PIPELINE
+================================================================================
+
+3.1 MARKET DATA PROTOCOLS
+--------------------------
+NASDAQ ITCH 5.0:
+- Binary protocol
+- ~20-40 bytes per message
+- Very efficient
+- Widely used format
+
+Message Types:
+'S' = System Event
+'R' = Stock Directory
+'H' = Stock Trading Action
+'Y' = Reg SHO Restriction
+'L' = Market Participant Position
+'A' = Add Order (no MPID)
+'F' = Add Order (with MPID)
+'E' = Order Executed
+'C' = Order Executed with Price
+'X' = Order Cancel
+'D' = Order Delete
+'U' = Order Replace
+'P' = Trade (non-cross)
+'Q' = Cross Trade
+'B' = Broken Trade
+
+3.2 MESSAGE PARSING
+--------------------
+Zero-copy parsing for performance:
+
+#include <cstdint>
+#include <cstring>
+#include <arpa/inet.h>
+
+#pragma pack(push, 1)
+
+struct ITCHMessageHeader {
+    uint16_t length;
+    char message_type;
+};
+
+struct ITCHAddOrder {
+    char message_type;           // 'A'
+    uint16_t stock_locate;
+    uint16_t tracking_number;
+    uint8_t timestamp[6];        // 48-bit nanoseconds
+    uint64_t order_reference;
+    char buy_sell_indicator;     // 'B' or 'S'
+    uint32_t shares;
+    char stock[8];
+    uint32_t price;              // Fixed-point * 10000
+};
+
+struct ITCHOrderExecuted {
+    char message_type;           // 'E'
+    uint16_t stock_locate;
+    uint16_t tracking_number;
+    uint8_t timestamp[6];
+    uint64_t order_reference;
+    uint32_t executed_shares;
+    uint64_t match_number;
+};
+
+struct ITCHOrderCancel {
+    char message_type;           // 'X'
+    uint16_t stock_locate;
+    uint16_t tracking_number;
+    uint8_t timestamp[6];
+    uint64_t order_reference;
+    uint32_t cancelled_shares;
+};
+
+struct ITCHOrderDelete {
+    char message_type;           // 'D'
+    uint16_t stock_locate;
+    uint16_t tracking_number;
+    uint8_t timestamp[6];
+    uint64_t order_reference;
+};
+
+struct ITCHOrderReplace {
+    char message_type;           // 'U'
+    uint16_t stock_locate;
+    uint16_t tracking_number;
+    uint8_t timestamp[6];
+    uint64_t original_order_reference;
+    uint64_t new_order_reference;
+    uint32_t shares;
+    uint32_t price;
+};
+
+#pragma pack(pop)
+
+// Helper to extract 48-bit timestamp
+inline uint64_t extract_timestamp_48(const uint8_t* data) {
+    uint64_t ts = 0;
+    ts |= static_cast<uint64_t>(data[0]) << 40;
+    ts |= static_cast<uint64_t>(data[1]) << 32;
+    ts |= static_cast<uint64_t>(data[2]) << 24;
+    ts |= static_cast<uint64_t>(data[3]) << 16;
+    ts |= static_cast<uint64_t>(data[4]) << 8;
+    ts |= static_cast<uint64_t>(data[5]);
+    return ts;
+}
+
+// Network byte order conversion
+inline uint32_t ntoh32(uint32_t x) {
+    return ntohl(x);
+}
+
+inline uint64_t ntoh64(uint64_t x) {
+    return be64toh(x);
+}
+
+3.3 FAST MESSAGE DISPATCH
+--------------------------
+Use function pointer table for fast dispatch without branches:
+
+class MessageDispatcher {
+private:
+    using MessageHandler = void (*)(const uint8_t*, void*);
+
+    MessageHandler handlers_[256];
+    void* context_;
+
+public:
+    MessageDispatcher(void* context) : context_(context) {
+        // Initialize all to nullptr
+        std::fill(std::begin(handlers_), std::end(handlers_), nullptr);
+
+        // Register handlers
+        handlers_['A'] = &handle_add_order;
+        handlers_['E'] = &handle_order_executed;
+        handlers_['X'] = &handle_order_cancel;
+        handlers_['D'] = &handle_order_delete;
+        handlers_['U'] = &handle_order_replace;
+    }
+
+    inline void dispatch(const uint8_t* message) __attribute__((always_inline)) {
+        char msg_type = message[0];
+        MessageHandler handler = handlers_[static_cast<uint8_t>(msg_type)];
+
+        if (handler) {
+            handler(message, context_);
+        }
+    }
+
+private:
+    static void handle_add_order(const uint8_t* data, void* ctx);
+    static void handle_order_executed(const uint8_t* data, void* ctx);
+    static void handle_order_cancel(const uint8_t* data, void* ctx);
+    static void handle_order_delete(const uint8_t* data, void* ctx);
+    static void handle_order_replace(const uint8_t* data, void* ctx);
+};
+
+================================================================================
+4. INCREMENTAL BOOK BUILDING
+================================================================================
+
+4.1 ORDER BOOK DATA STRUCTURE
+------------------------------
+Efficient representation optimized for updates:
+
+using Price = int64_t;
+using Volume = int64_t;
+using OrderRef = uint64_t;
+
+struct Order {
+    OrderRef ref;
+    Price price;
+    Volume volume;
+    uint64_t timestamp_ns;
+    bool is_buy;
+};
+
+struct PriceLevel {
+    Price price;
+    Volume total_volume;
+    std::list<Order> orders;  // FIFO queue
+
+    void add_order(const Order& order) {
+        orders.push_back(order);
+        total_volume += order.volume;
+    }
+
+    bool remove_order(OrderRef ref) {
+        for (auto it = orders.begin(); it != orders.end(); ++it) {
+            if (it->ref == ref) {
+                total_volume -= it->volume;
+                orders.erase(it);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool modify_order(OrderRef ref, Volume new_volume) {
+        for (auto& order : orders) {
+            if (order.ref == ref) {
+                total_volume = total_volume - order.volume + new_volume;
+                order.volume = new_volume;
+                return true;
+            }
+        }
+        return false;
+    }
+};
+
+class OrderBook {
+private:
+    // Price levels sorted for fast access to best bid/ask
+    std::map<Price, PriceLevel, std::greater<Price>> bids_;  // Descending
+    std::map<Price, PriceLevel> asks_;                        // Ascending
+
+    // Fast order lookup
+    std::unordered_map<OrderRef, Price> order_to_price_;
+    std::unordered_map<OrderRef, bool> order_to_side_;  // true = buy
+
+    uint64_t last_update_ns_ = 0;
+    uint64_t sequence_number_ = 0;
+
+public:
+    // Add order to book
+    void add_order(OrderRef ref, Price price, Volume volume,
+                   bool is_buy, uint64_t timestamp_ns) {
+        Order order{ref, price, volume, timestamp_ns, is_buy};
+
+        if (is_buy) {
+            bids_[price].add_order(order);
+        } else {
+            asks_[price].add_order(order);
+        }
+
+        order_to_price_[ref] = price;
+        order_to_side_[ref] = is_buy;
+
+        last_update_ns_ = timestamp_ns;
+        sequence_number_++;
+    }
+
+    // Remove order
+    bool remove_order(OrderRef ref, uint64_t timestamp_ns) {
+        auto price_it = order_to_price_.find(ref);
+        if (price_it == order_to_price_.end()) {
+            return false;  // Order not found
+        }
+
+        Price price = price_it->second;
+        bool is_buy = order_to_side_[ref];
+
+        bool removed = false;
+        if (is_buy) {
+            auto level_it = bids_.find(price);
+            if (level_it != bids_.end()) {
+                removed = level_it->second.remove_order(ref);
+                if (level_it->second.orders.empty()) {
+                    bids_.erase(level_it);
+                }
+            }
+        } else {
+            auto level_it = asks_.find(price);
+            if (level_it != asks_.end()) {
+                removed = level_it->second.remove_order(ref);
+                if (level_it->second.orders.empty()) {
+                    asks_.erase(level_it);
+                }
+            }
+        }
+
+        if (removed) {
+            order_to_price_.erase(price_it);
+            order_to_side_.erase(ref);
+            last_update_ns_ = timestamp_ns;
+            sequence_number_++;
+        }
+
+        return removed;
+    }
+
+    // Modify order volume
+    bool modify_order(OrderRef ref, Volume new_volume, uint64_t timestamp_ns) {
+        auto price_it = order_to_price_.find(ref);
+        if (price_it == order_to_price_.end()) {
+            return false;
+        }
+
+        Price price = price_it->second;
+        bool is_buy = order_to_side_[ref];
+
+        bool modified = false;
+        if (is_buy) {
+            auto level_it = bids_.find(price);
+            if (level_it != bids_.end()) {
+                modified = level_it->second.modify_order(ref, new_volume);
+            }
+        } else {
+            auto level_it = asks_.find(price);
+            if (level_it != asks_.end()) {
+                modified = level_it->second.modify_order(ref, new_volume);
+            }
+        }
+
+        if (modified) {
+            last_update_ns_ = timestamp_ns;
+            sequence_number_++;
+        }
+
+        return modified;
+    }
+
+    // Execute order (partial or full)
+    bool execute_order(OrderRef ref, Volume executed_volume, uint64_t timestamp_ns) {
+        auto price_it = order_to_price_.find(ref);
+        if (price_it == order_to_price_.end()) {
+            return false;
+        }
+
+        Price price = price_it->second;
+        bool is_buy = order_to_side_[ref];
+
+        // Find order and reduce volume
+        bool executed = false;
+        if (is_buy) {
+            auto level_it = bids_.find(price);
+            if (level_it != bids_.end()) {
+                for (auto it = level_it->second.orders.begin();
+                     it != level_it->second.orders.end(); ++it) {
+                    if (it->ref == ref) {
+                        if (executed_volume >= it->volume) {
+                            // Fully executed
+                            level_it->second.total_volume -= it->volume;
+                            level_it->second.orders.erase(it);
+                            order_to_price_.erase(ref);
+                            order_to_side_.erase(ref);
+
+                            if (level_it->second.orders.empty()) {
+                                bids_.erase(level_it);
+                            }
+                        } else {
+                            // Partially executed
+                            it->volume -= executed_volume;
+                            level_it->second.total_volume -= executed_volume;
+                        }
+                        executed = true;
+                        break;
+                    }
+                }
+            }
+        } else {
+            auto level_it = asks_.find(price);
+            if (level_it != asks_.end()) {
+                for (auto it = level_it->second.orders.begin();
+                     it != level_it->second.orders.end(); ++it) {
+                    if (it->ref == ref) {
+                        if (executed_volume >= it->volume) {
+                            level_it->second.total_volume -= it->volume;
+                            level_it->second.orders.erase(it);
+                            order_to_price_.erase(ref);
+                            order_to_side_.erase(ref);
+
+                            if (level_it->second.orders.empty()) {
+                                asks_.erase(level_it);
+                            }
+                        } else {
+                            it->volume -= executed_volume;
+                            level_it->second.total_volume -= executed_volume;
+                        }
+                        executed = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (executed) {
+            last_update_ns_ = timestamp_ns;
+            sequence_number_++;
+        }
+
+        return executed;
+    }
+
+    // Replace order (loses time priority)
+    bool replace_order(OrderRef old_ref, OrderRef new_ref,
+                      Price new_price, Volume new_volume,
+                      uint64_t timestamp_ns) {
+        // Remove old order
+        auto price_it = order_to_price_.find(old_ref);
+        if (price_it == order_to_price_.end()) {
+            return false;
+        }
+
+        bool is_buy = order_to_side_[old_ref];
+        remove_order(old_ref, timestamp_ns);
+
+        // Add new order
+        add_order(new_ref, new_price, new_volume, is_buy, timestamp_ns);
+
+        return true;
+    }
+
+    // Query methods
+    std::optional<std::pair<Price, Volume>> best_bid() const {
+        if (bids_.empty()) return std::nullopt;
+        const auto& level = bids_.begin()->second;
+        return std::make_pair(level.price, level.total_volume);
+    }
+
+    std::optional<std::pair<Price, Volume>> best_ask() const {
+        if (asks_.empty()) return std::nullopt;
+        const auto& level = asks_.begin()->second;
+        return std::make_pair(level.price, level.total_volume);
+    }
+
+    std::optional<Price> spread() const {
+        auto bb = best_bid();
+        auto ba = best_ask();
+        if (!bb || !ba) return std::nullopt;
+        return ba->first - bb->first;
+    }
+
+    double mid_price() const {
+        auto bb = best_bid();
+        auto ba = best_ask();
+        if (!bb || !ba) return 0.0;
+        return (bb->first + ba->first) / 2.0;
+    }
+
+    uint64_t last_update_time() const { return last_update_ns_; }
+    uint64_t sequence_number() const { return sequence_number_; }
+
+    size_t total_orders() const {
+        return order_to_price_.size();
+    }
+
+    const std::map<Price, PriceLevel, std::greater<Price>>& bids() const {
+        return bids_;
+    }
+
+    const std::map<Price, PriceLevel>& asks() const {
+        return asks_;
+    }
+};
+
+4.2 FEED HANDLER
+----------------
+Process ITCH messages and update order book:
+
+class ITCHFeedHandler {
+private:
+    OrderBook& book_;
+    MessageDispatcher dispatcher_;
+
+public:
+    explicit ITCHFeedHandler(OrderBook& book)
+        : book_(book), dispatcher_(this) {}
+
+    void process_message(const uint8_t* data, size_t length) {
+        dispatcher_.dispatch(data);
+    }
+
+    // Message handlers
+    static void handle_add_order(const uint8_t* data, void* ctx) {
+        auto* handler = static_cast<ITCHFeedHandler*>(ctx);
+        const auto* msg = reinterpret_cast<const ITCHAddOrder*>(data);
+
+        OrderRef ref = ntoh64(msg->order_reference);
+        Price price = ntoh32(msg->price);
+        Volume volume = ntoh32(msg->shares);
+        bool is_buy = (msg->buy_sell_indicator == 'B');
+        uint64_t timestamp = extract_timestamp_48(msg->timestamp);
+
+        handler->book_.add_order(ref, price, volume, is_buy, timestamp);
+    }
+
+    static void handle_order_executed(const uint8_t* data, void* ctx) {
+        auto* handler = static_cast<ITCHFeedHandler*>(ctx);
+        const auto* msg = reinterpret_cast<const ITCHOrderExecuted*>(data);
+
+        OrderRef ref = ntoh64(msg->order_reference);
+        Volume executed = ntoh32(msg->executed_shares);
+        uint64_t timestamp = extract_timestamp_48(msg->timestamp);
+
+        handler->book_.execute_order(ref, executed, timestamp);
+    }
+
+    static void handle_order_cancel(const uint8_t* data, void* ctx) {
+        auto* handler = static_cast<ITCHFeedHandler*>(ctx);
+        const auto* msg = reinterpret_cast<const ITCHOrderCancel*>(data);
+
+        OrderRef ref = ntoh64(msg->order_reference);
+        Volume cancelled = ntoh32(msg->cancelled_shares);
+        uint64_t timestamp = extract_timestamp_48(msg->timestamp);
+
+        // Partial cancel = execute with reduced volume
+        handler->book_.execute_order(ref, cancelled, timestamp);
+    }
+
+    static void handle_order_delete(const uint8_t* data, void* ctx) {
+        auto* handler = static_cast<ITCHFeedHandler*>(ctx);
+        const auto* msg = reinterpret_cast<const ITCHOrderDelete*>(data);
+
+        OrderRef ref = ntoh64(msg->order_reference);
+        uint64_t timestamp = extract_timestamp_48(msg->timestamp);
+
+        handler->book_.remove_order(ref, timestamp);
+    }
+
+    static void handle_order_replace(const uint8_t* data, void* ctx) {
+        auto* handler = static_cast<ITCHFeedHandler*>(ctx);
+        const auto* msg = reinterpret_cast<const ITCHOrderReplace*>(data);
+
+        OrderRef old_ref = ntoh64(msg->original_order_reference);
+        OrderRef new_ref = ntoh64(msg->new_order_reference);
+        Price price = ntoh32(msg->price);
+        Volume volume = ntoh32(msg->shares);
+        uint64_t timestamp = extract_timestamp_48(msg->timestamp);
+
+        handler->book_.replace_order(old_ref, new_ref, price, volume, timestamp);
+    }
+};
+
+================================================================================
+5. SNAPSHOT AND RECOVERY
+================================================================================
+
+5.1 SNAPSHOT MESSAGES
+----------------------
+Periodic full book state for recovery:
+
+struct OrderBookSnapshot {
+    char symbol[8];
+    uint64_t sequence_number;
+    uint64_t timestamp_ns;
+
+    uint32_t num_bid_levels;
+    uint32_t num_ask_levels;
+
+    struct Level {
+        Price price;
+        Volume volume;
+        uint32_t num_orders;
+    };
+
+    std::vector<Level> bid_levels;
+    std::vector<Level> ask_levels;
+};
+
+class SnapshotHandler {
+public:
+    void load_snapshot(OrderBook& book, const OrderBookSnapshot& snapshot) {
+        // Clear existing book
+        // (Would need to add clear() method to OrderBook)
+
+        // Load bid levels
+        for (const auto& level : snapshot.bid_levels) {
+            // Create synthetic order references for snapshot levels
+            // In practice, snapshots may not have individual orders
+            OrderRef ref = generate_ref();
+            book.add_order(ref, level.price, level.volume, true, snapshot.timestamp_ns);
+        }
+
+        // Load ask levels
+        for (const auto& level : snapshot.ask_levels) {
+            OrderRef ref = generate_ref();
+            book.add_order(ref, level.price, level.volume, false, snapshot.timestamp_ns);
+        }
+    }
+
+private:
+    OrderRef ref_counter_ = 1;
+
+    OrderRef generate_ref() {
+        return ref_counter_++;
+    }
+};
+
+5.2 GAP DETECTION AND RECOVERY
+-------------------------------
+Detect missing messages and request retransmission:
+
+class GapDetector {
+private:
+    uint64_t expected_seq_ = 1;
+    uint64_t last_seen_seq_ = 0;
+
+    struct Gap {
+        uint64_t start_seq;
+        uint64_t end_seq;
+        uint64_t detected_time_us;
+    };
+
+    std::vector<Gap> detected_gaps_;
+
+public:
+    bool check_sequence(uint64_t seq_num) {
+        if (seq_num == expected_seq_) {
+            expected_seq_++;
+            last_seen_seq_ = seq_num;
+            return true;  // In sequence
+        }
+
+        if (seq_num < expected_seq_) {
+            // Duplicate or late message
+            return false;
+        }
+
+        // Gap detected
+        detected_gaps_.push_back({
+            expected_seq_,
+            seq_num - 1,
+            get_timestamp_us()
+        });
+
+        expected_seq_ = seq_num + 1;
+        last_seen_seq_ = seq_num;
+
+        return false;  // Gap detected
+    }
+
+    std::vector<Gap> get_gaps() const {
+        return detected_gaps_;
+    }
+
+    void clear_gaps() {
+        detected_gaps_.clear();
+    }
+
+private:
+    uint64_t get_timestamp_us() {
+        return std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+};
+
+================================================================================
+6. PERFORMANCE OPTIMIZATION
+================================================================================
+
+6.1 MEMORY POOL ALLOCATION
+---------------------------
+Pre-allocate order objects to avoid dynamic allocation:
+
+template<typename T>
+class ObjectPool {
+private:
+    std::vector<T*> free_list_;
+    std::vector<std::unique_ptr<T[]>> blocks_;
+
+    static constexpr size_t BLOCK_SIZE = 1024;
+
+public:
+    ObjectPool() {
+        allocate_block();
+    }
+
+    T* allocate() {
+        if (free_list_.empty()) {
+            allocate_block();
+        }
+
+        T* obj = free_list_.back();
+        free_list_.pop_back();
+        return obj;
+    }
+
+    void deallocate(T* obj) {
+        free_list_.push_back(obj);
+    }
+
+private:
+    void allocate_block() {
+        auto block = std::make_unique<T[]>(BLOCK_SIZE);
+
+        for (size_t i = 0; i < BLOCK_SIZE; ++i) {
+            free_list_.push_back(&block[i]);
+        }
+
+        blocks_.push_back(std::move(block));
+    }
+};
+
+6.2 LOCK-FREE ORDER BOOK
+-------------------------
+Single writer, multiple readers:
+
+class LockFreeOrderBook {
+private:
+    std::atomic<OrderBook*> current_book_;
+    ObjectPool<OrderBook> book_pool_;
+
+public:
+    LockFreeOrderBook() {
+        current_book_.store(book_pool_.allocate());
+    }
+
+    // Writer (single thread)
+    void update(const std::function<void(OrderBook&)>& updater) {
+        OrderBook* old_book = current_book_.load(std::memory_order_acquire);
+        OrderBook* new_book = book_pool_.allocate();
+
+        // Copy-on-write
+        *new_book = *old_book;
+
+        // Apply update
+        updater(*new_book);
+
+        // Swap
+        current_book_.store(new_book, std::memory_order_release);
+
+        // Return old book to pool (after grace period)
+        book_pool_.deallocate(old_book);
+    }
+
+    // Readers (multiple threads)
+    const OrderBook* read() const {
+        return current_book_.load(std::memory_order_acquire);
+    }
+};
+
+================================================================================
+SUMMARY
+================================================================================
+
+Order book construction requires:
+- Efficient message parsing (zero-copy)
+- Fast data structures (maps, lists)
+- Incremental updates (add, modify, delete)
+- Snapshot recovery
+- Gap detection and handling
+- Performance optimization (memory pools, lock-free)
+
+Key metrics:
+- Processing latency: <10 μs per message
+- Throughput: 1M+ messages/second
+- Memory efficiency: <100 MB per symbol
+- Update accuracy: 100%
+
+Implementation considerations:
+- Choose appropriate data structures
+- Optimize hot paths
+- Profile and benchmark
+- Test with production-like data
+- Handle edge cases and errors
+
+================================================================================
+Version: 1.0
+Last Updated: 2025-11-26
+Total Size: ~22 KB
+================================================================================

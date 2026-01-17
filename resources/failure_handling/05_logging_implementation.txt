@@ -1,0 +1,771 @@
+================================================================================
+                      LOGGING IMPLEMENTATION GUIDE
+                    spdlog Integration & Best Practices
+================================================================================
+
+DOCUMENT: Logging Implementation with spdlog
+VERSION: 2.1.0
+LAST UPDATED: 2025-11-26
+SCOPE: Practical logging implementation for HFT systems
+
+================================================================================
+                          TABLE OF CONTENTS
+================================================================================
+
+1. spdlog Overview & Setup
+2. Custom Formatters for Trading Data
+3. Log Rotation Strategies
+4. Centralized Logging Infrastructure  
+5. Performance Tuning
+6. Multi-Sink Configuration
+7. Error Handling in Logging
+8. Production Deployment
+9. Code Examples
+
+================================================================================
+                     1. SPDLOG OVERVIEW & SETUP
+================================================================================
+
+WHY SPDLOG:
+-----------
+- Header-only library (easy integration)
+- Exceptionally fast (async logging < 1μs)
+- Feature-rich (formatters, sinks, patterns)
+- Thread-safe
+- Zero-copy when possible
+- Proven in production HFT systems
+
+INSTALLATION:
+-------------
+# Via package manager
+sudo apt-get install libspdlog-dev
+
+# Or from source
+git clone https://github.com/gabime/spdlog.git
+cd spdlog && mkdir build && cd build
+cmake .. && make -j && sudo make install
+
+BASIC SETUP:
+------------
+
+#include <spdlog/spdlog.h>
+#include <spdlog/async.h>
+#include <spdlog/sinks/rotating_file_sink.h>
+#include <spdlog/sinks/stdout_color_sinks.h>
+
+namespace hft::logging {
+
+class LoggerSetup {
+public:
+    static void initialize() {
+        try {
+            // Configure async logging
+            spdlog::init_thread_pool(
+                8192,    // Queue size
+                1        // Background thread count
+            );
+            
+            // Create rotating file sink
+            auto file_sink = std::make_shared<
+                spdlog::sinks::rotating_file_sink_mt>(
+                "/var/log/hft/trading.log",
+                1024 * 1024 * 100,  // 100MB per file
+                10                   // Keep 10 files
+            );
+            
+            // Create console sink for development
+            auto console_sink = std::make_shared<
+                spdlog::sinks::stdout_color_sink_mt>();
+            
+            // Combine sinks
+            std::vector<spdlog::sink_ptr> sinks{file_sink, console_sink};
+            
+            // Create async logger
+            auto logger = std::make_shared<spdlog::async_logger>(
+                "hft_main",
+                sinks.begin(),
+                sinks.end(),
+                spdlog::thread_pool(),
+                spdlog::async_overflow_policy::block
+            );
+            
+            // Set pattern
+            logger->set_pattern(
+                "[%Y-%m-%d %H:%M:%S.%e] [%n] [%^%l%$] [thread %t] %v"
+            );
+            
+            // Set level
+            logger->set_level(spdlog::level::info);
+            
+            // Register as default logger
+            spdlog::set_default_logger(logger);
+            
+            // Flush every 5 seconds
+            spdlog::flush_every(std::chrono::seconds(5));
+            
+            spdlog::info("Logging system initialized");
+            
+        } catch (const spdlog::spdlog_ex& ex) {
+            std::cerr << "Log initialization failed: " << ex.what() << std::endl;
+            throw;
+        }
+    }
+    
+    static void shutdown() {
+        spdlog::info("Shutting down logging system");
+        spdlog::shutdown();
+    }
+};
+
+} // namespace hft::logging
+
+LOGGER REGISTRY:
+----------------
+
+class LoggerRegistry {
+private:
+    std::unordered_map<std::string, std::shared_ptr<spdlog::logger>> loggers_;
+    std::mutex mutex_;
+    
+public:
+    std::shared_ptr<spdlog::logger> get_logger(
+        const std::string& name,
+        bool create_if_missing = true
+    ) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        
+        auto it = loggers_.find(name);
+        if (it != loggers_.end()) {
+            return it->second;
+        }
+        
+        if (!create_if_missing) {
+            return nullptr;
+        }
+        
+        // Create new logger
+        auto logger = spdlog::get(name);
+        if (!logger) {
+            logger = spdlog::default_logger()->clone(name);
+            spdlog::register_logger(logger);
+        }
+        
+        loggers_[name] = logger;
+        return logger;
+    }
+    
+    void set_level_all(spdlog::level::level_enum level) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        
+        for (auto& [name, logger] : loggers_) {
+            logger->set_level(level);
+        }
+        
+        spdlog::info("Set log level to {} for all loggers",
+                    spdlog::level::to_string_view(level));
+    }
+};
+
+================================================================================
+                2. CUSTOM FORMATTERS FOR TRADING DATA
+================================================================================
+
+JSON FORMATTER:
+---------------
+
+#include <spdlog/pattern_formatter.h>
+#include <nlohmann/json.hpp>
+
+class JsonFormatter : public spdlog::custom_flag_formatter {
+public:
+    void format(const spdlog::details::log_msg& msg,
+               const std::tm& tm_time,
+               spdlog::memory_buf_t& dest) override {
+        nlohmann::json log_entry;
+        
+        // Timestamp (nanosecond precision)
+        auto now = std::chrono::system_clock::now();
+        auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            now.time_since_epoch()).count();
+        
+        log_entry["timestamp_ns"] = ns;
+        log_entry["timestamp"] = format_timestamp(tm_time);
+        log_entry["level"] = spdlog::level::to_string_view(msg.level).data();
+        log_entry["logger"] = std::string(msg.logger_name.begin(),
+                                          msg.logger_name.end());
+        log_entry["thread_id"] = msg.thread_id;
+        log_entry["message"] = std::string(msg.payload.begin(),
+                                           msg.payload.end());
+        
+        // Add context if available
+        if (auto* ctx = get_thread_context()) {
+            log_entry["context"] = *ctx;
+        }
+        
+        // Add correlation ID
+        if (auto corr_id = CorrelationIdManager::get_current();
+            !corr_id.empty()) {
+            log_entry["correlation_id"] = corr_id;
+        }
+        
+        std::string json_str = log_entry.dump();
+        dest.append(json_str.data(), json_str.data() + json_str.size());
+    }
+    
+    std::unique_ptr<custom_flag_formatter> clone() const override {
+        return std::make_unique<JsonFormatter>();
+    }
+    
+private:
+    std::string format_timestamp(const std::tm& tm_time) {
+        char buffer[64];
+        std::strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%S", &tm_time);
+        
+        auto now = std::chrono::system_clock::now();
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now.time_since_epoch()) % 1000;
+        auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+            now.time_since_epoch()) % 1000;
+        auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            now.time_since_epoch()) % 1000;
+        
+        std::string result = buffer;
+        result += fmt::format(".{:03d}{:03d}{:03d}Z", ms.count(),
+                             us.count(), ns.count());
+        return result;
+    }
+};
+
+// Register custom formatter
+auto formatter = std::make_unique<spdlog::pattern_formatter>();
+formatter->add_flag<JsonFormatter>('*').set_pattern("%*");
+logger->set_formatter(std::move(formatter));
+
+TRADING-SPECIFIC FORMATTER:
+----------------------------
+
+class TradingDataFormatter {
+public:
+    static std::string format_order(const Order& order) {
+        return fmt::format(
+            "Order[id={}, symbol={}, side={}, qty={}, price={:.2f}, "
+            "status={}, exchange={}]",
+            order.id,
+            order.symbol,
+            order.side == Side::BUY ? "BUY" : "SELL",
+            order.quantity,
+            order.price,
+            to_string(order.status),
+            order.exchange
+        );
+    }
+    
+    static std::string format_fill(const Fill& fill) {
+        return fmt::format(
+            "Fill[order_id={}, qty={}, price={:.2f}, "
+            "commission={:.4f}, timestamp={}]",
+            fill.order_id,
+            fill.quantity,
+            fill.price,
+            fill.commission,
+            fill.timestamp
+        );
+    }
+    
+    static std::string format_position(const Position& pos) {
+        return fmt::format(
+            "Position[symbol={}, qty={}, avg_price={:.2f}, "
+            "unrealized_pnl={:.2f}, realized_pnl={:.2f}]",
+            pos.symbol,
+            pos.quantity,
+            pos.avg_price,
+            pos.unrealized_pnl,
+            pos.realized_pnl
+        );
+    }
+    
+    static std::string format_market_data(const Quote& quote) {
+        return fmt::format(
+            "Quote[symbol={}, bid={:.2f}x{}, ask={:.2f}x{}, "
+            "spread={:.2f}, timestamp={}]",
+            quote.symbol,
+            quote.bid_price,
+            quote.bid_size,
+            quote.ask_price,
+            quote.ask_size,
+            quote.ask_price - quote.bid_price,
+            quote.timestamp
+        );
+    }
+};
+
+// Usage:
+logger->info("Order submitted: {}",
+            TradingDataFormatter::format_order(order));
+
+================================================================================
+                    3. LOG ROTATION STRATEGIES
+================================================================================
+
+3.1 SIZE-BASED ROTATION
+------------------------
+
+// Rotate when file reaches 100MB, keep 10 files
+auto rotating_sink = std::make_shared<
+    spdlog::sinks::rotating_file_sink_mt>(
+    "/var/log/hft/trading.log",
+    1024 * 1024 * 100,  // 100 MB max file size
+    10                   // Keep 10 rotated files
+);
+
+// Files created:
+// trading.log        (current)
+// trading.log.1      (most recent rotation)
+// trading.log.2
+// ...
+// trading.log.10     (oldest, will be deleted on next rotation)
+
+3.2 TIME-BASED ROTATION
+------------------------
+
+#include <spdlog/sinks/daily_file_sink.h>
+
+// Rotate daily at midnight
+auto daily_sink = std::make_shared<spdlog::sinks::daily_file_sink_mt>(
+    "/var/log/hft/trading.log",
+    0,   // Hour (midnight)
+    0,   // Minute
+    false,  // Don't truncate
+    10   // Keep 10 days
+);
+
+// Files created:
+// trading_2025-11-26.log
+// trading_2025-11-25.log
+// trading_2025-11-24.log
+// ...
+
+3.3 HOURLY ROTATION
+-------------------
+
+#include <spdlog/sinks/hourly_file_sink.h>
+
+auto hourly_sink = std::make_shared<spdlog::sinks::hourly_file_sink_mt>(
+    "/var/log/hft/trading.log",
+    false,  // Don't truncate
+    24      // Keep 24 hours
+);
+
+// Files created:
+// trading_2025-11-26_10.log
+// trading_2025-11-26_09.log
+// ...
+
+3.4 CUSTOM ROTATION POLICY
+---------------------------
+
+class CustomRotatingSink : public spdlog::sinks::base_sink<std::mutex> {
+private:
+    std::string base_filename_;
+    std::size_t max_size_;
+    std::size_t max_files_;
+    std::ofstream file_stream_;
+    std::size_t current_size_{0};
+    std::size_t file_index_{0};
+    
+public:
+    CustomRotatingSink(
+        const std::string& base_filename,
+        std::size_t max_size,
+        std::size_t max_files
+    ) : base_filename_(base_filename),
+        max_size_(max_size),
+        max_files_(max_files) {
+        open_file();
+    }
+    
+protected:
+    void sink_it_(const spdlog::details::log_msg& msg) override {
+        // Check if rotation needed
+        if (should_rotate(msg.payload.size())) {
+            rotate_files();
+        }
+        
+        // Write message
+        spdlog::memory_buf_t formatted;
+        formatter_->format(msg, formatted);
+        
+        file_stream_.write(formatted.data(), formatted.size());
+        current_size_ += formatted.size();
+        
+        // Conditional flush based on severity
+        if (msg.level >= spdlog::level::warn) {
+            file_stream_.flush();
+        }
+    }
+    
+    void flush_() override {
+        file_stream_.flush();
+    }
+    
+private:
+    bool should_rotate(std::size_t msg_size) {
+        // Rotate if:
+        // 1. Size limit reached
+        if (current_size_ + msg_size > max_size_) {
+            return true;
+        }
+        
+        // 2. Time-based (every hour)
+        static auto last_rotation = std::chrono::system_clock::now();
+        auto now = std::chrono::system_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::hours>(
+            now - last_rotation);
+        
+        if (elapsed.count() >= 1) {
+            last_rotation = now;
+            return true;
+        }
+        
+        return false;
+    }
+    
+    void rotate_files() {
+        file_stream_.close();
+        
+        // Delete oldest file if limit reached
+        if (file_index_ >= max_files_) {
+            std::string oldest_file = fmt::format(
+                "{}.{}", base_filename_, file_index_ - max_files_ + 1
+            );
+            std::remove(oldest_file.c_str());
+        }
+        
+        // Rename current file
+        std::string rotated_file = fmt::format(
+            "{}.{}", base_filename_, ++file_index_
+        );
+        std::rename(base_filename_.c_str(), rotated_file.c_str());
+        
+        // Open new file
+        open_file();
+        current_size_ = 0;
+    }
+    
+    void open_file() {
+        file_stream_.open(base_filename_,
+                         std::ios::out | std::ios::app);
+        
+        if (!file_stream_.is_open()) {
+            throw spdlog::spdlog_ex("Failed to open log file: " +
+                                   base_filename_);
+        }
+    }
+};
+
+================================================================================
+                4. CENTRALIZED LOGGING INFRASTRUCTURE
+================================================================================
+
+4.1 ELK STACK INTEGRATION
+--------------------------
+
+ARCHITECTURE:
+    [HFT Application]
+           |
+           v
+    [spdlog with JSON formatter]
+           |
+           v
+    [Filebeat] -----> [Logstash] -----> [Elasticsearch]
+                                              |
+                                              v
+                                         [Kibana]
+
+FILEBEAT CONFIGURATION:
+-----------------------
+
+# /etc/filebeat/filebeat.yml
+filebeat.inputs:
+- type: log
+  enabled: true
+  paths:
+    - /var/log/hft/*.log
+  
+  # JSON parsing
+  json.keys_under_root: true
+  json.add_error_key: true
+  
+  # Fields
+  fields:
+    environment: production
+    application: hft-trading
+    datacenter: dc1
+  fields_under_root: true
+
+# Multiline support for stack traces
+multiline.pattern: '^{'
+multiline.negate: true
+multiline.match: after
+
+# Output to Logstash
+output.logstash:
+  hosts: ["logstash:5044"]
+  compression_level: 3
+  bulk_max_size: 2048
+
+# Monitoring
+monitoring.enabled: true
+
+LOGSTASH CONFIGURATION:
+-----------------------
+
+# /etc/logstash/conf.d/hft.conf
+input {
+  beats {
+    port => 5044
+  }
+}
+
+filter {
+  # Parse JSON
+  json {
+    source => "message"
+  }
+  
+  # Add geolocation
+  geoip {
+    source => "client_ip"
+  }
+  
+  # Parse timestamp
+  date {
+    match => [ "timestamp", "ISO8601" ]
+    target => "@timestamp"
+  }
+  
+  # Extract error codes
+  if [error_code] {
+    mutate {
+      add_field => {
+        "error_severity" => "%{[error_code]}"
+      }
+    }
+  }
+  
+  # Enrich with additional data
+  if [symbol] {
+    elasticsearch {
+      hosts => ["elasticsearch:9200"]
+      index => "symbols"
+      query => "symbol:%{[symbol]}"
+      fields => {
+        "sector" => "sector"
+        "market_cap" => "market_cap"
+      }
+    }
+  }
+}
+
+output {
+  elasticsearch {
+    hosts => ["elasticsearch:9200"]
+    index => "hft-logs-%{+YYYY.MM.dd}"
+    
+    # Use bulk API for performance
+    flush_size => 5000
+    idle_flush_time => 5
+  }
+  
+  # Also output critical errors to separate index
+  if [level] == "CRITICAL" or [level] == "FATAL" {
+    elasticsearch {
+      hosts => ["elasticsearch:9200"]
+      index => "hft-critical-%{+YYYY.MM.dd}"
+    }
+  }
+}
+
+ELASTICSEARCH INDEX TEMPLATE:
+------------------------------
+
+PUT _index_template/hft-logs
+{
+  "index_patterns": ["hft-logs-*"],
+  "template": {
+    "settings": {
+      "number_of_shards": 3,
+      "number_of_replicas": 1,
+      "refresh_interval": "5s",
+      "index.codec": "best_compression"
+    },
+    "mappings": {
+      "properties": {
+        "@timestamp": { "type": "date" },
+        "level": { "type": "keyword" },
+        "logger": { "type": "keyword" },
+        "message": { "type": "text" },
+        "thread_id": { "type": "long" },
+        "correlation_id": { "type": "keyword" },
+        "order_id": { "type": "keyword" },
+        "symbol": { "type": "keyword" },
+        "error_code": { "type": "integer" },
+        "latency_us": { "type": "long" },
+        "context": { "type": "object", "enabled": true }
+      }
+    }
+  }
+}
+
+4.2 DISTRIBUTED TRACING
+------------------------
+
+#include <opentelemetry/trace/provider.h>
+#include <opentelemetry/exporters/jaeger/jaeger_exporter.h>
+
+class DistributedTracingLogger {
+private:
+    std::shared_ptr<spdlog::logger> logger_;
+    opentelemetry::trace::Tracer* tracer_;
+    
+public:
+    void log_with_trace(spdlog::level::level_enum level,
+                       const std::string& message,
+                       const ContextMap& context = {}) {
+        // Get current span
+        auto span = tracer_->GetCurrentSpan();
+        
+        // Add log as span event
+        span->AddEvent(message, {
+            {"log.level", spdlog::level::to_string_view(level).data()},
+            {"log.logger", logger_->name()}
+        });
+        
+        // Also log normally
+        logger_->log(level, "{} [trace_id={}, span_id={}]",
+                    message,
+                    span->GetContext().trace_id().ToHex(),
+                    span->GetContext().span_id().ToHex());
+    }
+};
+
+================================================================================
+                      5. PERFORMANCE TUNING
+================================================================================
+
+5.1 ASYNC QUEUE TUNING
+-----------------------
+
+// Large queue for burst tolerance
+spdlog::init_thread_pool(
+    131072,  // 128K message queue (power of 2 for efficiency)
+    2        // 2 background threads for parallel processing
+);
+
+// Overflow policy options:
+// - block: Block caller until space available (default, safe)
+// - overrun_oldest: Drop oldest messages (dangerous, can lose data)
+auto logger = std::make_shared<spdlog::async_logger>(
+    "async_logger",
+    sinks.begin(),
+    sinks.end(),
+    spdlog::thread_pool(),
+    spdlog::async_overflow_policy::block  // or overrun_oldest
+);
+
+5.2 SINK OPTIMIZATION
+---------------------
+
+class OptimizedFileSink : public spdlog::sinks::base_sink<std::mutex> {
+private:
+    int fd_;
+    char buffer_[4096 * 16];  // 64KB write buffer
+    size_t buffer_pos_{0};
+    
+public:
+    OptimizedFileSink(const std::string& filename) {
+        // Open with optimal flags
+        fd_ = open(filename.c_str(),
+                  O_WRONLY | O_CREAT | O_APPEND | O_DIRECT,
+                  0644);
+        
+        if (fd_ < 0) {
+            throw spdlog::spdlog_ex("Failed to open file");
+        }
+        
+        // Advise kernel about access pattern
+        posix_fadvise(fd_, 0, 0, POSIX_FADV_SEQUENTIAL);
+        posix_fadvise(fd_, 0, 0, POSIX_FADV_NOREUSE);
+    }
+    
+protected:
+    void sink_it_(const spdlog::details::log_msg& msg) override {
+        spdlog::memory_buf_t formatted;
+        formatter_->format(msg, formatted);
+        
+        // Buffer writes
+        if (buffer_pos_ + formatted.size() > sizeof(buffer_)) {
+            flush_buffer();
+        }
+        
+        memcpy(buffer_ + buffer_pos_, formatted.data(), formatted.size());
+        buffer_pos_ += formatted.size();
+    }
+    
+    void flush_() override {
+        flush_buffer();
+        fsync(fd_);
+    }
+    
+private:
+    void flush_buffer() {
+        if (buffer_pos_ == 0) return;
+        
+        ssize_t written = write(fd_, buffer_, buffer_pos_);
+        if (written != static_cast<ssize_t>(buffer_pos_)) {
+            throw spdlog::spdlog_ex("Write failed");
+        }
+        
+        buffer_pos_ = 0;
+    }
+};
+
+5.3 CPU AFFINITY
+----------------
+
+void pin_logger_thread() {
+    // Pin async logger thread to specific CPU
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(LOGGER_CPU_ID, &cpuset);  // e.g., CPU 15
+    
+    // Get thread pool's thread handle
+    auto thread_pool = spdlog::thread_pool();
+    // Note: spdlog doesn't expose thread handle directly
+    // You may need to create custom thread pool
+    
+    // Alternative: Set affinity in custom sink
+    pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+}
+
+5.4 CONDITIONAL COMPILATION
+----------------------------
+
+// Debug logging only in debug builds
+#ifdef NDEBUG
+    #define LOG_DEBUG(...) ((void)0)
+#else
+    #define LOG_DEBUG(...) spdlog::debug(__VA_ARGS__)
+#endif
+
+// Trace logging controlled by runtime flag
+#define LOG_TRACE(...) \
+    do { \
+        if (UNLIKELY(trace_enabled_)) { \
+            spdlog::trace(__VA_ARGS__); \
+        } \
+    } while(0)
+
+================================================================================
+                              END OF DOCUMENT
+================================================================================

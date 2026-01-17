@@ -1,0 +1,534 @@
+================================================================================
+SECURITY AUDITING AND LOGGING FOR HFT TRADING SYSTEMS
+================================================================================
+
+OVERVIEW
+--------
+This document provides comprehensive guidelines for implementing security auditing
+and logging in high-frequency trading systems. Proper audit logging is critical
+for detecting security incidents, conducting forensic investigations, meeting
+regulatory compliance requirements, and maintaining system accountability.
+
+================================================================================
+SECURITY ARCHITECTURE
+================================================================================
+
+1. LOGGING ARCHITECTURE
+------------------------
+
+Multi-Tier Logging Strategy:
+
+Tier 1: Application Logs
+├── Trading Engine Logs
+├── Order Management System Logs
+├── Risk Engine Logs
+└── API Gateway Logs
+
+Tier 2: Security Logs
+├── Authentication Logs
+├── Authorization Logs
+├── API Access Logs
+└── Cryptographic Operation Logs
+
+Tier 3: System Logs
+├── Operating System Logs (syslog)
+├── Network Logs (firewall, IDS/IPS)
+├── Database Audit Logs
+└── Infrastructure Logs
+
+Tier 4: Aggregation and Analysis
+├── Centralized Log Management (ELK, Splunk)
+├── Security Information and Event Management (SIEM)
+├── Log Correlation and Analysis
+└── Alerting and Notification
+
+2. LOG DATA FLOW
+-----------------
+
+Applications → Log Shippers (Filebeat) → Log Pipeline (Logstash) → 
+Storage (Elasticsearch) → Visualization (Kibana) → Alerting (ElastAlert)
+
+3. AUDIT EVENT CATEGORIES
+--------------------------
+
+Security Events:
+- Authentication attempts (success/failure)
+- Authorization decisions
+- Privilege escalation
+- Account changes
+- Configuration changes
+
+Trading Events:
+- Order submissions
+- Order modifications
+- Order cancellations
+- Position changes
+- Risk limit breaches
+
+System Events:
+- Service start/stop
+- Configuration reloads
+- Error conditions
+- Performance issues
+
+================================================================================
+IMPLEMENTATION CODE EXAMPLES
+================================================================================
+
+1. SECURITY AUDIT LOGGER (C++)
+-------------------------------
+
+```cpp
+#include <syslog.h>
+#include <fstream>
+#include <chrono>
+#include <mutex>
+#include <queue>
+#include <thread>
+#include <json/json.h>
+
+class SecurityAuditLogger {
+public:
+    enum class EventType {
+        AUTHENTICATION,
+        AUTHORIZATION,
+        API_ACCESS,
+        DATA_ACCESS,
+        CONFIG_CHANGE,
+        SECURITY_ALERT,
+        TRADING_ACTION
+    };
+
+    enum class Severity {
+        DEBUG,
+        INFO,
+        WARNING,
+        ERROR,
+        CRITICAL
+    };
+
+    struct AuditEvent {
+        std::chrono::system_clock::time_point timestamp;
+        EventType event_type;
+        Severity severity;
+        std::string user_id;
+        std::string source_ip;
+        std::string action;
+        std::string resource;
+        bool success;
+        std::map<std::string, std::string> metadata;
+    };
+
+private:
+    std::string log_file_path_;
+    std::ofstream log_file_;
+    std::queue<AuditEvent> event_queue_;
+    std::mutex queue_mutex_;
+    std::condition_variable queue_cv_;
+    std::atomic<bool> running_{false};
+    std::thread writer_thread_;
+    bool syslog_enabled_{true};
+
+public:
+    explicit SecurityAuditLogger(const std::string& log_file_path)
+        : log_file_path_(log_file_path) {
+
+        log_file_.open(log_file_path_, std::ios::app);
+        if (!log_file_.is_open()) {
+            throw std::runtime_error("Failed to open audit log file");
+        }
+
+        if (syslog_enabled_) {
+            openlog("hft-security", LOG_PID | LOG_CONS, LOG_LOCAL5);
+        }
+
+        running_ = true;
+        writer_thread_ = std::thread(&SecurityAuditLogger::writerLoop, this);
+    }
+
+    ~SecurityAuditLogger() {
+        running_ = false;
+        queue_cv_.notify_all();
+
+        if (writer_thread_.joinable()) {
+            writer_thread_.join();
+        }
+
+        if (log_file_.is_open()) {
+            log_file_.close();
+        }
+
+        if (syslog_enabled_) {
+            closelog();
+        }
+    }
+
+    void logEvent(const AuditEvent& event) {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        event_queue_.push(event);
+        queue_cv_.notify_one();
+    }
+
+    // Convenience methods for common events
+    void logAuthentication(const std::string& user_id,
+                          const std::string& source_ip,
+                          bool success,
+                          const std::string& method = "") {
+        AuditEvent event;
+        event.timestamp = std::chrono::system_clock::now();
+        event.event_type = EventType::AUTHENTICATION;
+        event.severity = success ? Severity::INFO : Severity::WARNING;
+        event.user_id = user_id;
+        event.source_ip = source_ip;
+        event.action = "LOGIN";
+        event.resource = "SYSTEM";
+        event.success = success;
+
+        if (!method.empty()) {
+            event.metadata["auth_method"] = method;
+        }
+
+        logEvent(event);
+    }
+
+    void logAuthorization(const std::string& user_id,
+                         const std::string& action,
+                         const std::string& resource,
+                         bool success) {
+        AuditEvent event;
+        event.timestamp = std::chrono::system_clock::now();
+        event.event_type = EventType::AUTHORIZATION;
+        event.severity = success ? Severity::INFO : Severity::WARNING;
+        event.user_id = user_id;
+        event.action = action;
+        event.resource = resource;
+        event.success = success;
+
+        logEvent(event);
+    }
+
+    void logTradingAction(const std::string& user_id,
+                         const std::string& action,
+                         const std::string& symbol,
+                         double price,
+                         int64_t quantity) {
+        AuditEvent event;
+        event.timestamp = std::chrono::system_clock::now();
+        event.event_type = EventType::TRADING_ACTION;
+        event.severity = Severity::INFO;
+        event.user_id = user_id;
+        event.action = action;
+        event.resource = symbol;
+        event.success = true;
+        event.metadata["price"] = std::to_string(price);
+        event.metadata["quantity"] = std::to_string(quantity);
+
+        logEvent(event);
+    }
+
+    void logSecurityAlert(const std::string& alert_type,
+                         const std::string& description,
+                         Severity severity = Severity::CRITICAL) {
+        AuditEvent event;
+        event.timestamp = std::chrono::system_clock::now();
+        event.event_type = EventType::SECURITY_ALERT;
+        event.severity = severity;
+        event.action = alert_type;
+        event.resource = "SECURITY_SYSTEM";
+        event.success = false;
+        event.metadata["description"] = description;
+
+        logEvent(event);
+    }
+
+private:
+    void writerLoop() {
+        while (running_) {
+            std::unique_lock<std::mutex> lock(queue_mutex_);
+
+            queue_cv_.wait(lock, [this] {
+                return !event_queue_.empty() || !running_;
+            });
+
+            while (!event_queue_.empty()) {
+                AuditEvent event = event_queue_.front();
+                event_queue_.pop();
+                lock.unlock();
+
+                writeEvent(event);
+
+                lock.lock();
+            }
+        }
+    }
+
+    void writeEvent(const AuditEvent& event) {
+        // Write to file (JSON format)
+        Json::Value json_event;
+        json_event["timestamp"] = formatTimestamp(event.timestamp);
+        json_event["event_type"] = eventTypeToString(event.event_type);
+        json_event["severity"] = severityToString(event.severity);
+        json_event["user_id"] = event.user_id;
+        json_event["source_ip"] = event.source_ip;
+        json_event["action"] = event.action;
+        json_event["resource"] = event.resource;
+        json_event["success"] = event.success;
+
+        Json::Value metadata(Json::objectValue);
+        for (const auto& [key, value] : event.metadata) {
+            metadata[key] = value;
+        }
+        json_event["metadata"] = metadata;
+
+        Json::StreamWriterBuilder builder;
+        builder["indentation"] = "";
+        std::string json_str = Json::writeString(builder, json_event);
+
+        log_file_ << json_str << std::endl;
+        log_file_.flush();
+
+        // Write to syslog if enabled
+        if (syslog_enabled_) {
+            int syslog_priority = severityToSyslog(event.severity);
+            std::string syslog_msg = formatSyslogMessage(event);
+            syslog(syslog_priority, "%s", syslog_msg.c_str());
+        }
+    }
+
+    std::string formatTimestamp(
+        std::chrono::system_clock::time_point tp) const {
+        auto tt = std::chrono::system_clock::to_time_t(tp);
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            tp.time_since_epoch()) % 1000;
+
+        std::ostringstream ss;
+        ss << std::put_time(std::gmtime(&tt), "%Y-%m-%dT%H:%M:%S")
+           << '.' << std::setfill('0') << std::setw(3) << ms.count() << 'Z';
+        return ss.str();
+    }
+
+    std::string eventTypeToString(EventType type) const {
+        switch (type) {
+            case EventType::AUTHENTICATION: return "AUTHENTICATION";
+            case EventType::AUTHORIZATION: return "AUTHORIZATION";
+            case EventType::API_ACCESS: return "API_ACCESS";
+            case EventType::DATA_ACCESS: return "DATA_ACCESS";
+            case EventType::CONFIG_CHANGE: return "CONFIG_CHANGE";
+            case EventType::SECURITY_ALERT: return "SECURITY_ALERT";
+            case EventType::TRADING_ACTION: return "TRADING_ACTION";
+            default: return "UNKNOWN";
+        }
+    }
+
+    std::string severityToString(Severity severity) const {
+        switch (severity) {
+            case Severity::DEBUG: return "DEBUG";
+            case Severity::INFO: return "INFO";
+            case Severity::WARNING: return "WARNING";
+            case Severity::ERROR: return "ERROR";
+            case Severity::CRITICAL: return "CRITICAL";
+            default: return "UNKNOWN";
+        }
+    }
+
+    int severityToSyslog(Severity severity) const {
+        switch (severity) {
+            case Severity::DEBUG: return LOG_DEBUG;
+            case Severity::INFO: return LOG_INFO;
+            case Severity::WARNING: return LOG_WARNING;
+            case Severity::ERROR: return LOG_ERR;
+            case Severity::CRITICAL: return LOG_CRIT;
+            default: return LOG_INFO;
+        }
+    }
+
+    std::string formatSyslogMessage(const AuditEvent& event) const {
+        std::ostringstream ss;
+        ss << eventTypeToString(event.event_type) << " | "
+           << "User: " << event.user_id << " | "
+           << "Action: " << event.action << " | "
+           << "Resource: " << event.resource << " | "
+           << "Success: " << (event.success ? "YES" : "NO");
+
+        if (!event.source_ip.empty()) {
+            ss << " | IP: " << event.source_ip;
+        }
+
+        return ss.str();
+    }
+};
+```
+
+2. ELK STACK INTEGRATION
+-------------------------
+
+```cpp
+#include <curl/curl.h>
+
+class ElasticsearchLogger {
+private:
+    std::string es_url_;
+    std::string index_name_;
+
+public:
+    ElasticsearchLogger(const std::string& es_url, const std::string& index)
+        : es_url_(es_url), index_name_(index) {}
+
+    bool logToElasticsearch(const Json::Value& document) {
+        CURL* curl = curl_easy_init();
+        if (!curl) return false;
+
+        // Generate document ID (timestamp-based)
+        auto now = std::chrono::system_clock::now();
+        auto epoch = now.time_since_epoch();
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(epoch);
+        std::string doc_id = std::to_string(ms.count());
+
+        std::string url = es_url_ + "/" + index_name_ + "/_doc/" + doc_id;
+
+        Json::StreamWriterBuilder builder;
+        std::string json_data = Json::writeString(builder, document);
+
+        struct curl_slist* headers = nullptr;
+        headers = curl_slist_append(headers, "Content-Type: application/json");
+
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_data.c_str());
+
+        CURLcode res = curl_easy_perform(curl);
+        bool success = (res == CURLE_OK);
+
+        curl_slist_free_all(headers);
+        curl_easy_cleanup(curl);
+
+        return success;
+    }
+};
+```
+
+================================================================================
+CONFIGURATION TEMPLATES
+================================================================================
+
+1. RSYSLOG CONFIGURATION
+-------------------------
+
+```conf
+# /etc/rsyslog.d/50-hft-security.conf
+
+# HFT Security Audit Logs
+local5.*                        /var/log/hft/security-audit.log
+
+# Template for structured logging
+template(name="JsonFormat" type="list") {
+    constant(value="{")
+    constant(value="\"timestamp\":\"")      property(name="timereported" dateFormat="rfc3339")
+    constant(value="\",\"host\":\"")        property(name="hostname")
+    constant(value="\",\"severity\":\"")    property(name="syslogseverity-text")
+    constant(value="\",\"facility\":\"")    property(name="syslogfacility-text")
+    constant(value="\",\"program\":\"")     property(name="programname")
+    constant(value="\",\"message\":\"")     property(name="msg" format="json")
+    constant(value="\"}\n")
+}
+
+# Send to central log server
+*.* @@log-server.hft-system.local:514;JsonFormat
+
+# Retention policy
+$outchannel log_rotation,/var/log/hft/security-audit.log,104857600,/usr/sbin/logrotate
+local5.* :omfile:$log_rotation
+```
+
+2. LOGROTATE CONFIGURATION
+---------------------------
+
+```conf
+# /etc/logrotate.d/hft-security
+
+/var/log/hft/*.log {
+    daily
+    rotate 365
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 hft-user hft-group
+    sharedscripts
+    postrotate
+        /bin/kill -HUP `cat /var/run/syslogd.pid 2> /dev/null` 2> /dev/null || true
+    endscript
+}
+```
+
+3. ELASTICSEARCH INDEX TEMPLATE
+--------------------------------
+
+```json
+{
+  "index_patterns": ["hft-security-*"],
+  "settings": {
+    "number_of_shards": 3,
+    "number_of_replicas": 2,
+    "index.lifecycle.name": "hft-security-policy",
+    "index.lifecycle.rollover_alias": "hft-security"
+  },
+  "mappings": {
+    "properties": {
+      "timestamp": {
+        "type": "date"
+      },
+      "event_type": {
+        "type": "keyword"
+      },
+      "severity": {
+        "type": "keyword"
+      },
+      "user_id": {
+        "type": "keyword"
+      },
+      "source_ip": {
+        "type": "ip"
+      },
+      "action": {
+        "type": "keyword"
+      },
+      "resource": {
+        "type": "keyword"
+      },
+      "success": {
+        "type": "boolean"
+      },
+      "metadata": {
+        "type": "object",
+        "enabled": true
+      }
+    }
+  }
+}
+```
+
+================================================================================
+BEST PRACTICES SUMMARY
+================================================================================
+
+1. LOG all security-relevant events
+2. USE structured logging (JSON format)
+3. INCLUDE contextual information (user, IP, timestamp)
+4. IMPLEMENT log aggregation and centralization
+5. ENABLE log encryption in transit and at rest
+6. SET appropriate log retention periods
+7. IMPLEMENT real-time log monitoring and alerting
+8. PROTECT log integrity (write-once, tamper-evident)
+9. REGULARLY review and analyze logs
+10. IMPLEMENT automated log analysis and correlation
+11. ENSURE log availability during incidents
+12. COMPLY with regulatory logging requirements
+13. IMPLEMENT log backup and archival
+14. RESTRICT access to audit logs
+15. TEST log monitoring and alerting regularly
+
+================================================================================
+END OF DOCUMENT
+================================================================================
